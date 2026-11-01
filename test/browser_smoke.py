@@ -111,7 +111,7 @@ def run(prefix):
                           const link = r.querySelector('a.title');
                           const clone = link?.cloneNode(true);
                           clone?.querySelectorAll('img.emoji').forEach(img => img.replaceWith(document.createTextNode(emojiMap[img.alt] || `:${img.alt}:`)));
-                          return {id: r.dataset.topicId, title: clone?.textContent.trim(), href: link?.getAttribute('href')};
+                          return {id: r.dataset.topicId, title: clone?.textContent.trim(), raw_title: link?.textContent.trim(), href: link?.getAttribute('href'), emoji: Array.from(link?.querySelectorAll('img.emoji') || [], i => ({alt: i.alt, src: i.src}))};
                         })""", emoji_map)
                         evidence["title_emoji_images"] = page.locator('.topic-list a.title img.emoji').evaluate_all("images => images.map(i => ({src:i.src, alt:i.alt, complete:i.complete, width:i.naturalWidth}))")
                         evidence["icons"] = page.locator('svg.d-icon use').evaluate_all("""uses => uses.map(use => {
