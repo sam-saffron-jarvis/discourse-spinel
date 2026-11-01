@@ -4,6 +4,7 @@
 Runs before the complete browser proof, which replaces the interrupted run's
 partial report/screenshots with complete desktop/phone evidence.
 """
+import argparse
 import json
 from pathlib import Path
 import signal
@@ -18,17 +19,22 @@ def assert_port_free():
         probe.bind(("127.0.0.1", 3498))
 
 
+parser = argparse.ArgumentParser()
+parser.add_argument("--topic", action="store_true")
+args = parser.parse_args()
 assert_port_free()
-shot = Path("build/browser/prefix-desktop.png")
-previous = shot.stat().st_mtime_ns if shot.exists() else None
+shots = "build/topic-browser/prefix-desktop-*-click.png" if args.topic else "build/browser/prefix-desktop.png"
+previous = {str(path): path.stat().st_mtime_ns for path in Path('.').glob(shots)}
+label = "topic-browser-cleanup" if args.topic else "browser-cleanup"
+command = ["python3", "test/topic_browser_smoke.py"] if args.topic else ["python3", "test/browser_smoke.py", "--base-uri", "/node/jarvis/widgets/discourse-spinel-app"]
 Path("build").mkdir(exist_ok=True)
-with Path("build/browser-cleanup.log").open("w") as log:
-    child = subprocess.Popen(["python3", "test/browser_smoke.py", "--base-uri", "/node/jarvis/widgets/discourse-spinel-app"], stdout=log, stderr=log)
+with Path(f"build/{label}.log").open("w") as log:
+    child = subprocess.Popen(command, stdout=log, stderr=log)
     try:
         deadline = time.monotonic() + 45
         rendered = False
         while time.monotonic() < deadline and child.poll() is None:
-            rendered = shot.exists() and shot.stat().st_mtime_ns != previous
+            rendered = any(path.stat().st_mtime_ns != previous.get(str(path)) for path in Path('.').glob(shots))
             if rendered:
                 break
             time.sleep(.05)
@@ -45,5 +51,5 @@ with Path("build/browser-cleanup.log").open("w") as log:
 assert_port_free()
 report = {"signal": "SIGTERM", "interrupted_after_desktop_screenshot": True,
           "exit_code": code, "shutdown_seconds": elapsed, "owned_native3498_released": True}
-Path("build/browser-cleanup.json").write_text(json.dumps(report, indent=2) + "\n")
+Path(f"build/{label}.json").write_text(json.dumps(report, indent=2) + "\n")
 print("Browser signal cleanup passed: rendered desktop interrupted; owned native3498 released")

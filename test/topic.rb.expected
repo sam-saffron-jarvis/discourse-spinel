@@ -1,0 +1,20 @@
+topic permits source public direct access
+topic direct unlisted link follows Guardian rather than latest visibility
+topic excludes deleted topics
+topic excludes private messages
+topic excludes restricted categories
+topic Guardian denies absent and nonexistent categories unlike list SQL
+topic excludes shared drafts even in public categories
+post stream excludes deleted whisper foreign posts and uses sort_order not IDs/numbers
+hidden cooked redacted at SQL boundary and raw never selected
+source readers count and nil score getters
+topic reads changed cooked source rows without fixtures
+near-post source window loads five before and fifteen from target
+near-post source window backfills from earlier visible posts at end
+near-post first window never underflows
+slug route and source client transport flags
+numeric source topic and post-number route
+malformed topic IDs routes post-numbers and encoded separators fail closed
+unsupported filters raw deleted and duplicate parameters never widen visibility
+missing primary group never aliases actual group zero everyone
+post score preserves source nil fallback integer versus stored float zero

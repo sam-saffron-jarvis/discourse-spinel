@@ -1,6 +1,9 @@
 prefixed and proxy-stripped native routes
 prefix boundary is segment exact
 outbound mount prefix
+mounted cooked response rebases local URLs once without changing external protocol-relative or fragment URLs
+root cooked response preserves source bytes without rebaking
+mount adapter preserves native post identity and changes only cooked local URL attributes
 static MIME and binary length
 traversal symlinks source maps evidence and unknown MIME fail closed
 mount config rejects ambiguous and injectable paths

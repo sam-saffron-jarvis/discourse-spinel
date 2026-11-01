@@ -14,12 +14,15 @@ class NativeReferenceTest < Minitest::Test
 
   class FakeConnection
     attr_reader :queries
-    def initialize
+    def initialize(chat_setting = "t")
       @queries = []
+      @chat_setting = chat_setting
     end
     def exec_params(sql, params)
       @queries << [sql, params]
-      if sql.include?("FROM uploads")
+      if sql.include?("SELECT value FROM site_settings")
+        Result.new([[@chat_setting]])
+      elsif sql.include?("FROM uploads")
         Result.new([[-5, "/images/discourse-logo-sketch.png"], [-6, "/images/discourse-logo-sketch-small.png"]])
       else
         Result.new([["default_locale", "en"], ["login_required", "f"], ["title", "Live title"], ["smtp_password", "dont-expose"]])
@@ -52,7 +55,7 @@ class NativeReferenceTest < Minitest::Test
     assert_equal %w[regular banner], json.fetch("archetypes").map { |a| a.fetch("id") }
     assert_equal "Regular Topic", json.fetch("archetypes").first.fetch("name")
     assert_equal ["public"], json.fetch("categories").map { |c| c.fetch("name") }
-    assert_match(/WHERE c.read_restricted = false/, FakeConnection.new.tap { |conn| NativeReference.site_json(conn) }.queries.last.first)
+    assert_match(/WHERE c.read_restricted = false/, FakeConnection.new.tap { |conn| NativeReference.site_json(conn) }.queries.map(&:first).find { |sql| sql.include?("FROM categories") })
     assert_equal({ "newuser" => 0, "basic" => 1, "member" => 2, "regular" => 3, "leader" => 4 }, json.fetch("trust_levels"))
     assert_equal 1, json.fetch("post_types").fetch("regular")
     assert_equal 2, json.fetch("notification_types").fetch("replied")
@@ -63,6 +66,18 @@ class NativeReferenceTest < Minitest::Test
     assert_equal %w[all yearly quarterly monthly weekly daily], json.fetch("periods")
     assert_equal %w[latest unread new unseen top read posted bookmarks hot categories votes], json.fetch("top_menu_items")
     assert_equal %w[latest top categories hot categories top votes], json.fetch("anonymous_top_menu_items")
+    assert_equal({ "category" => "folder", "tag" => "tag", "channel" => "comment" }, json.fetch("hashtag_icons"))
+  end
+
+  def test_hashtag_icons_follow_enabled_source_registry
+    conn = FakeConnection.new
+    assert_equal({ "category" => "folder", "tag" => "tag", "channel" => "comment" }, NativeReference.hashtag_icons(conn, "tagging_enabled" => true))
+    assert_equal({ "category" => "folder", "channel" => "comment" }, NativeReference.hashtag_icons(conn, "tagging_enabled" => false))
+    disabled_conn = FakeConnection.new("f")
+    assert_equal({ "category" => "folder", "tag" => "tag" }, NativeReference.hashtag_icons(disabled_conn, "tagging_enabled" => true))
+    query, params = conn.queries.last
+    assert_match(/SELECT value FROM site_settings WHERE name = \$1/, query)
+    assert_equal ["enable_public_channels"], params
   end
 
   def test_metadata_is_pinned_and_client_settings_are_bounded

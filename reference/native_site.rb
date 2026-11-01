@@ -42,6 +42,23 @@ module NativeReference
     "circles_activity" => 900, "live_invitation" => 1000,
   }.freeze
 
+  # Core and task-enabled Chat HashtagAutocompleteService source projection.
+  # Values are source constants from CategoryHashtagDataSource, TagHashtagDataSource,
+  # and Chat::ChannelHashtagDataSource. Arbitrary plugin registry additions are not
+  # available to this standalone runtime and remain unsupported.
+  CORE_HASHTAG_ICONS = { "category" => "folder", "tag" => "tag", "channel" => "comment" }.freeze
+  CHAT_PUBLIC_CHANNELS_SETTING = "enable_public_channels".freeze
+
+  def self.hashtag_icons(conn, settings)
+    icons = { "category" => CORE_HASHTAG_ICONS.fetch("category") }
+    icons["tag"] = CORE_HASHTAG_ICONS.fetch("tag") if settings.fetch("tagging_enabled")
+    rows = conn.exec_params("SELECT value FROM site_settings WHERE name = $1", [CHAT_PUBLIC_CHANNELS_SETTING])
+    # Chat plugin's pinned config default is true; an explicit DB override wins.
+    chat_public_channels = rows.ntuples.zero? || %w[t true 1].include?(rows.getvalue(0, 0).to_s)
+    icons["channel"] = CORE_HASHTAG_ICONS.fetch("channel") if chat_public_channels
+    icons
+  end
+
   def self.site_json(conn)
     settings = read_client_settings(conn)
     raise "unsupported locale" unless settings["default_locale"] == "en"
@@ -61,6 +78,7 @@ module NativeReference
       "can_search" => true,
       "can_tag_topics" => false,
       "can_tag_pms" => false,
+      "hashtag_icons" => hashtag_icons(conn, settings),
       "categories" => categories,
       "archetypes" => ARCHETYPES,
     })

@@ -5,12 +5,17 @@
 require "json"
 require "uri"
 require_relative "valkey"
+require_relative "topic"
 
 class NativeMessageBus
   CHANNELS = %w[/latest /delete /recover /destroy /site/banner /file-change /site/read-only /refresh_client /global/asset-version].freeze
 
+  def initialize(conn = nil)
+    @conn = conn
+  end
+
   def self.channel_allowed?(channel)
-    CHANNELS.include?(channel) || channel.match?(/\A\/private-messages\/unread-indicator\/[1-9]\d{0,9}\z/)
+    CHANNELS.include?(channel) || channel.match?(/\A\/topic\/[1-9]\d{0,9}\z/) || channel.match?(/\A\/private-messages\/unread-indicator\/[1-9]\d{0,9}\z/)
   end
 
   def parse(body)
@@ -31,6 +36,12 @@ class NativeMessageBus
 
   def call(body, client_id)
     subscriptions = parse(body)
+    subscriptions.keys.each do |channel|
+      if channel.start_with?("/topic/")
+        id = channel.split("/").last.to_s
+        raise "topic channel inaccessible" unless @conn && id.to_i <= 2147483647 && @conn.exec_params(NativeTopic::TOPIC_QUERY, [id]).ntuples == 1
+      end
+    end
     redis = NativeValkey.new
     begin
       JSON.generate(poll(subscriptions, client_id, redis))

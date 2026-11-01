@@ -11,7 +11,7 @@ abort "wrong task Valkey" unless ENV["REDIS_URL"] == expected_redis_url
 SITE_FIELDS = %w[
   default_archetype notification_types post_types trust_levels filters
   anonymous_list_filters periods archetypes top_menu_items anonymous_top_menu_items
-  can_create_tag can_search can_tag_topics can_tag_pms categories
+  can_create_tag can_search can_tag_topics can_tag_pms hashtag_icons categories
 ].freeze
 
 # A separate savepoint isolates Site.json_for's write-on-read error while leaving

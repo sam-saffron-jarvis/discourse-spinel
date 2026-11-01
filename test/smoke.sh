@@ -30,7 +30,7 @@ with socket.socket() as listener:
     listener.bind(('127.0.0.1', 3498))  # fail rather than test a shared listener
 PY
 python3 test/source_contract.py
-spin test test/query_contract.rb test/serializers.rb test/settings_users.rb test/surface.rb test/avatars.rb test/message_bus.rb test/site.rb test/document.rb test/preloads.rb
+spin test test/query_contract.rb test/serializers.rb test/settings_users.rb test/surface.rb test/avatars.rb test/message_bus.rb test/site.rb test/document.rb test/preloads.rb test/topic.rb
 ruby reference/native_site_test.rb
 ruby frontend/test_native_document.rb
 PYTHONDONTWRITEBYTECODE=1 python3 frontend/test_stage_assets.py
@@ -55,6 +55,16 @@ with open('build/latest-rails.new.json') as source:
 assert capture['responses']['latest']['body']['topic_list']['topics'], 'seeded reference must contain real topics'
 PY
 mv build/latest-rails.new.json build/latest-rails.json
+export TOPIC_ORACLE_IDS
+TOPIC_ORACLE_IDS=$(python3 -c 'import json; print(",".join(str(t["id"]) for t in json.load(open("build/latest-rails.json"))["responses"]["latest"]["body"]["topic_list"]["topics"]))')
+(
+  cd ../discourse
+  timeout --kill-after=5s 120s bin/rails runner ../minimal/reference/capture-topic-rails.rb
+) >build/topic-rails.json 2>build/topic-rails.stderr
+(
+  cd ../discourse
+  TOPIC_ORACLE_POST_NUMBER=2147483647 timeout --kill-after=5s 120s bin/rails runner ../minimal/reference/capture-topic-rails.rb
+) >build/topic-near-rails.json 2>build/topic-near-rails.stderr
 
 build/bin/discourse >build/server.log 2>&1 &
 pid=$!
@@ -68,4 +78,5 @@ done
 kill -0 "$pid"
 python3 reference/compare-latest.py --compare-recorded build/latest-rails.json --candidate http://127.0.0.1:3498
 python3 test/http_contract.py
+python3 test/topic_http_contract.py
 printf 'smoke: native ELF, live read-only PG, strict Rails JSON parity, site/settings contract, native HTML/assets and semantic/security fixtures passed; browser DOM verified separately by browser-smoke\n'

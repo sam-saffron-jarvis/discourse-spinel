@@ -51,6 +51,33 @@ entries = [
         "plugins/discourse-topic-voting/lib/discourse_topic_voting/category_extension.rb"],
         ["ListController latest no_definitions and pagination URL selection", "TopicQuery#list_latest/#latest_results/#default_results selected anonymous scopes", "TopicQuery#apply_ordering/#prioritize_pinned_topics/#remove_muted_categories/#apply_shared_drafts", "Topic listable/visible/deleted scopes and guardian public category policy", "TopicListSerializer list metadata and conditional fields", "Solved TopicAnswerMixin#has_accepted_answer/include_has_accepted_answer?", "Topic voting anonymous list can_vote/vote_count/user_voted fields"],
         "ActiveRecord scopes translated to parameterized PostgreSQL CTEs plus explicit JSON projection, 30-row default pagination. Reads run in read-only repeatable-read transactions. Settings defaults selected from source with explicit unsupported guards. No plugin registration/hook/modifier runtime; selected list attributes only. Tags/images/title generation and broader settings/options remain guarded or unextracted, see GAPS.md."),
+    entry(["lib/topic.rb", "reference/capture-topic-rails.rb", "reference/topic-contract.md"],
+        "bounded anonymous TopicView/serializer SQL and JSON-record adaptation; not unchanged Rails", [
+            "lib/topic_view.rb", "app/controllers/topics_controller.rb", "config/routes.rb",
+            "app/models/topic.rb", "app/models/post.rb", "app/models/draft_sequence.rb",
+            "lib/guardian/topic_guardian.rb", "lib/guardian/category_guardian.rb", "lib/guardian/post_guardian.rb",
+            "app/serializers/topic_view_serializer.rb", "app/serializers/topic_view_details_serializer.rb",
+            "app/serializers/post_stream_serializer_mixin.rb", "app/serializers/basic_post_serializer.rb",
+            "app/serializers/post_serializer.rb", "app/serializers/basic_user_serializer.rb",
+            "lib/pinned_check.rb", "config/locales/server.en.yml"],
+        ["TopicView authorization/visible post types/sort_order/20-post and near-post windows",
+         "TopicViewSerializer selected anonymous scalar getters", "PostStreamSerializerMixin stream/posts",
+         "BasicPostSerializer hidden cooked placeholder", "PostSerializer selected anonymous getters",
+         "TopicViewDetailsSerializer limited details/basic users", "source slug/numeric/post-number routes"],
+        "Bound SELECTs over live task PG in repeatable-read read-only transactions. Public-category Guardian policy denies absent categories, restricted/private/deleted/shared-draft topics, permits direct unlisted links. Deleted posts/whispers omitted, hidden cooked redacted by SQL to the source English placeholder, never raw. All emitted root response keys/values/order compared to fresh actual source getters, not full serializer parity. No writes/visits/view-counter acknowledgement, arbitrary filters, plugin hooks, post-ID window endpoint, mega streams, title cooking, tags or images. See exact contract and gaps."),
+    entry(["lib/surface.rb", "frontend/native_document.rb"], "mounted topic deployment adaptation and native topic document", [
+            "lib/pretty_text.rb", "config/discourse_defaults.conf", "app/controllers/topics_controller.rb",
+            "frontend/discourse/app/models/topic.ts", "frontend/discourse/app/routes/topic/from-params.js"],
+        ["PrettyText.paths baseUri cook-time deployment context", "topic_<id> preload and Ember loadTopicView",
+         "topic document title and canonical metadata"],
+        "Unmodified Ember renders source-backed posts. Root cooked bytes match actual source; configured widget-prefix response copies relocate quoted local src/href/poster attributes to the mount without rebaking stored posts. This explicit mount-only divergence is not counted as root Rails serializer byte parity. External/protocol-relative/fragment URLs unchanged."),
+    entry(["reference/native_site.rb"], "selected source hashtag registry/icons for actual cooked decorators", [
+            "app/serializers/site_serializer.rb", "app/services/hashtag_autocomplete_service.rb",
+            "app/services/category_hashtag_data_source.rb", "app/services/tag_hashtag_data_source.rb",
+            "plugins/chat/lib/chat/channel_hashtag_data_source.rb", "plugins/chat/config/settings.yml"],
+        ["SiteSerializer#hashtag_icons", "HashtagAutocompleteService.data_source_icon_map",
+         "category/tag/Chat channel source icons and enable predicates"],
+        "Selected source constants plus live tagging_enabled/enable_public_channels SELECTs, with exact actual getter comparison. No arbitrary plugin registry or Chat routes/runtime support."),
     entry(["lib/letter_avatar_colors.rb"], "unchanged selected constant in renamed module", ["lib/letter_avatar.rb"],
         ["LetterAvatar::COLORS"], "Palette constant copied byte-for-byte; containing module renamed LetterAvatarColors. Image renderer not copied."),
     entry(["frontend/reference/application.html.erb"], "unchanged source reference only; NOT served", ["app/views/layouts/application.html.erb"],
@@ -95,9 +122,9 @@ entries = [
 entries.append({"destinations": ["lib/message_bus.rb", "vendor/message_bus/LICENSE"],
                 "kind": "native read-only short-poll adaptation of MessageBus 5.0.0", "license": "MIT; vendor/message_bus/LICENSE",
                 "sources": [source(p, "message_bus", "5.0.0") for p in ["lib/message_bus.rb", "lib/message_bus/client.rb", "lib/message_bus/message.rb", "lib/message_bus/backends/redis.rb", "lib/message_bus/rack/middleware.rb", "LICENSE"]] +
-                           [source("config/initializers/004-message_bus.rb"), source("app/models/group.rb")],
+                           [source("config/initializers/004-message_bus.rb"), source("app/models/group.rb"), source("app/models/post.rb"), source("app/models/topic.rb")],
                 "selected_definitions": ["Client#backlog/#allowed?", "Redis last_ids/backlog storage", "Message transport codec", "Rack backlog_to_json and synchronous branch", "Discourse logical site/anonymous group selection"],
-                "adaptations": "Bounded observed guest latest channels only; live Valkey MGET/ZRANGEBYSCORE and source user/group/client ACL filtering. No canned empty poll body. Native pure tests plus exact live comparison at four positions to actual MessageBus. No long-poll/chunking, publish, authenticated identity, arbitrary/plugin channels or listeners."})
+                "adaptations": "Bounded observed guest latest and live-authorized public /topic/:id channels only; live Valkey MGET/ZRANGEBYSCORE and source user/group/client ACL filtering. Native topic channels recheck live topic Guardian SQL before reading backlog. No canned empty poll body. Native pure tests plus exact live comparison at four positions to actual MessageBus including three real topic channels. No long-poll/chunking, publish, authenticated identity, arbitrary/plugin channels or listeners."})
 emoji_paths = ["dist/emojis.json", "dist/aliases.json", "dist/tonable_emojis.json"]
 entries.append({"destinations": ["data/emoji-unicode.json", "tools/carry-emoji.py", "data/discourse-emojis-attributions.md"],
                 "kind": "source-data transformation, not Rails output", "license": "MIT package metadata; upstream artwork notices retained, no artwork copied",
@@ -120,6 +147,6 @@ entries.append({"destinations": ["bin/discourse.rb", "tools/build.py", "test/", 
                 "adaptations": "Loopback TCP HTTP server over installed Spinel sockets; live pure-native PG client; no Ruby subprocess/proxy/canned response in serving path. Verification uses synchronous read-only Rails runner only, never a final data backend."})
 manifest = {"schema_version": 1, "upstream": "Discourse", "original_revision": PIN,
             "upstream_license": "GPL-2.0-or-later; Copyright 2014-2026 Civilized Discourse Construction Kit, Inc. and contributors",
-            "scope": "anonymous latest JSON and actual core Ember browser list at task-owned site; topic pages and full plugin support NOT complete",
+            "scope": "anonymous latest JSON and bounded anonymous topic JSON/content with actual core Ember browser rendering at task-owned site; no full serializer/plugin/auth parity",
             "gaps": "GAPS.md", "plugin_coverage": "PLUGIN_SUPPORT.json", "entries": entries}
 Path("SOURCE_MANIFEST.json").write_text(json.dumps(manifest, indent=2) + "\n")

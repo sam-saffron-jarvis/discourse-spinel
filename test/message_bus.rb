@@ -17,6 +17,27 @@ class BusRedis
   end
 end
 
+class TopicBusResult
+  def initialize(count)
+    @count = count
+  end
+  def ntuples
+    @count
+  end
+end
+
+class TopicBusConnection
+  attr_reader :queries
+  def initialize(visible)
+    @visible = visible
+    @queries = []
+  end
+  def exec_params(query, params)
+    @queries << [query, params]
+    TopicBusResult.new(@visible ? 1 : 0)
+  end
+end
+
 def check(value, label)
   raise label unless value
   puts label
@@ -57,6 +78,19 @@ rejected = 0
   end
 end
 check(rejected == 4, "message bus rejects unsupported channels duplicate subscriptions and malformed positions")
+check(bus.parse("%2Ftopic%2F15=-1") == { "/topic/15" => "-1" }, "topic bus accepts source numeric channel syntax")
+rejected = 0
+[nil, TopicBusConnection.new(false)].each do |connection|
+  begin
+    NativeMessageBus.new(connection).call("%2Ftopic%2F15=-1", "abcdef")
+  rescue => error
+    rejected += 1 if error.message == "topic channel inaccessible"
+  end
+end
+check(rejected == 2, "topic bus rejects missing authorization and inaccessible topics before backlog reads")
+connection = TopicBusConnection.new(true)
+NativeMessageBus.new(connection).call("%2Ftopic%2F2147483647=-1", "abcdef")
+check(connection.queries == [[NativeTopic::TOPIC_QUERY, ["2147483647"]]], "topic bus binds IDs and uses same live public topic Guardian policy as API")
 redis = NativeValkey.new
 begin
   check(redis.command(["EXISTS", "default:readonly_mode"]).is_a?(Integer), "native Valkey reads task-owned DB0")

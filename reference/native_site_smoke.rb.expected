@@ -6,3 +6,5 @@ unextracted uploaded-image list fails closed
 site enums follow source mappings
 site archetype list excludes private messages and uses source names
 site categories use anonymous visibility filter
+site hashtag icons use source category tag and Chat registry defaults
+site hashtag icons honor live disabled tag and Chat source predicates

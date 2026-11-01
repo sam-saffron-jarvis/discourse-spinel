@@ -14,12 +14,16 @@ end
 
 class ReferenceConnection
   attr_reader :queries
-  def initialize(promotion = nil)
+  def initialize(promotion = nil, chat = nil)
     @queries = []
     @promotion = promotion
+    @chat = chat
   end
   def exec_params(sql, params)
     @queries << [sql, params]
+    if sql == "SELECT value FROM site_settings WHERE name = $1" && params == ["enable_public_channels"]
+      return ReferenceRows.new(@chat.nil? ? [] : [[@chat]])
+    end
     raise "unsafe settings query" unless sql.include?("name = ANY($1::text[])") || sql.include?("FROM uploads")
     if sql.include?("FROM uploads")
       ReferenceRows.new([[-5, "/images/discourse-logo-sketch.png"], [-6, "/images/discourse-logo-sketch-small.png"]])
@@ -65,3 +69,5 @@ site = JSON.parse(NativeReference.site_json(conn))
 check(site["trust_levels"]["regular"] == 3 && site["post_types"]["regular"] == 1 && site["notification_types"]["replied"] == 2, "site enums follow source mappings")
 check(site["archetypes"][0]["name"] == "Regular Topic" && site["archetypes"].length == 2, "site archetype list excludes private messages and uses source names")
 check(site["categories"].length == 1 && site["categories"][0]["name"] == "public", "site categories use anonymous visibility filter")
+check(site["hashtag_icons"] == { "category" => "folder", "tag" => "tag", "channel" => "comment" }, "site hashtag icons use source category tag and Chat registry defaults")
+check(NativeReference.hashtag_icons(ReferenceConnection.new(nil, "f"), { "tagging_enabled" => false }) == { "category" => "folder" }, "site hashtag icons honor live disabled tag and Chat source predicates")

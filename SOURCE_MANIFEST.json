@@ -3,7 +3,7 @@
   "upstream": "Discourse",
   "original_revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
   "upstream_license": "GPL-2.0-or-later; Copyright 2014-2026 Civilized Discourse Construction Kit, Inc. and contributors",
-  "scope": "anonymous latest JSON and actual core Ember browser list at task-owned site; topic pages and full plugin support NOT complete",
+  "scope": "anonymous latest JSON and bounded anonymous topic JSON/content with actual core Ember browser rendering at task-owned site; no full serializer/plugin/auth parity",
   "gaps": "GAPS.md",
   "plugin_coverage": "PLUGIN_SUPPORT.json",
   "entries": [
@@ -254,6 +254,226 @@
         "Topic voting anonymous list can_vote/vote_count/user_voted fields"
       ],
       "adaptations": "ActiveRecord scopes translated to parameterized PostgreSQL CTEs plus explicit JSON projection, 30-row default pagination. Reads run in read-only repeatable-read transactions. Settings defaults selected from source with explicit unsupported guards. No plugin registration/hook/modifier runtime; selected list attributes only. Tags/images/title generation and broader settings/options remain guarded or unextracted, see GAPS.md."
+    },
+    {
+      "destinations": [
+        "lib/topic.rb",
+        "reference/capture-topic-rails.rb",
+        "reference/topic-contract.md"
+      ],
+      "kind": "bounded anonymous TopicView/serializer SQL and JSON-record adaptation; not unchanged Rails",
+      "license": "GPL-2.0-or-later",
+      "sources": [
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "lib/topic_view.rb",
+          "sha256": "2709c807c73b27b4a67b609f642c195540dfbc43f6bcf1b9711304a2f3b4a34b"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/controllers/topics_controller.rb",
+          "sha256": "46dd790d8d7406539b31ee7f02f5f6d1afa5630f5880903c5efdb7d701df5c60"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "config/routes.rb",
+          "sha256": "66ce2ecb978c2e5b8d084f242878ca9233761a25d984527d4f36ec6d5fa889c6"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/models/topic.rb",
+          "sha256": "8202e548cd9ce289b61aca469449e282ce061b411a9b0551c0f1cd3b82455952"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/models/post.rb",
+          "sha256": "83ddbfe431d831eb6e05b00d87a3ebed1be91560544d17159c8835119db9912f"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/models/draft_sequence.rb",
+          "sha256": "304caf5f9a5beb1f29373e2a233d229417509008e6ecef8bdc5ceb8dfb5d190f"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "lib/guardian/topic_guardian.rb",
+          "sha256": "9c647803cbd137df5f18080fe0659447789ea264308df4e3d2aa7ca8a1152cae"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "lib/guardian/category_guardian.rb",
+          "sha256": "f7e3d398829c8eebcd8c55da94deaa153e51e4c8497cb144fbd723fa365dee29"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "lib/guardian/post_guardian.rb",
+          "sha256": "9fff511fa27b9efb94fad209a765997c9f5874a1c2c9dc3070b5c29c1fb91513"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/serializers/topic_view_serializer.rb",
+          "sha256": "b83ccb93e67e9f4b7a94d83ea5f2f8707d9ed593c6a916f5a1a970a6c0bc557e"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/serializers/topic_view_details_serializer.rb",
+          "sha256": "f6075ecc52c316c927ef6fea444f69a58283692841c28478fe209e9fede183a1"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/serializers/post_stream_serializer_mixin.rb",
+          "sha256": "0da660fbec6db8bd037c07835b1f9f288bc7c4bd9d0aa8ace6b3d8ac13daf01d"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/serializers/basic_post_serializer.rb",
+          "sha256": "b571426b84b4cfee37d5597403469597f5127c7d82f30ae0b9bb49544e423206"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/serializers/post_serializer.rb",
+          "sha256": "00a1751cab3687b031e787f25eb8a64e9f7a4e70af87a16d27a9171ec001812c"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/serializers/basic_user_serializer.rb",
+          "sha256": "e22b92f6de231ac3bd26ece1a3741cf002438e47554ebaa21757feda5b4ea3db"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "lib/pinned_check.rb",
+          "sha256": "e8fb1c0e3e37a792fa0d1aa9b082a7f08766b3b69bb16de28731c1b44e8906c7"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "config/locales/server.en.yml",
+          "sha256": "13fdf75fb404c3da601f7605d7f8e307f87676774e30c6bb199ecbcd62d46af9"
+        }
+      ],
+      "selected_definitions": [
+        "TopicView authorization/visible post types/sort_order/20-post and near-post windows",
+        "TopicViewSerializer selected anonymous scalar getters",
+        "PostStreamSerializerMixin stream/posts",
+        "BasicPostSerializer hidden cooked placeholder",
+        "PostSerializer selected anonymous getters",
+        "TopicViewDetailsSerializer limited details/basic users",
+        "source slug/numeric/post-number routes"
+      ],
+      "adaptations": "Bound SELECTs over live task PG in repeatable-read read-only transactions. Public-category Guardian policy denies absent categories, restricted/private/deleted/shared-draft topics, permits direct unlisted links. Deleted posts/whispers omitted, hidden cooked redacted by SQL to the source English placeholder, never raw. All emitted root response keys/values/order compared to fresh actual source getters, not full serializer parity. No writes/visits/view-counter acknowledgement, arbitrary filters, plugin hooks, post-ID window endpoint, mega streams, title cooking, tags or images. See exact contract and gaps."
+    },
+    {
+      "destinations": [
+        "lib/surface.rb",
+        "frontend/native_document.rb"
+      ],
+      "kind": "mounted topic deployment adaptation and native topic document",
+      "license": "GPL-2.0-or-later",
+      "sources": [
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "lib/pretty_text.rb",
+          "sha256": "ad8807406ae750e08bc8b9190724bad324c10d8775adcac7beed269793ecb2cc"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "config/discourse_defaults.conf",
+          "sha256": "ffc088046d70a1a0fa7bea1b6f1458ea7a45e689614faadb5ad508cf50a002c6"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/controllers/topics_controller.rb",
+          "sha256": "46dd790d8d7406539b31ee7f02f5f6d1afa5630f5880903c5efdb7d701df5c60"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "frontend/discourse/app/models/topic.ts",
+          "sha256": "dfabb415084b8f427d05f833b4dea29691d4cff55daed9193a9fbc36dbf0fdae"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "frontend/discourse/app/routes/topic/from-params.js",
+          "sha256": "0fc9a5b9192b20a71f285f8f1a901ba59ea772cfe0ad0d4c1cd073fc8dbd9ddf"
+        }
+      ],
+      "selected_definitions": [
+        "PrettyText.paths baseUri cook-time deployment context",
+        "topic_<id> preload and Ember loadTopicView",
+        "topic document title and canonical metadata"
+      ],
+      "adaptations": "Unmodified Ember renders source-backed posts. Root cooked bytes match actual source; configured widget-prefix response copies relocate quoted local src/href/poster attributes to the mount without rebaking stored posts. This explicit mount-only divergence is not counted as root Rails serializer byte parity. External/protocol-relative/fragment URLs unchanged."
+    },
+    {
+      "destinations": [
+        "reference/native_site.rb"
+      ],
+      "kind": "selected source hashtag registry/icons for actual cooked decorators",
+      "license": "GPL-2.0-or-later",
+      "sources": [
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/serializers/site_serializer.rb",
+          "sha256": "f734b1b158118654bee273478d696b0a11b6350b58f36c3dbbe76a5544ebe927"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/services/hashtag_autocomplete_service.rb",
+          "sha256": "f99347b3cc3356218c6b687dc4b4b5636816f4100ac5e1f4ec1e85841b5483c4"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/services/category_hashtag_data_source.rb",
+          "sha256": "a2c3c4f32b64774210c57cf3cb34e856d21be112260b9b623ff15a37e10bd812"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/services/tag_hashtag_data_source.rb",
+          "sha256": "2feb69af15d923def41f74e8d6845cc3633868d73f1aefd2f2ad409f369d39e9"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "plugins/chat/lib/chat/channel_hashtag_data_source.rb",
+          "sha256": "4244429c23cbe4bfcf2bf7e0c9129b43a9fec6f4c4432b7e3bbcda5c0f17fdb2"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "plugins/chat/config/settings.yml",
+          "sha256": "d55a9477bca1cf621b66925399edb4d9bf95d7ae907d902f9f3d96aab78a72fd"
+        }
+      ],
+      "selected_definitions": [
+        "SiteSerializer#hashtag_icons",
+        "HashtagAutocompleteService.data_source_icon_map",
+        "category/tag/Chat channel source icons and enable predicates"
+      ],
+      "adaptations": "Selected source constants plus live tagging_enabled/enable_public_channels SELECTs, with exact actual getter comparison. No arbitrary plugin registry or Chat routes/runtime support."
     },
     {
       "destinations": [
@@ -729,6 +949,18 @@
           "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
           "path": "app/models/group.rb",
           "sha256": "4f53a5cfc4e861a7a1ac2d9c6cf131987cdd4e45694b523c551128faef79d91f"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/models/post.rb",
+          "sha256": "83ddbfe431d831eb6e05b00d87a3ebed1be91560544d17159c8835119db9912f"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/models/topic.rb",
+          "sha256": "8202e548cd9ce289b61aca469449e282ce061b411a9b0551c0f1cd3b82455952"
         }
       ],
       "selected_definitions": [
@@ -738,7 +970,7 @@
         "Rack backlog_to_json and synchronous branch",
         "Discourse logical site/anonymous group selection"
       ],
-      "adaptations": "Bounded observed guest latest channels only; live Valkey MGET/ZRANGEBYSCORE and source user/group/client ACL filtering. No canned empty poll body. Native pure tests plus exact live comparison at four positions to actual MessageBus. No long-poll/chunking, publish, authenticated identity, arbitrary/plugin channels or listeners."
+      "adaptations": "Bounded observed guest latest and live-authorized public /topic/:id channels only; live Valkey MGET/ZRANGEBYSCORE and source user/group/client ACL filtering. Native topic channels recheck live topic Guardian SQL before reading backlog. No canned empty poll body. Native pure tests plus exact live comparison at four positions to actual MessageBus including three real topic channels. No long-poll/chunking, publish, authenticated identity, arbitrary/plugin channels or listeners."
     },
     {
       "destinations": [

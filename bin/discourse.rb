@@ -5,6 +5,7 @@ require "pg"
 require "uri"
 require "json"
 require_relative "../lib/latest"
+require_relative "../lib/topic"
 require_relative "../lib/surface"
 require_relative "../lib/preloads"
 require_relative "../lib/avatars"
@@ -21,12 +22,13 @@ conn.exec("SET statement_timeout = '5s'")
 conn.exec("SET TIME ZONE 'UTC'")
 emoji_map = JSON.parse(File.read("data/emoji-unicode.json"))
 latest = NativeLatest.new(conn, emoji_map)
+topics = NativeTopic.new(conn, emoji_map)
 port = ENV.fetch("PORT", "3499").to_i
 raise "unexpected listener port" unless port == 3498 || port == 3499
 paths = NativePaths.new(ENV.fetch("MINIMAL_BASE_URI", ""))
 preloader = NativePreloads.new(conn)
 avatars = NativeAvatars.new(conn, paths)
-message_bus = NativeMessageBus.new
+message_bus = NativeMessageBus.new(conn)
 document = NativeDocument.new(paths.base_uri)
 origin = ENV.fetch("MINIMAL_ORIGIN", "http://127.0.0.1:#{port}")
 server = TCPServer.new("127.0.0.1", port)
@@ -87,7 +89,7 @@ loop do
       body = JSON.generate({ "error" => "only anonymous GET is supported" })
     elsif path == "/srv/status" && query.empty?
       conn.exec("SELECT 1")
-      body = JSON.generate({ "status" => "ok", "database" => "read-only", "frontend" => "core Ember latest integration; topic pages not implemented" })
+      body = JSON.generate({ "status" => "ok", "database" => "read-only", "frontend" => "core Ember latest and anonymous topic integration; bounded serializer contract" })
     elsif path == "/latest.json" || path == "/latest" || path == "/"
       # Discourse pagination URLs omit .json, but XHR/Accept requests are JSON.
       normalized_query = query.sub(/\Ano_definitions=true&/, "").sub(/&no_definitions=true\z/, "")
@@ -114,6 +116,29 @@ loop do
       else
         status = "400 Bad Request"
         body = JSON.generate({ "error" => "only the page parameter (0..2000) is supported" })
+      end
+    elsif path.start_with?("/t/")
+      begin
+        topic_request = NativeTopicRequest.new(path, query)
+        topic_body = topics.call(topic_request.id, topic_request.post_number)
+        topic_body = paths.mount_topic(topic_body) unless topic_body.nil?
+        if topic_body.nil?
+          status = "404 Not Found"
+          body = JSON.generate({ "error" => "topic not found or inaccessible" })
+        else
+          body = topic_body
+          unless topic_request.json || wants_json
+            preloads = preloader.call(latest.call(0))
+            preloads["topic_#{topic_request.id}"] = topic_body
+            data = JSON.parse(topic_body)
+            body = document.render(preloads, JSON.parse(preloads["siteSettings"]), origin,
+              topic: { id: data["id"], slug: data["slug"], title: data["title"] })
+            content_type = "text/html; charset=utf-8"
+          end
+        end
+      rescue ArgumentError => error
+        status = "400 Bad Request"
+        body = JSON.generate({ "error" => error.message })
       end
     elsif path == "/service-worker.js" && query.empty?
       body = document.render_service_worker(origin)

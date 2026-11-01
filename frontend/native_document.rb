@@ -1,7 +1,9 @@
 # frozen_string_literal: true
 
 # Source-derived native /latest HTML bootstrap. Pure Ruby: no Rails, templates, or data
-# capture. The native server may port this contract; preloads/settings remain backend-owned.
+# capture. Topic mode accepts { id:, slug:, title: } and requires the corresponding
+# JSON-text topic_<id> preload produced from TopicViewSerializer. The native server
+# may port this contract; preloads/settings remain backend-owned.
 require "cgi"
 require "digest"
 require "json"
@@ -16,10 +18,11 @@ class NativeDocument
     @manifest_path = manifest_path
   end
 
-  def render(preloads, settings_hash, origin)
+  def render(preloads, settings_hash, origin, topic: nil)
     descriptor = JSON.parse(File.read(@manifest_path))
     origin = normalize_origin(origin)
     settings = settings_hash.each_with_object({}) { |(key, value), out| out[key.to_s] = value }
+    topic = normalize_topic(topic, preloads) if topic
     default_locale = settings.fetch("default_locale", "en").to_s
     setup = {
       "base_url" => "#{origin}#{@base_uri}",
@@ -94,10 +97,10 @@ class NativeDocument
       <head>
       <meta charset="utf-8">
       <meta name="viewport" content="width=device-width, initial-scale=1">
-      <title>Latest topics - #{attr(settings.fetch("title", "Discourse"))}</title>
+      <title>#{topic ? "#{attr(topic.fetch("title"))} - #{attr(settings.fetch("title", "Discourse"))}" : "Latest topics - #{attr(settings.fetch("title", "Discourse"))}"}</title>
       <meta name="generator" content="Discourse #{attr(descriptor.fetch("source").fetch("discourse_version"))} - https://github.com/discourse/discourse version #{attr(descriptor.fetch("source").fetch("discourse_commit"))}">
       <meta name="discourse_theme_id" content="-1">
-      <meta name="discourse_current_homepage" content="latest">
+      #{topic ? %(<link rel="canonical" href="#{attr("#{origin}#{@base_uri}/t/#{topic.fetch("slug")}/#{topic.fetch("id")}")}">) : %(<meta name="discourse_current_homepage" content="latest">)}
       <link rel="icon" href="#{attr(favicon)}">
       <script type="importmap">#{import_map_json}</script>
       #{module_preloads}
@@ -137,6 +140,26 @@ class NativeDocument
   end
 
   private
+
+  def normalize_topic(topic, preloads)
+    raise ArgumentError, "topic must be a Hash" unless topic.is_a?(Hash)
+    fields = topic.each_with_object({}) { |(key, value), out| out[key.to_s] = value }
+    id = fields.fetch("id")
+    id = Integer(id, 10) if id.is_a?(String)
+    raise ArgumentError, "topic id must be a positive integer" unless id.is_a?(Integer) && id.positive?
+    slug = fields.fetch("slug")
+    title = fields.fetch("title")
+    unless slug.is_a?(String) && !slug.empty? && !slug.match?(%r{[/?#]})
+      raise ArgumentError, "topic slug must be a non-empty path segment"
+    end
+    raise ArgumentError, "topic title must be a String" unless title.is_a?(String)
+    unless preloads.key?("topic_#{id}") || preloads.key?(:"topic_#{id}")
+      raise ArgumentError, "topic preload topic_#{id} is required"
+    end
+    { "id" => id, "slug" => slug, "title" => title }
+  rescue KeyError => error
+    raise ArgumentError, "topic requires #{error.key.inspect}"
+  end
 
   def normalize_base_uri(value)
     raise ArgumentError, "base_uri must be a String" unless value.is_a?(String)

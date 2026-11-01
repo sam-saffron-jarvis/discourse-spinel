@@ -5,5 +5,8 @@ message bus decodes actual transport and backlog position
 message bus relative backlog positions
 message bus empty response only when live position is current
 message bus rejects unsupported channels duplicate subscriptions and malformed positions
+topic bus accepts source numeric channel syntax
+topic bus rejects missing authorization and inaccessible topics before backlog reads
+topic bus binds IDs and uses same live public topic Guardian policy as API
 native Valkey reads task-owned DB0
 native Valkey rejects write commands before sending bytes
