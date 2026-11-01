@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """Native server HTTP contract; no Rails HTTP server or DB mutations."""
 import json
+import os
 import pathlib
 import socket
 from html.parser import HTMLParser
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+PORT = int(os.environ.get("MINIMAL_TEST_PORT", "3529"))
+assert PORT in (3528, 3529), "parallel lane test ports only"
+
 
 def request(path, code=200, method="GET", headers=None, content_type="application/json; charset=utf-8", raw=False):
     try:
-        response = urlopen(Request("http://127.0.0.1:3498" + path, method=method, headers=headers or {}), timeout=5)
+        response = urlopen(Request(f"http://127.0.0.1:{PORT}" + path, method=method, headers=headers or {}), timeout=5)
     except HTTPError as error:
         response = error
     with response:
@@ -49,7 +53,7 @@ class Document(HTMLParser):
 
 
 # An unused browser preconnect may close cleanly without an HTTP request.
-with socket.create_connection(("127.0.0.1", 3498), timeout=5) as idle:
+with socket.create_connection(("127.0.0.1", PORT), timeout=5) as idle:
     idle.shutdown(socket.SHUT_WR)
     assert idle.recv(1024) == b"", "EOF is not a malformed HTTP route"
 status = request("/srv/status")

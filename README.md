@@ -36,7 +36,7 @@ make -C minimal topic-browser-smoke
   ELF/input sizes to `build/compile.json`. No whole-app compiler input or compiler
   optimization is involved. Build outputs and evidence are ignored under `build/`.
 - `smoke`: native query/serializer/settings/security tests; fresh synchronous
-  read-only Rails oracle comparisons; then its **own** temporary native3498.
+  read-only Rails oracle comparisons; then its **own** temporary native3529.
   Complete latest JSON equality on two pages is preserved. Topic checks compare
   every emitted root key/value to fresh actual Rails source getters for all 20
   latest topics at post 1 and the maximum supported near-post number, without
@@ -44,7 +44,7 @@ make -C minimal topic-browser-smoke
   live `topic_list` preloads, real module scripts, escaping/static MIME/traversal
   boundaries and read-only polling. Trap kills/waits the child. No DB fixture/DDL
   or seed writes, no Rails HTTP server, no shared listener reuse.
-- `browser-smoke`: its **own** native3498 plus real headless Chromium. Tests desktop
+- `browser-smoke`: its **own** native3529 plus real headless Chromium. Tests desktop
   1440×1000 and phone390×844 with the configured widget prefix and direct root.
   Compares actual Ember topic IDs/titles/links to the native live API; emoji title
   text is reconstructed from real rendered image alt names using source Unicode
@@ -52,7 +52,7 @@ make -C minimal topic-browser-smoke
   screenshots, rendered DOM and reports under `build/browser/`. Remote requests
   are blocked and fail the test. All owned native/browser children are cleaned up.
 
-- `topic-browser-smoke`: its **own** native3498 plus real Chromium; two live
+- `topic-browser-smoke`: its **own** native3529 plus real Chromium; two live
   topics, root/configured prefix, desktop/phone, latest `a.title` click and direct
   topic documents (16 cases). Requires real `.topic-post article[data-post-id]`
   and nonempty `.cooked` matching native first-post identity and live source
@@ -167,3 +167,61 @@ arbitrary incoming Host headers are not reflected into the document.
 
 Coordinator acceptance remains independent; worker browser proof is not a public
 3499 deployment claim. No whole-app/compiler lane is involved.
+
+## Optional native MiniProfiler (development only)
+
+Set `MINIMAL_PROFILER=1` when launching this worktree's native ELF. No profiler
+routes, result headers or HTML injection exist when unset/disabled. The server
+still binds **127.0.0.1 only**; expose it only through the existing authenticated
+private Hub dev surface, never as a new unauthenticated production feature.
+
+Actual upstream **rack-mini-profiler5.0.0** JS/CSS/vendor/templates render the
+request duration, SQL count/elapsed and clickable SQL drill-down on `/latest`.
+`X-MiniProfiler-Ids` lets the unchanged client discover subsequent JSON/XHR/fetch
+results. Routes honor `MINIMAL_BASE_URI` and stripped widget forwarding:
+
+- `GET <prefix>/mini-profiler-resources/includes.js`, `includes.css`, `vendor.js`
+- `POST <prefix>/mini-profiler-resources/results` (upstream form `id` protocol)
+- `GET <prefix>/mini-profiler-resources/results?id=<id>` (JSON diagnostics only)
+
+The reusable port is vendored under `vendor/rack-mini-profiler/`, with MIT license,
+source commit/checksums and unchanged client bytes in `MANIFEST.json`. A separate
+app-owned `frontend/mini-profiler.css` only contains the real upstream popup within
+the phone viewport; it does not replace the UI or modify upstream assets. The small
+app adapter is `lib/mini_profiler.rb`; the PG driver is **unchanged**. No Rails,
+Rack, Ruby service, proxy or subprocess participates in native requests.
+
+Collection is explicit request-local state in this serial server, cleared in
+`ensure`; it includes actual successful/failed `exec`/`exec_params` elapsed time.
+No bind values, query strings, cookies, authorization, request bodies, data rows
+or database error text are stored. SQL literals/comments/quoted identifiers are
+redacted before storage and HTML escaped. Results expire after5min and are bounded
+to32 entries/1MiB total, SQL inputs16KiB/text4KiB/details128 per request. Counts/time
+include omitted details, annotated in the upstream UI. Known result IDs are shared
+within the private dev process, **not per-user authorized**; no results listing.
+
+Unsupported initially: sampling/flamegraphs, allocations/GC/memory, stack/call-site
+and controller/template steps, SQL duplicate analysis, result-reader counts/timing,
+prepared/async PG APIs, client Performance data, snapshots, session controls,
+standalone share HTML and distributed storage. No fabricated stack/reader data.
+Request timing includes query/extraction/serialization/document work, but excludes
+socket transfer, storing profiling results and bootstrap insertion.
+
+```sh
+source ../harness/env.sh
+make profiler-test
+MINIMAL_PROFILER=0 make smoke
+MINIMAL_PROFILER=0 make browser-smoke
+```
+
+Lane tests bind **3528/3529 only**, refuse an occupied listener, and clean their own
+children. Existing test-port override is `MINIMAL_TEST_PORT=3528|3529` (default3529).
+Builds reuse only this worktree's staged assets after hash-verifying all source and
+output bytes (never shared build directories). They always rebuild the own executable: current `spin build` only
+checks entrypoint mtimes and otherwise misses changed required/vendor Ruby files.
+Profiler evidence and warmed same-workload enabled/disabled overhead samples are
+private under `build/profiler-*`; this is not a speedup claim.
+
+When both independent repos are available, `python3 tools/vendor-mini-profiler.py`
+refreshes only the core, unchanged upstream assets/license and provenance manifest.
+No sibling repo is needed to build or run the committed vendored app.

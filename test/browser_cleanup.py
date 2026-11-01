@@ -1,22 +1,26 @@
 #!/usr/bin/env python3
-"""Regression: SIGTERM after real rendering must release owned native3498.
+"""Regression: SIGTERM after real rendering must release owned native test port.
 
 Runs before the complete browser proof, which replaces the interrupted run's
 partial report/screenshots with complete desktop/phone evidence.
 """
 import argparse
 import json
+import os
 from pathlib import Path
 import signal
 import socket
 import subprocess
 import time
 
+PORT = int(os.environ.get("MINIMAL_TEST_PORT", "3529"))
+assert PORT in (3528, 3529), "parallel lane test ports only"
+
 
 def assert_port_free():
     with socket.socket() as probe:
         probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        probe.bind(("127.0.0.1", 3498))
+        probe.bind(("127.0.0.1", PORT))
 
 
 parser = argparse.ArgumentParser()
@@ -50,6 +54,7 @@ with Path(f"build/{label}.log").open("w") as log:
             child.wait(timeout=45)
 assert_port_free()
 report = {"signal": "SIGTERM", "interrupted_after_desktop_screenshot": True,
-          "exit_code": code, "shutdown_seconds": elapsed, "owned_native3498_released": True}
-Path(f"build/{label}.json").write_text(json.dumps(report, indent=2) + "\n")
-print("Browser signal cleanup passed: rendered desktop interrupted; owned native3498 released")
+          "exit_code": code, "shutdown_seconds": elapsed, "owned_native_test_port_released": True}
+Path(f"build/{label}.json").write_text(json.dumps(report, indent=2) + "
+")
+print("Browser signal cleanup passed: rendered desktop interrupted; owned native test port released")

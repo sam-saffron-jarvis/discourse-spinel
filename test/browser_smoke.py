@@ -17,6 +17,9 @@ from urllib.request import urlopen
 
 from playwright.sync_api import sync_playwright
 
+PORT = int(os.environ.get("MINIMAL_TEST_PORT", "3529"))
+assert PORT in (3528, 3529), "parallel lane test ports only"
+
 parser = argparse.ArgumentParser()
 parser.add_argument("--base-uri", default=os.environ.get("MINIMAL_BASE_URI", "/node/jarvis/widgets/discourse-spinel-app"))
 parser.add_argument("--root", action="store_true", help="also exercise unmounted root")
@@ -50,15 +53,15 @@ def run(prefix):
     check_interrupted()
     with socket.socket() as probe:
         probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        probe.bind(("127.0.0.1", 3498))  # never accidentally test a shared listener
-    env = dict(os.environ, PORT="3498", MINIMAL_BASE_URI=prefix, MINIMAL_ORIGIN="http://127.0.0.1:3498",
+        probe.bind(("127.0.0.1", PORT))  # never accidentally test a shared listener
+    env = dict(os.environ, PORT=str(PORT), MINIMAL_BASE_URI=prefix, MINIMAL_ORIGIN=f"http://127.0.0.1:{PORT}",
                DATABASE_URL=os.environ["DSPINEL_PG_URL"] + "/discourse_development",
                REDIS_URL="redis://127.0.0.1:6399/0")
     label = "prefix" if prefix else "root"
     with (output / f"{label}-server.log").open("w") as log:
         child = subprocess.Popen(["build/bin/discourse"], env=env, stdout=log, stderr=log)
         try:
-            origin = "http://127.0.0.1:3498"
+            origin = f"http://127.0.0.1:{PORT}"
             base = origin + prefix
             for _ in range(100):
                 check_interrupted()

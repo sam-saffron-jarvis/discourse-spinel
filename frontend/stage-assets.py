@@ -7,6 +7,7 @@ Only writes minimal/build/assets/native/. Existing generated output is hash-veri
 """
 from __future__ import annotations
 
+import argparse
 import base64
 import hashlib
 import json
@@ -43,7 +44,7 @@ def copy_file(source: Path, target: Path) -> None:
     shutil.copy2(source, target)
 
 
-def verify_existing_stage() -> None:
+def verify_existing_stage(strict_sources: bool = False) -> None:
     """Refuse to replace an unknown/corrupt directory; accept our intact stage on rerun."""
     manifest_path = OUTPUT / "manifest.json"
     if not manifest_path.is_file():
@@ -74,9 +75,16 @@ def verify_existing_stage() -> None:
         source_entries.append((descriptor["service_worker"]["source"], descriptor["service_worker"]["source_sha256"]))
         for relative, expected in source_entries:
             source = ROOT / relative
+            # Lane copies retain original source provenance. Only locked gem
+            # inputs live outside this worktree; never fall back to shared
+            # minimal/build output or create a mutable symlink to it.
+            if relative.startswith("run/") and not source.is_file() and os.environ.get("DSPINEL_ROOT"):
+                source = Path(os.environ["DSPINEL_ROOT"]) / relative
             if not source.is_file():
                 fail(f"existing stage source is missing: {relative}")
             if sha(source) != expected:
+                if strict_sources:
+                    fail(f"staged asset source changed; explicit regeneration required: {relative}")
                 print(f"Existing stage input changed; rebuilding from current source: {relative}", file=sys.stderr)
         for url, expected in entries:
             if url.startswith("/assets/native/"):
@@ -146,8 +154,14 @@ def compile_foundation_palette() -> dict:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--reuse", action="store_true", help="reuse an existing stage only after verifying all staged bytes and source hashes")
+    args = parser.parse_args()
     if OUTPUT.exists():
-        verify_existing_stage()
+        verify_existing_stage(strict_sources=args.reuse)
+        if args.reuse:
+            print("Reused this worktree's staged assets after verifying every staged byte and source hash")
+            return
     temporary = OUTPUT.with_name(".native-stage-tmp")
     if temporary.exists():
         fail(f"refusing to reuse temporary stage: {temporary.relative_to(ROOT)}")

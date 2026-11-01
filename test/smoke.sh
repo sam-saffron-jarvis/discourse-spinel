@@ -6,9 +6,13 @@ cd "$(dirname "$0")/.."
 source ../harness/env.sh
 export DATABASE_URL="$DSPINEL_PG_URL/discourse_development"
 export REDIS_URL="redis://127.0.0.1:6399/0"
-export PORT=3498
+export MINIMAL_TEST_PORT="${MINIMAL_TEST_PORT:-3529}"
+[[ "$MINIMAL_TEST_PORT" == 3528 || "$MINIMAL_TEST_PORT" == 3529 ]]
+export PORT="$MINIMAL_TEST_PORT"
+export MINIMAL_PROFILER=0
+WORKTREE="$PWD"
 export MINIMAL_BASE_URI=""
-export MINIMAL_ORIGIN="http://127.0.0.1:3498"
+export MINIMAL_ORIGIN="http://127.0.0.1:$PORT"
 mkdir -p build/tmp
 export TMPDIR="$PWD/build/tmp"
 export PGOPTIONS='-c default_transaction_read_only=on -c statement_timeout=15000'
@@ -24,10 +28,10 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 python3 - <<'PY'
-import socket
+import socket, os
 with socket.socket() as listener:
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    listener.bind(('127.0.0.1', 3498))  # fail rather than test a shared listener
+    listener.bind(('127.0.0.1', int(os.environ['PORT'])))  # fail rather than test a shared listener
 PY
 python3 test/source_contract.py
 spin test test/query_contract.rb test/serializers.rb test/settings_users.rb test/surface.rb test/avatars.rb test/message_bus.rb test/site.rb test/document.rb test/preloads.rb test/topic.rb
@@ -36,16 +40,16 @@ ruby frontend/test_native_document.rb
 PYTHONDONTWRITEBYTECODE=1 python3 frontend/test_stage_assets.py
 (
   cd ../discourse
-  timeout --kill-after=5s 120s bin/rails runner ../minimal/reference/capture-latest-rails.rb
+  timeout --kill-after=5s 120s bin/rails runner "$WORKTREE/reference/capture-latest-rails.rb"
 ) >build/latest-rails.new.json 2>build/rails-capture.stderr
 (
   cd ../discourse
-  timeout --kill-after=5s 120s bin/rails runner ../minimal/reference/site-oracle.rb
+  timeout --kill-after=5s 120s bin/rails runner "$WORKTREE/reference/site-oracle.rb"
 ) >build/site-contract.json 2>build/site-contract.stderr
 cat build/site-contract.json
 (
   cd ../discourse
-  timeout --kill-after=5s 120s bin/rails runner ../minimal/test/message_bus_oracle.rb
+  timeout --kill-after=5s 120s bin/rails runner "$WORKTREE/test/message_bus_oracle.rb"
 ) >build/message-bus-contract.json 2>build/message-bus-contract.stderr
 cat build/message-bus-contract.json
 python3 - <<'PY'
@@ -70,13 +74,13 @@ build/bin/discourse >build/server.log 2>&1 &
 pid=$!
 for _ in {1..100}; do
   kill -0 "$pid" 2>/dev/null || { cat build/server.log >&2; exit 1; }
-  if curl --max-time 2 -fsS http://127.0.0.1:3498/srv/status >build/status.json 2>/dev/null; then
+  if curl --max-time 2 -fsS http://127.0.0.1:$PORT/srv/status >build/status.json 2>/dev/null; then
     break
   fi
   sleep .1
 done
 kill -0 "$pid"
-python3 reference/compare-latest.py --compare-recorded build/latest-rails.json --candidate http://127.0.0.1:3498
+python3 reference/compare-latest.py --compare-recorded build/latest-rails.json --candidate http://127.0.0.1:$PORT
 python3 test/http_contract.py
 python3 test/topic_http_contract.py
 printf 'smoke: native ELF, live read-only PG, strict Rails JSON parity, site/settings contract, native HTML/assets and semantic/security fixtures passed; browser DOM verified separately by browser-smoke\n'

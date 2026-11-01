@@ -11,6 +11,7 @@ require_relative "../lib/preloads"
 require_relative "../lib/avatars"
 require_relative "../lib/message_bus"
 require_relative "../frontend/native_document"
+require_relative "../lib/mini_profiler"
 
 url = ENV.fetch("DATABASE_URL")
 raise "unexpected Valkey URL" unless ENV.fetch("REDIS_URL") == "redis://127.0.0.1:6399/0"
@@ -20,12 +21,14 @@ conn = PG.connect(uri.host.to_s, uri.port, uri.path[1..-1].to_s, uri.user.to_s, 
 conn.exec("SET default_transaction_read_only = on")
 conn.exec("SET statement_timeout = '5s'")
 conn.exec("SET TIME ZONE 'UTC'")
+conn = SpinelMiniProfilerConnection.new(conn)
 emoji_map = JSON.parse(File.read("data/emoji-unicode.json"))
 latest = NativeLatest.new(conn, emoji_map)
 topics = NativeTopic.new(conn, emoji_map)
 port = ENV.fetch("PORT", "3499").to_i
-raise "unexpected listener port" unless port == 3498 || port == 3499
+raise "unexpected listener port" unless [3498, 3499, 3528, 3529].include?(port)
 paths = NativePaths.new(ENV.fetch("MINIMAL_BASE_URI", ""))
+profiler = ENV.fetch("MINIMAL_PROFILER", "") == "1" ? NativeMiniProfiler.new(paths.base_uri) : nil
 preloader = NativePreloads.new(conn)
 avatars = NativeAvatars.new(conn, paths)
 message_bus = NativeMessageBus.new(conn)
@@ -36,6 +39,9 @@ puts "native discourse minimal listening on 127.0.0.1:#{port}"
 loop do
   client = server.accept
   content_type = "application/json; charset=utf-8"
+  profile_request = nil
+  profiler_header = ""
+  conn.request = nil
   begin
     # Chromium may preconnect without sending a request. Do not let an idle
     # speculative connection block the single small native listener forever.
@@ -74,8 +80,22 @@ loop do
     query = target.split("?", 2)[1].to_s
     status = "200 OK"
     body = ""
+    profile_request = profiler.start(path, parts[0].to_s) if profiler
+    conn.request = profile_request
+    profile_route = nil
+    if profiler && path.start_with?(NativeMiniProfiler::PREFIX)
+      form = ""
+      if parts[0] == "POST"
+        raise "invalid profiler content type" unless request_type.start_with?("application/x-www-form-urlencoded")
+        form = content_length == 0 ? "" : client.read(content_length).to_s
+        raise "truncated profiler request" unless form.bytesize == content_length
+      end
+      profile_route = profiler.route(parts[0].to_s, path, query, form)
+    end
     poll_match = path.match(/\A\/message-bus\/([a-f0-9]{1,64})\/poll\z/)
-    if parts[0] == "POST" && poll_match
+    if profile_route
+      status, content_type, body = profile_route
+    elsif parts[0] == "POST" && poll_match
       if (query.empty? || query == "dlp=t") && request_type.start_with?("application/x-www-form-urlencoded")
         request_body = content_length == 0 ? "" : client.read(content_length).to_s
         raise "truncated poll request" unless request_body.bytesize == content_length
@@ -157,9 +177,17 @@ loop do
   rescue => error
     status = "501 Not Implemented"
     body = JSON.generate({ "error" => error.message })
+  ensure
+    # The server is serial. No state survives successful, failed, or idle requests.
+    conn.request = nil
+  end
+  if profiler && profile_request
+    id = profiler.finish(profile_request)
+    profiler_header = "X-MiniProfiler-Ids: #{id}\r\n"
+    body = profiler.inject(body, id) if content_type == "text/html; charset=utf-8" && status == "200 OK"
   end
   begin
-    client.write("HTTP/1.1 #{status}\r\nContent-Type: #{content_type}\r\nContent-Length: #{body.bytesize}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n#{body}")
+    client.write("HTTP/1.1 #{status}\r\nContent-Type: #{content_type}\r\nContent-Length: #{body.bytesize}\r\nCache-Control: no-store\r\n#{profiler_header}X-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n#{body}")
   ensure
     client.close
   end

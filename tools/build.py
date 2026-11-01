@@ -18,6 +18,10 @@ build = pathlib.Path("build")
 os.environ["TMPDIR"] = str((build / "tmp").resolve())
 binary = build / "bin/discourse"
 previous_mtime = binary.stat().st_mtime_ns if binary.exists() else None
+# spin currently checks the entrypoint mtime, not changed required/vendor files.
+# This is a measured build command: force our OWN executable to be rebuilt so
+# a newly vendored profiler core can never silently run an older native binary.
+binary.unlink(missing_ok=True)
 start = time.monotonic()
 with (build / "compile.stdout").open("w") as stdout, (build / "compile.stderr").open("w") as stderr:
     result = subprocess.run(["spin", "build", "discourse"], stdout=stdout, stderr=stderr)

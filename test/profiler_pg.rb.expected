@@ -1,0 +1,9 @@
+real exec_params preserves result
+real exec preserves result
+real failed PG call preserves original exception
+real successful and failed exec calls recorded
+pg_sleep 20ms measured as actual latency
+real request and SQL elapsed plus failed annotation
+real SQL secrets redacted while placeholders retained
+real latest JSON identical with profiler enabled and disabled
+new latest request has no previous queries or failed state

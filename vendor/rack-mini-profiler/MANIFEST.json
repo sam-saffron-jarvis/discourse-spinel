@@ -1,0 +1,44 @@
+{
+  "version": "5.0.0",
+  "locked_gem_sha256": "99c5ba087fa91c8d9ba80a43f6b2213f1ebead6e863d49286170129d391302e1",
+  "source_repository": "../rack-mini-profiler",
+  "source_commit": "9f521f52d5b4145f6134023167ee038f9c6aec8e",
+  "files": [
+    {
+      "source": "spinel/lib/spinel_mini_profiler.rb",
+      "path": "spinel_mini_profiler.rb",
+      "sha256": "50e14e65e247105c13a88c94ffaa92b1073beaecb49e7e8f787843f10c974512",
+      "unchanged_upstream": false
+    },
+    {
+      "source": "LICENSE.txt",
+      "path": "LICENSE.txt",
+      "sha256": "98befc950cce1d590a3bfa08adbf6389db3515adac2dce01fc60112435556738",
+      "unchanged_upstream": false
+    },
+    {
+      "source": "lib/html/includes.js",
+      "path": "html/includes.js",
+      "sha256": "4f99a29aab512481727ea90553f30b299ec0186fec2d251834d10c0e5507704a",
+      "unchanged_upstream": true
+    },
+    {
+      "source": "lib/html/includes.css",
+      "path": "html/includes.css",
+      "sha256": "8eab9ad24258be8ccaab5c5d90b81e5d46fb27debe51d0c44514cdcc1c0e4358",
+      "unchanged_upstream": true
+    },
+    {
+      "source": "lib/html/vendor.js",
+      "path": "html/vendor.js",
+      "sha256": "64987ca8b8d4697c34a85d3d5baa89efd6f2684fff0388980b251180b0735544",
+      "unchanged_upstream": true
+    },
+    {
+      "source": "lib/html/profile_handler.js",
+      "path": "html/profile_handler.js",
+      "sha256": "4d4dae497a855a75a3b9d23b13796a8923073b53debd3367518774cdc9286da7",
+      "unchanged_upstream": true
+    }
+  ]
+}
