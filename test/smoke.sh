@@ -7,6 +7,8 @@ source ../harness/env.sh
 export DATABASE_URL="$DSPINEL_PG_URL/discourse_development"
 export REDIS_URL="redis://127.0.0.1:6399/0"
 export PORT=3498
+export MINIMAL_BASE_URI=""
+export MINIMAL_ORIGIN="http://127.0.0.1:3498"
 mkdir -p build/tmp
 export TMPDIR="$PWD/build/tmp"
 export PGOPTIONS='-c default_transaction_read_only=on -c statement_timeout=15000'
@@ -28,11 +30,24 @@ with socket.socket() as listener:
     listener.bind(('127.0.0.1', 3498))  # fail rather than test a shared listener
 PY
 python3 test/source_contract.py
-spin test test/query_contract.rb test/serializers.rb test/settings_users.rb
+spin test test/query_contract.rb test/serializers.rb test/settings_users.rb test/surface.rb test/avatars.rb test/message_bus.rb test/site.rb test/document.rb test/preloads.rb
+ruby reference/native_site_test.rb
+ruby frontend/test_native_document.rb
+PYTHONDONTWRITEBYTECODE=1 python3 frontend/test_stage_assets.py
 (
   cd ../discourse
   timeout --kill-after=5s 120s bin/rails runner ../minimal/reference/capture-latest-rails.rb
 ) >build/latest-rails.new.json 2>build/rails-capture.stderr
+(
+  cd ../discourse
+  timeout --kill-after=5s 120s bin/rails runner ../minimal/reference/site-oracle.rb
+) >build/site-contract.json 2>build/site-contract.stderr
+cat build/site-contract.json
+(
+  cd ../discourse
+  timeout --kill-after=5s 120s bin/rails runner ../minimal/test/message_bus_oracle.rb
+) >build/message-bus-contract.json 2>build/message-bus-contract.stderr
+cat build/message-bus-contract.json
 python3 - <<'PY'
 import json
 with open('build/latest-rails.new.json') as source:
@@ -53,4 +68,4 @@ done
 kill -0 "$pid"
 python3 reference/compare-latest.py --compare-recorded build/latest-rails.json --candidate http://127.0.0.1:3498
 python3 test/http_contract.py
-printf 'smoke: native ELF, live read-only PG, strict Rails JSON parity and semantic fixtures passed; frontend remains 501\n'
+printf 'smoke: native ELF, live read-only PG, strict Rails JSON parity, site/settings contract, native HTML/assets and semantic/security fixtures passed; browser DOM verified separately by browser-smoke\n'

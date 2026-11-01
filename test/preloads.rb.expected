@@ -1,0 +1,3 @@
+banner excludes restricted deleted topics and deleted posts using source post order
+banner responds to changed source rows without captured HTML
+banner returns empty only when no eligible source topic exists

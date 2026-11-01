@@ -16,6 +16,8 @@ import time
 build = pathlib.Path("build")
 (build / "tmp").mkdir(parents=True, exist_ok=True)
 os.environ["TMPDIR"] = str((build / "tmp").resolve())
+binary = build / "bin/discourse"
+previous_mtime = binary.stat().st_mtime_ns if binary.exists() else None
 start = time.monotonic()
 with (build / "compile.stdout").open("w") as stdout, (build / "compile.stderr").open("w") as stderr:
     result = subprocess.run(["spin", "build", "discourse"], stdout=stdout, stderr=stderr)
@@ -36,7 +38,13 @@ if result.returncode == 0:
     stats.update(compiler_input_files=len(inputs), compiler_input_bytes=sum(p.stat().st_size for p in inputs),
                  project_input_files=len(project_inputs), project_input_bytes=sum(p.stat().st_size for p in project_inputs),
                  binary_bytes=binary.stat().st_size,
-                 runtime_data_bytes=pathlib.Path("data/emoji-unicode.json").stat().st_size,
+                 binary_rebuilt=binary.stat().st_mtime_ns != previous_mtime,
+                 runtime_data_bytes=sum(pathlib.Path(p).stat().st_size for p in ["data/emoji-unicode.json", "reference/client-settings-contract.json"]),
+                 unicode_metadata_bytes=pathlib.Path("data/emoji-unicode.json").stat().st_size,
+                 client_settings_metadata_bytes=pathlib.Path("reference/client-settings-contract.json").stat().st_size,
+                 browser_asset_files=sum(p.is_file() for p in pathlib.Path("build/assets").rglob("*")),
+                 browser_asset_bytes=sum(p.stat().st_size for p in pathlib.Path("build/assets").rglob("*") if p.is_file()),
+                 staged_media_bytes=sum(p.stat().st_size for p in pathlib.Path("build/media").rglob("*") if p.is_file()),
                  spinel_version=subprocess.run(["spinel", "--version"], capture_output=True, text=True).stdout.strip())
 (build / "compile.json").write_text(json.dumps(stats, indent=2) + "\n")
 print(json.dumps(stats, indent=2))

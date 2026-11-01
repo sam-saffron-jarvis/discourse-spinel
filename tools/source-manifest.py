@@ -8,7 +8,13 @@ PIN = "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8"
 
 
 def source(path, origin="discourse", revision=PIN):
-    root = Path("../discourse") if origin == "discourse" else Path("../run/bundle/ruby/4.0.0/gems/discourse-emojis-1.0.47")
+    roots = {
+        "discourse": Path("../discourse"),
+        "discourse-emojis": Path("../run/bundle/ruby/4.0.0/gems/discourse-emojis-1.0.47"),
+        "message_bus": Path("../run/bundle/ruby/4.0.0/gems/message_bus-5.0.0"),
+        "discourse-fonts": Path("../run/bundle/ruby/4.0.0/gems/discourse-fonts-0.0.19"),
+    }
+    root = roots[origin]
     return {"origin": origin, "revision": revision, "path": path,
             "sha256": hashlib.sha256((root / path).read_bytes()).hexdigest()}
 
@@ -58,13 +64,52 @@ entries = [
         "frontend/discourse/rolldown.config.mjs", "frontend/discourse/package.json"],
         ["actual core Ember/Rolldown JS build"],
         "Stages source under build/, links installed dependencies, writes core JS/manifest only under build/assets/discourse. No Rails data backend, CSS/plugin/theme build or browser proof."),
+    entry(["reference/native_site.rb", "reference/client-settings-contract.json", "reference/generate-client-settings.rb"],
+        "bounded anonymous Site/client-safe settings adaptation; not full serializer parity", [
+            "app/models/site.rb", "app/serializers/site_serializer.rb", "app/serializers/site_category_serializer.rb",
+            "lib/site_setting_extension.rb", "lib/upcoming_changes.rb", "app/models/site_setting.rb", "config/site_settings.yml",
+            "app/models/notification.rb", "app/models/post.rb", "lib/trust_level.rb", "lib/archetype.rb",
+            "config/locales/server.en.yml", "lib/discourse.rb", "plugins/discourse-topic-voting/plugin.rb"],
+        ["Site.json_for anonymous serializer fields", "source client:true catalog defaults/types and bound live overrides",
+         "English archetype/notification/post/trust enums", "public category projection", "core/voting navigation constants"],
+        "Source YAML generates a safe bounded catalog, never DB/preload captures. Live selected overrides and upload URLs are read natively. Every emitted field is compared to actual read-only Rails getters; aggregate Site.json_for write-on-read wizard blocker and all omitted fields remain reported. Non-English/login-required site unsupported. No full Guardian/plugin/theme runtime."),
+    entry(["lib/preloads.rb", "lib/valkey.rb"], "selected guest common preloads and read-only task Valkey adapter", [
+        "lib/application_layout_preloader.rb", "lib/read_only_mixin.rb", "lib/discourse.rb", "lib/discourse_redis.rb",
+        "app/models/topic.rb", "app/models/post.rb", "app/models/concerns/trashable.rb", "app/models/custom_emoji.rb"],
+        ["ApplicationLayoutPreloader common keys", "Topic#banner guest category guard", "Discourse read-only flags and logical current_db namespace"],
+        "Live public banner/site/settings/topic_list and read-only mode keys. Valkey RESP reads use task DB0/logical site default. Theme overrides/custom HTML/activated themes/upcoming changes omitted explicitly; custom emoji fails closed when nonempty. Latest and common preload read transactions are separate."),
+    entry(["frontend/native_document.rb", "frontend/stage-assets.py"], "actual core document/bootstrap and isolated source-asset adaptation", [
+        "app/views/layouts/application.html.erb", "app/views/layouts/_head.html.erb", "app/helpers/application_helper.rb", "lib/ember_assets.rb",
+        "lib/js_locale_helper.rb", "config/locales/client.en.yml", "config/locales/server.en.yml",
+        "lib/svg_sprite.rb", "app/controllers/svg_sprite_controller.rb", "app/views/static/service-worker.js.erb",
+        "frontend/discourse/scripts/js/browser-detect.js", "frontend/discourse/scripts/js/browser-update.js",
+        "lib/stylesheet/compiler.rb", "lib/stylesheet/importer.rb", "app/assets/stylesheets/color_definitions.scss"],
+        ["real setup/config/import-map/modulepreload/mount layout", "English locale/moment formatter contract", "core SVG symbols",
+         "core service worker", "actual stylesheets and public image assets"],
+        "Existing core Rolldown outputs reused without JS edits. Common CSS is byte-hashed reference cache output (not independently reproduced), with local root/reference-host image URLs rebased relative to the staged stylesheet; stage descriptor records separate source/output hashes. Native document escapes attributes and script JSON, prefixes static/module/link routes. English core locale only; compiled MessageFormat/plugin/theme translations and plugin worker hooks remain explicit gaps. Other stage artifacts and source hashes are recorded in ignored build/assets/native/manifest.json, not captured Rails preloads."),
+    entry(["lib/avatars.rb", "tools/stage-media.py"], "selected public avatar adapter and source asset staging", [
+        "app/controllers/user_avatars_controller.rb", "app/models/user_avatar.rb", "app/models/optimized_image.rb"],
+        ["UserAvatarsController#show_in_site/#render_blank", "current uploaded avatar membership and optimized image lookup"],
+        "Stages actual current-public avatar bytes into private build/media; serving checks live username/current-upload/secure flag, canonical path and realpath containment. Existing optimized size preferred; original image fallback omits resizing. External letter-avatar CDN prohibited: explicitly uses actual source blank-avatar fallback rather than fabricating identities. Historical/associated avatars not implemented."),
 ]
+entries.append({"destinations": ["lib/message_bus.rb", "vendor/message_bus/LICENSE"],
+                "kind": "native read-only short-poll adaptation of MessageBus 5.0.0", "license": "MIT; vendor/message_bus/LICENSE",
+                "sources": [source(p, "message_bus", "5.0.0") for p in ["lib/message_bus.rb", "lib/message_bus/client.rb", "lib/message_bus/message.rb", "lib/message_bus/backends/redis.rb", "lib/message_bus/rack/middleware.rb", "LICENSE"]] +
+                           [source("config/initializers/004-message_bus.rb"), source("app/models/group.rb")],
+                "selected_definitions": ["Client#backlog/#allowed?", "Redis last_ids/backlog storage", "Message transport codec", "Rack backlog_to_json and synchronous branch", "Discourse logical site/anonymous group selection"],
+                "adaptations": "Bounded observed guest latest channels only; live Valkey MGET/ZRANGEBYSCORE and source user/group/client ACL filtering. No canned empty poll body. Native pure tests plus exact live comparison at four positions to actual MessageBus. No long-poll/chunking, publish, authenticated identity, arbitrary/plugin channels or listeners."})
 emoji_paths = ["dist/emojis.json", "dist/aliases.json", "dist/tonable_emojis.json"]
 entries.append({"destinations": ["data/emoji-unicode.json", "tools/carry-emoji.py", "data/discourse-emojis-attributions.md"],
                 "kind": "source-data transformation, not Rails output", "license": "MIT package metadata; upstream artwork notices retained, no artwork copied",
                 "sources": [source("app/models/emoji.rb")] + [source(path, "discourse-emojis", "1.0.47") for path in emoji_paths + ["attributions.md"]],
                 "selected_definitions": ["Emoji.lookup_unicode/replacement_code and Unicode alias/tone data"],
                 "adaptations": "Build-time Python transformation of packaged Unicode metadata. Runtime uses generated lookup; emoji deny-list policy is guarded unsupported. No image assets copied."})
+entries.append({"destinations": ["build/assets/native/images/emoji/twitter/", "build/assets/native/css/fonts/"],
+                "kind": "unchanged installed package artwork/font build assets; ignored outputs only",
+                "license": "Original packaged artwork/font licensing; emoji attributions in data/discourse-emojis-attributions.md; original font bytes retain embedded notices",
+                "sources": [source(p, "discourse-emojis", "1.0.47") for p in ["attributions.md", "dist/emoji/twemoji/wave.png", "dist/emoji/twemoji/speaking_head.png"]] +
+                           [source(p, "discourse-fonts", "0.0.19") for p in ["lib/discourse_fonts.rb", "vendor/assets/fonts/InterVariable.woff2", "vendor/assets/fonts/JetBrainsMono-Regular.woff2", "vendor/assets/fonts/JetBrainsMono-Bold.woff2"]],
+                "adaptations": "No artwork/font byte edits. Stage manifest records all Twemoji source/output paths and hashes, not only these observed emoji requests; twitter is the legacy public alias for twemoji. Palette font URLs rebased relative to CSS so root and widget prefix use the same bytes. No remote font/avatar/CDN request."})
 pg_files = sorted(p for p in Path("vendor/pg").rglob("*") if p.is_file())
 entries.append({"destinations": ["vendor/pg"], "kind": "unchanged vendored runtime dependency", "license": "MIT; vendor/pg/LICENSE",
                 "origin": "https://github.com/roundhouse-rb/spinel-pg", "revision": "fe631b4ac4aba68168adf2ecce2c6c21006f7455", "version": "0.2.0",
@@ -75,6 +120,6 @@ entries.append({"destinations": ["bin/discourse.rb", "tools/build.py", "test/", 
                 "adaptations": "Loopback TCP HTTP server over installed Spinel sockets; live pure-native PG client; no Ruby subprocess/proxy/canned response in serving path. Verification uses synchronous read-only Rails runner only, never a final data backend."})
 manifest = {"schema_version": 1, "upstream": "Discourse", "original_revision": PIN,
             "upstream_license": "GPL-2.0-or-later; Copyright 2014-2026 Civilized Discourse Construction Kit, Inc. and contributors",
-            "scope": "anonymous latest JSON at task-owned seeded site; browser and full plugin support NOT complete",
+            "scope": "anonymous latest JSON and actual core Ember browser list at task-owned site; topic pages and full plugin support NOT complete",
             "gaps": "GAPS.md", "plugin_coverage": "PLUGIN_SUPPORT.json", "entries": entries}
 Path("SOURCE_MANIFEST.json").write_text(json.dumps(manifest, indent=2) + "\n")

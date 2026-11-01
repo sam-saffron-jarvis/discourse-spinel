@@ -1,4 +1,93 @@
-# Ticket 004 measured checkpoint
+# Measured checkpoints
+
+## Ticket 007 — actual native `/latest` browser list
+
+Before: accepted minimal `42d8a13`, strict live latest JSON parity, HTML501 and
+unintegrated core JS. After: native source-adapted document/preloads/static surface
+renders actual core Ember topic rows at direct root and the configured widget
+prefix. Topic content/full plugin support remain unimplemented. This larger
+program is not a performance comparison with the previous JSON-only program.
+
+### Final native build phase
+
+Installed Spinel unchanged: `2026.10.25+1664 (f969b32a7)`. No whole-app compiler
+input, compiler changes or optimization loop.
+
+| Measurement | Verified value |
+|---|---:|
+| Fresh native build (`binary_rebuilt=true`) | 12.234150 s |
+| Peak single child/descendant RSS, not aggregate | 370,664 KiB |
+| Ruby compiler graph | 24 files / 193,613 bytes |
+| In-repository graph, including vendored PG | 19 files / 95,125 bytes |
+| Native ELF | 2,015,976 bytes |
+| Runtime source metadata | 215,146 bytes: Unicode124,752 + settings90,394 |
+| Staged browser files, including reused core JS | 5,134 files / 73,358,989 bytes |
+| Privately staged avatar bytes | 334,448 bytes / 13 files |
+
+Fresh-build evidence: `build/compile-cold.json`. The final `build/compile.json`
+may describe a **cached** invocation (`binary_rebuilt=false`, approximately0.002s),
+not a compiler speedup. These timings cover the native `spin build discourse`
+phase only, excluding separate asset staging/oracle/browser work. Build metadata
+now distinguishes binary rebuild/reuse and separately accounts source data/assets.
+
+### Final verification
+
+- `make smoke` passed: 9/9 native executables / 66 named checks. Original 28
+  query/serializer/security checks preserved; new native checks cover source-safe
+  settings, dynamic promotion, image-list refusal, script/attribute escaping,
+  prefix/static MIME/traversal/symlink boundaries, avatar authorization, actual
+  MessageBus ACL/backlog/transport and read-only banner visibility/order/data changes.
+- Strict complete Rails latest JSON equality remains on20 first-page topics and
+  empty page1. No allowlist/normalization;22 users/2 primary groups/2 flair groups.
+- Read-only Site oracle: all14 emitted scalar/enum/menu/permission fields and every
+  field in the ordered nine-public-category projection match actual Rails getters.
+ 390/390 emitted source client settings match the actual client API. Full parity
+  remains false:375 additional client keys and315 aggregate category fields omitted.
+- Actual aggregate `Site.json_for` is correctly blocked by its wizard setting
+  INSERT under read-only PG; the exact stack is retained in `build/site-contract.json`.
+  Safe field comparison uses actual getters, not stubs or write-enabled warmups.
+- Actual MessageBus5 comparison exactly matches four live positions (-1,0,-3,ahead),
+  with message counts1/8/2/1; native synthetic fixtures exclude private user/group/
+  other-client data. Valkey uses DB0/logical multisite ID `default`.
+- Additional MRI source tests:5 tests/68 assertions passing. Source/stage checks:
+ 110 source/vendor hashes, regenerable390-setting source catalog, unchanged layout/
+  avatar palette reference,46 plugin entries,2,203 real icon IDs and4 font faces.
+- PG seed remains34 topics/115 posts. No seed/DDL/shared-row writes; read-only
+  typed CTE fixtures cover changed rows and privacy cases missing from the seed.
+
+### Real browser evidence
+
+`make browser-smoke` passed all four combinations. Both mounts render20 ordered
+actual Ember `.topic-list-item` rows and real title links exactly matching live API
+IDs/titles/links; title emoji images load. Each run loads2 module entry scripts.
+Desktop observes74 responses/9 resolved icon uses; phone53 responses/8 icon uses.
+All four have0 uncaught page errors,0 failed requests,0 HTTP≥400 responses and
+0 console errors. No configured-prefix response escapes the mount. Typography is
+Inter and actual base palette `--primary:#222`.
+
+| Check | Viewport | Full-page screenshot |
+|---|---|---|
+| Widget prefix desktop | 1440×1000 | `build/browser/prefix-desktop.png` (1440×1883) |
+| Widget prefix phone | 390×844 | `build/browser/prefix-phone.png` (390×1983) |
+| Direct root desktop | 1440×1000 | `build/browser/root-desktop.png` (1440×1883) |
+| Direct root phone | 390×844 | `build/browser/root-phone.png` (390×1983) |
+
+`build/browser/report.json` records DOM rows, styles, module scripts, XHR payloads,
+network/console/errors. Corresponding HTML/API/server logs are verification-only.
+`test/browser_cleanup.py` interrupts a real rendered desktop run with SIGTERM;
+exit143 and native3498 release passed (under0.2s shutdown in the final probe), then the full
+proof is regenerated. The handler uses cooperative checkpoints because throwing
+inside Playwright greenlets stranded close tasks in the initial cleanup probe.
+
+Resolved first-browser gaps: emoji404s now serve real packaged Twemoji; core worker
+404 now serves adapted actual source; MessageBus405 now reads real backlog/ACLs;
+SVG namespace prefixes/incomplete palette initially hid icons/typography, now fixed
+with actual symbols and guarded source palette/font compilation. No modified Ember
+modules, Ruby-serving wrapper, captured preloads or handmade topic table.
+
+---
+
+# Ticket 004 measured checkpoint (historical)
 
 ## Scope / result
 

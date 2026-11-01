@@ -3,7 +3,7 @@
   "upstream": "Discourse",
   "original_revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
   "upstream_license": "GPL-2.0-or-later; Copyright 2014-2026 Civilized Discourse Construction Kit, Inc. and contributors",
-  "scope": "anonymous latest JSON at task-owned seeded site; browser and full plugin support NOT complete",
+  "scope": "anonymous latest JSON and actual core Ember browser list at task-owned site; topic pages and full plugin support NOT complete",
   "gaps": "GAPS.md",
   "plugin_coverage": "PLUGIN_SUPPORT.json",
   "entries": [
@@ -368,6 +368,380 @@
     },
     {
       "destinations": [
+        "reference/native_site.rb",
+        "reference/client-settings-contract.json",
+        "reference/generate-client-settings.rb"
+      ],
+      "kind": "bounded anonymous Site/client-safe settings adaptation; not full serializer parity",
+      "license": "GPL-2.0-or-later",
+      "sources": [
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/models/site.rb",
+          "sha256": "77e404c42b30329ce3c05f06e46110afaddf4380062b3f8670298c7bbb08d427"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/serializers/site_serializer.rb",
+          "sha256": "f734b1b158118654bee273478d696b0a11b6350b58f36c3dbbe76a5544ebe927"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/serializers/site_category_serializer.rb",
+          "sha256": "f71a4329b2dfd2eadf944d59503b2989e1498ca7d4afabffec3a82a45317c084"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "lib/site_setting_extension.rb",
+          "sha256": "7f4e727c17ef9a4da8254e5ee70ea272dd886dbf88b0936a4ee37f435b6aaeab"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "lib/upcoming_changes.rb",
+          "sha256": "adb01f9d8b3d1e0bc49e1df7fe13834eb9375dd4c2c9788751d1547c61bec4f1"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/models/site_setting.rb",
+          "sha256": "a44e4bf6277b8693ae59f63dcabca0b4fbf474f3a80e6a10f6ef6db682d86986"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "config/site_settings.yml",
+          "sha256": "f5d22ff1dc5e7afc1d5c136d0160c12443639a1df792ed43553460252db1e3d1"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/models/notification.rb",
+          "sha256": "ecd70b08f9c48bb87754daeb425788360103a20a2fdbe01e190701ff13ebe1d6"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/models/post.rb",
+          "sha256": "83ddbfe431d831eb6e05b00d87a3ebed1be91560544d17159c8835119db9912f"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "lib/trust_level.rb",
+          "sha256": "b2cae9d0a789fed04c50eea7b68669056b248d92d6a5e4a7230722054fdca657"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "lib/archetype.rb",
+          "sha256": "c3c10927b5fa53645e5799fd8543585ce024447050dcc3eb88c9fbf473de62ae"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "config/locales/server.en.yml",
+          "sha256": "13fdf75fb404c3da601f7605d7f8e307f87676774e30c6bb199ecbcd62d46af9"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "lib/discourse.rb",
+          "sha256": "1330fdf219417287e80958fae9e90e9a15eff984d298e1203f301ff25f0e6aba"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "plugins/discourse-topic-voting/plugin.rb",
+          "sha256": "b602db8812683e9d7a4375922381407ab383ccca6df29385d283458611f758ad"
+        }
+      ],
+      "selected_definitions": [
+        "Site.json_for anonymous serializer fields",
+        "source client:true catalog defaults/types and bound live overrides",
+        "English archetype/notification/post/trust enums",
+        "public category projection",
+        "core/voting navigation constants"
+      ],
+      "adaptations": "Source YAML generates a safe bounded catalog, never DB/preload captures. Live selected overrides and upload URLs are read natively. Every emitted field is compared to actual read-only Rails getters; aggregate Site.json_for write-on-read wizard blocker and all omitted fields remain reported. Non-English/login-required site unsupported. No full Guardian/plugin/theme runtime."
+    },
+    {
+      "destinations": [
+        "lib/preloads.rb",
+        "lib/valkey.rb"
+      ],
+      "kind": "selected guest common preloads and read-only task Valkey adapter",
+      "license": "GPL-2.0-or-later",
+      "sources": [
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "lib/application_layout_preloader.rb",
+          "sha256": "d1527e34b8ed09cbbe2b1e9fc5f2f472bf58d26e4036ff8611e531099c86335d"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "lib/read_only_mixin.rb",
+          "sha256": "403e40baa6b2e61242c0874fbeacd67f0932d2a4c3c5f6c7d5138683ec8a1f0c"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "lib/discourse.rb",
+          "sha256": "1330fdf219417287e80958fae9e90e9a15eff984d298e1203f301ff25f0e6aba"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "lib/discourse_redis.rb",
+          "sha256": "3af7b8284dfdf82bf81c3a86cfca6f3fae5c7e991b626871a7a613eba81e5394"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/models/topic.rb",
+          "sha256": "8202e548cd9ce289b61aca469449e282ce061b411a9b0551c0f1cd3b82455952"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/models/post.rb",
+          "sha256": "83ddbfe431d831eb6e05b00d87a3ebed1be91560544d17159c8835119db9912f"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/models/concerns/trashable.rb",
+          "sha256": "14363cac2b95190f6f143ef943eb4a6564883851aade706f469b020388b1c347"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/models/custom_emoji.rb",
+          "sha256": "dc361b0c4647fc12b6d74e841a478915e2dd95086e852d22d8e1ad48e45a68c9"
+        }
+      ],
+      "selected_definitions": [
+        "ApplicationLayoutPreloader common keys",
+        "Topic#banner guest category guard",
+        "Discourse read-only flags and logical current_db namespace"
+      ],
+      "adaptations": "Live public banner/site/settings/topic_list and read-only mode keys. Valkey RESP reads use task DB0/logical site default. Theme overrides/custom HTML/activated themes/upcoming changes omitted explicitly; custom emoji fails closed when nonempty. Latest and common preload read transactions are separate."
+    },
+    {
+      "destinations": [
+        "frontend/native_document.rb",
+        "frontend/stage-assets.py"
+      ],
+      "kind": "actual core document/bootstrap and isolated source-asset adaptation",
+      "license": "GPL-2.0-or-later",
+      "sources": [
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/views/layouts/application.html.erb",
+          "sha256": "c9c62986b9c9f70ef776d6ba89a9b6a243b275a67df39ef62e2a959d599743d4"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/views/layouts/_head.html.erb",
+          "sha256": "8812af48e3a826a5b1e78a0aaf5e971990e2f783dfff184cdc4af3e27b619792"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/helpers/application_helper.rb",
+          "sha256": "657c2c838b498ba38ed7bb5d4a7f31c73ee5ee2bf98f629c192a1897ca862034"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "lib/ember_assets.rb",
+          "sha256": "6435e5c5a84f109c3355c733ebf6bafa54ab3d349f107d7ba82d959d3bf6d741"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "lib/js_locale_helper.rb",
+          "sha256": "84a777ddfba29c8d80263cd420b139f27c083d1cb3531b78806d3213ba009fdb"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "config/locales/client.en.yml",
+          "sha256": "64dd75303aad1c507d49cedc0d3c4ea72b73a27685b3b8f3e3208a6b4ae0db55"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "config/locales/server.en.yml",
+          "sha256": "13fdf75fb404c3da601f7605d7f8e307f87676774e30c6bb199ecbcd62d46af9"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "lib/svg_sprite.rb",
+          "sha256": "f162f703c742a4df14fcea72b3fc1184d7d6fafb07b76a6fd7dde945205db975"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/controllers/svg_sprite_controller.rb",
+          "sha256": "651e720c6b7153a8c1d62d17b84394b4f710b228fd693e50ca0c5dd23df58642"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/views/static/service-worker.js.erb",
+          "sha256": "c7761b4a8c1f3c47b16302371fbdb0065796824d143e8a6dba11331871bc94de"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "frontend/discourse/scripts/js/browser-detect.js",
+          "sha256": "b20de4122cfdffdc457098b29269b00ee7b60838e633010c3e3c6a99679de5ea"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "frontend/discourse/scripts/js/browser-update.js",
+          "sha256": "99d8444465945ecc8c52b4af0c6a230a3ebd6bea1570bcfcfebb364745064672"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "lib/stylesheet/compiler.rb",
+          "sha256": "815f245c7e6b0a519a410818664461c88c368420553a55534fb7ddb669bc1aba"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "lib/stylesheet/importer.rb",
+          "sha256": "af5fa071ab91899720aecbfbed3a8a084780077b1c07e0e329f4caf201dec21b"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/assets/stylesheets/color_definitions.scss",
+          "sha256": "9ae756ae19a987e0a2a4eea3cef8c8dfb3dedb3e8e20b60fda63762a9f33f68e"
+        }
+      ],
+      "selected_definitions": [
+        "real setup/config/import-map/modulepreload/mount layout",
+        "English locale/moment formatter contract",
+        "core SVG symbols",
+        "core service worker",
+        "actual stylesheets and public image assets"
+      ],
+      "adaptations": "Existing core Rolldown outputs reused without JS edits. Common CSS is byte-hashed reference cache output (not independently reproduced), with local root/reference-host image URLs rebased relative to the staged stylesheet; stage descriptor records separate source/output hashes. Native document escapes attributes and script JSON, prefixes static/module/link routes. English core locale only; compiled MessageFormat/plugin/theme translations and plugin worker hooks remain explicit gaps. Other stage artifacts and source hashes are recorded in ignored build/assets/native/manifest.json, not captured Rails preloads."
+    },
+    {
+      "destinations": [
+        "lib/avatars.rb",
+        "tools/stage-media.py"
+      ],
+      "kind": "selected public avatar adapter and source asset staging",
+      "license": "GPL-2.0-or-later",
+      "sources": [
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/controllers/user_avatars_controller.rb",
+          "sha256": "1f94a42c22da3c59363da5d0fb6fa23d5d9f33ae35207a89c5e61771637ea7d6"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/models/user_avatar.rb",
+          "sha256": "c6752e54850417b1e0dea38096eacda8df4c88b057e78cfa936abc4198575d76"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/models/optimized_image.rb",
+          "sha256": "19595717f19aa679357117b3a63c0e52bc6e9b88c8dd3c5e2b663fc2e92f6c55"
+        }
+      ],
+      "selected_definitions": [
+        "UserAvatarsController#show_in_site/#render_blank",
+        "current uploaded avatar membership and optimized image lookup"
+      ],
+      "adaptations": "Stages actual current-public avatar bytes into private build/media; serving checks live username/current-upload/secure flag, canonical path and realpath containment. Existing optimized size preferred; original image fallback omits resizing. External letter-avatar CDN prohibited: explicitly uses actual source blank-avatar fallback rather than fabricating identities. Historical/associated avatars not implemented."
+    },
+    {
+      "destinations": [
+        "lib/message_bus.rb",
+        "vendor/message_bus/LICENSE"
+      ],
+      "kind": "native read-only short-poll adaptation of MessageBus 5.0.0",
+      "license": "MIT; vendor/message_bus/LICENSE",
+      "sources": [
+        {
+          "origin": "message_bus",
+          "revision": "5.0.0",
+          "path": "lib/message_bus.rb",
+          "sha256": "5f33baf938aea38eb982516021470a541d51f75d933d5c18c39b5171d2342e21"
+        },
+        {
+          "origin": "message_bus",
+          "revision": "5.0.0",
+          "path": "lib/message_bus/client.rb",
+          "sha256": "33dbbb63d4390aeb62759268d5836f099df9435d170116002ec5682fdd33f619"
+        },
+        {
+          "origin": "message_bus",
+          "revision": "5.0.0",
+          "path": "lib/message_bus/message.rb",
+          "sha256": "e9a4a91221ee61e03cbca4c1f0c6f26fb645119628664f0140e0dbff786f2ab3"
+        },
+        {
+          "origin": "message_bus",
+          "revision": "5.0.0",
+          "path": "lib/message_bus/backends/redis.rb",
+          "sha256": "d30f26b643852a8f7fdd3586c9a11847a33975d48cf1565469944213b8446676"
+        },
+        {
+          "origin": "message_bus",
+          "revision": "5.0.0",
+          "path": "lib/message_bus/rack/middleware.rb",
+          "sha256": "11da0305f311916f3d98e53031857528829f06d6cafbbc0f9b141cdb6eda8d41"
+        },
+        {
+          "origin": "message_bus",
+          "revision": "5.0.0",
+          "path": "LICENSE",
+          "sha256": "2b688a3ca9aa15aebeb361d7ec89aa08bc9aa9005210bc42fad305c133b8712a"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "config/initializers/004-message_bus.rb",
+          "sha256": "477b0059d8addce2b37d13a28416a56be67f6f38046495548e5837228aeae2e9"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/models/group.rb",
+          "sha256": "4f53a5cfc4e861a7a1ac2d9c6cf131987cdd4e45694b523c551128faef79d91f"
+        }
+      ],
+      "selected_definitions": [
+        "Client#backlog/#allowed?",
+        "Redis last_ids/backlog storage",
+        "Message transport codec",
+        "Rack backlog_to_json and synchronous branch",
+        "Discourse logical site/anonymous group selection"
+      ],
+      "adaptations": "Bounded observed guest latest channels only; live Valkey MGET/ZRANGEBYSCORE and source user/group/client ACL filtering. No canned empty poll body. Native pure tests plus exact live comparison at four positions to actual MessageBus. No long-poll/chunking, publish, authenticated identity, arbitrary/plugin channels or listeners."
+    },
+    {
+      "destinations": [
         "data/emoji-unicode.json",
         "tools/carry-emoji.py",
         "data/discourse-emojis-attributions.md"
@@ -410,6 +784,59 @@
         "Emoji.lookup_unicode/replacement_code and Unicode alias/tone data"
       ],
       "adaptations": "Build-time Python transformation of packaged Unicode metadata. Runtime uses generated lookup; emoji deny-list policy is guarded unsupported. No image assets copied."
+    },
+    {
+      "destinations": [
+        "build/assets/native/images/emoji/twitter/",
+        "build/assets/native/css/fonts/"
+      ],
+      "kind": "unchanged installed package artwork/font build assets; ignored outputs only",
+      "license": "Original packaged artwork/font licensing; emoji attributions in data/discourse-emojis-attributions.md; original font bytes retain embedded notices",
+      "sources": [
+        {
+          "origin": "discourse-emojis",
+          "revision": "1.0.47",
+          "path": "attributions.md",
+          "sha256": "c4b07dfa9ef4cf681ccd1bc18208b035e4e601e7099a2a7fc057e0cc825410a9"
+        },
+        {
+          "origin": "discourse-emojis",
+          "revision": "1.0.47",
+          "path": "dist/emoji/twemoji/wave.png",
+          "sha256": "dfee1561c6e59c90f7a292f90157bae85f75ccb3ae27b655898a51429e3a8910"
+        },
+        {
+          "origin": "discourse-emojis",
+          "revision": "1.0.47",
+          "path": "dist/emoji/twemoji/speaking_head.png",
+          "sha256": "3442d45033ee7e9667f6cd4d7f61dfb169300488c00833f7da9dd7bd3c296163"
+        },
+        {
+          "origin": "discourse-fonts",
+          "revision": "0.0.19",
+          "path": "lib/discourse_fonts.rb",
+          "sha256": "38e60e654bee33b47b09473ce72509d0be5e18e51c6c124131564e6501e440e0"
+        },
+        {
+          "origin": "discourse-fonts",
+          "revision": "0.0.19",
+          "path": "vendor/assets/fonts/InterVariable.woff2",
+          "sha256": "693b77d4f32ee9b8bfc995589b5fad5e99adf2832738661f5402f9978429a8e3"
+        },
+        {
+          "origin": "discourse-fonts",
+          "revision": "0.0.19",
+          "path": "vendor/assets/fonts/JetBrainsMono-Regular.woff2",
+          "sha256": "a9cb1cd82332b23a47e3a1239d25d13c86d16c4220695e34b243effa999f45f2"
+        },
+        {
+          "origin": "discourse-fonts",
+          "revision": "0.0.19",
+          "path": "vendor/assets/fonts/JetBrainsMono-Bold.woff2",
+          "sha256": "c503cc5ec5f8b2c7666b7ecda1adf44bd45f2e6579b2eba0fc292150416588a2"
+        }
+      ],
+      "adaptations": "No artwork/font byte edits. Stage manifest records all Twemoji source/output paths and hashes, not only these observed emoji requests; twitter is the legacy public alias for twemoji. Palette font URLs rebased relative to CSS so root and widget prefix use the same bytes. No remote font/avatar/CDN request."
     },
     {
       "destinations": [

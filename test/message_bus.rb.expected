@@ -1,0 +1,9 @@
+message bus initial status uses live last IDs
+message bus uses actual logical site namespace
+message bus excludes private user group and client messages and advances status
+message bus decodes actual transport and backlog position
+message bus relative backlog positions
+message bus empty response only when live position is current
+message bus rejects unsupported channels duplicate subscriptions and malformed positions
+native Valkey reads task-owned DB0
+native Valkey rejects write commands before sending bytes

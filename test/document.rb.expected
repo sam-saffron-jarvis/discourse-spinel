@@ -1,0 +1,8 @@
+source document mounts Ember without a bespoke table
+document title escaped and unrelated settings never dumped
+script JSON neutralizes HTML parser metacharacters
+hostile script preload round trips without changing data
+source environment metadata and anonymous layout classes
+relative module imports resolve through prefixed stable URL map
+actual core service worker receives native mount and origin
+invalid preload JSON fails closed

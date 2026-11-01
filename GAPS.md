@@ -1,49 +1,56 @@
-# Minimal extraction gaps — ticket 004
+# Minimal extraction gaps — native `/latest` browser checkpoint
 
-This is a scoped native **anonymous JSON** implementation on the task-owned site,
-not a compiled Rails application. `SOURCE_MANIFEST.json` distinguishes source
-extractions, adaptations and runtime adapters. No captured Rails body is served.
+This is a scoped native **anonymous latest** extraction, not a compiled Rails
+application. `SOURCE_MANIFEST.json` distinguishes source adaptations and runtime
+adapters. No captured Rails response/preload is a runtime input.
 
 ## Implemented and verified
 
-- `/srv/status`: native TCP HTTP response after a live read-only PostgreSQL query.
-- Anonymous `/latest.json`, `page=0..2000`; `/latest` also returns JSON for
-  `Accept: application/json` or XHR. Unsupported filters/methods are rejected.
-- Deleted/unlisted/private-message/restricted-category exclusion; optional category
-  definitions, shared-draft category exclusion and default-muted categories.
-- Global-pin priority by `pinned_at`, remaining topics by `bumped_at`, 30-row limit
-  and pin-adjusted pagination. Local category pins do not jump to the top.
-- The **entire seeded JSON response**, including root users/primary_groups/flair_groups,
-  exactly matches Rails for first and empty second page. Fields observed:
-  `id`, `title`, `fancy_title`, `slug`, `posts_count`, `reply_count`,
-  `highest_post_number`, `image_url`, `created_at`, `last_posted_at`, `bumped`,
-  `bumped_at`, `archetype`, `unseen`, `pinned`, `unpinned`, conditional `excerpt`,
-  `visible`, `closed`, `archived`, `bookmarked`, `liked`, conditional `unicode_title`,
-  `tags`, `tags_descriptions`, `views`, `like_count`, `has_summary`,
-  `last_poster_username`, `category_id`, `op_like_count`, `pinned_globally`,
-  `featured_link`, `has_accepted_answer`, `can_vote`, and `posters`.
-- List fields: `can_create_topic`, `filter`, `per_page`, `top_tags`, `topics`;
-  `more_topics_url` is conditional on a full 30-row page. The seeded list has only
-  20 rows so URL generation is source-derived, not established by live Rails parity.
-- Native SELECT-only synthetic CTE tests cover security cases absent from seed,
-  changed-data ordering, categoryless NULL behavior, and multi-page global pins.
-  Shared database rows are never changed, even temporarily.
+- Real Spinel-produced ELF, loopback TCP HTTP, live pure-native PG driver and
+  read-only transactions. Only task PG5499/Valkey6399 are accepted.
+- Accepted default `/latest.json` ordering, anonymous visibility and complete seeded
+  serializer projection remain unchanged: strict Rails equality on two pages,
+  SELECT-only synthetic security/pagination fixtures, no field normalization.
+- `/latest` and `/` serve source-adapted Discourse document/setup/import-map and
+  dynamic `topic_list`, safe `site`/`siteSettings` and common preloads. Core Ember
+  modules render the actual `.topic-list` and `a.title` links; no handmade table.
+- Root and configured `MINIMAL_BASE_URI` document/module/asset/link routes. Both
+  prefixed requests and proxy-stripped requests are accepted at segment boundaries.
+- Canonical staged public static paths, explicit MIME allowlist, binary lengths,
+  no source maps/compressed variants/JSON manifests/dotfiles/traversal/symlink escapes.
+- Bounded actual MessageBus5 short polling reads live Valkey backlog/positions and
+  applies source anonymous user/group/client ACLs. Exact live comparison to the
+  actual Ruby implementation at four positions; no canned empty response.
+- Native source-derived client-settings catalog: 390 safe core fields with typed
+  live overrides, source upcoming-change default promotion and upload URL lookup.
+  The internal promotion threshold is read live but is not exposed as a client
+  setting. Every emitted setting matches the read-only Rails client API on this DB.
+- Every emitted Site scalar/enum/menu/permission field and ordered public category
+  projection matches actual read-only Rails getters. Full Site/category parity is
+  explicitly **not** claimed.
 
-## Missing / deliberately narrowed scope
+## Deliberate divergences and missing scope
 
-| Path | Construct/scope | Current boundary | Required next work |
+| Path | Construct | Boundary / why | Required work |
 |---|---|---|---|
-| `bin/discourse.rb`, `frontend/` | Real browser `/latest` document | HTML request returns **501**, not a handmade table. Core Ember JS builds independently but is not served. | Implement dynamic, client-safe `site` and `siteSettings` preloads, actual document/setup/import-map generation, static routing, locale/icon/CSS assets, widget-prefix handling; then verify browser DOM/network. |
-| `lib/latest.rb` | Full ActiveRecord `TopicQuery` and request options | Explicit anonymous SQL **translation**, not unchanged Discourse code. Only default latest ordering and page supported. No arbitrary category/tag/search/sort/custom field filters. | Extract each option and its guardian/plugin behavior with value-for-value oracle tests. |
-| `lib/latest.rb`, `lib/serializers.rb` | Tag permissions/top tags | Any nonempty `tags` table returns 501. Empty tag arrays/objects are valid for the currently empty table only. | Carry visible-tag guardian, tag-group restrictions, sorting, descriptions, top-tag and muted-tag policy. |
-| `lib/latest.rb`, `lib/serializers.rb` | Image/thumbnail/featured-link handling and title generation | Selected image uploads/thumbnails, uncached fancy titles, or nonempty featured links return 501; `image_url=null` and `featured_link=null` are only served when warranted by live rows. | Extract upload URL/security/thumbnail lookup, title formatting, and featured-link domain methods. No thumbnail jobs/DB writes are attempted. |
-| `lib/latest.rb` | Alternate locale, localization, nested replies, mute-all category mode, default avatars, custom small logo, emoji deny list, plain title mode, solved empty box | These known unextracted configurations fail closed with 501. Current English/default settings are the tested scope; other theme/plugin/global-setting changes are not generally validated. | Extract relevant source behaviors; remove a guard only with real parity coverage. |
-| `lib/users.rb` | Avatar normalization, deployment hostname, flair uploads | Non-ASCII usernames, flair image uploads and empty external-avatar URL fail closed. Task-site host `localhost`, root base path, default small-logo URL and optimized-image version 2 are explicit runtime adaptations from source defaults. | Native Unicode normalization; deployment hostname/base-path/CDN configuration; upload/secure flair URL adapters. Avatar/image URLs are serialized but not served. |
-| `lib/latest.rb`, `lib/serializers.rb` | Authenticated state | Always anonymous. Cookies/auth headers do not establish a session. No unread/notification/like/bookmark state, private-message participant fields or authenticated create permission. | Session/auth/Guardian adapters and separate permission/parity tests. |
-| `lib/latest.rb`, `PLUGIN_SUPPORT.json` | Core plugin registration and theme modifiers | Only selected Solved/topic-voting list attributes are adapted; no plugin boot/hooks/events, full plugin behavior, theme modifiers, hot score, OP-like extras, nested views, or plugin routes. | Explicit per-plugin extraction/runtime tests. Compiling core JS does not establish plugin support. |
-| `bin/discourse.rb` | Server runtime | Small loopback-only sequential HTTP adapter, one read-only PG connection, connection-close responses. Valkey URL is validated but no Valkey connection/caching is used. Not a production Rack/session/websocket server. | Request timeouts/concurrency, connection recovery, proper HEAD/negotiation, cache/Valkey behavior as needed by extracted routes. |
-| `bin/discourse.rb` | Topic and other APIs | No topic page, `/site`, `/site/basic-info`, assets, sessions, plugin routes or mutations; unknown route 404. | Browser bootstrap first; topic extraction is a later rung. |
+| `reference/native_site.rb` | Full `Site.json_for` / `SiteSerializer` | Narrow anonymous projection. Nine public categories omit 315 serializer fields in aggregate. Group/sidebar/auth-provider/tag/color-scheme/access-control/user-field/plugin metadata is not extracted. Permission booleans reflect tested default anonymous configuration, not full dynamic Guardian/plugin policy. | Extract remaining source fields/guards with read-only oracle tests; never use captured Site JSON. |
+| `reference/site-oracle.rb` | Aggregate Rails oracle write-on-read | Actual `Site.json_for(Guardian.new)` tries to persist `bypass_wizard_check` through `Wizard#requires_completion?`; PG rejects the INSERT in a read-only savepoint. The failure/stack is retained, and actual safe field getters are compared separately without stubbing or allowing the write. | An independently appropriate read-only upstream wizard path, or a read-only-safe aggregate oracle. No DB reset/warm writes. |
+| `reference/native_site.rb` | Complete client-settings registry | 390 source-core non-themeable client fields only; 375 additional plugin/computed/themeable fields omitted on this site. Full catalog parity remains false in the report. Nonempty uploaded-image lists, plugin-owned upcoming-change dependencies and broader setting-type/custom policy cases remain unextracted; English/login-required guards remain. | Extract computed helpers and theme/plugin settings from source, preserve client-safe filtering/type behavior, test changed configurations. |
+| `lib/preloads.rb` | Theme/custom HTML/upcoming per-user hooks | `themeSiteSettingOverrides`, `customHTML`, `activatedThemes` and per-user `upcomingChanges` are explicit empty objects, not evaluations of theme/plugin builders. Source-default promotion is separately handled in settings. Nonempty custom emoji fails closed rather than inventing assets. | Real theme selection/settings/HTML builders, anonymous upcoming-group logic and custom emoji/upload ACLs. |
+| `frontend/stage-assets.py` | Locale scope | Core English YAML and source moment formatter adaptation. Compiled MessageFormat bundle is not extracted: `messageFormatData` currently returns an explicitly empty bundle. Plugin/theme/override translations are omitted. | Stage actual MessageFormat compiler output and additional locale/override/plugin sources. |
+| `frontend/stage-assets.py` | CSS and asset build provenance | Core common CSS is byte-hashed existing reference compiler output, not independently rebuilt from raw Sass. No Horizon CSS is attached to Foundation. Theme/plugin asset bundles and changing theme/site settings are not automatically restaged in the running process. | Reproducible isolated common/plugin/theme build and dynamic asset invalidation/selection. Stage descriptor records actual inputs/outputs and any palette/font compilation. |
+| `frontend/native_document.rb` | Layout and setup | Anonymous source-adapted layout, not a Rails ERB engine. No authentication/CSRF/session, analytics, theme/plugin HTML or full noscript document. Trusted `MINIMAL_ORIGIN` is needed for canonical absolute URLs behind the existing proxy (which forwards Host localhost). | Extract only required layout surfaces with separate security and browser tests. |
+| `frontend/native_document.rb` | Core service worker | Actual source worker is served with native prefix/origin substitution; Rails-registered plugin worker hooks are deliberately omitted. Push subscription/share-target backend routes are not implemented. | Plugin worker assets and corresponding authenticated APIs; registering a core worker is not push-feature coverage. |
+| `lib/avatars.rb`, `tools/stage-media.py` | Public uploaded avatars | Live username/current-upload/secure checks; existing optimized images preferred, otherwise actual original image bytes without resize writes. Historical/associated-account avatar lookup and runtime media restaging are not implemented. Missing/ineligible images use the actual stock blank asset. | Native resize/cache adapter, broader avatar membership and secure-upload behavior; dynamic media availability. |
+| `lib/avatars.rb` | External letter-avatar proxy | Task forbids external HTTP. Uses the real Rails `render_blank` asset (offline divergence), not generated letter identities or a CDN proxy. | Local source-correct letter-avatar image generation; no external network dependency. |
+| `lib/message_bus.rb` | Complete MessageBus transport | Synchronous short polling for observed guest latest channels only; no long-poll/hijack/chunking, publish, authenticated identity, arbitrary/plugin channels or subscriptions/listeners. | Additional channels/filters and transport semantics only as required, with ACL regression tests. |
+| `lib/latest.rb` | Full query options | Explicit SQL translation, anonymous default ordering/page only. No arbitrary category/tag/search/sort/custom field filters. | Extract options and guardian/plugin behavior with parity tests. |
+| `lib/latest.rb`, `lib/serializers.rb` | Tags/images/featured links/title generation | Nonempty tags, topic images/thumbnails, uncached fancy titles or featured links fail closed. Unsupported localization/nested/mute-all/default avatar/custom-small-logo/emoji-deny/plain-title/solved-empty-box settings remain guarded. | Source-correct serializer/upload/title/tag policy, no DB-writing jobs. |
+| `lib/users.rb` | Avatar normalization/flair | Non-ASCII usernames, flair image uploads and unsupported external-avatar configurations remain guarded. Task hostname localhost; client applies mount prefix to serialized root-relative avatar URLs. | Native Unicode/CDN/deployment/flair adapters. |
+| `lib/latest.rb`, `PLUGIN_SUPPORT.json` | Full plugin/authentication support | Selected Solved/topic-voting list attributes and source navigation constants only. No complete plugin boot/hooks/events/routes/frontend bundles or theme behavior. Cookies do not authenticate; mutations rejected. | Explicit per-plugin/authenticated extraction and tests. Core Ember boot is not plugin coverage. |
+| `bin/discourse.rb` | Production server | Small sequential loopback connection-close adapter; one PG connection, no production Rack/session/websocket/concurrency/rate-limiting/recovery. Only GET plus bounded read-only MessageBus POST. | Production HTTP/runtime hardening if this extraction grows beyond local proof. |
+| `bin/discourse.rb` | Topic page / other routes | `/t/...` and `/t/...json`, `/site` APIs, login/search/category/plugin/mutation routes remain 404/405. A correct topic link is **not** topic content. | Topic page/API extraction is next M3, not part of this ticket. |
 
-Read-only Rails capture is verification tooling only. It is synchronous and exits
-before the native smoke listener starts. `build/` evidence, responses, binaries and
-assets are ignored by Git. No Rails process serves final native data.
+Oracle runners are verification/build tooling only and exit synchronously. No Ruby
+or Rails subprocess serves native data/documents/static requests. Ignored `build/`
+contains generated binaries/assets/screenshots/logs and verification-only captures.

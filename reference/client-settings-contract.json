@@ -1,0 +1,3290 @@
+{
+  "source_revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+  "source_path": "config/site_settings.yml",
+  "source_sha256": "f5d22ff1dc5e7afc1d5c136d0160c12443639a1df792ed43553460252db1e3d1",
+  "promote_upcoming_changes_on_status_default": "beta",
+  "generation": "YAML client:true settings only; static defaults/types, never runtime overrides",
+  "settings": [
+    {
+      "name": "about_page_extra_groups",
+      "default": "",
+      "type": "group_list",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "about_page_extra_groups_initial_members",
+      "default": 6,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "about_page_extra_groups_order",
+      "default": "alphabetically",
+      "type": "enum",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "about_page_extra_groups_show_description",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "admin_allow_filter_untranslated_text",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "admin_quick_start_topic_id",
+      "default": -1,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "alert_admins_if_errors_per_hour",
+      "default": 0,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "alert_admins_if_errors_per_minute",
+      "default": 0,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "allow_all_users_to_flag_illegal_content",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "allow_anonymous_mode",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "allow_bulk_invite",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "allow_email_invites",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "allow_featured_topic_on_user_profiles",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "allow_likes_in_anonymous_mode",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "allow_new_registrations",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "allow_passkeys_for_2fa",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "allow_profile_backgrounds",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "allow_staff_to_upload_any_file_in_pm",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "allow_uncategorized_topics",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "allow_user_locale",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "allow_username_in_share_links",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "allow_users_to_hide_profile",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "allowed_href_schemes",
+      "default": "",
+      "type": "list",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "allowed_iframes",
+      "default": "https://www.google.com/maps/embed?|https://www.openstreetmap.org/export/embed.html?|https://calendar.google.com/calendar/embed?|https://codepen.io/*/embed/preview/|https://www.instagram.com/|https://open.spotify.com/",
+      "type": "list",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "anon_polling_interval",
+      "default": 25000,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "apple_touch_icon",
+      "default": "",
+      "type": "upload",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "auth_immediately",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "auth_overrides_email",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "auth_skip_create_confirm",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "authorized_extensions",
+      "default": "jpg|jpeg|png|gif|heic|heif|webp|avif|svg|jxl",
+      "type": "list",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "authorized_extensions_for_staff",
+      "default": "",
+      "type": "list",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "autohighlight_all_code",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "automatically_unpin_topics",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "avatar_sizes",
+      "default": "24|48|72|96|144|288",
+      "type": "list",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "background_polling_interval",
+      "default": 60000,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "backup_location",
+      "default": "local",
+      "type": "enum",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "base_font",
+      "default": "inter",
+      "type": "list",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "blur_tl0_flagged_posts_media",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "bounce_score_threshold",
+      "default": 4,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "browser_pageview_max_engaged_seconds",
+      "default": 1800,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "cache_control_bfcache_compatibility",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "can_permanently_delete",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "category_colors",
+      "default": "BF1E2E|F1592A|F7941D|9EB83B|3AB54A|12A89D|25AAE2|0E76BD|652D90|92278F|ED207B|8C6238|231F20|808281|B3B5B4|E45735",
+      "type": "list",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "code_formatting_style",
+      "default": "code-fences",
+      "type": "enum",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "cold_age_days_high",
+      "default": 180,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "cold_age_days_low",
+      "default": 14,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "cold_age_days_medium",
+      "default": 90,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "composer_ios_media_optimisation_image_enabled",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "composer_media_optimization_debug_mode",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "composer_media_optimization_gif_conversion_threshold",
+      "default": 512000,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "composer_media_optimization_image_bytes_optimization_threshold",
+      "default": 524288,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "composer_media_optimization_image_convert_enabled",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": {
+        "status": "alpha",
+        "impact": "feature,all_members",
+        "learn_more_url": "https://meta.discourse.org/t/-/402705",
+        "allow_enabled_for": [
+          "everyone"
+        ]
+      },
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "composer_media_optimization_image_enabled",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "composer_media_optimization_image_encode_quality",
+      "default": 0,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "composer_media_optimization_image_resize_dimensions_threshold",
+      "default": 1920,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "composer_media_optimization_image_resize_linear_rgb",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "composer_media_optimization_image_resize_pre_multiply",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "composer_media_optimization_image_resize_width_target",
+      "default": 1920,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "contact_email",
+      "default": "",
+      "type": "email",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "content_localization_allow_author_localization",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "content_localization_allowed_groups",
+      "default": "1|2",
+      "type": "group_list",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "content_localization_enabled",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "content_localization_language_switcher",
+      "default": "none",
+      "type": "enum",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "content_localization_max_locales",
+      "default": 10,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "content_localization_supported_locales",
+      "default": "",
+      "type": "list",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "custom_flags_limit",
+      "default": 50,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "dashboard_improvements",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": {
+        "status": "permanent",
+        "impact": "feature,admins",
+        "learn_more_url": "https://meta.discourse.org/t/-/404528"
+      },
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "default_avatars",
+      "default": "",
+      "type": "url_list",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "default_code_lang",
+      "default": "auto",
+      "type": "string",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "default_composer_category",
+      "default": "",
+      "type": "category",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "default_emoji_reactions",
+      "default": "+1|heart|tada",
+      "type": "emoji_list",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "default_homepage",
+      "default": "",
+      "type": "enum",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "default_locale",
+      "default": "en",
+      "type": "string",
+      "source_client_flag": "SiteSettingExtension.client_settings default"
+    },
+    {
+      "name": "default_navigation_menu_categories",
+      "default": "",
+      "type": "category_list",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "default_navigation_menu_tags",
+      "default": "",
+      "type": "tag_list",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "default_sidebar_switch_panel_position",
+      "default": "bottom",
+      "type": "enum",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "default_subcategory_on_read_only_category",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "default_text_size",
+      "default": "normal",
+      "type": "enum",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "default_topics_automatic_unpin",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "default_watched_precedence_over_muted",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "delete_all_posts_background_threshold",
+      "default": 200,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "delete_all_posts_max",
+      "default": 15,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "delete_removed_posts_after",
+      "default": 24,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "delete_user_max_post_age",
+      "default": 60,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "desktop_category_page_style",
+      "default": "categories_and_latest_topics",
+      "type": "string",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "digest_logo",
+      "default": "",
+      "type": "upload",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "disable_digest_emails",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "disable_emails",
+      "default": "no",
+      "type": "enum",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "disable_mailing_list_mode",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "discourse_connect_overrides_avatar",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "display_eu_visitor_stats",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "display_local_time_in_user_card",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "display_name_on_posts",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "dsa_reporting_enabled",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "edit_history_visible_to_public",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "email_address_to_report_illegal_content",
+      "default": "",
+      "type": "string",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "email_editable",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "email_in",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "email_time_window_mins",
+      "default": 10,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "embed_full_app",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "embed_full_app_signin_flow",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "emoji_autocomplete_min_chars",
+      "default": 0,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "emoji_deny_list",
+      "default": "",
+      "type": "emoji_list",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "emoji_picker_pinned_groups",
+      "default": "",
+      "type": "list",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "emoji_set",
+      "default": "twitter",
+      "type": "string",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "enable_auto_grid_images",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "enable_backups",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "enable_badge_sql",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "enable_badges",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "enable_category_group_moderation",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "enable_category_hashtag_cards",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": {
+        "status": "experimental",
+        "impact": "feature,all_members",
+        "learn_more_url": "https://meta.discourse.org/t/-/412529"
+      },
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "enable_chunked_encoding",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "enable_composer_redesign",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": {
+        "status": "beta",
+        "impact": "other,all_members",
+        "body_class": true,
+        "learn_more_url": "https://meta.discourse.org/t/-/407849"
+      },
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "enable_composer_toolbar_customization",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": {
+        "status": "experimental",
+        "impact": "feature,all_members",
+        "learn_more_url": "https://meta.discourse.org/t/-/412749"
+      },
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "enable_desktop_push_notifications",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "enable_direct_s3_uploads",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "enable_discourse_connect",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "enable_emoji",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "enable_emoji_shortcuts",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "enable_fast_edit",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "enable_filtered_replies_view",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "enable_form_templates",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "enable_generated_llms_txt",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": {
+        "status": "beta",
+        "impact": "feature,all_members",
+        "allow_enabled_for": [
+          "everyone"
+        ],
+        "learn_more_url": "https://meta.discourse.org/t/-/411435"
+      },
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "enable_gifs",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "enable_group_directory",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "enable_horizon_high_context_topic_cards",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": {
+        "status": "stable",
+        "impact": "site_setting_default,all_members",
+        "learn_more_url": "https://meta.discourse.org/t/-/402843",
+        "permanent_warning": false,
+        "allow_enabled_for": [
+          "everyone"
+        ]
+      },
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "enable_inline_emoji_translation",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "enable_invite_modal_with_roles",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": {
+        "status": "stable",
+        "impact": "feature,admins",
+        "learn_more_url": "https://meta.discourse.org/t/-/407727"
+      },
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "enable_local_logins",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "enable_local_logins_via_code",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": {
+        "status": "beta",
+        "impact": "feature,all_members",
+        "learn_more_url": "https://meta.discourse.org/t/-/407068",
+        "permanent_warning": false,
+        "allow_enabled_for": [
+          "everyone"
+        ]
+      },
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "enable_local_logins_via_email",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "enable_main_outlet_grid_layout_change",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": {
+        "status": "alpha",
+        "impact": "other,all_members",
+        "body_class": true,
+        "learn_more_url": "https://meta.discourse.org/t/-/414357"
+      },
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "enable_markdown_endpoints",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": {
+        "status": "stable",
+        "impact": "feature,all_members",
+        "learn_more_url": "https://meta.discourse.org/t/-/413006",
+        "permanent_warning": false,
+        "allow_enabled_for": [
+          "everyone"
+        ]
+      },
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "enable_markdown_linkify",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "enable_markdown_typographer",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "enable_max_tags_per_email_subject",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "enable_mentions",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "enable_names",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "enable_new_checkbox_style",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": {
+        "status": "permanent",
+        "impact": "feature,all_members",
+        "learn_more_url": "https://meta.discourse.org/t/-/403284",
+        "body_class": true
+      },
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "enable_new_defaults_for_trust_level_3_requirements",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": {
+        "status": "permanent",
+        "impact": "site_setting_default,all_members",
+        "learn_more_url": "https://meta.discourse.org/t/-/397098",
+        "permanent_warning": false,
+        "allow_enabled_for": [
+          "everyone"
+        ]
+      },
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "enable_new_reordering_controls",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": {
+        "status": "alpha",
+        "impact": "feature,all_members",
+        "learn_more_url": "https://meta.discourse.org/t/-/414613"
+      },
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "enable_offline_indicator",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "enable_passkeys",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "enable_powered_by_discourse",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "enable_random_usernames",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "enable_rich_text_paste",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "enable_s3_uploads",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "enable_safe_mode",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "enable_secondary_emails",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "enable_signup_cta",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "enable_simplified_category_creation",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": {
+        "status": "permanent",
+        "impact": "feature,staff",
+        "learn_more_url": "https://meta.discourse.org/t/-/394971"
+      },
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "enable_site_owner_onboarding",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "enable_smtp",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "enable_unified_new",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": {
+        "status": "stable",
+        "impact": "feature,all_members",
+        "learn_more_url": "https://meta.discourse.org/t/-/404728"
+      },
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "enable_upload_debug_mode",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "enable_user_directory",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "enable_user_menu_mentions_tab",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": {
+        "status": "beta",
+        "impact": "feature,all_members",
+        "learn_more_url": "https://meta.discourse.org/t/-/415579"
+      },
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "enable_user_status",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "enable_user_tips",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "enforce_second_factor",
+      "default": "no",
+      "type": "enum",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "enforce_second_factor_on_external_auth",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "exclude_rel_nofollow_domains",
+      "default": "",
+      "type": "list",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "external_emoji_url",
+      "default": "",
+      "type": "string",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "external_system_avatars_enabled",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "external_system_avatars_url",
+      "default": "/letter_avatar_proxy/v4/letter/{first_letter}/{color}/{size}.png",
+      "type": "string",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "facebook_app_id",
+      "default": "",
+      "type": "string",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "faq_url",
+      "default": "",
+      "type": "string",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "favicon",
+      "default": "",
+      "type": "upload",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "fixed_category_positions",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "fixed_category_positions_on_create",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "floating_dismiss_topics_on_mobile",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": {
+        "status": "permanent",
+        "impact": "feature,all_members",
+        "learn_more_url": "https://meta.discourse.org/t/-/387322",
+        "body_class": true
+      },
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "force_lowercase_tags",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "ga_universal_domain_name",
+      "default": "auto",
+      "type": "string",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "ga_universal_tracking_code",
+      "default": "",
+      "type": "string",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "general_category_id",
+      "default": -1,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "generate_topic_og_image",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "global_notice",
+      "default": "",
+      "type": "string",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "granular_anonymous_and_logged_in_groups_permissions",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": {
+        "status": "beta",
+        "impact": "feature,all_members",
+        "learn_more_url": "https://meta.discourse.org/t/-/402273",
+        "allow_enabled_for": [
+          "everyone"
+        ]
+      },
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "gravatar_base_url",
+      "default": "www.gravatar.com",
+      "type": "string",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "gravatar_enabled",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "gravatar_login_url",
+      "default": "/emails",
+      "type": "string",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "gravatar_name",
+      "default": "Gravatar",
+      "type": "string",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "gtm_container_id",
+      "default": "",
+      "type": "string",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "header_dropdown_category_count",
+      "default": 8,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "heading_font",
+      "default": "inter",
+      "type": "list",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "here_mention",
+      "default": "here",
+      "type": "string",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "hide_disabled_create_topic_button",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "hide_email_address_taken",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "hide_silencing_reasons",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "hide_suspension_reasons",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "hide_user_activity_tab",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "hide_user_profiles_from_public",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "highlighted_languages",
+      "default": "bash|c|cpp|csharp|css|diff|go|graphql|ini|java|javascript|json|kotlin|lua|makefile|markdown|objectivec|perl|php|php-template|plaintext|python|python-repl|r|ruby|rust|scss|shell|sql|swift|typescript|xml|yaml|wasm",
+      "type": "list",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "history_hours_high",
+      "default": 48,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "history_hours_low",
+      "default": 12,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "history_hours_medium",
+      "default": 24,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "ignored_users_count_message_threshold",
+      "default": 5,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "ignored_users_message_gap_days",
+      "default": 365,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "image_quality",
+      "default": 90,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "improved_crawler_detection",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": {
+        "status": "experimental",
+        "impact": "other,all_members",
+        "learn_more_url": "https://meta.discourse.org/t/-/409316",
+        "allow_enabled_for": [
+          "everyone"
+        ]
+      },
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "include_s3_uploads_in_backups",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "interface_color_selector",
+      "default": "disabled",
+      "type": "string",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "invite_expiry_days",
+      "default": 90,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "invite_link_max_redemptions_limit",
+      "default": 5000,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "invite_link_max_redemptions_limit_users",
+      "default": 10,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "invite_only",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "invites_per_page",
+      "default": 40,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "klipy_content_filter",
+      "default": "high",
+      "type": "enum",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "klipy_country",
+      "default": "US",
+      "type": "string",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "klipy_file_detail",
+      "default": "webp",
+      "type": "enum",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "klipy_limit_infinite_search_results",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "klipy_locale",
+      "default": "en_US",
+      "type": "string",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "klipy_max_results_limit",
+      "default": 240,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "large_icon",
+      "default": "",
+      "type": "upload",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "log_search_queries",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "login_required",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "logo",
+      "default": -5,
+      "type": "upload",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "logo_dark",
+      "default": "",
+      "type": "upload",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "logo_small",
+      "default": -6,
+      "type": "upload",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "logo_small_dark",
+      "default": "",
+      "type": "upload",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "logout_redirect",
+      "default": "",
+      "type": "string",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "long_polling_base_url",
+      "default": "/",
+      "type": "string",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "manifest_icon",
+      "default": "",
+      "type": "upload",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "manifest_screenshots",
+      "default": "",
+      "type": "list",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "markdown_linkify_tlds",
+      "default": "com|net|org|io|onion|co|tv|ru|cn|us|uk|me|de|fr|fi|gov",
+      "type": "list",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "markdown_typographer_quotation_marks",
+      "default": "“|”|‘|’",
+      "type": "list",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "max_allowed_secondary_emails",
+      "default": 10,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "max_attachment_size_kb",
+      "default": 10240,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "max_category_nesting",
+      "default": 2,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "max_favorite_badges",
+      "default": 2,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "max_image_height",
+      "default": 500,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "max_image_size_kb",
+      "default": 10240,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "max_image_width",
+      "default": 690,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "max_new_topics",
+      "default": 500,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "max_oneboxes_per_post",
+      "default": 50,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "max_post_length",
+      "default": 32000,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "max_prints_per_hour_per_user",
+      "default": 5,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "max_reply_history",
+      "default": 1,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "max_tag_length",
+      "default": 20,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "max_tag_search_results",
+      "default": 5,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "max_tags_in_filter_list",
+      "default": 30,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "max_tags_per_email_subject",
+      "default": 5,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "max_tags_per_topic",
+      "default": 5,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "max_topic_title_length",
+      "default": 255,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "max_username_length",
+      "default": 20,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "max_users_notified_per_group_mention",
+      "default": 100,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "maximum_backups",
+      "default": 5,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "mcp_server_enabled",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "min_admin_password_length",
+      "default": 15,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "min_first_post_length",
+      "default": 20,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "min_password_length",
+      "default": 10,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "min_personal_message_post_length",
+      "default": 10,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "min_personal_message_title_length",
+      "default": 2,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "min_post_length",
+      "default": 20,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "min_search_term_length",
+      "default": 3,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "min_title_similar_length",
+      "default": 10,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "min_topic_title_length",
+      "default": 15,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "min_topic_views_for_delete_confirm",
+      "default": 5000,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "min_username_length",
+      "default": 3,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "mobile_category_page_style",
+      "default": "categories_with_featured_topics",
+      "type": "string",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "mobile_logo",
+      "default": "",
+      "type": "upload",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "mobile_logo_dark",
+      "default": "",
+      "type": "upload",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "moderator_guide_topic",
+      "default": "",
+      "type": "topic",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "moderators_change_post_ownership",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "moderators_manage_categories",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "moderators_manage_groups",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "moderators_view_emails",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "moderators_view_ips",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "moderators_view_sso_details",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "modernize_foundation_theme",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": {
+        "impact": "feature,all_members",
+        "status": "beta",
+        "learn_more_url": "https://meta.discourse.org/t/-/395331",
+        "body_class": true
+      },
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "must_approve_users",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "mute_all_categories_by_default",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "navigation_menu",
+      "default": "sidebar",
+      "type": "enum",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "nested_replies_cap_nesting_depth",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "nested_replies_default",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "nested_replies_default_sort",
+      "default": "top",
+      "type": "enum",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "nested_replies_enabled",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "nested_replies_hot_sort_enabled",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "nested_replies_max_depth",
+      "default": 3,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "newuser_max_attachments",
+      "default": 0,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "newuser_max_embedded_media",
+      "default": 5,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "old_post_notice_days",
+      "default": 14,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "opengraph_image",
+      "default": "",
+      "type": "upload",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "page_loading_indicator",
+      "default": "slider",
+      "type": "enum",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "penalty_include_post_message",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "polling_interval",
+      "default": 3000,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "post_menu",
+      "default": "read|like|copyLink|flag|edit|bookmark|delete|admin|reply",
+      "type": "list",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "post_menu_hidden_items",
+      "default": "flag|bookmark|edit|delete|admin",
+      "type": "list",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "prevent_anons_from_downloading_files",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "prevent_uploads_only_posts",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "prioritize_full_name_in_ux",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "prioritize_recently_used_tags",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": {
+        "status": "experimental",
+        "impact": "feature,all_members",
+        "learn_more_url": "https://meta.discourse.org/t/-/410419"
+      },
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "prioritize_username_in_ux",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "privacy_policy_url",
+      "default": "",
+      "type": "string",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "push_notifications_prompt",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "read_time_word_count",
+      "default": 500,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "relative_date_duration",
+      "default": 30,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "remove_and_replace_uncategorized",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": {
+        "status": "stable",
+        "impact": "other,all_members",
+        "allow_enabled_for": [
+          "everyone"
+        ],
+        "hide_settings": [
+          "allow_uncategorized_topics",
+          "suppress_uncategorized_badge"
+        ],
+        "learn_more_url": "https://meta.discourse.org/t/-/406373"
+      },
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "remove_muted_tags_from_latest",
+      "default": "always",
+      "type": "enum",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "remove_older_backups",
+      "default": "",
+      "type": "string",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "rename_faq_to_guidelines",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": {
+        "impact": "feature,all_members",
+        "status": "stable",
+        "learn_more_url": "https://meta.discourse.org/t/-/395099"
+      },
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "reporting_improvements",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": {
+        "status": "permanent",
+        "impact": "feature,staff",
+        "learn_more_url": "https://meta.discourse.org/t/-/395768"
+      },
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "reviewable_claiming",
+      "default": "disabled",
+      "type": "enum",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "reviewable_default_topics",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "reviewable_default_visibility",
+      "default": "low",
+      "type": "enum",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "reviewable_old_moderator_actions",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "reviewable_revision_reasons",
+      "default": "Duplicate|Does not meet posting guidelines",
+      "type": "list",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "search_default_sort_order",
+      "default": 0,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "secure_uploads",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "secure_uploads_pm_only",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "selectable_avatars",
+      "default": "",
+      "type": "uploaded_image_list",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "selectable_avatars_mode",
+      "default": "disabled",
+      "type": "enum",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "set_locale_from_accept_language_header",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "set_locale_from_cookie",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "set_locale_from_param",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "share_links",
+      "default": "twitter|facebook|email",
+      "type": "list",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "share_quote_buttons",
+      "default": "twitter|email",
+      "type": "list",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "share_quote_visibility",
+      "default": "all",
+      "type": "enum",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "short_progress_text_threshold",
+      "default": 10000,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "short_site_description",
+      "default": "",
+      "type": "string",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "show_badges_in_post_header",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "show_bottom_topic_map",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "show_category_definitions_in_topic_lists",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "show_copy_button_on_codeblocks",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "show_pinned_excerpt_desktop",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "show_pinned_excerpt_mobile",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "show_preview_for_form_templates",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "show_signup_form_email_instructions",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "show_signup_form_full_name_instructions",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "show_signup_form_password_instructions",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "show_signup_form_username_instructions",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "show_time_gap_days",
+      "default": 7,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "show_topic_map_in_topics_without_replies",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "show_user_menu_avatars",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "sidebar_user_navigation",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": {
+        "status": "experimental",
+        "impact": "feature,all_members",
+        "learn_more_url": "https://meta.discourse.org/t/-/413150"
+      },
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "simple_email_subject",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "simultaneous_uploads",
+      "default": 15,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "site_archived",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "site_setting_verbose_client_logging",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "slug_generation_method",
+      "default": "ascii",
+      "type": "string",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "staff_category_id",
+      "default": -1,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "suggest_weekends_in_date_pickers",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "suggested_topics",
+      "default": 5,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "summary_timeline_button",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "support_mixed_text_direction",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "suppress_overlapping_tags_in_list",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "suppress_reply_directly_above",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "suppress_reply_directly_below",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "suppress_uncategorized_badge",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "svg_icon_subset",
+      "default": "",
+      "type": "list",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "tag_style",
+      "default": "simple",
+      "type": "enum",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "tag_topic_allowed_groups",
+      "default": "1|2|10",
+      "type": "group_list",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "tagging_enabled",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "tags_listed_by_group",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "tags_sort_alphabetically",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "title",
+      "default": "Discourse",
+      "type": "string",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "tl1_requires_read_posts",
+      "default": 30,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "tl3_links_no_follow",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "top_menu",
+      "default": "latest|new|unread|hot|categories",
+      "type": "list",
+      "upcoming_change": null,
+      "upcoming_change_default_override": {
+        "upcoming_change": "enable_unified_new",
+        "new_default": "latest|new|hot|categories"
+      },
+      "source_client_flag": true
+    },
+    {
+      "name": "top_page_default_timeframe",
+      "default": "yearly",
+      "type": "enum",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "topic_featured_link_enabled",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "topic_page_title_includes_category",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "topic_post_like_heat_high",
+      "default": 2.0,
+      "type": "float",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "topic_post_like_heat_low",
+      "default": 0.5,
+      "type": "float",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "topic_post_like_heat_medium",
+      "default": 1.0,
+      "type": "float",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "topic_views_heat_high",
+      "default": 3500,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "topic_views_heat_low",
+      "default": 1000,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "topic_views_heat_medium",
+      "default": 2000,
+      "type": "integer",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "tos_url",
+      "default": "",
+      "type": "string",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "traditional_markdown_linebreaks",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "unicode_usernames",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "update_pending_users_reminder_default",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": {
+        "status": "alpha",
+        "impact": "site_setting_default,all_members",
+        "learn_more_url": "https://meta.discourse.org/t/-/408429",
+        "permanent_warning": false,
+        "allow_enabled_for": [
+          "everyone"
+        ]
+      },
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "update_whispers_allowed_groups_default",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": {
+        "status": "alpha",
+        "impact": "site_setting_default,staff",
+        "learn_more_url": "https://meta.discourse.org/t/-/414354",
+        "permanent_warning": false,
+        "allow_enabled_for": [
+          "everyone"
+        ]
+      },
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "use_admin_ip_allowlist",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "use_legacy_pageviews",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "use_pg_headlines_for_excerpt",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "user_selected_primary_groups",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "vapid_public_key_bytes",
+      "default": "",
+      "type": "string",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "verbose_localization",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "version_checks",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "video_thumbnails_enabled",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "view_user_route",
+      "default": "summary",
+      "type": "string",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "warn_critical_js_deprecations",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "warn_critical_js_deprecations_message",
+      "default": "",
+      "type": "string",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "watched_words_regular_expressions",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "welcome_banner_image",
+      "default": "",
+      "type": "upload",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "welcome_banner_location",
+      "default": "above_topic_content",
+      "type": "string",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "welcome_banner_page_visibility",
+      "default": "top_menu_pages",
+      "type": "string",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "welcome_banner_text_color",
+      "default": "",
+      "type": "color",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "x_summary_large_image",
+      "default": "",
+      "type": "upload",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    }
+  ]
+}

@@ -1,0 +1,4 @@
+avatar access verifies live username upload size parameters
+offline letter avatar explicit source blank fallback
+avatar route storage size and injection boundaries
+avatar database URL traversal is not a filesystem path

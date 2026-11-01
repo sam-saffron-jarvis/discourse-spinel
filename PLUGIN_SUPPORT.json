@@ -1,5 +1,5 @@
 {
-  "scope": "anonymous latest JSON extraction; no complete plugin support claimed",
+  "scope": "anonymous latest JSON and core Ember browser list; no complete plugin support claimed; no plugin frontend bundles or boot hooks",
   "source_revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
   "plugins": [
     {
@@ -228,7 +228,7 @@
       "plugin": "discourse-topic-voting",
       "source": "plugins/discourse-topic-voting/plugin.rb",
       "status": "selected anonymous latest field adaptation only",
-      "detail": "can_vote derives from live category setting and source conditions; vote_count and anonymous user_voted branch when applicable. Full voting behavior/hooks not integrated; seeded can_vote=false only compared to Rails."
+      "detail": "can_vote derives from live category setting and source conditions; vote_count and anonymous user_voted branch when applicable. Full voting behavior/hooks not integrated; seeded can_vote=false only compared to Rails. Ticket 007 also extracts source votes navigation-list constants for anonymous Site metadata; votes routes/UI plugin bundle remain unimplemented."
     },
     {
       "plugin": "discourse-user-notes",

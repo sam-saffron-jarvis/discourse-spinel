@@ -1,0 +1,8 @@
+client settings use typed live overrides and source upcoming-change defaults
+client settings exclude unknown rows
+generated catalog covers browser polling/avatar/navigation settings
+dynamic internal promotion threshold changes defaults without being exposed
+unextracted uploaded-image list fails closed
+site enums follow source mappings
+site archetype list excludes private messages and uses source names
+site categories use anonymous visibility filter
