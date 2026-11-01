@@ -1,0 +1,475 @@
+{
+  "schema_version": 1,
+  "upstream": "Discourse",
+  "original_revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+  "upstream_license": "GPL-2.0-or-later; Copyright 2014-2026 Civilized Discourse Construction Kit, Inc. and contributors",
+  "scope": "anonymous latest JSON at task-owned seeded site; browser and full plugin support NOT complete",
+  "gaps": "GAPS.md",
+  "plugin_coverage": "PLUGIN_SUPPORT.json",
+  "entries": [
+    {
+      "destinations": [
+        "lib/serializers.rb"
+      ],
+      "kind": "selective anonymous-scope adaptation",
+      "license": "GPL-2.0-or-later",
+      "sources": [
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/serializers/basic_topic_serializer.rb",
+          "sha256": "42e4a354cf6c5c9da17aedeb45895170e0f55cca9e40190a29d4d13703b59f85"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/serializers/listable_topic_serializer.rb",
+          "sha256": "7768ea13a61e33f4164725b1ae717378a88dd1ddc10667a44eef260dfc47d66b"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/serializers/topic_list_item_serializer.rb",
+          "sha256": "33a5cbc233e0f4c4b0457f7d99f288f12dd7a97719f457ea5a90623eb4795812"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/serializers/topic_poster_serializer.rb",
+          "sha256": "398602fab0f12109f0aa075a1f4a257f33696cc797b97c2f06a2a6ca8df88761"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/models/topic_posters_summary.rb",
+          "sha256": "51a36d26c9a920b23979da1b200386d45fb506db375c93431d16c68da36ef152"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "lib/pinned_check.rb",
+          "sha256": "e8fb1c0e3e37a792fa0d1aa9b082a7f08766b3b69bb16de28731c1b44e8906c7"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "config/locales/server.en.yml",
+          "sha256": "13fdf75fb404c3da601f7605d7f8e307f87676774e30c6bb199ecbcd62d46af9"
+        }
+      ],
+      "selected_definitions": [
+        "BasicTopicSerializer attributes",
+        "ListableTopicSerializer#bumped/#seen/#unseen/#pinned/#unpinned/#include_excerpt?",
+        "TopicListItemSerializer attributes/#last_poster_username",
+        "TopicPostersSummary poster selection/descriptions/extras",
+        "PinnedCheck anonymous branch",
+        "English poster translations"
+      ],
+      "adaptations": "ActiveModel serializers replaced with explicit JSON record projection. Only anonymous branches extracted; Ruby objects/UserLookup mapped to integer IDs and live PG records. No full serializer framework or I18n runtime."
+    },
+    {
+      "destinations": [
+        "lib/users.rb"
+      ],
+      "kind": "selective anonymous-scope adaptation",
+      "license": "GPL-2.0-or-later",
+      "sources": [
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/models/user.rb",
+          "sha256": "36d66d4c6fce6b245c505771f5136e65b08c14e964b7665381721fd4a84c9fe2"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/models/user_avatar.rb",
+          "sha256": "c6752e54850417b1e0dea38096eacda8df4c88b057e78cfa936abc4198575d76"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/models/optimized_image.rb",
+          "sha256": "19595717f19aa679357117b3a63c0e52bc6e9b88c8dd3c5e2b663fc2e92f6c55"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "lib/user_lookup.rb",
+          "sha256": "1d0c9648d7b48a05576e7114d315c903417173e25e1e96bea35e22a26dd5db19"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/serializers/basic_user_serializer.rb",
+          "sha256": "e22b92f6de231ac3bd26ece1a3741cf002438e47554ebaa21757feda5b4ea3db"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/serializers/poster_serializer.rb",
+          "sha256": "2aec379a95411f8bd2503d8bba17adf72260dbe196945876c18ef74cf3005cde"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/serializers/concerns/user_primary_group_mixin.rb",
+          "sha256": "21d43084e6935559dbc57d6940027e6f1380ecda308cd93441ad174b444369fa"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/serializers/concerns/user_flair_mixin.rb",
+          "sha256": "45044ae147145079456dfafb5902175174c952e0c70ef8f826c6658800604bdd"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/models/group.rb",
+          "sha256": "4f53a5cfc4e861a7a1ac2d9c6cf131987cdd4e45694b523c551128faef79d91f"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "config/site_settings.yml",
+          "sha256": "f5d22ff1dc5e7afc1d5c136d0160c12443639a1df792ed43553460252db1e3d1"
+        }
+      ],
+      "selected_definitions": [
+        "User.avatar_template/system_avatar_template/letter_avatar_color/color_index",
+        "UserAvatar.local_avatar_template/version",
+        "OptimizedImage::VERSION",
+        "UserLookup selected user/group columns",
+        "BasicUserSerializer/PosterSerializer fields",
+        "UserPrimaryGroupMixin/UserFlairMixin conditional attributes",
+        "Group#flair_url selected icon/nil branches"
+      ],
+      "adaptations": "JSON records instead of ActiveRecord. Task-site hostname localhost and root base-path, default small-logo path, optimized-image version 2 selected from pinned source defaults. Non-ASCII usernames, flair image uploads and unsupported avatar configurations fail closed; no image serving."
+    },
+    {
+      "destinations": [
+        "lib/latest.rb"
+      ],
+      "kind": "runtime adapter and explicit SQL translation; NOT unchanged Discourse code",
+      "license": "GPL-2.0-or-later",
+      "sources": [
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "lib/topic_query.rb",
+          "sha256": "9066840709436451bd392921f1dfaeed121ce0024e63916bb0e388145f8762dc"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/controllers/list_controller.rb",
+          "sha256": "dbced8e36813d9d6221cb6316b48e1e3eb4ad70ecdec58f319f9569ba5f9edc0"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/models/topic.rb",
+          "sha256": "8202e548cd9ce289b61aca469449e282ce061b411a9b0551c0f1cd3b82455952"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "lib/guardian/topic_guardian.rb",
+          "sha256": "9c647803cbd137df5f18080fe0659447789ea264308df4e3d2aa7ca8a1152cae"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "lib/guardian/category_guardian.rb",
+          "sha256": "f7e3d398829c8eebcd8c55da94deaa153e51e4c8497cb144fbd723fa365dee29"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "lib/guardian.rb",
+          "sha256": "d14e82df366bb63d2d2a34add5ae9417dc17ff0d1ad91f991c0582134489645c"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/serializers/topic_list_serializer.rb",
+          "sha256": "c3d062421d91095c0f378de047693de500192ca3dc4b3f94a4f8b6a764f4cbc4"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/models/topic_list.rb",
+          "sha256": "5247ac80e9469741140f8d93e8cf2be750dc04b9af9907e6973780ab1c534e58"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "config/site_settings.yml",
+          "sha256": "f5d22ff1dc5e7afc1d5c136d0160c12443639a1df792ed43553460252db1e3d1"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "plugins/discourse-solved/app/serializers/concerns/discourse_solved/topic_answer_mixin.rb",
+          "sha256": "d2cc45fbda40c5b34ee37929559f63033c2c29e834bb85a194c25c98265ae305"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "plugins/discourse-solved/app/models/discourse_solved/solved_topic.rb",
+          "sha256": "017b392c281686fb93813e14ddb29f16e3dd3d8a09ecf9f4262d53560443c934"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "plugins/discourse-solved/app/models/discourse_solved/topic_answer.rb",
+          "sha256": "e5a5730c2740d668a4ae38b082dd95b484620849584630d0f1edb71873a8ea8f"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "plugins/discourse-topic-voting/plugin.rb",
+          "sha256": "b602db8812683e9d7a4375922381407ab383ccca6df29385d283458611f758ad"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "plugins/discourse-topic-voting/lib/discourse_topic_voting/topic_extension.rb",
+          "sha256": "801c6e87eb18a2771f6fecf34458f2bb3250fab957776448df32cef07285b12b"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "plugins/discourse-topic-voting/lib/discourse_topic_voting/category_extension.rb",
+          "sha256": "121d824b06a2d7fb2549e550f00aa49097d0223171d88a47a18ca74992eb46b7"
+        }
+      ],
+      "selected_definitions": [
+        "ListController latest no_definitions and pagination URL selection",
+        "TopicQuery#list_latest/#latest_results/#default_results selected anonymous scopes",
+        "TopicQuery#apply_ordering/#prioritize_pinned_topics/#remove_muted_categories/#apply_shared_drafts",
+        "Topic listable/visible/deleted scopes and guardian public category policy",
+        "TopicListSerializer list metadata and conditional fields",
+        "Solved TopicAnswerMixin#has_accepted_answer/include_has_accepted_answer?",
+        "Topic voting anonymous list can_vote/vote_count/user_voted fields"
+      ],
+      "adaptations": "ActiveRecord scopes translated to parameterized PostgreSQL CTEs plus explicit JSON projection, 30-row default pagination. Reads run in read-only repeatable-read transactions. Settings defaults selected from source with explicit unsupported guards. No plugin registration/hook/modifier runtime; selected list attributes only. Tags/images/title generation and broader settings/options remain guarded or unextracted, see GAPS.md."
+    },
+    {
+      "destinations": [
+        "lib/letter_avatar_colors.rb"
+      ],
+      "kind": "unchanged selected constant in renamed module",
+      "license": "GPL-2.0-or-later",
+      "sources": [
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "lib/letter_avatar.rb",
+          "sha256": "67bc3333274faf89988b49133e4c1d15aa71e1458bd81ba8b87e050f7ef19df8"
+        }
+      ],
+      "selected_definitions": [
+        "LetterAvatar::COLORS"
+      ],
+      "adaptations": "Palette constant copied byte-for-byte; containing module renamed LetterAvatarColors. Image renderer not copied."
+    },
+    {
+      "destinations": [
+        "frontend/reference/application.html.erb"
+      ],
+      "kind": "unchanged source reference only; NOT served",
+      "license": "GPL-2.0-or-later",
+      "sources": [
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/views/layouts/application.html.erb",
+          "sha256": "c9c62986b9c9f70ef776d6ba89a9b6a243b275a67df39ef62e2a959d599743d4"
+        }
+      ],
+      "selected_definitions": [
+        "entire application layout"
+      ],
+      "adaptations": "Byte-identical copy for next native bootstrap task; no Rails template engine is embedded."
+    },
+    {
+      "destinations": [
+        "frontend/application-shell.excerpt.html.erb",
+        "frontend/INTEGRATION.md"
+      ],
+      "kind": "selected source reference and integration contract; NOT served",
+      "license": "GPL-2.0-or-later",
+      "sources": [
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/views/layouts/application.html.erb",
+          "sha256": "c9c62986b9c9f70ef776d6ba89a9b6a243b275a67df39ef62e2a959d599743d4"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "lib/application_layout_preloader.rb",
+          "sha256": "d1527e34b8ed09cbbe2b1e9fc5f2f472bf58d26e4036ff8611e531099c86335d"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/helpers/application_helper.rb",
+          "sha256": "657c2c838b498ba38ed7bb5d4a7f31c73ee5ee2bf98f629c192a1897ca862034"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "lib/topic_list_responder.rb",
+          "sha256": "aa029946c01a1cd803504af21e9960f2d259482f67656b4a6d151da3e985704b"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "frontend/discourse/app/lib/preload-store.js",
+          "sha256": "dc2b066767ea97f101c1b97e55c768869ac22e8d0e0a153c068613623a8b8b1e"
+        }
+      ],
+      "selected_definitions": [
+        "document setup/preload/mount hooks",
+        "ApplicationLayoutPreloader common preload keys",
+        "client_side_setup_data/preloaded_json",
+        "TopicListResponder HTML/JSON selection",
+        "populatePreloadStore"
+      ],
+      "adaptations": "Selected excerpt explicitly omits most layout and is not a functional native template. Contract contains field names, not captured response/settings/session data."
+    },
+    {
+      "destinations": [
+        "frontend/build-ember-assets.sh"
+      ],
+      "kind": "new isolated build adapter using actual Discourse frontend sources",
+      "license": "GPL-2.0-or-later",
+      "sources": [
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "frontend/discourse/rolldown.config.mjs",
+          "sha256": "6a1d0d34cabdda312f7a64199ff53ef9c616437f9f3027c1cdc80dd4e357279c"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "frontend/discourse/package.json",
+          "sha256": "5e35875ce22c9fb8af95dcaa7ffeb13c387610fbe048aac81d3809a8581682ed"
+        }
+      ],
+      "selected_definitions": [
+        "actual core Ember/Rolldown JS build"
+      ],
+      "adaptations": "Stages source under build/, links installed dependencies, writes core JS/manifest only under build/assets/discourse. No Rails data backend, CSS/plugin/theme build or browser proof."
+    },
+    {
+      "destinations": [
+        "data/emoji-unicode.json",
+        "tools/carry-emoji.py",
+        "data/discourse-emojis-attributions.md"
+      ],
+      "kind": "source-data transformation, not Rails output",
+      "license": "MIT package metadata; upstream artwork notices retained, no artwork copied",
+      "sources": [
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/models/emoji.rb",
+          "sha256": "2b6e655755e8791642a56689448b8645213253fd039226f2882cc5463eddcc71"
+        },
+        {
+          "origin": "discourse-emojis",
+          "revision": "1.0.47",
+          "path": "dist/emojis.json",
+          "sha256": "760785d628114cfdf4ad8d3dd746f58b46ecaa5b6057adb3262aee10a0c73a64"
+        },
+        {
+          "origin": "discourse-emojis",
+          "revision": "1.0.47",
+          "path": "dist/aliases.json",
+          "sha256": "da6fee5934923cb79212811b6529ac36205244cd064d34aafaf1fdb121b8eba8"
+        },
+        {
+          "origin": "discourse-emojis",
+          "revision": "1.0.47",
+          "path": "dist/tonable_emojis.json",
+          "sha256": "a5562b7c98d6b43d70dbd6a8c6e2154d435135b09f5a4ab649fd18a7e2bb9734"
+        },
+        {
+          "origin": "discourse-emojis",
+          "revision": "1.0.47",
+          "path": "attributions.md",
+          "sha256": "c4b07dfa9ef4cf681ccd1bc18208b035e4e601e7099a2a7fc057e0cc825410a9"
+        }
+      ],
+      "selected_definitions": [
+        "Emoji.lookup_unicode/replacement_code and Unicode alias/tone data"
+      ],
+      "adaptations": "Build-time Python transformation of packaged Unicode metadata. Runtime uses generated lookup; emoji deny-list policy is guarded unsupported. No image assets copied."
+    },
+    {
+      "destinations": [
+        "vendor/pg"
+      ],
+      "kind": "unchanged vendored runtime dependency",
+      "license": "MIT; vendor/pg/LICENSE",
+      "origin": "https://github.com/roundhouse-rb/spinel-pg",
+      "revision": "fe631b4ac4aba68168adf2ecce2c6c21006f7455",
+      "version": "0.2.0",
+      "adaptations": "Only runtime sources, package manifest and license carried; no source edits. Vendored because spin git ref accepts branches/tags rather than detached SHA.",
+      "files": [
+        {
+          "path": "vendor/pg/LICENSE",
+          "sha256": "fe4975c026e02499c51912583c2a5d571f0da7abb03a412b0ba0278d9519e87c"
+        },
+        {
+          "path": "vendor/pg/pg/client.rb",
+          "sha256": "3c2a483f00deb74f0250d832e4a0583e7c06de6297c13a10c43a7b580d996dcb"
+        },
+        {
+          "path": "vendor/pg/pg/connection.rb",
+          "sha256": "e5245f92e0d92688540357128673a89667a82bbcb72ad356358e92c1a0015334"
+        },
+        {
+          "path": "vendor/pg/pg/errors.rb",
+          "sha256": "7fcab6f19bae92dbb0d275de68146266c29bd4228ebc8e8a4f309d4a2ff02e2e"
+        },
+        {
+          "path": "vendor/pg/pg/scram.rb",
+          "sha256": "a1ede10bb7218a834ff7a9e1c0aca901082176d1e66d3f1c81833ef8334bb4a5"
+        },
+        {
+          "path": "vendor/pg/pg/sock.rb",
+          "sha256": "980e351be22e2105b9c363cb2470f79c15bba76ebb0c4561b7b32db9c6b19ca7"
+        },
+        {
+          "path": "vendor/pg/pg/wire.rb",
+          "sha256": "fa9a23d4acb20559811f2eaa57b81a6b71f3f6c4602d8f7cd8d19b258dbc59b4"
+        },
+        {
+          "path": "vendor/pg/pg.rb",
+          "sha256": "9b9e43a45be833ac03c2bf46dd2b96d331484a21a84f57de9b3de0a03d7b3cb8"
+        },
+        {
+          "path": "vendor/pg/spin.toml",
+          "sha256": "51fddd4dfdb70c7831955730345522cba6834b884613b288ee6b0f3926240b95"
+        }
+      ]
+    },
+    {
+      "destinations": [
+        "bin/discourse.rb",
+        "tools/build.py",
+        "test/",
+        "reference/"
+      ],
+      "kind": "new local runtime/build/verification adapters",
+      "license": "GPL-2.0-or-later for this extraction",
+      "adaptations": "Loopback TCP HTTP server over installed Spinel sockets; live pure-native PG client; no Ruby subprocess/proxy/canned response in serving path. Verification uses synchronous read-only Rails runner only, never a final data backend."
+    }
+  ]
+}

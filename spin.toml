@@ -1,0 +1,7 @@
+[package]
+name = "discourse-minimal"
+
+[dependencies]
+# Vendored unchanged MIT driver at fe631b4ac4aba68168adf2ecce2c6c21006f7455.
+# Spin's git ref key names a branch/tag, not a detached SHA.
+pg = { path = "vendor/pg" }

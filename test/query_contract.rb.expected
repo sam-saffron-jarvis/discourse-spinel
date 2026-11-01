@@ -1,0 +1,11 @@
+visibility: public/deleted/unlisted/PM/private/category-definition; global pin first
+category definitions setting
+shared drafts category excluded
+anonymous default-muted category excluded
+changed source data changes order; local pin not globally prioritized
+categoryless topic allowed with default settings
+shared-draft SQL preserves NULL category exclusion
+muted-category SQL preserves NULL category exclusion
+30-row first page includes two global pins in pinned_at order
+second page compensates pinned offset without repeats
+exhausted page

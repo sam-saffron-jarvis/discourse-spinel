@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="<%= html_lang %>" class="<%= html_classes %>">
+  <head>
+    <meta charset="utf-8">
+    <title><%= title_content %></title>
+    <meta name="description" content="<%= description_content %>">
+    <meta name="discourse_theme_id" content="<%= theme_id %>">
+    <meta name="discourse_current_homepage" content="<%= current_homepage %>">
+
+    <%- if GlobalSetting.early_hint_header_mode == "prefetch" %>
+      <%= render partial: "common/discourse_preload_stylesheet" %>
+    <%- end %>
+    <%= render partial: "layouts/head" %>
+    <%= discourse_csrf_tags %>
+
+    <%- if SiteSetting.enable_escaped_fragments? %>
+      <meta name="fragment" content="!">
+    <%- end %>
+
+    <%- if shared_session_key %>
+      <meta name="shared_session_key" content="<%= shared_session_key %>">
+    <%- end %>
+
+    <%= render("layouts/plugin_js", opts: {
+        include_official: allow_plugins?,
+        include_unofficial: allow_third_party_plugins?,
+        request: request,
+        include_admin_asset: staff?
+      })
+     %>
+
+    <%= build_plugin_html 'server:before-script-load' %>
+
+    <%- if bfcache_compatibility_mode? %>
+      <script id="bfcache-stale-document-check" nonce="<%= csp_nonce_placeholder %>">
+        {
+          const nav = performance.getEntriesByType("navigation")[0];
+          if (nav?.type === "back_forward" && nav.transferSize === 0) {
+            location.reload();
+          }
+        }
+      </script>
+    <%- end %>
+
+    <script nonce="<%= csp_nonce_placeholder %>">
+      window.EmberENV ??= {};
+      window.EmberENV._DEFAULT_ASYNC_OBSERVERS = true;
+    </script>
+
+    <%= preload_script_url ExtraLocalesController.url("main"), type_module: true %>
+    <%= preload_script_url ExtraLocalesController.url("mf"), type_module: true %>
+    <%- if ExtraLocalesController.client_overrides_exist? %>
+      <%= preload_script_url ExtraLocalesController.url("overrides"), type_module: true %>
+    <%- end %>
+    <%- if staff? %>
+      <%= preload_script_url ExtraLocalesController.url("admin"), type_module: true %>
+    <%- end %>
+    <%- if admin? %>
+      <%= preload_script_url ExtraLocalesController.url("wizard"), type_module: true %>
+    <%- end %>
+    <%- unless customization_disabled? %>
+      <%= theme_translations_lookup %>
+    <%- end %>
+
+    <link rel="preload" href="<%= script_asset_path "js/browser-update" %>" as="script" nonce="<%= csp_nonce_placeholder %>">
+
+    <%= preload_script 'js/browser-detect' %>
+
+    <%= module_preloads_for "discourse", (staff? ? "admin/compat-modules" : nil) %>
+
+    <%- unless customization_disabled? %>
+      <%- theme_js_assets.each do |asset| %>
+        <link rel="modulepreload" href="<%= asset[:url] %>" data-theme-id="<%= asset[:theme_id] %>" nonce="<%= csp_nonce_placeholder %>">
+      <%- end %>
+      <%= theme_lookup("head_tag") %>
+    <%- end %>
+
+    <%= render_google_tag_manager_head_code %>
+    <%= render_google_universal_analytics_code %>
+    <%= render_adobe_analytics_tags_code %>
+
+    <link id="manifest-link" rel="manifest" href=<%= manifest_url %> crossorigin="use-credentials">
+
+    <%- if include_ios_native_app_banner? %>
+        <meta name="apple-itunes-app" content="app-id=<%= SiteSetting.ios_app_id %><%= ios_app_argument %>">
+    <%- end %>
+
+    <%= yield :head %>
+    <%= markdown_alternate_link_tag %>
+
+    <%= build_plugin_html 'server:before-head-close' %>
+
+    <%= tag.meta id: 'data-discourse-setup', data: client_side_setup_data %>
+
+    <meta name="discourse/config/environment" content="<%=u discourse_config_environment %>" />
+    <%- if authentication_data %>
+      <meta id="data-authentication" data-authentication-data="<%= authentication_data %>">
+    <%- end %>
+  </head>
+
+  <body class="<%= body_classes %>">
+    <%- if include_splash_screen? %>
+      <%= render partial: "common/discourse_splash" %>
+    <%- end %>
+
+    <discourse-assets>
+      <discourse-assets-stylesheets>
+        <%= render partial: "common/discourse_stylesheet" %>
+      </discourse-assets-stylesheets>
+      <discourse-assets-json>
+        <script type="application/json" id="data-preloaded"><%= raw(preloaded_json) %></script>
+      </discourse-assets-json>
+      <discourse-assets-icons></discourse-assets-icons>
+    </discourse-assets>
+
+    <%- if allow_plugins? %>
+      <%= build_plugin_html 'server:after-body-open' %>
+    <%- end -%>
+
+    <%= render_google_tag_manager_body_code %>
+    <noscript data-path="<%= request.env['PATH_INFO'] %>">
+      <%= escape_noscript do %>
+        <%= render partial: "layouts/noscript_header" %>
+
+        <div id="main-outlet" class="wrap" role="main">
+          <!-- preload-content: -->
+          <%= yield %>
+          <!-- :preload-content -->
+        </div>
+
+        <%= render partial: "layouts/noscript_footer" %>
+      <% end %>
+    </noscript>
+
+    <%- unless customization_disabled? %>
+      <%= theme_lookup("header") %>
+    <%- end %>
+
+    <%- if allow_plugins? %>
+      <%= build_plugin_html 'server:header' %>
+    <%- end %>
+
+    <section id='main'>
+    </section>
+
+    <% unless current_user %>
+      <form id='hidden-login-form' method="post" action="<%=main_app.login_path%>" style="display: none;">
+        <input name="username" type="text"     id="signin_username">
+        <input name="password" type="password" id="signin_password">
+        <input name="redirect" type="hidden">
+        <input type="submit" id="signin-button" value="<%= t 'log_in' %>">
+      </form>
+    <% end %>
+
+    <%= preload_script "discourse", type_module: true %>
+
+    <script defer src="<%= script_asset_path "js/browser-update" %>" nonce="<%= csp_nonce_placeholder %>"></script>
+
+    <%= yield :data %>
+
+    <%- unless customization_disabled? %>
+      <%= theme_lookup("body_tag") %>
+    <%- end %>
+
+    <%- if allow_plugins? %>
+      <%= build_plugin_html 'server:before-body-close' %>
+    <%- end %>
+
+    <script nonce="<%= csp_nonce_placeholder %>">/* Workaround for https://bugs.webkit.org/show_bug.cgi?id=209261 */</script>
+  </body>
+</html>

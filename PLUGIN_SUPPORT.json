@@ -1,0 +1,282 @@
+{
+  "scope": "anonymous latest JSON extraction; no complete plugin support claimed",
+  "source_revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+  "plugins": [
+    {
+      "plugin": "automation",
+      "source": "plugins/automation/plugin.rb",
+      "status": "not extracted; no runtime claim",
+      "detail": "No boot DSL, route, hooks, jobs, serializer extensions, frontend plugin bundle or plugin tests integrated."
+    },
+    {
+      "plugin": "boards",
+      "source": "plugins/boards/plugin.rb",
+      "status": "not extracted; no runtime claim",
+      "detail": "No boot DSL, route, hooks, jobs, serializer extensions, frontend plugin bundle or plugin tests integrated."
+    },
+    {
+      "plugin": "chat",
+      "source": "plugins/chat/plugin.rb",
+      "status": "not extracted; no runtime claim",
+      "detail": "No boot DSL, route, hooks, jobs, serializer extensions, frontend plugin bundle or plugin tests integrated."
+    },
+    {
+      "plugin": "checklist",
+      "source": "plugins/checklist/plugin.rb",
+      "status": "not extracted; no runtime claim",
+      "detail": "No boot DSL, route, hooks, jobs, serializer extensions, frontend plugin bundle or plugin tests integrated."
+    },
+    {
+      "plugin": "discourse-adplugin",
+      "source": "plugins/discourse-adplugin/plugin.rb",
+      "status": "not extracted; no runtime claim",
+      "detail": "No boot DSL, route, hooks, jobs, serializer extensions, frontend plugin bundle or plugin tests integrated."
+    },
+    {
+      "plugin": "discourse-affiliate",
+      "source": "plugins/discourse-affiliate/plugin.rb",
+      "status": "not extracted; no runtime claim",
+      "detail": "No boot DSL, route, hooks, jobs, serializer extensions, frontend plugin bundle or plugin tests integrated."
+    },
+    {
+      "plugin": "discourse-ai",
+      "source": "plugins/discourse-ai/plugin.rb",
+      "status": "not extracted; no runtime claim",
+      "detail": "No boot DSL, route, hooks, jobs, serializer extensions, frontend plugin bundle or plugin tests integrated."
+    },
+    {
+      "plugin": "discourse-apple-auth",
+      "source": "plugins/discourse-apple-auth/plugin.rb",
+      "status": "not extracted; no runtime claim",
+      "detail": "No boot DSL, route, hooks, jobs, serializer extensions, frontend plugin bundle or plugin tests integrated."
+    },
+    {
+      "plugin": "discourse-assign",
+      "source": "plugins/discourse-assign/plugin.rb",
+      "status": "not extracted; no runtime claim",
+      "detail": "No boot DSL, route, hooks, jobs, serializer extensions, frontend plugin bundle or plugin tests integrated."
+    },
+    {
+      "plugin": "discourse-cakeday",
+      "source": "plugins/discourse-cakeday/plugin.rb",
+      "status": "not extracted; no runtime claim",
+      "detail": "No boot DSL, route, hooks, jobs, serializer extensions, frontend plugin bundle or plugin tests integrated."
+    },
+    {
+      "plugin": "discourse-captcha",
+      "source": "plugins/discourse-captcha/plugin.rb",
+      "status": "not extracted; no runtime claim",
+      "detail": "No boot DSL, route, hooks, jobs, serializer extensions, frontend plugin bundle or plugin tests integrated."
+    },
+    {
+      "plugin": "discourse-chat-integration",
+      "source": "plugins/discourse-chat-integration/plugin.rb",
+      "status": "not extracted; no runtime claim",
+      "detail": "No boot DSL, route, hooks, jobs, serializer extensions, frontend plugin bundle or plugin tests integrated."
+    },
+    {
+      "plugin": "discourse-data-explorer",
+      "source": "plugins/discourse-data-explorer/plugin.rb",
+      "status": "not extracted; no runtime claim",
+      "detail": "No boot DSL, route, hooks, jobs, serializer extensions, frontend plugin bundle or plugin tests integrated."
+    },
+    {
+      "plugin": "discourse-details",
+      "source": "plugins/discourse-details/plugin.rb",
+      "status": "not extracted; no runtime claim",
+      "detail": "No boot DSL, route, hooks, jobs, serializer extensions, frontend plugin bundle or plugin tests integrated."
+    },
+    {
+      "plugin": "discourse-events",
+      "source": "plugins/discourse-events/plugin.rb",
+      "status": "not extracted; no runtime claim",
+      "detail": "No boot DSL, route, hooks, jobs, serializer extensions, frontend plugin bundle or plugin tests integrated."
+    },
+    {
+      "plugin": "discourse-gamification",
+      "source": "plugins/discourse-gamification/plugin.rb",
+      "status": "not extracted; no runtime claim",
+      "detail": "No boot DSL, route, hooks, jobs, serializer extensions, frontend plugin bundle or plugin tests integrated."
+    },
+    {
+      "plugin": "discourse-github",
+      "source": "plugins/discourse-github/plugin.rb",
+      "status": "not extracted; no runtime claim",
+      "detail": "No boot DSL, route, hooks, jobs, serializer extensions, frontend plugin bundle or plugin tests integrated."
+    },
+    {
+      "plugin": "discourse-graphviz",
+      "source": "plugins/discourse-graphviz/plugin.rb",
+      "status": "not extracted; no runtime claim",
+      "detail": "No boot DSL, route, hooks, jobs, serializer extensions, frontend plugin bundle or plugin tests integrated."
+    },
+    {
+      "plugin": "discourse-lazy-videos",
+      "source": "plugins/discourse-lazy-videos/plugin.rb",
+      "status": "not extracted; no runtime claim",
+      "detail": "No boot DSL, route, hooks, jobs, serializer extensions, frontend plugin bundle or plugin tests integrated."
+    },
+    {
+      "plugin": "discourse-local-dates",
+      "source": "plugins/discourse-local-dates/plugin.rb",
+      "status": "not extracted; no runtime claim",
+      "detail": "No boot DSL, route, hooks, jobs, serializer extensions, frontend plugin bundle or plugin tests integrated."
+    },
+    {
+      "plugin": "discourse-login-with-amazon",
+      "source": "plugins/discourse-login-with-amazon/plugin.rb",
+      "status": "not extracted; no runtime claim",
+      "detail": "No boot DSL, route, hooks, jobs, serializer extensions, frontend plugin bundle or plugin tests integrated."
+    },
+    {
+      "plugin": "discourse-lti",
+      "source": "plugins/discourse-lti/plugin.rb",
+      "status": "not extracted; no runtime claim",
+      "detail": "No boot DSL, route, hooks, jobs, serializer extensions, frontend plugin bundle or plugin tests integrated."
+    },
+    {
+      "plugin": "discourse-math",
+      "source": "plugins/discourse-math/plugin.rb",
+      "status": "not extracted; no runtime claim",
+      "detail": "No boot DSL, route, hooks, jobs, serializer extensions, frontend plugin bundle or plugin tests integrated."
+    },
+    {
+      "plugin": "discourse-microsoft-auth",
+      "source": "plugins/discourse-microsoft-auth/plugin.rb",
+      "status": "not extracted; no runtime claim",
+      "detail": "No boot DSL, route, hooks, jobs, serializer extensions, frontend plugin bundle or plugin tests integrated."
+    },
+    {
+      "plugin": "discourse-narrative-bot",
+      "source": "plugins/discourse-narrative-bot/plugin.rb",
+      "status": "not extracted; no runtime claim",
+      "detail": "No boot DSL, route, hooks, jobs, serializer extensions, frontend plugin bundle or plugin tests integrated."
+    },
+    {
+      "plugin": "discourse-oauth2-basic",
+      "source": "plugins/discourse-oauth2-basic/plugin.rb",
+      "status": "not extracted; no runtime claim",
+      "detail": "No boot DSL, route, hooks, jobs, serializer extensions, frontend plugin bundle or plugin tests integrated."
+    },
+    {
+      "plugin": "discourse-openid-connect",
+      "source": "plugins/discourse-openid-connect/plugin.rb",
+      "status": "not extracted; no runtime claim",
+      "detail": "No boot DSL, route, hooks, jobs, serializer extensions, frontend plugin bundle or plugin tests integrated."
+    },
+    {
+      "plugin": "discourse-patreon",
+      "source": "plugins/discourse-patreon/plugin.rb",
+      "status": "not extracted; no runtime claim",
+      "detail": "No boot DSL, route, hooks, jobs, serializer extensions, frontend plugin bundle or plugin tests integrated."
+    },
+    {
+      "plugin": "discourse-policy",
+      "source": "plugins/discourse-policy/plugin.rb",
+      "status": "not extracted; no runtime claim",
+      "detail": "No boot DSL, route, hooks, jobs, serializer extensions, frontend plugin bundle or plugin tests integrated."
+    },
+    {
+      "plugin": "discourse-post-voting",
+      "source": "plugins/discourse-post-voting/plugin.rb",
+      "status": "not extracted; no runtime claim",
+      "detail": "No boot DSL, route, hooks, jobs, serializer extensions, frontend plugin bundle or plugin tests integrated."
+    },
+    {
+      "plugin": "discourse-presence",
+      "source": "plugins/discourse-presence/plugin.rb",
+      "status": "not extracted; no runtime claim",
+      "detail": "No boot DSL, route, hooks, jobs, serializer extensions, frontend plugin bundle or plugin tests integrated."
+    },
+    {
+      "plugin": "discourse-reactions",
+      "source": "plugins/discourse-reactions/plugin.rb",
+      "status": "not extracted; no runtime claim",
+      "detail": "No boot DSL, route, hooks, jobs, serializer extensions, frontend plugin bundle or plugin tests integrated."
+    },
+    {
+      "plugin": "discourse-rewind",
+      "source": "plugins/discourse-rewind/plugin.rb",
+      "status": "not extracted; no runtime claim",
+      "detail": "No boot DSL, route, hooks, jobs, serializer extensions, frontend plugin bundle or plugin tests integrated."
+    },
+    {
+      "plugin": "discourse-rss-polling",
+      "source": "plugins/discourse-rss-polling/plugin.rb",
+      "status": "not extracted; no runtime claim",
+      "detail": "No boot DSL, route, hooks, jobs, serializer extensions, frontend plugin bundle or plugin tests integrated."
+    },
+    {
+      "plugin": "discourse-solved",
+      "source": "plugins/discourse-solved/plugin.rb",
+      "status": "selected anonymous latest field adaptation only",
+      "detail": "has_accepted_answer derives from live topic-answer associations; solved_enabled gating. Empty-box configuration fails closed. Full Solved behavior not integrated."
+    },
+    {
+      "plugin": "discourse-subscriptions",
+      "source": "plugins/discourse-subscriptions/plugin.rb",
+      "status": "not extracted; no runtime claim",
+      "detail": "No boot DSL, route, hooks, jobs, serializer extensions, frontend plugin bundle or plugin tests integrated."
+    },
+    {
+      "plugin": "discourse-templates",
+      "source": "plugins/discourse-templates/plugin.rb",
+      "status": "not extracted; no runtime claim",
+      "detail": "No boot DSL, route, hooks, jobs, serializer extensions, frontend plugin bundle or plugin tests integrated."
+    },
+    {
+      "plugin": "discourse-topic-voting",
+      "source": "plugins/discourse-topic-voting/plugin.rb",
+      "status": "selected anonymous latest field adaptation only",
+      "detail": "can_vote derives from live category setting and source conditions; vote_count and anonymous user_voted branch when applicable. Full voting behavior/hooks not integrated; seeded can_vote=false only compared to Rails."
+    },
+    {
+      "plugin": "discourse-user-notes",
+      "source": "plugins/discourse-user-notes/plugin.rb",
+      "status": "not extracted; no runtime claim",
+      "detail": "No boot DSL, route, hooks, jobs, serializer extensions, frontend plugin bundle or plugin tests integrated."
+    },
+    {
+      "plugin": "discourse-workflows",
+      "source": "plugins/discourse-workflows/plugin.rb",
+      "status": "not extracted; no runtime claim",
+      "detail": "No boot DSL, route, hooks, jobs, serializer extensions, frontend plugin bundle or plugin tests integrated."
+    },
+    {
+      "plugin": "discourse-zendesk-plugin",
+      "source": "plugins/discourse-zendesk-plugin/plugin.rb",
+      "status": "not extracted; no runtime claim",
+      "detail": "No boot DSL, route, hooks, jobs, serializer extensions, frontend plugin bundle or plugin tests integrated."
+    },
+    {
+      "plugin": "footnote",
+      "source": "plugins/footnote/plugin.rb",
+      "status": "not extracted; no runtime claim",
+      "detail": "No boot DSL, route, hooks, jobs, serializer extensions, frontend plugin bundle or plugin tests integrated."
+    },
+    {
+      "plugin": "live",
+      "source": "plugins/live/plugin.rb",
+      "status": "not extracted; no runtime claim",
+      "detail": "No boot DSL, route, hooks, jobs, serializer extensions, frontend plugin bundle or plugin tests integrated."
+    },
+    {
+      "plugin": "poll",
+      "source": "plugins/poll/plugin.rb",
+      "status": "not extracted; no runtime claim",
+      "detail": "No boot DSL, route, hooks, jobs, serializer extensions, frontend plugin bundle or plugin tests integrated."
+    },
+    {
+      "plugin": "spoiler-alert",
+      "source": "plugins/spoiler-alert/plugin.rb",
+      "status": "not extracted; no runtime claim",
+      "detail": "No boot DSL, route, hooks, jobs, serializer extensions, frontend plugin bundle or plugin tests integrated."
+    },
+    {
+      "plugin": "styleguide",
+      "source": "plugins/styleguide/plugin.rb",
+      "status": "not extracted; no runtime claim",
+      "detail": "No boot DSL, route, hooks, jobs, serializer extensions, frontend plugin bundle or plugin tests integrated."
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+source setting defaults
+conditional pagination URL construction
+unextracted settings fail closed
+uploaded-avatar path/version adaptation
+user roles/primary-group/flair conditional fields
+enable_names setting respected
+system avatar uses source default small logo
+unextracted Unicode avatar normalization fails closed
+emoji aliases/skin-tones carried from source
