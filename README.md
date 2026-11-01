@@ -26,9 +26,11 @@ From the run root, always load the task toolchain/service environment first:
 ```sh
 source harness/env.sh
 make -C minimal build
-make -C minimal smoke
-make -C minimal browser-smoke
-make -C minimal topic-browser-smoke
+MINIMAL_PROFILER=0 make -C minimal smoke
+MINIMAL_PROFILER=0 make -C minimal browser-smoke
+MINIMAL_PROFILER=0 make -C minimal topic-browser-smoke
+make -C minimal profiler-test
+MINIMAL_PROFILER=1 make -C minimal topic-browser-smoke
 ```
 
 - `build`: stages actual browser assets, then compiles `build/bin/discourse` with
@@ -127,7 +129,7 @@ cd minimal
 DATABASE_URL="$DSPINEL_PG_URL/discourse_development" \
 REDIS_URL='redis://127.0.0.1:6399/0' PORT=3499 \
 MINIMAL_BASE_URI='/node/jarvis/widgets/discourse-spinel-app' \
-MINIMAL_ORIGIN='https://hub.samsaffron.com' ./build/bin/discourse
+MINIMAL_PROFILER=1 MINIMAL_ORIGIN='https://hub.samsaffron.com' ./build/bin/discourse
 ```
 
 For a direct local root, omit `MINIMAL_BASE_URI`/`MINIMAL_ORIGIN`. The origin defaults
@@ -176,7 +178,13 @@ still binds **127.0.0.1 only**; expose it only through the existing authenticate
 private Hub dev surface, never as a new unauthenticated production feature.
 
 Actual upstream **rack-mini-profiler5.0.0** JS/CSS/vendor/templates render the
-request duration, SQL count/elapsed and clickable SQL drill-down on `/latest`.
+request duration, SQL count/elapsed and clickable SQL drill-down on `/latest`
+and native topic documents/JSON, including real topic fetches after list clicks.
+Topic profile names use canonical numeric routes, never user-controlled slugs;
+query strings/binds/content remain excluded. As in the dedicated profiler test,
+the combined click test waits for the real upstream bootstrap before exercising
+its XHR/fetch hooks (requests begun before upstream hook readiness are not a
+claim of automatic UI discovery).
 `X-MiniProfiler-Ids` lets the unchanged client discover subsequent JSON/XHR/fetch
 results. Routes honor `MINIMAL_BASE_URI` and stripped widget forwarding:
 
@@ -212,6 +220,8 @@ source ../harness/env.sh
 make profiler-test
 MINIMAL_PROFILER=0 make smoke
 MINIMAL_PROFILER=0 make browser-smoke
+MINIMAL_PROFILER=0 make topic-browser-smoke
+MINIMAL_PROFILER=1 make topic-browser-smoke
 ```
 
 Lane tests bind **3528/3529 only**, refuse an occupied listener, and clean their own
@@ -225,3 +235,15 @@ private under `build/profiler-*`; this is not a speedup claim.
 When both independent repos are available, `python3 tools/vendor-mini-profiler.py`
 refreshes only the core, unchanged upstream assets/license and provenance manifest.
 No sibling repo is needed to build or run the committed vendored app.
+
+Combined evidence is saved separately under `build/topic-browser/` (disabled)
+and `build/topic-browser-profiler/` (enabled); all 16 enabled cases also pointer-open
+the genuine upstream SQL drill-down and require actual post SQL with elapsed values.
+The native profiler HTTP checks require byte-identical enabled/disabled numeric,
+slug and near-post JSON and real document injection without changing topic routes.
+
+An existing `run/active-app-release.json` pins the coordinator-owned profiler
+release, not this main binary. Only the coordinator may remove/switch that marker
+and activate the combined main after acceptance. Keep profiling enabled when
+replacing that deployment; a successful local integration test is not a restart
+or topic-deployment claim.

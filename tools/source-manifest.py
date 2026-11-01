@@ -142,9 +142,9 @@ entries.append({"destinations": ["vendor/pg"], "kind": "unchanged vendored runti
                 "origin": "https://github.com/roundhouse-rb/spinel-pg", "revision": "fe631b4ac4aba68168adf2ecce2c6c21006f7455", "version": "0.2.0",
                 "adaptations": "Only runtime sources, package manifest and license carried; no source edits. Vendored because spin git ref accepts branches/tags rather than detached SHA.",
                 "files": [{"path": str(p), "sha256": hashlib.sha256(p.read_bytes()).hexdigest()} for p in pg_files]})
-entries.append({"destinations": ["bin/discourse.rb", "tools/build.py", "test/", "reference/"],
+entries.append({"destinations": ["bin/discourse.rb", "lib/mini_profiler.rb", "tools/build.py", "test/", "reference/"],
                 "kind": "new local runtime/build/verification adapters", "license": "GPL-2.0-or-later for this extraction",
-                "adaptations": "Loopback TCP HTTP server over installed Spinel sockets; live pure-native PG client; no Ruby subprocess/proxy/canned response in serving path. Verification uses synchronous read-only Rails runner only, never a final data backend."})
+                "adaptations": "Loopback TCP HTTP server over installed Spinel sockets; live pure-native PG client; no Ruby subprocess/proxy/canned response in serving path. Verification uses synchronous read-only Rails runner only, never a final data backend. Optional request-local MiniProfiler integration uses the separately hash-verified MIT native port/client under vendor/rack-mini-profiler/MANIFEST.json; canonical numeric topic names exclude user slugs, bindings and query strings."})
 manifest = {"schema_version": 1, "upstream": "Discourse", "original_revision": PIN,
             "upstream_license": "GPL-2.0-or-later; Copyright 2014-2026 Civilized Discourse Construction Kit, Inc. and contributors",
             "scope": "anonymous latest JSON and bounded anonymous topic JSON/content with actual core Ember browser rendering at task-owned site; no full serializer/plugin/auth parity",

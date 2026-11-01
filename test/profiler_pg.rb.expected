@@ -7,3 +7,8 @@ real request and SQL elapsed plus failed annotation
 real SQL secrets redacted while placeholders retained
 real latest JSON identical with profiler enabled and disabled
 new latest request has no previous queries or failed state
+real topic JSON bytes identical with profiler enabled and disabled
+topic profiler names use numeric route identity without user slugs
+topic profiler records actual topic and post SQL without previous request state
+escaped topic slugs profile through safe canonical numeric near-post names
+malformed topic routes and mutation requests are not profiled

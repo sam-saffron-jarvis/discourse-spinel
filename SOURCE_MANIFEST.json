@@ -1122,13 +1122,14 @@
     {
       "destinations": [
         "bin/discourse.rb",
+        "lib/mini_profiler.rb",
         "tools/build.py",
         "test/",
         "reference/"
       ],
       "kind": "new local runtime/build/verification adapters",
       "license": "GPL-2.0-or-later for this extraction",
-      "adaptations": "Loopback TCP HTTP server over installed Spinel sockets; live pure-native PG client; no Ruby subprocess/proxy/canned response in serving path. Verification uses synchronous read-only Rails runner only, never a final data backend."
+      "adaptations": "Loopback TCP HTTP server over installed Spinel sockets; live pure-native PG client; no Ruby subprocess/proxy/canned response in serving path. Verification uses synchronous read-only Rails runner only, never a final data backend. Optional request-local MiniProfiler integration uses the separately hash-verified MIT native port/client under vendor/rack-mini-profiler/MANIFEST.json; canonical numeric topic names exclude user slugs, bindings and query strings."
     }
   ]
 }

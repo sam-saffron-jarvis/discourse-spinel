@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Read-only native topic HTTP contract against fresh source getters."""
 import json
+import os
 import copy
 import runpy
 from pathlib import Path
@@ -8,7 +9,9 @@ import subprocess
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-BASE = 'http://127.0.0.1:3498'
+PORT = int(os.environ.get('MINIMAL_TEST_PORT', '3529'))
+assert PORT in (3528, 3529), 'owned integration test ports only'
+BASE = f'http://127.0.0.1:{PORT}'
 
 def request(path, status=200, headers=None):
     try:

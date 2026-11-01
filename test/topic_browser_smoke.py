@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Owned3498 actual unmodified Ember topic click + direct document evidence."""
+"""Owned integration-port actual unmodified Ember topic click + direct document evidence."""
 import html
 import json
 import os
@@ -11,10 +11,25 @@ import time
 from urllib.request import urlopen
 from playwright.sync_api import sync_playwright
 
-OUTPUT = Path('build/topic-browser')
+PORT = int(os.environ.get('MINIMAL_TEST_PORT', '3529'))
+assert PORT in (3528, 3529), 'owned integration test ports only'
+PROFILER = os.environ.get('MINIMAL_PROFILER', '0') == '1'
+OUTPUT = Path('build/topic-browser-profiler' if PROFILER else 'build/topic-browser')
 OUTPUT.mkdir(parents=True, exist_ok=True)
 reports = []
+emoji_map = json.loads(Path('data/emoji-unicode.json').read_text())
 interrupted = 0
+
+
+def record_failure(evidence, error):
+    # AssertionError() has an empty string message; presence, not truthiness of
+    # that message, must decide whether a browser assertion failed.
+    evidence['error'] = {'type': type(error).__name__, 'message': str(error)}
+
+
+def assert_success(evidence):
+    assert 'error' not in evidence, evidence
+
 
 def terminate(number, _frame):
     global interrupted
@@ -35,11 +50,11 @@ def run(prefix):
     checkpoint()
     with socket.socket() as probe:
         probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        probe.bind(('127.0.0.1', 3498))
-    origin = 'http://127.0.0.1:3498'
+        probe.bind(('127.0.0.1', PORT))
+    origin = f'http://127.0.0.1:{PORT}'
     base = origin + prefix
     label = 'prefix' if prefix else 'root'
-    env = dict(os.environ, PORT='3498', MINIMAL_BASE_URI=prefix, MINIMAL_ORIGIN=origin,
+    env = dict(os.environ, PORT=str(PORT), MINIMAL_BASE_URI=prefix, MINIMAL_ORIGIN=origin,
                DATABASE_URL=os.environ['DSPINEL_PG_URL'] + '/discourse_development',
                REDIS_URL='redis://127.0.0.1:6399/0')
     with (OUTPUT / f'{label}-server.log').open('w') as log:
@@ -91,6 +106,12 @@ def run(prefix):
                                         page.goto(base + '/latest', wait_until='commit', timeout=10000)
                                         link = page.locator(f".topic-list-item[data-topic-id='{topic['id']}'] a.title")
                                         link.wait_for(state='visible', timeout=30000)
+                                        if PROFILER:
+                                            # Like the profiler's dedicated UI test, wait for
+                                            # the real upstream bootstrap before exercising
+                                            # its asynchronous XHR/fetch observation hooks.
+                                            page.locator('.profiler-result').first.wait_for(state='attached', timeout=15000)
+                                            page.wait_for_function('window.MiniProfiler && window.MiniProfiler.patchesApplied', timeout=15000)
                                         evidence['clicked_href'] = link.get_attribute('href')
                                         assert evidence['clicked_href'] == prefix + path
                                         link.click()
@@ -103,7 +124,13 @@ def run(prefix):
                                         checkpoint()
                                         page.wait_for_timeout(100)
                                     evidence['url'] = page.url
-                                    evidence['title'] = page.locator('#topic-title .fancy-title').inner_text()
+                                    title = page.locator('#topic-title .fancy-title')
+                                    evidence['raw_title'] = title.inner_text()
+                                    evidence['title'] = title.evaluate('''(element, emojiMap) => {
+                                      const clone = element.cloneNode(true);
+                                      clone.querySelectorAll('img.emoji').forEach(img => img.replaceWith(document.createTextNode(emojiMap[img.alt] || `:${img.alt}:`)));
+                                      return clone.textContent.trim();
+                                    }''', emoji_map)
                                     evidence['first_post_id'] = cooked.locator('xpath=ancestor::article').get_attribute('data-post-id')
                                     evidence['cooked_html'] = cooked.inner_html()
                                     evidence['cooked_text'] = cooked.inner_text()
@@ -121,14 +148,42 @@ def run(prefix):
                                     assert evidence['cooked_text'].strip() and actual == expected, (actual, expected)
                                     assert evidence['title'] == html.unescape(api.get('unicode_title', api['title']))
                                     assert page.url.startswith(base + path), page.url
+                                    evidence['profiler_enabled'] = PROFILER
+                                    if PROFILER:
+                                        profile_name = f"/t/{topic['id']}" + ('.json' if mode == 'click' else '')
+                                        result = page.locator('.profiler-result').filter(has=page.locator(f'.profiler-name[title="{profile_name}"]')).last
+                                        result.wait_for(state='attached', timeout=15000)
+                                        result.locator('.profiler-button').click()
+                                        popup = result.locator('.profiler-popup')
+                                        popup.wait_for(state='visible', timeout=5000)
+                                        count_text = result.locator('.profiler-sql-count').inner_text()
+                                        sql_count = int(''.join(c for c in count_text if c.isdigit()))
+                                        assert sql_count > 0
+                                        query_link = popup.locator('.profiler-queries-show').first
+                                        query_link.evaluate("el => el.scrollIntoView({block:'center',inline:'center'})")
+                                        query_link.click(timeout=5000)
+                                        result.locator('.profiler-queries').wait_for(state='visible', timeout=5000)
+                                        sql_rows = result.locator('.profiler-queries tbody tr:has(.query pre.prettyprint code)').evaluate_all("rows => rows.map(row => ({query:row.querySelector('.query pre.prettyprint code').innerText, timing:row.querySelector('td.profiler-info').innerText}))")
+                                        assert len(sql_rows) == sql_count and any('FROM posts' in row['query'] for row in sql_rows)
+                                        assert all(any(c.isdigit() for c in row['timing']) for row in sql_rows)
+                                        evidence['topic_profile'] = {'name':profile_name, 'sql_count':sql_count, 'drilldown_rows':len(sql_rows), 'actual_post_sql':True}
+                                        stem = f"{label}-{viewport}-{topic['id']}-{mode}"
+                                        page.screenshot(path=str(OUTPUT / f'{stem}-profiler.png'), full_page=True)
+                                        page.mouse.click(width - 5, height - 5)
+                                        page.wait_for_function("!document.querySelector('.profiler-queries-bg')", timeout=5000)
+                                        result.locator('.profiler-button').click()
+                                        page.wait_for_function("Array.from(document.querySelectorAll('.profiler-popup')).every(p => p.style.display === 'none')", timeout=5000)
+                                    else:
+                                        assert page.locator('script#mini-profiler').count() == 0
+                                        assert page.locator('.profiler-result').count() == 0
                                 except Exception as error:
-                                    evidence['error'] = str(error)
+                                    record_failure(evidence, error)
                                 finally:
                                     stem = f"{label}-{viewport}-{topic['id']}-{mode}"
                                     page.screenshot(path=str(OUTPUT / f'{stem}.png'), full_page=True)
                                     (OUTPUT / f'{stem}.html').write_text(page.content())
                                     context.close()
-                                assert not evidence.get('error'), evidence
+                                assert_success(evidence)
                                 assert not evidence['pageerrors'], evidence['pageerrors']
                                 assert not evidence['failed'], evidence['failed']
                                 assert not [r for r in evidence['responses'] if r['status'] >= 400], evidence['responses']
@@ -145,8 +200,9 @@ def run(prefix):
                 child.kill()
                 child.wait()
 
-try:
-    run('/node/jarvis/widgets/discourse-spinel-app')
-    run('')
-finally:
-    (OUTPUT / 'report.json').write_text(json.dumps(reports, indent=2) + '\n')
+if __name__ == '__main__':
+    try:
+        run('/node/jarvis/widgets/discourse-spinel-app')
+        run('')
+    finally:
+        (OUTPUT / 'report.json').write_text(json.dumps(reports, indent=2) + '\n')

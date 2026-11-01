@@ -63,11 +63,11 @@ export TOPIC_ORACLE_IDS
 TOPIC_ORACLE_IDS=$(python3 -c 'import json; print(",".join(str(t["id"]) for t in json.load(open("build/latest-rails.json"))["responses"]["latest"]["body"]["topic_list"]["topics"]))')
 (
   cd ../discourse
-  timeout --kill-after=5s 120s bin/rails runner ../minimal/reference/capture-topic-rails.rb
+  timeout --kill-after=5s 120s bin/rails runner "$WORKTREE/reference/capture-topic-rails.rb"
 ) >build/topic-rails.json 2>build/topic-rails.stderr
 (
   cd ../discourse
-  TOPIC_ORACLE_POST_NUMBER=2147483647 timeout --kill-after=5s 120s bin/rails runner ../minimal/reference/capture-topic-rails.rb
+  TOPIC_ORACLE_POST_NUMBER=2147483647 timeout --kill-after=5s 120s bin/rails runner "$WORKTREE/reference/capture-topic-rails.rb"
 ) >build/topic-near-rails.json 2>build/topic-near-rails.stderr
 
 build/bin/discourse >build/server.log 2>&1 &

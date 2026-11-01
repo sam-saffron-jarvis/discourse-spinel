@@ -11,6 +11,7 @@ browser-smoke: build
 	python3 test/browser_smoke.py --root
 
 topic-browser-smoke: build
+	python3 test/topic_browser_test.py
 	python3 test/browser_cleanup.py --topic
 	python3 test/topic_browser_smoke.py
 # Source ../harness/env.sh before invoking. Every server is owned/ephemeral3528/3529.

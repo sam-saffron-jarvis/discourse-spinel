@@ -94,6 +94,43 @@ for enabled in (False, True):
                     assert profile['request_path'] == '/latest.json'
                     mode['parity_pages'].append({'page': suffix or '0', 'sql_count': profile['sql_count'],
                                                 'request_ms': profile['duration_milliseconds'], 'sql_ms': profile['duration_milliseconds_in_sql']})
+            _, live_latest = fetch('/latest.json')
+            topic = json.loads(live_latest)['topic_list']['topics'][0]
+            topic_paths = [f"/t/{topic['id']}.json", f"/t/{topic['slug']}/{topic['id']}.json",
+                           f"/t/{topic['id']}/2.json"]
+            mode['topic_parity'] = []
+            for path in topic_paths:
+                headers, body = fetch(path)
+                topic_body = json.loads(body)
+                assert topic_body['id'] == topic['id'] and topic_body['post_stream']['posts']
+                if not enabled:
+                    responses[path] = body
+                    assert 'X-MiniProfiler-Ids' not in headers
+                else:
+                    assert responses[path] == body, 'profiler must not change topic bytes'
+                    h, raw = result(headers['X-MiniProfiler-Ids'])
+                    profile = json.loads(raw)
+                    assert profile['request_path'] == (f"/t/{topic['id']}/2.json" if path.endswith('/2.json') else f"/t/{topic['id']}.json")
+                    assert profile['sql_count'] > 1 and profile['custom_fields']['Failed PG calls'] == '0'
+                    assert profile['duration_milliseconds'] >= profile['duration_milliseconds_in_sql'] > 0
+                    assert any('FROM posts' in timing['formatted_command_string'] for timing in profile['root']['sql_timings'])
+                    assert topic_body['post_stream']['posts'][0]['cooked'].encode() not in raw
+                    mode['topic_parity'].append({'path': path, 'sql_count': profile['sql_count']})
+            topic_document = f"/t/{topic['slug']}/{topic['id']}"
+            headers, topic_html = fetch(topic_document)
+            assert (f'topic_{topic["id"]}').encode() in topic_html
+            if enabled:
+                assert b'id="mini-profiler"' in topic_html
+                topic_profile = json.loads(result(headers['X-MiniProfiler-Ids'])[1])
+                assert topic_profile['request_path'] == f"/t/{topic['id']}" and topic_profile['sql_count'] > 1
+                # Query rejection and denied topics must not poison following state.
+                headers, _ = fetch(topic_paths[0] + '?password=do-not-store-secret', expected=400,
+                                   headers={'Cookie': 'secret-cookie', 'Authorization': 'Bearer secret-token'})
+                assert b'secret' not in result(headers['X-MiniProfiler-Ids'])[1]
+                headers, _ = fetch('/t/2147483647.json', expected=404)
+                assert json.loads(result(headers['X-MiniProfiler-Ids'])[1])['custom_fields']['Failed PG calls'] == '0'
+            else:
+                assert b'id="mini-profiler"' not in topic_html and 'X-MiniProfiler-Ids' not in headers
             headers, html = fetch('/latest')
             if enabled:
                 assert b'id="mini-profiler"' in html
@@ -149,7 +186,8 @@ for enabled in (False, True):
             child.wait(timeout=10)
     free()
 report['byte_equal_latest_pages'] = True
+report['byte_equal_topic_paths'] = len(report['modes']['enabled']['topic_parity']) == 3
 report['ports_released'] = True
 (OUTPUT / 'report.json').write_text(json.dumps(report, indent=2) + '\n')
-print('Profiler HTTP passed: own native ELF; disabled surface absent; live latest pages byte-identical; prefixed real assets/results; privacy, traversal, state cleanup and size eviction')
+print('Profiler HTTP passed: own native ELF; disabled surface absent; live latest/topic JSON byte-identical; topic document injection; prefixed real assets/results; privacy, traversal, state cleanup and size eviction')
 print('Comparable warmed HTTP medians ms:', {key: round(mode['http_ms']['median'], 3) for key, mode in report['modes'].items()})

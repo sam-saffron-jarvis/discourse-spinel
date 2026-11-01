@@ -27,9 +27,9 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--topic", action="store_true")
 args = parser.parse_args()
 assert_port_free()
-shots = "build/topic-browser/prefix-desktop-*-click.png" if args.topic else "build/browser/prefix-desktop.png"
+shots = ("build/topic-browser-profiler/prefix-desktop-*-click.png" if os.environ.get("MINIMAL_PROFILER") == "1" else "build/topic-browser/prefix-desktop-*-click.png") if args.topic else "build/browser/prefix-desktop.png"
 previous = {str(path): path.stat().st_mtime_ns for path in Path('.').glob(shots)}
-label = "topic-browser-cleanup" if args.topic else "browser-cleanup"
+label = ("topic-browser-profiler-cleanup" if os.environ.get("MINIMAL_PROFILER") == "1" else "topic-browser-cleanup") if args.topic else "browser-cleanup"
 command = ["python3", "test/topic_browser_smoke.py"] if args.topic else ["python3", "test/browser_smoke.py", "--base-uri", "/node/jarvis/widgets/discourse-spinel-app"]
 Path("build").mkdir(exist_ok=True)
 with Path(f"build/{label}.log").open("w") as log:
@@ -55,6 +55,5 @@ with Path(f"build/{label}.log").open("w") as log:
 assert_port_free()
 report = {"signal": "SIGTERM", "interrupted_after_desktop_screenshot": True,
           "exit_code": code, "shutdown_seconds": elapsed, "owned_native_test_port_released": True}
-Path(f"build/{label}.json").write_text(json.dumps(report, indent=2) + "
-")
+Path(f"build/{label}.json").write_text(json.dumps(report, indent=2) + "\n")
 print("Browser signal cleanup passed: rendered desktop interrupted; owned native test port released")
