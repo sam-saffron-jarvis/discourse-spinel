@@ -7,6 +7,7 @@ require "json"
 require_relative "../lib/latest"
 require_relative "../lib/topic"
 require_relative "../lib/reactions"
+require_relative "../lib/reaction_summary"
 require_relative "../lib/surface"
 require_relative "../lib/preloads"
 require_relative "../lib/avatars"
@@ -27,6 +28,7 @@ emoji_map = JSON.parse(File.read("data/emoji-unicode.json"))
 latest = NativeLatest.new(conn, emoji_map)
 topics = NativeTopic.new(conn, emoji_map)
 reactions = NativeReactions.new(conn)
+reaction_summary = NativeReactionSummary.new(conn)
 port = ENV.fetch("PORT", "3499").to_i
 raise "unexpected listener port" unless [3498, 3499, 3528, 3529].include?(port)
 paths = NativePaths.new(ENV.fetch("MINIMAL_BASE_URI", ""))
@@ -58,11 +60,16 @@ loop do
     end
     bytes = line.bytesize
     wants_json = false
+    unsupported_summary_auth = false
     content_length = 0
     content_length_seen = false
     request_type = ""
     while (header = client.gets)
       downcased = header.downcase
+      # This slice has no authenticated behavior. Never interpret credentials or
+      # silently claim an authenticated summary; no header values are retained.
+      unsupported_summary_auth = true if downcased.match?(/\A(?:authorization|api-key|api-username|api-user-id|api-user-external-id|user-api-key|user-api-client-id|x-shared-session-key|discourse-logged-in):/)
+      unsupported_summary_auth = true if downcased.start_with?("cookie:") && downcased.match?(/(?:[:;]\s*)(?:_t|_forum_session)=[^;\s]+/)
       if downcased.start_with?("content-length:")
         value = header.split(":", 2)[1].to_s.strip
         raise "invalid content length" unless !content_length_seen && value.match?(/\A\d{1,5}\z/) && value.to_i <= 16384
@@ -138,6 +145,23 @@ loop do
       else
         status = "400 Bad Request"
         body = JSON.generate({ "error" => "only the page parameter (0..2000) is supported" })
+      end
+    elsif path.start_with?("/discourse-reactions/posts/") && (path.end_with?("/reactions-users") || path.end_with?("/reactions-users.json"))
+      begin
+        summary_request = NativeReactionSummaryRequest.new(path, query)
+        if unsupported_summary_auth
+          status = "403 Forbidden"
+          body = JSON.generate({ "error" => "authenticated reaction summaries are not extracted" })
+        elsif !path.end_with?(".json") && !wants_json
+          status = "501 Not Implemented"
+          body = JSON.generate({ "error" => "non-JSON reactions shell is not extracted; use .json or JSON/XHR" })
+        else
+          code, body = reaction_summary.call(summary_request)
+          status = { 200 => "200 OK", 403 => "403 Forbidden", 404 => "404 Not Found" }.fetch(code)
+        end
+      rescue ArgumentError => error
+        status = "400 Bad Request"
+        body = JSON.generate({ "error" => error.message })
       end
     elsif path.start_with?("/discourse-reactions/posts/")
       begin

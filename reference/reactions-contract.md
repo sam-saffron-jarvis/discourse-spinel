@@ -84,8 +84,10 @@ custom default_avatars, empty external avatar URLs fail explicitly rather than
 return invented avatars; source Unicode/default-avatar behavior is not extracted.
 Root JSON avatar URLs are not rebased, matching upstream class getter bytes.
 
+The distinct grouped post-reactions-users slice is documented independently in
+`reaction-summary-contract.md`; its semantics are not derived from this query.
 No writes/toggle/authenticated behavior, ignored-user state, reactions-given or
-received, grouped post-reactions-users, other routes, frontend plugin bundles,
+received, remaining routes, frontend plugin bundles,
 UI changes, plugin topic serializers/hooks/jobs or full plugin support is claimed.
 
 ## Executable evidence

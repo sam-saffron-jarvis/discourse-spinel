@@ -1,5 +1,60 @@
 # Measured checkpoints
 
+## Ticket011 — distinct anonymous per-post reaction summary
+
+Base: accepted minimal `6f19f7d08bedc276841a2485c289a32737192e6f`.
+Scope: native `GET /discourse-reactions/posts/:id/reactions-users[.json]`,
+actual grouped summary source semantics, not010 users-list behavior. No compiler,
+Discourse, live3499, Hub, database/settings writes or deployment changes.
+
+| Measurement | Accepted010 baseline |011 local native build |
+|---|---:|---:|
+| Compiler inputs |29 files /244,185 bytes |30 files /255,936 bytes |
+| Project inputs |23 files /137,467 bytes |24 files /149,218 bytes |
+| Native ELF |2,280,760 bytes |2,336,448 bytes |
+| Fresh build wall time (one observation) |15.490314s |16.472738s |
+| Peak single-child/descendant RSS, not aggregate |401,972KiB |418,444KiB |
+
+Same installed Spinel `2026.10.25+1664 (f969b32a7)`. Runtime metadata215,146
+bytes, browser assets5,134 files /73,358,989 bytes and staged media334,448 bytes
+unchanged. This is an expanded-program checkpoint, **not a speedup claim**.
+Raw baseline/final observations: `build/reaction-summary/baseline-compile.json`,
+`build/compile.json`; later rebuilds may vary in timing/RSS.
+
+`make reaction-summary-test` passes18 native/source semantic cases using actual
+source action/helpers with SELECT-only typed CTE dependencies and a process-local
+frozen clock/settings. Eight visibility fixtures compare the actual source
+fetch_post_from_params/Guardian with native statuses; denied summary calls cannot
+issue reactor SQL and always roll back. Positive main/non-main/disabled/NULL/zero
+values, source count-versus-cap27 behavior, historical main omission/merge,
+first27-like reversal, descending reaction users, subsecond serialized ties,
+name privacy, instance system avatar and strict undo-window boundary all pass.
+Fresh actual Rails/plugin HTTP captures22 success cases plus9 denied/missing
+cases, checked at root/prefix × profiler0/1 (including response-byte parity).
+62 actual redacted SQL profiles are retained across the enabled modes. Native
+credential/malformed/method/HTML boundaries, injection, profile state isolation,
+ELF/no children and owned-port cleanup pass. Live global counts are0 reactions,
+0 ReactionUsers and0 likes: **live empty-data parity**, separate from positive
+source-driven fixtures, not positive live reaction evidence.
+
+Full existing contracts also pass: plugin-test (8 source fixtures,48 fresh live
+cases), smoke (10 native executables,20 latest and20 topic sources at first/near
+windows), latest browser4 cases per profiler mode, topic browser16 cases per mode
+with actual upstream SQL drill-down when enabled, profiler-test and injected502
+visible error + Reload recovery. Latest/topic browser reports contain no page,
+console, failed-request or HTTP errors. Warmed same-binary profiler HTTP medians
+in this run: disabled1.924ms/enabled2.444ms; observed overhead, not speedup.
+Logs `build/011-*.log`; private summary reports `build/reaction-summary/`.
+
+Explicit narrower boundaries remain: anonymous JSON/XHR only, canonical32-bit
+IDs and one bounded scalar reaction_value, credential/session auth403, plain
+HTML shell501 versus source shell500, native error bodies, existing bounded
+ASCII/default-avatar settings, no writes/other routes/plugin frontend/hooks or
+all-core-plugin support. Source malformed/ignored-parameter and HEAD behavior
+is captured honestly rather than mislabeled as native parity. See
+`reference/reaction-summary-contract.md` and `GAPS.md`.
+
+
 ## Ticket 007 — actual native `/latest` browser list
 
 Before: accepted minimal `42d8a13`, strict live latest JSON parity, HTML501 and

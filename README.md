@@ -192,6 +192,30 @@ at root/prefix with profiler disabled/enabled. Live empty reaction data and posi
 synthetic fixture evidence remain separately labeled in `build/plugin/`. Runtime
 never launches Rails/Ruby/Python/Node, nor reads oracle/fixture response files.
 
+## Bounded core-plugin read: distinct reaction summary
+
+Ticket011 adds anonymous `GET /discourse-reactions/posts/:id/reactions-users[.json]`.
+This is the actual grouped summary source action, **not** the010 users-list query.
+It retains stored counters, valid/historical disabled-like exclusion, source main
+merge condition and count/cap27/order semantics, names, instance avatars, UTC
+created_at and source can_undo. Only JSON suffix or extensionless JSON Accept/XHR
+is supported; plain HTML501, credential/session auth403 and malformed/unsupported
+params400 are explicit narrower boundaries. See
+`reference/reaction-summary-contract.md`, source manifest and `GAPS.md`.
+
+```sh
+source ../harness/env.sh
+make reaction-summary-test
+```
+
+This rebuilds the native ELF, checks runtime synthetic read-only CTE fixtures
+against actual source action/helpers, captures a fresh actual read-only Rails
+HTTP oracle, and tests root/prefix profiler0/1 byte parity with redacted real SQL.
+Positive source-driven fixtures are separate from live empty-data parity in
+`build/reaction-summary/`. No live writes/seeding/DDL or runtime proxy. Existing
+plugin/latest/topic/upstream-profiler and injected502+Reload tests still apply;
+two routes do not constitute all-core-plugin or full reactions support.
+
 ## Optional native MiniProfiler (development only)
 
 Set `MINIMAL_PROFILER=1` when launching this worktree's native ELF. No profiler

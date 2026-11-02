@@ -44,6 +44,22 @@ entries = [
          "PostReactionsQuery anonymous rows/total/filter branches", "PostActionExtension.strict_filter_reaction_likes_sql",
          "Reaction.main_reaction_id", "Guardian anonymous direct post/topic/category and hidden visibility", "User.avatar_template class method"],
         "Native bound SELECTs replace ActiveRecord/MiniSql, in repeatable-read read-only request transactions. No plugin DSL runtime. Source ASC ordering, strict any-reaction shadow-like suppression, count/row join asymmetry, source scalar to_i clamps and name privacy retained. Both .json and extensionless JSON Accept/XHR users-list return JSON; source check_xhr HTML shell remains explicitly unsupported501, not fabricated success. Unknown/duplicate/structured/oversized params and out-of-range IDs/integers fail closed. Login-required fails closed403 (auth redirects not implemented); disabled plugin404. Existing ASCII task-site avatar adapter only; unsupported avatar configurations raise, never invented success. Actual upstream SQL/serializer on synthetic SELECT-only CTE fixtures and fresh actual anonymous Rails/plugin HTTP sessions on live PG are test-only, never runtime dependencies."),
+    entry(["lib/reaction_summary.rb", "reference/reaction-summary-contract.md", "reference/capture-reaction-summary-rails.rb", "reference/check-reaction-summary-fixtures.rb", "test/reaction_summary.rb", "test/reaction_summary_test.py"],
+        "bounded distinct anonymous per-post reaction summary adaptation", [
+            "plugins/discourse-reactions/config/routes.rb", "plugins/discourse-reactions/config/settings.yml",
+            "plugins/discourse-reactions/app/controllers/discourse_reactions/custom_reactions_controller.rb",
+            "plugins/discourse-reactions/lib/discourse_reactions/post_action_extension.rb",
+            "plugins/discourse-reactions/lib/discourse_reactions/post_reactions_query.rb",
+            "plugins/discourse-reactions/app/models/discourse_reactions/reaction.rb",
+            "plugins/discourse-reactions/app/models/discourse_reactions/reaction_user.rb",
+            "plugins/discourse-reactions/spec/requests/custom_reactions_controller_spec.rb",
+            "plugins/discourse-reactions/assets/javascripts/discourse/models/discourse-reactions-custom-reaction.js",
+            "app/controllers/application_controller.rb", "app/models/post.rb", "app/models/post_action.rb",
+            "app/models/user.rb", "lib/guardian.rb", "lib/guardian/post_guardian.rb", "lib/auth/default_current_user_provider.rb", "config/site_settings.yml"],
+        ["CustomReactionsController#post_reactions_users/#get_users/#format_reaction_user/#format_likes_users/#filtered_reaction_users_counts anonymous branch",
+         "PostActionExtension.filter_reaction_likes_sql and historical_reaction_likes", "Reaction.main_reaction_id/.valid_reactions", "ReactionUser#can_undo?",
+         "User#avatar_template instance method", "Guardian#can_delete_post_action? anonymous false", "CustomReaction.findReactionUsers JSON caller and source route/check_xhr suffix contract"],
+        "Native bound read-only PG relations and JSON helper adaptation, not users-list behavior or a plugin runtime. Stored counters, exact absent/main/specific filter distinction, historical valid/disabled-like exclusion, source unsorted first27 likes/reverse and historical-main merge, recent27 reaction users, UTC created_at and undo/privacy/instance-avatar semantics retained. Existing direct-post visibility and native profiler reused. Bounded scalar-only params and canonical IDs; auth credential/session requests403, HTML shell501, no Rails error-template parity. Existing ASCII/avatar defaults only, custom system logo unsupported. Test-only actual source action/helpers use SELECT-only CTE dependencies; fresh live actual Rails/plugin HTTP oracle separately labels empty data. No runtime proxy/oracle or full plugin coverage."),
     entry(["lib/serializers.rb"], "selective anonymous-scope adaptation", [
         "app/serializers/basic_topic_serializer.rb", "app/serializers/listable_topic_serializer.rb",
         "app/serializers/topic_list_item_serializer.rb", "app/serializers/topic_poster_serializer.rb",
@@ -167,6 +183,6 @@ entries.append({"destinations": ["bin/discourse.rb", "lib/mini_profiler.rb", "to
                 "adaptations": "Loopback TCP HTTP server over installed Spinel sockets; live pure-native PG client; no Ruby subprocess/proxy/canned response in serving path. Verification uses synchronous read-only Rails runner only, never a final data backend. Optional request-local MiniProfiler integration uses the separately hash-verified MIT native port/client under vendor/rack-mini-profiler/MANIFEST.json; canonical numeric topic names exclude user slugs, bindings and query strings."})
 manifest = {"schema_version": 1, "upstream": "Discourse", "original_revision": PIN,
             "upstream_license": "GPL-2.0-or-later; Copyright 2014-2026 Civilized Discourse Construction Kit, Inc. and contributors",
-            "scope": "anonymous latest JSON and bounded anonymous topic JSON/content with actual core Ember browser rendering plus anonymous reactions users-list read-only plugin route at task-owned site; no full serializer/plugin/auth parity",
+            "scope": "anonymous latest JSON and bounded anonymous topic JSON/content with actual core Ember browser rendering plus anonymous reactions users-list and per-post summary read-only plugin routes at task-owned site; no full serializer/plugin/auth parity",
             "gaps": "GAPS.md", "plugin_coverage": "PLUGIN_SUPPORT.json", "entries": entries}
 Path("SOURCE_MANIFEST.json").write_text(json.dumps(manifest, indent=2) + "\n")

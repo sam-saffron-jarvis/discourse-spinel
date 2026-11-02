@@ -3,6 +3,7 @@
 # The outer authenticated Hub surface remains the access boundary. No cookies,
 # credentials or incoming authentication headers are stored or forwarded.
 require_relative "reactions"
+require_relative "reaction_summary"
 require_relative "../vendor/rack-mini-profiler/spinel_mini_profiler"
 require_relative "topic"
 
@@ -34,13 +35,15 @@ class NativeMiniProfiler
       path += "/#{route.post_number}" if route.post_number > 1
       path += ".json" if route.json
     elsif path.start_with?("/discourse-reactions/posts/")
+      summary = path.end_with?("/reactions-users") || path.end_with?("/reactions-users.json")
       begin
-        route = NativeReactionsRequest.new(path, "")
+        route = summary ? NativeReactionSummaryRequest.new(path, "") : NativeReactionsRequest.new(path, "")
       rescue ArgumentError
         return nil
       end
       # Only canonical numeric identity; never reaction filters or query strings.
-      path = "/discourse-reactions/posts/#{route.id}/reactions-users-list.json"
+      endpoint = summary ? "reactions-users" : "reactions-users-list"
+      path = "/discourse-reactions/posts/#{route.id}/#{endpoint}.json"
     elsif !["/", "/latest", "/latest.json", "/srv/status"].include?(path)
       return nil
     end

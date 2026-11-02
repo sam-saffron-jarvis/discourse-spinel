@@ -1,0 +1,38 @@
+names-disabled summary omits names from likes and all reaction groups
+non-main reaction users preserve descending source order and truncate to27
+all reaction summaries include enabled reaction rows and the merged main likes
+main filter merges plain likes with historical main reaction users
+specific filter returns matching reaction only and never merges likes
+explicit blank and whitespace filters are specific values, not absent filter
+disabled historical reaction with NULL counter is excluded
+zero reaction counter remains a source-present row with zero count
+unknown specific reaction returns an empty summary
+no-likes historical main with positive or NULL counter is omitted
+likes without any main-reaction definition still produce capped main summary
+likes with NULL-counter main definition still produce capped main summary
+subsecond ties serialize to source seconds without an added tie-breaker
+changed enabled reactions and hyphenated main setting normalize source main reaction
+main reaction count reflects all source likes/counter, not truncated users
+main reaction truncates to source MAX_USERS_COUNT plus one
+plain likes cap before merge and reverse, so the capped recent likes displace older main reaction users
+merged main users sort newest-first before truncation
+reaction users order by source created_at descending
+NULL-valued reaction stays visible and can duplicate the same actor's source like
+valid reaction actor shadow-like is excluded from merged summaries
+disabled non-NULL historical reaction remains visible but suppresses its shadow-like
+disabled historical reaction user does not reappear as a shadow-like
+reaction can_undo uses explicit 10-minute source window
+can_undo strict boundary rejects exactly 10 minutes and older
+names-disabled reaction users omit name
+system user's summary avatar uses actual instance system-logo shortcut
+custom system-logo override is rejected rather than fabricated
+PostgreSQL array binding round-trips backslashes quotes commas and braces
+all-reactions Ruby comparison includes a non-null-count row with NULL reaction_value
+summary request accepts only optional scalar reaction_value and preserves absent versus blank
+malformed summary paths duplicate and unsupported query parameters fail closed
+native POST_QUERY denies hidden and private posts while allowing public post
+native POST_QUERY grants hidden visibility only via explicit group-visibility setting
+disabled plugin guard exits before post/reaction queries and rolls back read-only transaction
+login-required summary fails closed before content queries and rolls back
+summary call denies hidden private deleted missing restricted and whisper fixtures before any reactor query
+synthetic native reaction-summary fixture report written under build
