@@ -13,6 +13,7 @@ def source(path, origin="discourse", revision=PIN):
         "discourse-emojis": Path("../run/bundle/ruby/4.0.0/gems/discourse-emojis-1.0.47"),
         "message_bus": Path("../run/bundle/ruby/4.0.0/gems/message_bus-5.0.0"),
         "discourse-fonts": Path("../run/bundle/ruby/4.0.0/gems/discourse-fonts-0.0.19"),
+        "fast_blank": Path("../run/bundle/ruby/4.0.0/gems/fast_blank-1.0.1"),
     }
     root = roots[origin]
     return {"origin": origin, "revision": revision, "path": path,
@@ -26,6 +27,23 @@ def entry(destinations, kind, paths, definitions, adaptations):
 
 
 entries = [
+    entry(["lib/reactions.rb", "reference/reactions-contract.md", "reference/reactions-upstream/", "reference/capture-reactions-rails.rb", "reference/check-reactions-fixtures.rb", "test/reactions.rb", "test/plugin_test.py"],
+        "bounded anonymous core-plugin read-only route/query/serialization adaptation; original plugin sources retained unchanged", [
+            "plugins/discourse-reactions/config/routes.rb", "plugins/discourse-reactions/config/settings.yml",
+            "plugins/discourse-reactions/plugin.rb", "plugins/discourse-reactions/app/controllers/discourse_reactions/custom_reactions_controller.rb",
+            "plugins/discourse-reactions/lib/discourse_reactions/post_reactions_query.rb",
+            "plugins/discourse-reactions/lib/discourse_reactions/post_action_extension.rb",
+            "plugins/discourse-reactions/app/models/discourse_reactions/reaction.rb",
+            "plugins/discourse-reactions/app/models/discourse_reactions/reaction_user.rb",
+            "plugins/discourse-reactions/assets/javascripts/discourse/models/discourse-reactions-custom-reaction.js",
+            "plugins/discourse-reactions/spec/requests/custom_reactions_controller_spec.rb",
+            "app/controllers/application_controller.rb", "app/models/post.rb", "app/models/post_action_type.rb",
+            "app/models/user.rb", "app/models/group.rb", "lib/guardian.rb",
+            "lib/guardian/post_guardian.rb", "lib/guardian/topic_guardian.rb", "lib/guardian/category_guardian.rb", "config/site_settings.yml"],
+        ["CustomReactionsController#reactions_users_list/#format_user/#fetch_post_from_params and requires_plugin anonymous exception",
+         "PostReactionsQuery anonymous rows/total/filter branches", "PostActionExtension.strict_filter_reaction_likes_sql",
+         "Reaction.main_reaction_id", "Guardian anonymous direct post/topic/category and hidden visibility", "User.avatar_template class method"],
+        "Native bound SELECTs replace ActiveRecord/MiniSql, in repeatable-read read-only request transactions. No plugin DSL runtime. Source ASC ordering, strict any-reaction shadow-like suppression, count/row join asymmetry, source scalar to_i clamps and name privacy retained. Both .json and extensionless JSON Accept/XHR users-list return JSON; source check_xhr HTML shell remains explicitly unsupported501, not fabricated success. Unknown/duplicate/structured/oversized params and out-of-range IDs/integers fail closed. Login-required fails closed403 (auth redirects not implemented); disabled plugin404. Existing ASCII task-site avatar adapter only; unsupported avatar configurations raise, never invented success. Actual upstream SQL/serializer on synthetic SELECT-only CTE fixtures and fresh actual anonymous Rails/plugin HTTP sessions on live PG are test-only, never runtime dependencies."),
     entry(["lib/serializers.rb"], "selective anonymous-scope adaptation", [
         "app/serializers/basic_topic_serializer.rb", "app/serializers/listable_topic_serializer.rb",
         "app/serializers/topic_list_item_serializer.rb", "app/serializers/topic_poster_serializer.rb",
@@ -137,6 +155,8 @@ entries.append({"destinations": ["build/assets/native/images/emoji/twitter/", "b
                 "sources": [source(p, "discourse-emojis", "1.0.47") for p in ["attributions.md", "dist/emoji/twemoji/wave.png", "dist/emoji/twemoji/speaking_head.png"]] +
                            [source(p, "discourse-fonts", "0.0.19") for p in ["lib/discourse_fonts.rb", "vendor/assets/fonts/InterVariable.woff2", "vendor/assets/fonts/JetBrainsMono-Regular.woff2", "vendor/assets/fonts/JetBrainsMono-Bold.woff2"]],
                 "adaptations": "No artwork/font byte edits. Stage manifest records all Twemoji source/output paths and hashes, not only these observed emoji requests; twitter is the legacy public alias for twemoji. Palette font URLs rebased relative to CSS so root and widget prefix use the same bytes. No remote font/avatar/CDN request."})
+entries[0]["sources"].append(source("ext/fast_blank/fast_blank.c", "fast_blank", "1.0.1"))
+entries[0]["selected_definitions"].append("fast_blank1.0.1 rb_str_blank loaded by Discourse (ASCII whitespace + NUL, not Unicode blank_as?)")
 pg_files = sorted(p for p in Path("vendor/pg").rglob("*") if p.is_file())
 entries.append({"destinations": ["vendor/pg"], "kind": "unchanged vendored runtime dependency", "license": "MIT; vendor/pg/LICENSE",
                 "origin": "https://github.com/roundhouse-rb/spinel-pg", "revision": "fe631b4ac4aba68168adf2ecce2c6c21006f7455", "version": "0.2.0",
@@ -147,6 +167,6 @@ entries.append({"destinations": ["bin/discourse.rb", "lib/mini_profiler.rb", "to
                 "adaptations": "Loopback TCP HTTP server over installed Spinel sockets; live pure-native PG client; no Ruby subprocess/proxy/canned response in serving path. Verification uses synchronous read-only Rails runner only, never a final data backend. Optional request-local MiniProfiler integration uses the separately hash-verified MIT native port/client under vendor/rack-mini-profiler/MANIFEST.json; canonical numeric topic names exclude user slugs, bindings and query strings."})
 manifest = {"schema_version": 1, "upstream": "Discourse", "original_revision": PIN,
             "upstream_license": "GPL-2.0-or-later; Copyright 2014-2026 Civilized Discourse Construction Kit, Inc. and contributors",
-            "scope": "anonymous latest JSON and bounded anonymous topic JSON/content with actual core Ember browser rendering at task-owned site; no full serializer/plugin/auth parity",
+            "scope": "anonymous latest JSON and bounded anonymous topic JSON/content with actual core Ember browser rendering plus anonymous reactions users-list read-only plugin route at task-owned site; no full serializer/plugin/auth parity",
             "gaps": "GAPS.md", "plugin_coverage": "PLUGIN_SUPPORT.json", "entries": entries}
 Path("SOURCE_MANIFEST.json").write_text(json.dumps(manifest, indent=2) + "\n")

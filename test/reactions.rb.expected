@@ -1,0 +1,35 @@
+all reactions merge ASC and count source reaction rows without user join
+plain likes map to configured main reaction and nil-count historical values remain rows
+main filter returns plain likes and excludes historical reaction users
+specific filter joins reaction definitions and omits missing profiles only from rows
+whitespace filter follows source blank semantics
+unknown filter is a specific reaction filter
+offset pagination preserves stable unpaged total
+ascending timestamp pagination yields adjacent rows
+main reaction mapping is supplied by caller and tags plain likes
+reaction serializer omits names and retains uploaded avatar source
+enabled names retains nullable name and default letter avatar
+reaction serializer uses User.avatar_template source semantics rather than instance system logo
+hidden visibility requires granular permissions and explicit group 4
+configured main reaction removes hyphens as source mapping
+hidden group setting alone does not enable granular visibility
+access status gives login/plugin/not-found/inaccessible source precedence
+post query allows public direct and unlisted access but rejects hidden by default
+post lookup denies deleted/whisper/PM/deleted-topic/missing-or-restricted-category/draft/foreign fixtures 102
+post lookup denies deleted/whisper/PM/deleted-topic/missing-or-restricted-category/draft/foreign fixtures 103
+post lookup denies deleted/whisper/PM/deleted-topic/missing-or-restricted-category/draft/foreign fixtures 104
+post lookup denies deleted/whisper/PM/deleted-topic/missing-or-restricted-category/draft/foreign fixtures 105
+post lookup denies deleted/whisper/PM/deleted-topic/missing-or-restricted-category/draft/foreign fixtures 106
+post lookup denies deleted/whisper/PM/deleted-topic/missing-or-restricted-category/draft/foreign fixtures 107
+post lookup denies deleted/whisper/PM/deleted-topic/missing-or-restricted-category/draft/foreign fixtures 108
+missing and deleted posts follow Post.find undeleted lookup
+post query excludes actual synthetic shared draft dependency
+hidden post admitted only through group-visibility bind
+real call exits disabled before post or reaction queries and rolls back read-only transaction
+request uses scalar to_i prefix parsing and source clamps
+numeric prefixes and junk values preserve String to_i behavior before clamping
+underscored integers and nonblank Unicode limit follow source fast_blank coercions
+Unicode space is a specific filter under actual source fast_blank predicate
+arrays duplicates unknown huge malformed and out-of-range parameters fail closed
+malformed routes and unsupported numeric ID ranges fail closed
+synthetic native parity fixture report written under build

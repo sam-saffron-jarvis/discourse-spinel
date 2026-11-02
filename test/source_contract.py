@@ -21,6 +21,8 @@ for entry in manifest["entries"]:
             root = run / "bundle/ruby/4.0.0/gems/message_bus-5.0.0"
         elif source["origin"] == "discourse-fonts":
             root = run / "bundle/ruby/4.0.0/gems/discourse-fonts-0.0.19"
+        elif source["origin"] == "fast_blank":
+            root = run / "bundle/ruby/4.0.0/gems/fast_blank-1.0.1"
         else:
             raise AssertionError(source["origin"])
         assert hashlib.sha256((root / source["path"]).read_bytes()).hexdigest() == source["sha256"], source["path"]
@@ -29,6 +31,11 @@ for entry in manifest["entries"]:
         assert hashlib.sha256(Path(source["path"]).read_bytes()).hexdigest() == source["sha256"], source["path"]
         count += 1
 assert Path("frontend/reference/application.html.erb").read_bytes() == (reference / "app/views/layouts/application.html.erb").read_bytes()
+reaction_copies = list(Path("reference/reactions-upstream").rglob("*"))
+assert sum(p.is_file() for p in reaction_copies) == 10
+for copy in reaction_copies:
+    if copy.is_file():
+        assert copy.read_bytes() == (reference / "plugins/discourse-reactions" / copy.relative_to("reference/reactions-upstream")).read_bytes(), str(copy)
 colors = (reference / "lib/letter_avatar.rb").read_text()
 assert colors[colors.index("  COLORS = ["):colors.rfind("\nend")] in Path("lib/letter_avatar_colors.rb").read_text()
 ledger = json.loads(Path("PLUGIN_SUPPORT.json").read_text())

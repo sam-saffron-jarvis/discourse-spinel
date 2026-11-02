@@ -3,10 +3,161 @@
   "upstream": "Discourse",
   "original_revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
   "upstream_license": "GPL-2.0-or-later; Copyright 2014-2026 Civilized Discourse Construction Kit, Inc. and contributors",
-  "scope": "anonymous latest JSON and bounded anonymous topic JSON/content with actual core Ember browser rendering at task-owned site; no full serializer/plugin/auth parity",
+  "scope": "anonymous latest JSON and bounded anonymous topic JSON/content with actual core Ember browser rendering plus anonymous reactions users-list read-only plugin route at task-owned site; no full serializer/plugin/auth parity",
   "gaps": "GAPS.md",
   "plugin_coverage": "PLUGIN_SUPPORT.json",
   "entries": [
+    {
+      "destinations": [
+        "lib/reactions.rb",
+        "reference/reactions-contract.md",
+        "reference/reactions-upstream/",
+        "reference/capture-reactions-rails.rb",
+        "reference/check-reactions-fixtures.rb",
+        "test/reactions.rb",
+        "test/plugin_test.py"
+      ],
+      "kind": "bounded anonymous core-plugin read-only route/query/serialization adaptation; original plugin sources retained unchanged",
+      "license": "GPL-2.0-or-later",
+      "sources": [
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "plugins/discourse-reactions/config/routes.rb",
+          "sha256": "fe78620482388aad7b633b7fed2f763af5a489bc7acc032f78cf44da26bd28a8"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "plugins/discourse-reactions/config/settings.yml",
+          "sha256": "15af0c1a896f0ebefa262b5bbd2720f8b03cff5c445b55c661b744c11aaa5401"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "plugins/discourse-reactions/plugin.rb",
+          "sha256": "285e86a08fabdbf596da2452aaf8500c7524532cba25a5d87b36f31b829c9092"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "plugins/discourse-reactions/app/controllers/discourse_reactions/custom_reactions_controller.rb",
+          "sha256": "c7444420e31fe63736a6427fd9ab343c8e5c805e0e3b902911f29145ac580a00"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "plugins/discourse-reactions/lib/discourse_reactions/post_reactions_query.rb",
+          "sha256": "29bf8f1592f9067db6f1a2aa9e049dd7f7b2ba1ea0fd3e1334c0621844467dc3"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "plugins/discourse-reactions/lib/discourse_reactions/post_action_extension.rb",
+          "sha256": "8f437e1364e033f146dc6a1991718dbfd1ba8e9ac7f3fb26fb65d0523893b709"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "plugins/discourse-reactions/app/models/discourse_reactions/reaction.rb",
+          "sha256": "ea7b2edaeccf5ea124056bf206f00ed302bc25497b37092c9aa966a428c0ebbc"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "plugins/discourse-reactions/app/models/discourse_reactions/reaction_user.rb",
+          "sha256": "84707587b7242ed04e5e8bf9b67a6d6f2d0d36650bd92e8ab16da5e51fd258aa"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "plugins/discourse-reactions/assets/javascripts/discourse/models/discourse-reactions-custom-reaction.js",
+          "sha256": "a09720ad9543f60e25cb3c88f39c91f2d157047bea6c5c8812d5b9df86b92d88"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "plugins/discourse-reactions/spec/requests/custom_reactions_controller_spec.rb",
+          "sha256": "492a8cfed1ce848d5b7b08bf28fdf76803c5f7b422e7025946c92af6d3e4035e"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/controllers/application_controller.rb",
+          "sha256": "793f89f85258089376c4e09da54030919afa29fc7b2cb3fad0109a3637ae012f"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/models/post.rb",
+          "sha256": "83ddbfe431d831eb6e05b00d87a3ebed1be91560544d17159c8835119db9912f"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/models/post_action_type.rb",
+          "sha256": "d1640ebe0f6e5f3aa42f40b37eee615db0a852914048d808df0368b34a32368b"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/models/user.rb",
+          "sha256": "36d66d4c6fce6b245c505771f5136e65b08c14e964b7665381721fd4a84c9fe2"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/models/group.rb",
+          "sha256": "4f53a5cfc4e861a7a1ac2d9c6cf131987cdd4e45694b523c551128faef79d91f"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "lib/guardian.rb",
+          "sha256": "d14e82df366bb63d2d2a34add5ae9417dc17ff0d1ad91f991c0582134489645c"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "lib/guardian/post_guardian.rb",
+          "sha256": "9fff511fa27b9efb94fad209a765997c9f5874a1c2c9dc3070b5c29c1fb91513"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "lib/guardian/topic_guardian.rb",
+          "sha256": "9c647803cbd137df5f18080fe0659447789ea264308df4e3d2aa7ca8a1152cae"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "lib/guardian/category_guardian.rb",
+          "sha256": "f7e3d398829c8eebcd8c55da94deaa153e51e4c8497cb144fbd723fa365dee29"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "config/site_settings.yml",
+          "sha256": "f5d22ff1dc5e7afc1d5c136d0160c12443639a1df792ed43553460252db1e3d1"
+        },
+        {
+          "origin": "fast_blank",
+          "revision": "1.0.1",
+          "path": "ext/fast_blank/fast_blank.c",
+          "sha256": "a53e252432e0d2db0ddbc938cd343710e81b38f5375da887ad5db85ac9168b27"
+        }
+      ],
+      "selected_definitions": [
+        "CustomReactionsController#reactions_users_list/#format_user/#fetch_post_from_params and requires_plugin anonymous exception",
+        "PostReactionsQuery anonymous rows/total/filter branches",
+        "PostActionExtension.strict_filter_reaction_likes_sql",
+        "Reaction.main_reaction_id",
+        "Guardian anonymous direct post/topic/category and hidden visibility",
+        "User.avatar_template class method",
+        "fast_blank1.0.1 rb_str_blank loaded by Discourse (ASCII whitespace + NUL, not Unicode blank_as?)"
+      ],
+      "adaptations": "Native bound SELECTs replace ActiveRecord/MiniSql, in repeatable-read read-only request transactions. No plugin DSL runtime. Source ASC ordering, strict any-reaction shadow-like suppression, count/row join asymmetry, source scalar to_i clamps and name privacy retained. Both .json and extensionless JSON Accept/XHR users-list return JSON; source check_xhr HTML shell remains explicitly unsupported501, not fabricated success. Unknown/duplicate/structured/oversized params and out-of-range IDs/integers fail closed. Login-required fails closed403 (auth redirects not implemented); disabled plugin404. Existing ASCII task-site avatar adapter only; unsupported avatar configurations raise, never invented success. Actual upstream SQL/serializer on synthetic SELECT-only CTE fixtures and fresh actual anonymous Rails/plugin HTTP sessions on live PG are test-only, never runtime dependencies."
+    },
     {
       "destinations": [
         "lib/serializers.rb"

@@ -2,6 +2,7 @@
 # Opt-in, private-loopback development adapter for the reusable native port.
 # The outer authenticated Hub surface remains the access boundary. No cookies,
 # credentials or incoming authentication headers are stored or forwarded.
+require_relative "reactions"
 require_relative "../vendor/rack-mini-profiler/spinel_mini_profiler"
 require_relative "topic"
 
@@ -32,6 +33,14 @@ class NativeMiniProfiler
       path = "/t/#{route.id}"
       path += "/#{route.post_number}" if route.post_number > 1
       path += ".json" if route.json
+    elsif path.start_with?("/discourse-reactions/posts/")
+      begin
+        route = NativeReactionsRequest.new(path, "")
+      rescue ArgumentError
+        return nil
+      end
+      # Only canonical numeric identity; never reaction filters or query strings.
+      path = "/discourse-reactions/posts/#{route.id}/reactions-users-list.json"
     elsif !["/", "/latest", "/latest.json", "/srv/status"].include?(path)
       return nil
     end

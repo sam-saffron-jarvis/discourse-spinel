@@ -170,6 +170,28 @@ arbitrary incoming Host headers are not reflected into the document.
 Coordinator acceptance remains independent; worker browser proof is not a public
 3499 deployment claim. No whole-app/compiler lane is involved.
 
+## Bounded core-plugin read: reactions users-list
+
+Ticket010 adds only anonymous
+`GET /discourse-reactions/posts/:id/reactions-users-list[.json]`, backed by live
+read-only native PG. It preserves the source reaction filter, plain-like shadow
+dedup, page/limit clamps, users/total_rows, names privacy, enablement and anonymous
+post visibility. Original pinned source copies and explicit native/unsupported
+boundaries are in `reference/reactions-contract.md` and `GAPS.md`; the plugin ledger
+does **not** claim full reactions/plugin support. No replacement UI or write route.
+
+```sh
+source ../harness/env.sh
+make plugin-test
+```
+
+This compiles native code, executes positive/negative typed CTE fixtures and
+compares them to actual upstream query/format_user, then captures a fresh actual
+read-only Rails/plugin oracle on live visible posts and checks the native endpoint
+at root/prefix with profiler disabled/enabled. Live empty reaction data and positive
+synthetic fixture evidence remain separately labeled in `build/plugin/`. Runtime
+never launches Rails/Ruby/Python/Node, nor reads oracle/fixture response files.
+
 ## Optional native MiniProfiler (development only)
 
 Set `MINIMAL_PROFILER=1` when launching this worktree's native ELF. No profiler

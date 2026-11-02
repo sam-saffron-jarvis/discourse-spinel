@@ -6,6 +6,7 @@ require "uri"
 require "json"
 require_relative "../lib/latest"
 require_relative "../lib/topic"
+require_relative "../lib/reactions"
 require_relative "../lib/surface"
 require_relative "../lib/preloads"
 require_relative "../lib/avatars"
@@ -25,6 +26,7 @@ conn = SpinelMiniProfilerConnection.new(conn)
 emoji_map = JSON.parse(File.read("data/emoji-unicode.json"))
 latest = NativeLatest.new(conn, emoji_map)
 topics = NativeTopic.new(conn, emoji_map)
+reactions = NativeReactions.new(conn)
 port = ENV.fetch("PORT", "3499").to_i
 raise "unexpected listener port" unless [3498, 3499, 3528, 3529].include?(port)
 paths = NativePaths.new(ENV.fetch("MINIMAL_BASE_URI", ""))
@@ -136,6 +138,20 @@ loop do
       else
         status = "400 Bad Request"
         body = JSON.generate({ "error" => "only the page parameter (0..2000) is supported" })
+      end
+    elsif path.start_with?("/discourse-reactions/posts/")
+      begin
+        reaction_request = NativeReactionsRequest.new(path, query)
+        if !path.end_with?(".json") && !wants_json
+          status = "501 Not Implemented"
+          body = JSON.generate({ "error" => "non-JSON reactions shell is not extracted; use .json or JSON/XHR" })
+        else
+          code, body = reactions.call(reaction_request)
+          status = { 200 => "200 OK", 403 => "403 Forbidden", 404 => "404 Not Found" }.fetch(code)
+        end
+      rescue ArgumentError => error
+        status = "400 Bad Request"
+        body = JSON.generate({ "error" => error.message })
       end
     elsif path.start_with?("/t/")
       begin

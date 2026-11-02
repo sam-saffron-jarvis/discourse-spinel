@@ -1,4 +1,4 @@
-.PHONY: build smoke frontend-assets browser-smoke topic-browser-smoke profiler-test boot-test
+.PHONY: build smoke frontend-assets browser-smoke topic-browser-smoke profiler-test boot-test plugin-test
 frontend-assets:
 	python3 frontend/stage-assets.py --reuse
 	python3 tools/stage-media.py
@@ -18,6 +18,9 @@ topic-browser-smoke: build
 boot-test: build
 	ruby frontend/test_native_document.rb
 	python3 test/boot_failure_browser.py
+
+plugin-test: build
+	python3 test/plugin_test.py
 
 profiler-test: build
 	DATABASE_URL="$$DSPINEL_PG_URL/discourse_development" spin test test/profiler_pg.rb
