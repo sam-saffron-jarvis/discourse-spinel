@@ -49,6 +49,24 @@ The `/latest` document bootstrap must not depend on a browser-side Rails proxy o
 Rails-hosted API data. Any additional XHR the browser actually makes must be observed
 and implemented natively before claiming a working page.
 
+## Bounded first boot behind a reverse Hub
+
+The generated document keeps the original import map, asset bytes and Ember entrypoint,
+but preloads the static module dependency graph in dependency-first order, one module
+at a time, before importing the locale and core application. Do not restore the eager
+23-link modulepreload burst: an isolated installed-binary Hub/reverse-tunnel reproduction
+admits 16 active operations, then returns HTTP502 for excess requests. Long streams
+also consume admission slots. This is a demonstrated transport constraint, not proof
+of the exact error returned by an inaccessible production Hub.
+
+A readable loading state is present immediately. A rejected/timed-out core preload
+shows a boot error with a reload button rather than an unexplained white screen.
+`python3 test/boot_failure_browser.py` injects one module502, verifies that error,
+then clicks Reload and requires 20 real topic rows and the actual MiniProfiler UI.
+`ruby frontend/test_native_document.rb` verifies dependency order and absence of the
+old eager preload/entry tags. Reverse-tunnel cold boots need their own integration
+check; direct native or loopback-widget checks do not establish public Hub health.
+
 ## Oracle-data and secret handling
 
 This contract records field names and source-code provenance only; it contains no

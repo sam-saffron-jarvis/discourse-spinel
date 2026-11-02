@@ -67,9 +67,14 @@ class NativeDocument
       stable_url = core_asset(real).sub(File.basename(real), File.basename(stable))
       imports[stable_url] = core_asset(real)
     end
-    module_preloads = dependency_files(entrypoint, core.fetch("chunks")).map do |filename|
-      %(<link rel="modulepreload" href="#{attr(core_asset(filename))}">)
-    end.join("\n")
+    # A reverse-connected Hub admits only a bounded number of requests. Do not
+    # eagerly fan out the entire Ember graph: preload dependencies before their
+    # parents, one request at a time, then evaluate the original entrypoint.
+    boot_assets = safe_script_json(
+      "modules" => dependency_files(entrypoint, core.fetch("chunks")).map { |filename| core_asset(filename) },
+      "locale" => prefixed(descriptor.fetch("locale").fetch("url")),
+      "entry" => core_asset(entrypoint),
+    )
 
     css_links = descriptor.fetch("css").values.map do |asset|
       %(<link rel="stylesheet" href="#{attr(prefixed(asset.fetch("url")))}">)
@@ -86,7 +91,6 @@ class NativeDocument
 
     import_map_json = safe_script_json("imports" => import_map)
     preloaded_json = safe_script_json(preloaded)
-    entry_url = core_asset(entrypoint)
     detect_url = prefixed(scripts.fetch("browser-detect").fetch("url"))
     update_url = prefixed(scripts.fetch("browser-update").fetch("url"))
     favicon = prefixed(descriptor.fetch("images").fetch("default-favicon.png").fetch("url"))
@@ -103,7 +107,7 @@ class NativeDocument
       #{topic ? %(<link rel="canonical" href="#{attr("#{origin}#{@base_uri}/t/#{topic.fetch("slug")}/#{topic.fetch("id")}")}">) : %(<meta name="discourse_current_homepage" content="latest">)}
       <link rel="icon" href="#{attr(favicon)}">
       <script type="importmap">#{import_map_json}</script>
-      #{module_preloads}
+      <script type="application/json" id="native-boot-assets">#{boot_assets}</script>
       <script defer src="#{attr(detect_url)}"></script>
       <script type="module" src="#{attr(locale_url)}"></script>
       <meta id="data-discourse-setup"#{setup_attributes}>
@@ -118,8 +122,54 @@ class NativeDocument
         <discourse-assets-json><script type="application/json" id="data-preloaded">#{preloaded_json}</script></discourse-assets-json>
         <discourse-assets-icons></discourse-assets-icons>
       </discourse-assets>
+      <p id="native-boot-progress" role="status" style="margin:3rem auto;padding:1rem;max-width:40rem;font:16px system-ui;color:#333">Loading Discourse…</p>
       <section id="main"></section>
-      <script type="module" src="#{attr(entry_url)}"></script>
+      <script type="module" id="native-bounded-boot">
+      const boot = JSON.parse(document.getElementById("native-boot-assets").textContent);
+      async function preload(url) {
+        await new Promise((resolve, reject) => {
+          const link = document.createElement("link");
+          link.rel = "modulepreload";
+          link.href = url;
+          link.crossOrigin = "anonymous";
+          const timer = setTimeout(() => finish(new Error("Timed out loading " + url)), 20000);
+          function finish(error) {
+            clearTimeout(timer);
+            link.onload = link.onerror = null;
+            if (error) { link.remove(); reject(error); } else { resolve(); }
+          }
+          link.onload = () => finish();
+          link.onerror = () => finish(new Error("Failed to load " + url));
+          document.head.appendChild(link);
+        });
+      }
+      try {
+        // Modulepreload populates the browser module map without evaluating the
+        // application. Postorder prevents recursive dependency fetch bursts.
+        for (const url of boot.modules) { await preload(url); }
+        await import(boot.locale);
+        await import(boot.entry);
+        document.getElementById("native-boot-progress")?.remove();
+        document.documentElement.dataset.nativeBoot = "complete";
+      } catch (error) {
+        console.error("Native Discourse boot failed", error);
+        document.getElementById("native-boot-progress")?.remove();
+        document.documentElement.dataset.nativeBoot = "failed";
+        const notice = document.createElement("section");
+        notice.id = "native-boot-error";
+        notice.style.cssText = "margin:3rem auto;padding:1.5rem;max-width:40rem;font:16px system-ui;color:#222;background:#fff;border:1px solid #ddd";
+        const title = document.createElement("h1");
+        title.textContent = "Discourse could not finish loading";
+        const message = document.createElement("p");
+        message.textContent = "A required application asset did not load. Reload to retry.";
+        const retry = document.createElement("button");
+        retry.type = "button";
+        retry.textContent = "Reload page";
+        retry.onclick = () => location.reload();
+        notice.append(title, message, retry);
+        document.body.prepend(notice);
+      }
+      </script>
       <script defer src="#{attr(update_url)}"></script>
       </body>
       </html>
@@ -196,7 +246,7 @@ class NativeDocument
     visited[filename] = true
     chunk = chunks[filename]
     return [filename] unless chunk
-    [filename, *Array(chunk["imports"]).flat_map { |path| dependency_files(path, chunks, visited) }]
+    [*Array(chunk["imports"]).flat_map { |path| dependency_files(path, chunks, visited) }, filename]
   end
 
   def safe_script_json(value)

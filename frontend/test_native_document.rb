@@ -23,7 +23,16 @@ class NativeDocumentTest < Minitest::Test
     assert_match(%r{href="/node/jarvis/widgets/discourse-spinel-app/assets/native/css/common.css"}, html)
     assert_match(%r{href="/node/jarvis/widgets/discourse-spinel-app/assets/native/css/color-definitions.css"}, html)
     assert_match(%r{src="/node/jarvis/widgets/discourse-spinel-app/assets/native/locale/en.js"}, html)
-    assert_match(%r{src="/node/jarvis/widgets/discourse-spinel-app/assets/discourse/assets/js/discourse-.*\.digested\.js"}, html)
+    boot = JSON.parse(html[/<script type="application\/json" id="native-boot-assets">(.*?)<\/script>/m, 1])
+    assert_match(%r{\A/node/jarvis/widgets/discourse-spinel-app/assets/discourse/assets/js/discourse-.*\.digested\.js\z}, boot.fetch("entry"))
+    assert_equal boot.fetch("entry"), boot.fetch("modules").last
+    assert_equal boot.fetch("modules").uniq, boot.fetch("modules")
+    refute_match(/<link rel="modulepreload"/, html)
+    refute_match(/<script type="module" src="[^"]*\/assets\/js\/discourse-[^"]*"/, html)
+    assert_includes html, 'for (const url of boot.modules) { await preload(url); }'
+    assert_includes html, 'await import(boot.locale);'
+    assert_includes html, 'await import(boot.entry);'
+    assert_includes html, 'notice.id = "native-boot-error";'
 
     preload_body = html[/<script type="application\/json" id="data-preloaded">(.*?)<\/script>/m, 1]
     refute_nil preload_body
@@ -69,6 +78,22 @@ class NativeDocumentTest < Minitest::Test
     assert_raises(ArgumentError) { document.render({}, {}, "http://127.0.0.1:3498", topic:) }
     assert_raises(ArgumentError) do
       document.render({ "topic_42" => "{}" }, {}, "http://127.0.0.1:3498", topic: topic.merge(slug: "a/b"))
+    end
+  end
+
+  def test_boot_graph_is_dependency_first
+    document = NativeDocument.new("")
+    descriptor = JSON.parse(File.read(NativeDocument::DEFAULT_STAGE_MANIFEST))
+    chunks = descriptor.fetch("core_ember").fetch("chunks")
+    entry = descriptor.fetch("core_ember").fetch("entrypoints").fetch("discourse")
+    ordered = document.send(:dependency_files, entry, chunks)
+    positions = ordered.each_with_index.to_h
+    assert_equal entry, ordered.last
+    ordered.each do |filename|
+      Array(chunks.fetch(filename, {})["imports"]).each do |dependency|
+        assert_operator positions.fetch(dependency), :<, positions.fetch(filename),
+                        "#{dependency} must preload before #{filename}"
+      end
     end
   end
 

@@ -1,4 +1,4 @@
-.PHONY: build smoke frontend-assets browser-smoke topic-browser-smoke profiler-test
+.PHONY: build smoke frontend-assets browser-smoke topic-browser-smoke profiler-test boot-test
 frontend-assets:
 	python3 frontend/stage-assets.py --reuse
 	python3 tools/stage-media.py
@@ -15,6 +15,10 @@ topic-browser-smoke: build
 	python3 test/browser_cleanup.py --topic
 	python3 test/topic_browser_smoke.py
 # Source ../harness/env.sh before invoking. Every server is owned/ephemeral3528/3529.
+boot-test: build
+	ruby frontend/test_native_document.rb
+	python3 test/boot_failure_browser.py
+
 profiler-test: build
 	DATABASE_URL="$$DSPINEL_PG_URL/discourse_development" spin test test/profiler_pg.rb
 	python3 test/profiler_http.py
