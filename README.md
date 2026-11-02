@@ -1,4 +1,49 @@
-# Discourse on Spinel — bottom-up latest and anonymous topics
+# Discourse on Spinel — experimental native read-only extraction
+
+A public source-browsing checkpoint of the bottom-up Discourse/Spinel experiment.
+**This is not the entire Rails application compiled unchanged, a drop-in
+Discourse replacement, or a complete core-plugin port.** It is a small native
+backend serving the real Discourse Ember frontend against an existing database.
+
+## Start browsing here
+
+| Area | Source |
+|---|---|
+| What was reused versus rewritten, with measured counts | [PORTING.md](PORTING.md) |
+| Native HTTP server and route dispatch | [bin/discourse.rb](bin/discourse.rb) |
+| Topic-list query / selected settings | [lib/latest.rb](lib/latest.rb) |
+| Topic/post query and visibility projection | [lib/topic.rb](lib/topic.rb) |
+| Selected anonymous serializers | [lib/serializers.rb](lib/serializers.rb) |
+| Native Site projection | [reference/native_site.rb](reference/native_site.rb) |
+| Document bootstrap / paced module loading | [frontend/native_document.rb](frontend/native_document.rb) |
+| Original reactions components and read-only adapters | [frontend/reactions/](frontend/reactions/) |
+| Native reaction endpoints | [lib/reactions.rb](lib/reactions.rb), [lib/reaction_summary.rb](lib/reaction_summary.rb) |
+| Original source paths, hashes and adaptations | [SOURCE_MANIFEST.json](SOURCE_MANIFEST.json) |
+| Unsupported behaviour and plugin-by-plugin boundaries | [GAPS.md](GAPS.md), [PLUGIN_SUPPORT.json](PLUGIN_SUPPORT.json) |
+| Copyright and dependency notices | [NOTICE.md](NOTICE.md), [LICENSE.txt](LICENSE.txt) |
+
+The source checkpoint is **`fbc2d203cf6f7dfca42591c2f8493ee067cd6e07`**: anonymous
+latest/topic reads, original read-only reactions counter/users-menu, selected
+reactions APIs, stored-cooked details reader, and bounded MiniProfiler support.
+It follows upstream Discourse **`96ce8d44401a8a568ecc71561c26dca8ec6bfeb8`**.
+Publication-only documentation is added on top; active implementation continues
+separately and uncommitted worker changes are not included in this checkpoint.
+
+**Reproduction caveat:** this is not yet a self-contained fresh-clone quickstart.
+The development commands below assume an external harness/toolchain, a sibling
+pinned Discourse checkout and prepared asset inputs, plus a populated read-only
+test database. The private harness, database, local media, credentials, generated
+browser assets and captured test reports are deliberately excluded. No binary
+release or production-ready deployment is promised by this repository.
+
+Discourse-derived code retains its GPL-2.0-or-later attribution; dependency
+licences are preserved separately. The original upstream reference tree was not
+edited in place. See **[PORTING.md](PORTING.md)** before interpreting this as an
+unchanged Rails compilation or treating file counts as whole-Discourse coverage.
+
+---
+
+## Original development contract and notes
 
 Goal: actual Discourse topic list in a browser, then a topic page. This independent
 local extraction is **not** the parked whole-app/33MB generated tree or a toy blog.
@@ -107,11 +152,11 @@ forbidden. Neither broad uploads nor private build evidence is statically expose
 - `SOURCE_MANIFEST.json` records source paths/SHA-256/revision, selected definitions,
   adaptations and dependency notices. `test/source_contract.py` checks original
   source/vendor hashes and regenerability of the source-only client catalog.
-- Source YAML generates the 390-field client-safe core settings catalog plus five
-  explicitly selected reactions counter/menu client fields; runtime reads typed
-  live overrides using bound SELECTs. No raw settings dump, secrets or captured
-  Rails preload is served. All 395 emitted fields match the read-only oracle on
-  this DB; 370 additional plugin/computed/themeable client fields remain omitted.
+- Source YAML generates a 396-field client-safe catalog: 390 core settings,
+  five explicitly selected reactions counter/menu fields, and `details_enabled`.
+  Runtime reads typed live overrides using bound SELECTs. No raw settings dump,
+  secrets or captured Rails preload is served. Source/native contract checks cover
+  the supported projection; other plugin/computed/themeable fields remain omitted.
 - Native Site metadata uses live public categories plus source enums/menu/permission
   projection. Every emitted field is compared to actual Rails getters. The full
   `Site.json_for` oracle attempts a wizard setting INSERT and is correctly blocked

@@ -1,0 +1,12 @@
+{
+  "component": "Google Code Prettify",
+  "license": "Apache-2.0",
+  "bundled_in": "vendor/rack-mini-profiler/html/vendor.js",
+  "upstream_repository": "https://github.com/googlearchive/code-prettify",
+  "notice_source_revision": "e006587b4a893f0281e9dc9a53001c7ed584d4e7",
+  "copying_url": "https://raw.githubusercontent.com/googlearchive/code-prettify/e006587b4a893f0281e9dc9a53001c7ed584d4e7/COPYING",
+  "copying_sha256": "deec98192f710d6e6aa8aba33f67087199e62c2db7f9d793b0ad465248ca3d05",
+  "license_header_url": "https://raw.githubusercontent.com/googlearchive/code-prettify/e006587b4a893f0281e9dc9a53001c7ed584d4e7/src/prettify.js",
+  "bundled_asset_sha256": "64987ca8b8d4697c34a85d3d5baa89efd6f2684fff0388980b251180b0735544",
+  "publication_note": "Added accompanying upstream license/attribution; original MiniProfiler browser asset bytes and vendor manifest remain unchanged."
+}

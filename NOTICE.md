@@ -28,8 +28,8 @@ Rails or queries a database.
 
 Generated browser assets under ignored `build/assets/` use actual pinned Discourse
 frontend source and installed dependencies, with their original distribution
-licenses. They serve the real core Ember `/latest` list; they do not establish topic
-pages or complete plugin/theme support. The copied application layout under
+licenses. They serve the real core Ember latest/topic UI; they do not establish
+complete plugin/theme support. The copied application layout under
 `frontend/reference/` remains byte-identical source, not rendered output; the native
 document is a separately labelled adaptation.
 
@@ -44,6 +44,15 @@ The browser stage additionally copies actual Twemoji PNG artwork from
 `data/discourse-emojis-attributions.md`; stage manifest records every copied source
 and SHA-256. This is separate from the artwork-free Unicode metadata transformation
 above. No screenshot or captured Rails preload is an asset input.
+
+`vendor/rack-mini-profiler/html/vendor.js` includes Google Code Prettify,
+Copyright (C) 2006 Google Inc.; the upstream distribution's COPYING also retains
+Copyright 2011 Mike Samuel et al. Prettify is Apache-2.0 licensed, separately from
+MiniProfiler's MIT licence. Its full upstream licence, original source licence
+header and notice-source revision/hash accompany the unmodified bundle in
+`vendor/rack-mini-profiler/third-party/code-prettify/`. The accompanying notices
+were added for publication; browser asset bytes and their original manifest
+hashes are unchanged. See also `THIRD_PARTY_NOTICES.md`.
 
 Foundation's generated palette references unchanged Inter and JetBrains Mono font
 bytes from installed `discourse-fonts` 0.0.19. The stage manifest and source manifest
