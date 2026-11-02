@@ -1,0 +1,73 @@
+{
+  "format": 1,
+  "repository": "../discourse",
+  "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+  "files": {
+    "counter": {
+      "path": "plugins/discourse-reactions/assets/javascripts/discourse/components/discourse-reactions-counter.gjs",
+      "sha256": "7805dbeaaa08df7b783dd9aa58cad43212e98c8931e616bad8749ec002f2a013"
+    },
+    "list": {
+      "path": "plugins/discourse-reactions/assets/javascripts/discourse/components/discourse-reactions-list.gjs",
+      "sha256": "8434a41cc63519adcc3e43fb06b37aab07b6e2c048d4789cf877a9b97f88e861"
+    },
+    "list_emoji": {
+      "path": "plugins/discourse-reactions/assets/javascripts/discourse/components/discourse-reactions-list-emoji.gjs",
+      "sha256": "4ae65a62e5a929d44751185da53200227494bfbef8d6886420fba57ec2204e87"
+    },
+    "users_menu": {
+      "path": "plugins/discourse-reactions/assets/javascripts/discourse/components/discourse-reactions-users-menu.gjs",
+      "sha256": "e16a8bd530450b56b89251a000a3bd44e9f7c5e534ab305619a63d7a58e1311b"
+    },
+    "action_summary": {
+      "path": "plugins/discourse-reactions/assets/javascripts/discourse/components/discourse-reactions-actions-summary.gjs",
+      "sha256": "5db5a4a5e550b2cafc3d3920da5b34f6a37728d2454d29cbd247068cba0821b2"
+    },
+    "action_caller": {
+      "path": "plugins/discourse-reactions/assets/javascripts/discourse/components/discourse-reactions-actions.gjs",
+      "sha256": "0c40868f57c1563ac36a0104e2a695818a97141f4ac8869b3f34dadb103fb109"
+    },
+    "helper": {
+      "path": "plugins/discourse-reactions/assets/javascripts/discourse/helpers/discourse-reactions-emoji.js",
+      "sha256": "93a3f3a99ec23c5b40e4a8b7a05b120b2dcf0cf308ee8f63f79aaef19592bb68"
+    },
+    "model": {
+      "path": "plugins/discourse-reactions/assets/javascripts/discourse/models/discourse-reactions-custom-reaction.js",
+      "sha256": "a09720ad9543f60e25cb3c88f39c91f2d157047bea6c5c8812d5b9df86b92d88"
+    },
+    "hidden_post": {
+      "path": "plugins/discourse-reactions/assets/javascripts/discourse/lib/hidden-post.js",
+      "sha256": "3f76aae9e73f991f6731a64f44d6d37909f17b38f30fda2c76160d673deecd83"
+    },
+    "upstream_initializer": {
+      "path": "plugins/discourse-reactions/assets/javascripts/discourse/initializers/discourse-reactions.gjs",
+      "sha256": "7956e4d2a47d3d36b8a8bbeec2348d9562b9ac6b6c1c839c7015b368a1853115"
+    },
+    "users_popup": {
+      "path": "frontend/discourse/app/components/user/users-popup.gjs",
+      "sha256": "ddbcd31b25b70cfb175d0da515acf0bf13ee2adcb5bc0e997792695ff879b441"
+    },
+    "settings": {
+      "path": "plugins/discourse-reactions/config/settings.yml",
+      "sha256": "15af0c1a896f0ebefa262b5bbd2720f8b03cff5c445b55c661b744c11aaa5401"
+    },
+    "client_locale_en": {
+      "path": "plugins/discourse-reactions/config/locales/client.en.yml",
+      "sha256": "e7f8211e71a0f83f3fcdd610ad33a31c158570cc7d7f2a1bcb4f4e36d7e214ee"
+    },
+    "common_stylesheet": {
+      "path": "plugins/discourse-reactions/assets/stylesheets/common/discourse-reactions.scss",
+      "sha256": "fc1ffd4784f5f28a43dcc1e85914d243e49c1a607da77682616fc17ac67d1c59"
+    },
+    "desktop_stylesheet": {
+      "path": "plugins/discourse-reactions/assets/stylesheets/desktop/discourse-reactions.scss",
+      "sha256": "370476cd27e3ae5657783d1c2269bfd210ea127f466aa58e85f45e82ae141200",
+      "copy": "reference/reactions-browser-sources/discourse-reactions.desktop.scss"
+    },
+    "mobile_stylesheet": {
+      "path": "plugins/discourse-reactions/assets/stylesheets/mobile/discourse-reactions.scss",
+      "sha256": "30629a063920059e28888761fc23539b72d84d61a18ea1b5b3120ca2e66a9340",
+      "copy": "reference/reactions-browser-sources/discourse-reactions.mobile.scss"
+    }
+  }
+}

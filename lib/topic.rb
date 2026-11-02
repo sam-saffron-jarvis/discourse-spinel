@@ -4,6 +4,7 @@
 require "json"
 require "uri"
 require_relative "latest"
+require_relative "reaction_metadata"
 
 class NativeTopicRequest
   attr_reader :id, :post_number, :json
@@ -106,6 +107,8 @@ class NativeTopic
       raise "unsupported mega topic" if rows.ntuples >= 10000 || topic["posts_count"].to_i >= 10000
       posts = []
       rows.ntuples.times { |i| posts << JSON.parse(rows.getvalue(i, 0).to_s) }
+      reaction_metadata = nil
+      reaction_helper = nil
       selected = posts[0, 20]
       if post_number > 1 && !posts.empty?
         # Source get_sort_order looks at all posts, then nearest number; only
@@ -115,6 +118,10 @@ class NativeTopic
           order = anchor.getvalue(0, 0).to_s.to_i
           selected = self.class.window(posts, order)
         end
+      end
+      if NativeReactionMetadata.plugin_enabled?(@conn)
+        reaction_helper = NativeReactionMetadata.new(@conn)
+        reaction_metadata = reaction_helper.preload(selected.map { |post| post["id"] })
       end
       ids = selected.map { |p| p["user_id"].to_i }
       ids << topic["user_id"].to_i
@@ -139,7 +146,8 @@ class NativeTopic
       result["unpinned"] = nil
       result["pinned"] = !topic["pinned_at"].nil?
       result["bookmarked"] = false
-      result["post_stream"] = { "stream" => posts.map { |p| p["id"] }, "posts" => selected.map { |p| serialize_post(p, topic, users, groups, settings) } }
+      result["post_stream"] = { "stream" => posts.map { |p| p["id"] }, "posts" => selected.map { |p| serialize_post(p, topic, users, groups, settings, reaction_metadata) } }
+      result["valid_reactions"] = reaction_helper.valid_reactions unless reaction_helper.nil?
       result["details"] = { "can_edit" => false, "notification_level" => 1,
         "created_by" => basic_user(users[topic["user_id"].to_i], settings),
         "last_poster" => basic_user(users[topic["last_post_user_id"].to_i], settings) }
@@ -164,7 +172,7 @@ class NativeTopic
     result
   end
 
-  def serialize_post(post, topic, users, groups, settings)
+  def serialize_post(post, topic, users, groups, settings, reaction_metadata = nil)
     user = users[post["user_id"].to_i]
     result = {}
     POST_FIELDS.each { |key| result[key] = post[key] }
@@ -186,6 +194,13 @@ class NativeTopic
     result["read"] = true
     result["cooked_hidden"] = true if post["hidden"] == true
     result["action_code"] = post["action_code"] unless post["action_code"].nil? || post["action_code"] == ""
+    unless reaction_metadata.nil?
+      metadata = reaction_metadata["reactions"].fetch(post["id"].to_i, [])
+      result.merge!(NativeReactionMetadata.post_fields(
+        "reactions" => metadata,
+        "reaction_users_count" => reaction_metadata["reaction_users_count"].fetch(post["id"].to_i, 0)
+      ))
+    end
     result
   end
 end

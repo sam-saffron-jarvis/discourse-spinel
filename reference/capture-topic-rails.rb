@@ -95,6 +95,11 @@ ActiveRecord::Base.transaction do
     topic_values["current_post_number"] = topic_serializer.current_post_number if conditional_topic_fields["current_post_number"]
     # fancy_title is a direct source getter, not a TopicViewSerializer attribute in this revision.
     topic_values["fancy_title"] = topic.fancy_title
+    # Ticket015 bounded anonymous plugin extension, evaluated by the actual
+    # serializer getter after its real TopicView preload hook. No fixture data.
+    if SiteSetting.discourse_reactions_enabled
+      topic_values["valid_reactions"] = topic_serializer.valid_reactions
+    end
 
     details_serializer = TopicViewDetailsSerializer.new(view, root: false, scope: guardian)
     basic_user = lambda do |user|
@@ -122,6 +127,11 @@ ActiveRecord::Base.transaction do
           [field, serializer.public_send(getter)]
         end
         values["cooked_hidden"] = true if serializer.include_cooked_hidden?
+        if SiteSetting.discourse_reactions_enabled
+          %w[reactions reaction_users_count current_user_reaction current_user_used_main_reaction].each do |field|
+            values[field] = serializer.public_send(field)
+          end
+        end
         values
       end
 
@@ -142,9 +152,9 @@ ActiveRecord::Base.transaction do
     (klass._attributes.values.map(&:to_s) + klass._associations.keys.map(&:to_s)).uniq.sort
   end
   omissions = {
-    "TopicViewSerializer" => registered_fields.call(TopicViewSerializer) - (TOPIC_SERIALIZER_FIELDS + %w[fancy_title visibility_reason_id featured_link unicode_title post_stream details]),
+    "TopicViewSerializer" => registered_fields.call(TopicViewSerializer) - (TOPIC_SERIALIZER_FIELDS + %w[fancy_title visibility_reason_id featured_link unicode_title post_stream details] + (SiteSetting.discourse_reactions_enabled ? %w[valid_reactions] : [])),
     "TopicViewDetailsSerializer" => registered_fields.call(TopicViewDetailsSerializer) - %w[can_edit notification_level created_by last_poster],
-    "PostSerializer" => registered_fields.call(PostSerializer) - (POST_GETTERS.keys + %w[cooked_hidden]),
+    "PostSerializer" => registered_fields.call(PostSerializer) - (POST_GETTERS.keys + %w[cooked_hidden] + (SiteSetting.discourse_reactions_enabled ? %w[reactions reaction_users_count current_user_reaction current_user_used_main_reaction] : [])),
   }
   report = {
     "contract" => "minimal-topic-v1",
@@ -153,6 +163,11 @@ ActiveRecord::Base.transaction do
     "selection" => "bumped_at desc,id desc; Guardian-eligible regular topics in public categories; non-deleted, non-private, non-shared-draft, excluding category definitions; post_number=#{requested_post_number}, TopicView near-post selection, maximum 20 serialized posts",
     "topics_checked_by_guardian" => checked_topic_count,
     "guardian_inaccessible_topic_ids" => denied_topic_ids.sort,
+    "reaction_live_counts" => {
+      "reactions" => DiscourseReactions::Reaction.count,
+      "reaction_users" => DiscourseReactions::ReactionUser.count,
+      "likes" => PostAction.where(post_action_type_id: PostActionType::LIKE_POST_ACTION_ID, deleted_at: nil).count,
+    },
     "topics" => rows,
     "read_only" => true,
   }

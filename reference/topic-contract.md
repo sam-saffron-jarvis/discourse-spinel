@@ -33,6 +33,17 @@ draft_sequence unpinned pinned bookmarked
 
 `fancy_title` is `Topic#fancy_title`: this pinned source has no `TopicViewSerializer#fancy_title` getter. `highest_post_number` and `current_post_number` come from TopicViewSerializer's corresponding getters (`TopicView#highest_post_number` is computed from filtered posts); `chunk_size` comes from TopicView and is 20. The `current_post_number` key is emitted only when `TopicViewSerializer#include_current_post_number?` is true. `visibility_reason_id` is present only when the actual `include_visibility_reason_id?` is true; `featured_link` only when `include_featured_link?` is true; `unicode_title` only when `include_unicode_title?` is true. Their values come from the respective serializer getters. These source conditionals are preserved, not replaced by unconditional nil or false values.
 
+When the reactions plugin is enabled, ticket015 additionally compares the actual
+source serializer/preload fields `valid_reactions` at topic level and `reactions`,
+`reaction_users_count`, `current_user_reaction`, `current_user_used_main_reaction`
+on every selected post. All five are omitted when disabled, matching actual plugin
+serializer include predicates. The native preload sees only the source-sized
+selected post window, not deleted/whisper/foreign posts or the entire stream.
+See `reaction-metadata-contract.md` for stored-counter/likes/distinct-actor
+semantics and explicit unsupported custom/cache-sensitive emoji boundaries.
+The capture also records fresh global `reaction_live_counts`; this is separate
+from synthetic CTE evidence, never runtime input or seeded demo data.
+
 `details` has the four current native keys `can_edit`, `notification_level`, `created_by`, `last_poster`. The first two use actual TopicViewDetailsSerializer getters; user objects are serialized with actual BasicUserSerializer. This is a deliberate limited details projection, not a claim of the full Details serializer.
 
 Every current native post includes the keys below, except the conditional fields listed afterward:

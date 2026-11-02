@@ -3,7 +3,7 @@
   "upstream": "Discourse",
   "original_revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
   "upstream_license": "GPL-2.0-or-later; Copyright 2014-2026 Civilized Discourse Construction Kit, Inc. and contributors",
-  "scope": "anonymous latest JSON and bounded anonymous topic JSON/content with actual core Ember browser rendering plus anonymous reactions users-list and per-post summary read-only plugin routes at task-owned site; no full serializer/plugin/auth parity",
+  "scope": "anonymous latest JSON and bounded anonymous topic JSON/content with actual core Ember plus original read-only reactions counter/users-menu; anonymous reactions users-list and per-post summary native routes at task-owned site; no full serializer/plugin/auth parity",
   "gaps": "GAPS.md",
   "plugin_coverage": "PLUGIN_SUPPORT.json",
   "entries": [
@@ -917,6 +917,12 @@
         {
           "origin": "discourse",
           "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "plugins/discourse-reactions/config/settings.yml",
+          "sha256": "15af0c1a896f0ebefa262b5bbd2720f8b03cff5c445b55c661b744c11aaa5401"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
           "path": "app/models/notification.rb",
           "sha256": "ecd70b08f9c48bb87754daeb425788360103a20a2fdbe01e190701ff13ebe1d6"
         },
@@ -1136,7 +1142,7 @@
         "core service worker",
         "actual stylesheets and public image assets"
       ],
-      "adaptations": "Existing core Rolldown outputs reused without JS edits. Common CSS is byte-hashed reference cache output (not independently reproduced), with local root/reference-host image URLs rebased relative to the staged stylesheet; stage descriptor records separate source/output hashes. Native document escapes attributes and script JSON, prefixes static/module/link routes. English core locale only; compiled MessageFormat/plugin/theme translations and plugin worker hooks remain explicit gaps. Other stage artifacts and source hashes are recorded in ignored build/assets/native/manifest.json, not captured Rails preloads."
+      "adaptations": "Existing core Rolldown outputs reused without JS edits. Common CSS is byte-hashed reference cache output (not independently reproduced), with local root/reference-host image URLs rebased relative to the staged stylesheet; stage descriptor records separate source/output hashes. Native document escapes attributes and script JSON, prefixes static/module/link routes. English core locale plus the source discourse_reactions namespace only; compiled MessageFormat/other-plugin/theme translations and plugin worker hooks remain explicit gaps. Other stage artifacts and source hashes are recorded in ignored build/assets/native/manifest.json, not captured Rails preloads."
     },
     {
       "destinations": [
@@ -1170,6 +1176,266 @@
         "current uploaded avatar membership and optimized image lookup"
       ],
       "adaptations": "Stages actual current-public avatar bytes into private build/media; serving checks live username/current-upload/secure flag, canonical path and realpath containment. Existing optimized size preferred; original image fallback omits resizing. External letter-avatar CDN prohibited: explicitly uses actual source blank-avatar fallback rather than fabricating identities. Historical/associated avatars not implemented."
+    },
+    {
+      "destinations": [
+        "lib/reaction_metadata.rb",
+        "lib/topic.rb",
+        "reference/reaction-metadata-contract.md",
+        "test/reaction_metadata.rb",
+        "test/reaction_metadata_browser.rb",
+        "test/reaction_metadata_source.rb",
+        "test/reaction_topic.rb"
+      ],
+      "kind": "bounded anonymous topic-post reactions serializer/preload adaptation",
+      "license": "GPL-2.0-or-later",
+      "sources": [
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "plugins/discourse-reactions/plugin.rb",
+          "sha256": "285e86a08fabdbf596da2452aaf8500c7524532cba25a5d87b36f31b829c9092"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "plugins/discourse-reactions/config/settings.yml",
+          "sha256": "15af0c1a896f0ebefa262b5bbd2720f8b03cff5c445b55c661b744c11aaa5401"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "plugins/discourse-reactions/lib/discourse_reactions/reactions_serializer_helpers.rb",
+          "sha256": "af438937b2dab487b30b9c46d19d53b86e29e1c333541a1a9c92e30aa80b463f"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "plugins/discourse-reactions/lib/discourse_reactions/post_extension.rb",
+          "sha256": "9b10dfa0e6858625cd12c7566860cbf85ad0f49df74deefa29d5f19bb74b85cd"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "plugins/discourse-reactions/lib/discourse_reactions/topic_view_serializer_extension.rb",
+          "sha256": "88d281ae1155f361a52f053f03235e4bc2b3d866d61951a8541bd0c73933c5a5"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "plugins/discourse-reactions/lib/discourse_reactions/posts_reaction_loader.rb",
+          "sha256": "7116334dd8a6c5cb7438a187f58e54c3e3450c4f349f0d9af06c1c2eabe75cce"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "plugins/discourse-reactions/app/models/discourse_reactions/reaction.rb",
+          "sha256": "ea7b2edaeccf5ea124056bf206f00ed302bc25497b37092c9aa966a428c0ebbc"
+        }
+      ],
+      "selected_definitions": [
+        "TopicView.on_preload anonymous selected posts",
+        "ReactionsSerializerHelpers.preload_post_reactions stored positive counters, source likes SQL/merge/order",
+        "TopicViewSerializer.posts_reaction_users_count distinct actor union",
+        "anonymous current-user fields and valid_reactions"
+      ],
+      "adaptations": "Native bound read-only PG SELECTs and source-only standard emoji lookup; enabled-only fields, source distinct-user count vs stored counter semantics. Original preload/query/format_user source compared with compiled typed CTE fixtures, never seeded live data. Custom emoji, unsupported stored types and cache-sensitive non-tonable toned values fail closed. No authenticated/ignored-user or writes support."
+    },
+    {
+      "destinations": [
+        "frontend/reactions/",
+        "frontend/stage-reactions.py",
+        "frontend/stage-assets.py",
+        "frontend/native_document.rb",
+        "reference/reactions-browser-sources/",
+        "reference/reaction-browser-extraction.md",
+        "test/reaction_browser_test.py",
+        "test/reaction_browser_smoke.py"
+      ],
+      "kind": "original plugin counter/menu graph via original Plugin::JsCompiler/AssetProcessor and core plugin loader, with explicit read-only adapters",
+      "license": "GPL-2.0-or-later",
+      "sources": [
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "plugins/discourse-reactions/assets/javascripts/discourse/components/discourse-reactions-counter.gjs",
+          "sha256": "7805dbeaaa08df7b783dd9aa58cad43212e98c8931e616bad8749ec002f2a013"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "plugins/discourse-reactions/assets/javascripts/discourse/components/discourse-reactions-list.gjs",
+          "sha256": "8434a41cc63519adcc3e43fb06b37aab07b6e2c048d4789cf877a9b97f88e861"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "plugins/discourse-reactions/assets/javascripts/discourse/components/discourse-reactions-list-emoji.gjs",
+          "sha256": "4ae65a62e5a929d44751185da53200227494bfbef8d6886420fba57ec2204e87"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "plugins/discourse-reactions/assets/javascripts/discourse/components/discourse-reactions-users-menu.gjs",
+          "sha256": "e16a8bd530450b56b89251a000a3bd44e9f7c5e534ab305619a63d7a58e1311b"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "plugins/discourse-reactions/assets/javascripts/discourse/components/discourse-reactions-actions-summary.gjs",
+          "sha256": "5db5a4a5e550b2cafc3d3920da5b34f6a37728d2454d29cbd247068cba0821b2"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "plugins/discourse-reactions/assets/javascripts/discourse/components/discourse-reactions-actions.gjs",
+          "sha256": "0c40868f57c1563ac36a0104e2a695818a97141f4ac8869b3f34dadb103fb109"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "plugins/discourse-reactions/assets/javascripts/discourse/helpers/discourse-reactions-emoji.js",
+          "sha256": "93a3f3a99ec23c5b40e4a8b7a05b120b2dcf0cf308ee8f63f79aaef19592bb68"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "plugins/discourse-reactions/assets/javascripts/discourse/models/discourse-reactions-custom-reaction.js",
+          "sha256": "a09720ad9543f60e25cb3c88f39c91f2d157047bea6c5c8812d5b9df86b92d88"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "plugins/discourse-reactions/assets/javascripts/discourse/lib/hidden-post.js",
+          "sha256": "3f76aae9e73f991f6731a64f44d6d37909f17b38f30fda2c76160d673deecd83"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "plugins/discourse-reactions/assets/javascripts/discourse/initializers/discourse-reactions.gjs",
+          "sha256": "7956e4d2a47d3d36b8a8bbeec2348d9562b9ac6b6c1c839c7015b368a1853115"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "frontend/discourse/app/components/user/users-popup.gjs",
+          "sha256": "ddbcd31b25b70cfb175d0da515acf0bf13ee2adcb5bc0e997792695ff879b441"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "plugins/discourse-reactions/config/settings.yml",
+          "sha256": "15af0c1a896f0ebefa262b5bbd2720f8b03cff5c445b55c661b744c11aaa5401"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "plugins/discourse-reactions/config/locales/client.en.yml",
+          "sha256": "e7f8211e71a0f83f3fcdd610ad33a31c158570cc7d7f2a1bcb4f4e36d7e214ee"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "plugins/discourse-reactions/assets/stylesheets/common/discourse-reactions.scss",
+          "sha256": "fc1ffd4784f5f28a43dcc1e85914d243e49c1a607da77682616fc17ac67d1c59"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "plugins/discourse-reactions/assets/stylesheets/desktop/discourse-reactions.scss",
+          "sha256": "370476cd27e3ae5657783d1c2269bfd210ea127f466aa58e85f45e82ae141200"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "plugins/discourse-reactions/assets/stylesheets/mobile/discourse-reactions.scss",
+          "sha256": "30629a063920059e28888761fc23539b72d84d61a18ea1b5b3120ca2e66a9340"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "lib/plugin/js_compiler.rb",
+          "sha256": "59e3f5988053c0cbdbed17125203361ea8ebe9f7c9a83fcecdfae94f8b999c92"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "lib/asset_processor.rb",
+          "sha256": "e1aad4ca7f55f9d91e83c93f32518dc8a73bde6af8cb1509b09dd25bd3d2b3e0"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "frontend/asset-processor/asset-processor-rollup.js",
+          "sha256": "cb931f2d77b965735aa3cde6becfe74c909162e97a5475350b7c9c3c8cd69012"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "frontend/discourse/app/app.js",
+          "sha256": "859062a3eb0abb1732ef2158eb245e1a09280c388e33dd3a91c6e11ff8f9c62b"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "frontend/discourse/app/components/post/menu.gjs",
+          "sha256": "063b7625c75d48af7d7ba5727489555a62624fa09e3fd4bfcd4841a373f1bffa"
+        }
+      ],
+      "selected_definitions": [
+        "original counter/list/list-emoji/users-menu/helper/model/summary/hidden-post",
+        "actual core UsersPopup and menu service",
+        "upstream customizePostMenu post-menu-buttons transformer and tracked fields",
+        "Plugin::JsCompiler bounded entrypoint; actual loadPluginFromModulePreload compatModules registration"
+      ],
+      "adaptations": "Original source copies and hashes retained. Named initializer removes LIKE and registers original read-only summary; named counter-only Actions caller excludes picker/touch/toggle/login deferral. Core Ember bytes unchanged. Original plugin Rollup builds only selected graph; original common/desktop/mobile Sass and selected English locale namespace staged. Dependency-first paced preloads mark the plugin entry for unchanged upstream loader. Positive browser data transport is explicitly mocked from separately native/source-verified CTE output; live-native browser evidence is genuinely empty-data, never positive live E2E. No full plugin initialization/all-plugin/auth/write claim."
+    },
+    {
+      "destinations": [
+        "lib/emoji_existence.rb",
+        "data/emoji-existence.json",
+        "tools/carry-emoji-existence.py",
+        "test/emoji_existence.rb",
+        "reference/check-emoji-existence.rb"
+      ],
+      "kind": "source-only standard emoji existence catalog and cold-lookup adaptation",
+      "license": "GPL-2.0-or-later source adapter; MIT packaged emoji metadata",
+      "sources": [
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/models/emoji.rb",
+          "sha256": "2b6e655755e8791642a56689448b8645213253fd039226f2882cc5463eddcc71"
+        },
+        {
+          "origin": "discourse-emojis",
+          "revision": "1.0.47",
+          "path": "dist/emojis.json",
+          "sha256": "760785d628114cfdf4ad8d3dd746f58b46ecaa5b6057adb3262aee10a0c73a64"
+        },
+        {
+          "origin": "discourse-emojis",
+          "revision": "1.0.47",
+          "path": "dist/groups.json",
+          "sha256": "1c663b1d78884e2ad061f8249d83154183173991c8ffead45b67193b9b7e9dc4"
+        },
+        {
+          "origin": "discourse-emojis",
+          "revision": "1.0.47",
+          "path": "dist/aliases.json",
+          "sha256": "da6fee5934923cb79212811b6529ac36205244cd064d34aafaf1fdb121b8eba8"
+        },
+        {
+          "origin": "discourse-emojis",
+          "revision": "1.0.47",
+          "path": "dist/tonable_emojis.json",
+          "sha256": "a5562b7c98d6b43d70dbd6a8c6e2154d435135b09f5a4ab649fd18a7e2bb9734"
+        }
+      ],
+      "selected_definitions": [
+        "Emoji.normalize_name/[]/find_emoji/load_standard/create_from_db_item/resolve_alias cold lookup"
+      ],
+      "adaptations": "Source-only names/groups/aliases/tonability, not unicode-rendering heuristics or captured output. Native tests compared to actual source with a fresh local cache TRANSPORT adapter per probe, preventing source deferred Redis publications. No custom/plugin emoji or warm distributed-cache artifacts claimed; see GAPS.md."
     },
     {
       "destinations": [

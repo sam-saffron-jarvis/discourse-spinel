@@ -86,6 +86,15 @@ CSS currently reuses a byte-hashed reference stylesheet-cache artifact. See
 `frontend/INTEGRATION.md` for exact reproduction/provenance and remaining locale,
 plugin/theme and asset-build gaps. No pinned Discourse sources are edited.
 
+`frontend/stage-reactions.py` additionally compiles only the selected original
+read-only reactions graph through Discourse's actual `Plugin::JsCompiler` /
+AssetProcessor, plus its original common/desktop/mobile Sass, into `build/assets/reactions-core/`.
+The unchanged core plugin loader registers the resulting compatModules. Named
+read-only initializer/caller adapters omit picker/toggle/auth nav rather than
+pretending full plugin initialization works. Core Ember bytes remain unchanged.
+Source/output hashes are verified on reuse; deliberate input changes require
+`python3 frontend/stage-reactions.py --regenerate`.
+
 `tools/stage-media.py` copies actual current public avatar image bytes with SELECTs
 only into **private** `build/media/`. Native requests still check live username,
 current upload membership and secure flags before reading a canonical contained
@@ -98,10 +107,11 @@ forbidden. Neither broad uploads nor private build evidence is statically expose
 - `SOURCE_MANIFEST.json` records source paths/SHA-256/revision, selected definitions,
   adaptations and dependency notices. `test/source_contract.py` checks original
   source/vendor hashes and regenerability of the source-only client catalog.
-- Source YAML generates the 390-field client-safe core settings catalog; runtime
-  reads typed live overrides using bound SELECTs. No raw settings dump, secrets or
-  captured Rails preload is served. All emitted fields match the read-only oracle
-  on this DB; 375 additional plugin/computed/themeable client fields remain omitted.
+- Source YAML generates the 390-field client-safe core settings catalog plus five
+  explicitly selected reactions counter/menu client fields; runtime reads typed
+  live overrides using bound SELECTs. No raw settings dump, secrets or captured
+  Rails preload is served. All 395 emitted fields match the read-only oracle on
+  this DB; 370 additional plugin/computed/themeable client fields remain omitted.
 - Native Site metadata uses live public categories plus source enums/menu/permission
   projection. Every emitted field is compared to actual Rails getters. The full
   `Site.json_for` oracle attempts a wizard setting INSERT and is correctly blocked
@@ -215,6 +225,51 @@ Positive source-driven fixtures are separate from live empty-data parity in
 `build/reaction-summary/`. No live writes/seeding/DDL or runtime proxy. Existing
 plugin/latest/topic/upstream-profiler and injected502+Reload tests still apply;
 two routes do not constitute all-core-plugin or full reactions support.
+
+## Actual read-only reactions counter and users menu
+
+Ticket015 stages the unchanged shipped counter, list/list-emoji, users-menu,
+emoji helper, custom-reaction model, summary and hidden-post helper. The actual
+core `UsersPopup`, menu service and router lifecycle render the UI. A named
+counter-only caller and guest initializer retain actual post-menu registration
+and tracked fields while excluding the unrelated picker/toggle/auth nav paths.
+This is **not** full reactions initialization or all-core-plugin support.
+
+Native topic JSON adds only the enabled anonymous source fields: `reactions`,
+`reaction_users_count`, `current_user_reaction`, `current_user_used_main_reaction`
+and topic `valid_reactions`. Metadata SELECTs follow the original selected-post
+preload semantics, stored positive emoji counters, likes shadow/merge/order and
+distinct actors, with actual plugin-disabled and post-visibility boundaries.
+The existing010 users-list and011 summary contracts remain distinct and unchanged.
+Source copies/hashes and adapters are documented in
+`reference/reaction-metadata-contract.md`,
+`reference/reaction-browser-extraction.md`, `SOURCE_MANIFEST.json` and `GAPS.md`.
+
+```sh
+source ../harness/env.sh
+make reaction-browser-test
+```
+
+This target rebuilds the native ELF and verifies original source semantics, then
+runs actual Chromium desktop+phone at root+widget prefix. Evidence under
+`build/reaction-browser/` clearly separates:
+
+- **Live native / real DB / empty state:** actual native topic/endpoint requests,
+  no phantom counter, zero live reactions/users/likes, profiler0/1 byte parity,
+  and original profiler drill-down containing the new real redacted metadata SQL.
+- **Positive source fixtures:** compiled SELECT-only typed CTE metadata and actual
+  native topic/endpoint paths compared to the original preload/query/serializer.
+  A separate labeled browser fixture mocks only topic metadata/users-list data
+  transport from those verified outputs (65 distinct actors; 40 clap/25 heart).
+  Original UI opens the real users menu, filters, scroll-paginates and closes on
+  actual route navigation. It is **not positive live-native end-to-end parity**.
+
+Every owned browser case requires zero page/console/module/failed/HTTP errors,
+all assets/API requests remain prefix-correct, and a SIGTERM-after-open cleanup
+regression releases the owned listener. Writes fail closed405; no convenient live
+settings/DB seeding or mutations. Existing latest/topic/profiler/boot tests still
+apply. Only the coordinator may accept or activate a release; this target never
+changes live3499, the widget or Hub.
 
 ## Optional native MiniProfiler (development only)
 

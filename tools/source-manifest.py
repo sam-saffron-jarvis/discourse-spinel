@@ -128,7 +128,7 @@ entries = [
     entry(["reference/native_site.rb", "reference/client-settings-contract.json", "reference/generate-client-settings.rb"],
         "bounded anonymous Site/client-safe settings adaptation; not full serializer parity", [
             "app/models/site.rb", "app/serializers/site_serializer.rb", "app/serializers/site_category_serializer.rb",
-            "lib/site_setting_extension.rb", "lib/upcoming_changes.rb", "app/models/site_setting.rb", "config/site_settings.yml",
+            "lib/site_setting_extension.rb", "lib/upcoming_changes.rb", "app/models/site_setting.rb", "config/site_settings.yml", "plugins/discourse-reactions/config/settings.yml",
             "app/models/notification.rb", "app/models/post.rb", "lib/trust_level.rb", "lib/archetype.rb",
             "config/locales/server.en.yml", "lib/discourse.rb", "plugins/discourse-topic-voting/plugin.rb"],
         ["Site.json_for anonymous serializer fields", "source client:true catalog defaults/types and bound live overrides",
@@ -147,12 +147,35 @@ entries = [
         "lib/stylesheet/compiler.rb", "lib/stylesheet/importer.rb", "app/assets/stylesheets/color_definitions.scss"],
         ["real setup/config/import-map/modulepreload/mount layout", "English locale/moment formatter contract", "core SVG symbols",
          "core service worker", "actual stylesheets and public image assets"],
-        "Existing core Rolldown outputs reused without JS edits. Common CSS is byte-hashed reference cache output (not independently reproduced), with local root/reference-host image URLs rebased relative to the staged stylesheet; stage descriptor records separate source/output hashes. Native document escapes attributes and script JSON, prefixes static/module/link routes. English core locale only; compiled MessageFormat/plugin/theme translations and plugin worker hooks remain explicit gaps. Other stage artifacts and source hashes are recorded in ignored build/assets/native/manifest.json, not captured Rails preloads."),
+        "Existing core Rolldown outputs reused without JS edits. Common CSS is byte-hashed reference cache output (not independently reproduced), with local root/reference-host image URLs rebased relative to the staged stylesheet; stage descriptor records separate source/output hashes. Native document escapes attributes and script JSON, prefixes static/module/link routes. English core locale plus the source discourse_reactions namespace only; compiled MessageFormat/other-plugin/theme translations and plugin worker hooks remain explicit gaps. Other stage artifacts and source hashes are recorded in ignored build/assets/native/manifest.json, not captured Rails preloads."),
     entry(["lib/avatars.rb", "tools/stage-media.py"], "selected public avatar adapter and source asset staging", [
         "app/controllers/user_avatars_controller.rb", "app/models/user_avatar.rb", "app/models/optimized_image.rb"],
         ["UserAvatarsController#show_in_site/#render_blank", "current uploaded avatar membership and optimized image lookup"],
         "Stages actual current-public avatar bytes into private build/media; serving checks live username/current-upload/secure flag, canonical path and realpath containment. Existing optimized size preferred; original image fallback omits resizing. External letter-avatar CDN prohibited: explicitly uses actual source blank-avatar fallback rather than fabricating identities. Historical/associated avatars not implemented."),
 ]
+entries.append(entry(["lib/reaction_metadata.rb", "lib/topic.rb", "reference/reaction-metadata-contract.md", "test/reaction_metadata.rb", "test/reaction_metadata_browser.rb", "test/reaction_metadata_source.rb", "test/reaction_topic.rb"],
+    "bounded anonymous topic-post reactions serializer/preload adaptation", [
+        "plugins/discourse-reactions/plugin.rb",
+        "plugins/discourse-reactions/config/settings.yml",
+        "plugins/discourse-reactions/lib/discourse_reactions/reactions_serializer_helpers.rb",
+        "plugins/discourse-reactions/lib/discourse_reactions/post_extension.rb",
+        "plugins/discourse-reactions/lib/discourse_reactions/topic_view_serializer_extension.rb",
+        "plugins/discourse-reactions/lib/discourse_reactions/posts_reaction_loader.rb",
+        "plugins/discourse-reactions/app/models/discourse_reactions/reaction.rb"],
+    ["TopicView.on_preload anonymous selected posts", "ReactionsSerializerHelpers.preload_post_reactions stored positive counters, source likes SQL/merge/order", "TopicViewSerializer.posts_reaction_users_count distinct actor union", "anonymous current-user fields and valid_reactions"],
+    "Native bound read-only PG SELECTs and source-only standard emoji lookup; enabled-only fields, source distinct-user count vs stored counter semantics. Original preload/query/format_user source compared with compiled typed CTE fixtures, never seeded live data. Custom emoji, unsupported stored types and cache-sensitive non-tonable toned values fail closed. No authenticated/ignored-user or writes support."))
+browser_sources = json.loads(Path("reference/reactions-browser-sources/manifest.json").read_text())
+entries.append(entry(["frontend/reactions/", "frontend/stage-reactions.py", "frontend/stage-assets.py", "frontend/native_document.rb", "reference/reactions-browser-sources/", "reference/reaction-browser-extraction.md", "test/reaction_browser_test.py", "test/reaction_browser_smoke.py"],
+    "original plugin counter/menu graph via original Plugin::JsCompiler/AssetProcessor and core plugin loader, with explicit read-only adapters", [row["path"] for row in browser_sources["files"].values()] + [
+        "lib/plugin/js_compiler.rb", "lib/asset_processor.rb", "frontend/asset-processor/asset-processor-rollup.js",
+        "frontend/discourse/app/app.js", "frontend/discourse/app/components/post/menu.gjs"],
+    ["original counter/list/list-emoji/users-menu/helper/model/summary/hidden-post", "actual core UsersPopup and menu service", "upstream customizePostMenu post-menu-buttons transformer and tracked fields", "Plugin::JsCompiler bounded entrypoint; actual loadPluginFromModulePreload compatModules registration"],
+    "Original source copies and hashes retained. Named initializer removes LIKE and registers original read-only summary; named counter-only Actions caller excludes picker/touch/toggle/login deferral. Core Ember bytes unchanged. Original plugin Rollup builds only selected graph; original common/desktop/mobile Sass and selected English locale namespace staged. Dependency-first paced preloads mark the plugin entry for unchanged upstream loader. Positive browser data transport is explicitly mocked from separately native/source-verified CTE output; live-native browser evidence is genuinely empty-data, never positive live E2E. No full plugin initialization/all-plugin/auth/write claim."))
+entries.append({"destinations": ["lib/emoji_existence.rb", "data/emoji-existence.json", "tools/carry-emoji-existence.py", "test/emoji_existence.rb", "reference/check-emoji-existence.rb"],
+    "kind": "source-only standard emoji existence catalog and cold-lookup adaptation", "license": "GPL-2.0-or-later source adapter; MIT packaged emoji metadata",
+    "sources": [source("app/models/emoji.rb")] + [source("dist/" + name, "discourse-emojis", "1.0.47") for name in ["emojis.json", "groups.json", "aliases.json", "tonable_emojis.json"]],
+    "selected_definitions": ["Emoji.normalize_name/[]/find_emoji/load_standard/create_from_db_item/resolve_alias cold lookup"],
+    "adaptations": "Source-only names/groups/aliases/tonability, not unicode-rendering heuristics or captured output. Native tests compared to actual source with a fresh local cache TRANSPORT adapter per probe, preventing source deferred Redis publications. No custom/plugin emoji or warm distributed-cache artifacts claimed; see GAPS.md."})
 entries.append({"destinations": ["lib/message_bus.rb", "vendor/message_bus/LICENSE"],
                 "kind": "native read-only short-poll adaptation of MessageBus 5.0.0", "license": "MIT; vendor/message_bus/LICENSE",
                 "sources": [source(p, "message_bus", "5.0.0") for p in ["lib/message_bus.rb", "lib/message_bus/client.rb", "lib/message_bus/message.rb", "lib/message_bus/backends/redis.rb", "lib/message_bus/rack/middleware.rb", "LICENSE"]] +
@@ -183,6 +206,6 @@ entries.append({"destinations": ["bin/discourse.rb", "lib/mini_profiler.rb", "to
                 "adaptations": "Loopback TCP HTTP server over installed Spinel sockets; live pure-native PG client; no Ruby subprocess/proxy/canned response in serving path. Verification uses synchronous read-only Rails runner only, never a final data backend. Optional request-local MiniProfiler integration uses the separately hash-verified MIT native port/client under vendor/rack-mini-profiler/MANIFEST.json; canonical numeric topic names exclude user slugs, bindings and query strings."})
 manifest = {"schema_version": 1, "upstream": "Discourse", "original_revision": PIN,
             "upstream_license": "GPL-2.0-or-later; Copyright 2014-2026 Civilized Discourse Construction Kit, Inc. and contributors",
-            "scope": "anonymous latest JSON and bounded anonymous topic JSON/content with actual core Ember browser rendering plus anonymous reactions users-list and per-post summary read-only plugin routes at task-owned site; no full serializer/plugin/auth parity",
+            "scope": "anonymous latest JSON and bounded anonymous topic JSON/content with actual core Ember plus original read-only reactions counter/users-menu; anonymous reactions users-list and per-post summary native routes at task-owned site; no full serializer/plugin/auth parity",
             "gaps": "GAPS.md", "plugin_coverage": "PLUGIN_SUPPORT.json", "entries": entries}
 Path("SOURCE_MANIFEST.json").write_text(json.dumps(manifest, indent=2) + "\n")

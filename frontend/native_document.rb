@@ -70,8 +70,19 @@ class NativeDocument
     # A reverse-connected Hub admits only a bounded number of requests. Do not
     # eagerly fan out the entire Ember graph: preload dependencies before their
     # parents, one request at a time, then evaluate the original entrypoint.
+    plugins = []
+    if settings["discourse_reactions_enabled"] == true
+      descriptor.fetch("plugins", []).each do |plugin|
+        plugins << {
+          "name" => plugin.fetch("name"),
+          "entry" => prefixed(plugin.fetch("entry")),
+          "modules" => plugin.fetch("modules").map { |path| prefixed(path) },
+        }
+      end
+    end
     boot_assets = safe_script_json(
       "modules" => dependency_files(entrypoint, core.fetch("chunks")).map { |filename| core_asset(filename) },
+      "plugins" => plugins,
       "locale" => prefixed(descriptor.fetch("locale").fetch("url")),
       "entry" => core_asset(entrypoint),
     )
@@ -147,6 +158,14 @@ class NativeDocument
         // Modulepreload populates the browser module map without evaluating the
         // application. Postorder prevents recursive dependency fetch bursts.
         for (const url of boot.modules) { await preload(url); }
+        for (const plugin of boot.plugins) {
+          for (const url of plugin.modules) { await preload(url); }
+          // The unchanged upstream loader discovers these modulepreload links,
+          // imports compatModules and runs plugin-style initialize(container).
+          const link = Array.from(document.querySelectorAll('link[rel="modulepreload"]')).find(node => node.href === new URL(plugin.entry, location.href).href);
+          if (!link) { throw new Error("Missing paced plugin entry: " + plugin.entry); }
+          link.dataset.pluginName = plugin.name;
+        }
         await import(boot.locale);
         await import(boot.entry);
         document.getElementById("native-boot-progress")?.remove();

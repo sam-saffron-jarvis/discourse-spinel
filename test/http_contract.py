@@ -85,7 +85,7 @@ modules = [attrs["src"] for tag, attrs in document.tags if tag == "script" and a
 assert modules, "real core module scripts must load; preload diagnostics alone are insufficient"
 for url in modules:
     request(url, content_type="text/javascript; charset=utf-8", raw=True)
-for path in ("/assets/../compile.json", "/assets/%2e%2e/compile.json", "/assets/discourse/manifest/manifest.json", "/assets/missing.js", "/assets/.hidden.js", "/data/emoji-unicode.json", "/assets/native/locale/en.js.map", "/assets/native/locale/en.js.gz"):
+for path in ("/assets/../compile.json", "/assets/%2e%2e/compile.json", "/assets/discourse/manifest/manifest.json", "/assets/reactions-core/manifest.json", "/assets/reactions-core/upstream/users-popup.gjs", "/assets/missing.js", "/assets/.hidden.js", "/data/emoji-unicode.json", "/assets/native/locale/en.js.map", "/assets/native/locale/en.js.gz"):
     request(path, 404)
 request("/latest?order=views", 400)
 request("/latest.json", 405, "POST")

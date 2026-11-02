@@ -38,6 +38,19 @@ for copy in reaction_copies:
         assert copy.read_bytes() == (reference / "plugins/discourse-reactions" / copy.relative_to("reference/reactions-upstream")).read_bytes(), str(copy)
 colors = (reference / "lib/letter_avatar.rb").read_text()
 assert colors[colors.index("  COLORS = ["):colors.rfind("\nend")] in Path("lib/letter_avatar_colors.rb").read_text()
+for copy in Path('reference/reaction-metadata-sources').glob('*.rb'):
+    assert copy.read_bytes() == (reference / 'plugins/discourse-reactions/lib/discourse_reactions' / copy.name).read_bytes(), str(copy)
+browser_sources = json.loads(Path('reference/reactions-browser-sources/manifest.json').read_text())
+assert browser_sources['revision'] == manifest['original_revision']
+for key, row in browser_sources['files'].items():
+    original = reference / row['path']
+    assert hashlib.sha256(original.read_bytes()).hexdigest() == row['sha256'], row['path']
+    candidates = [Path(row['copy'])] if row.get('copy') else []
+    candidates.append(Path('reference/reactions-browser-sources') / original.name)
+    candidates.extend(Path('frontend/reactions').rglob(original.name))
+    candidates.extend(Path('reference/reactions-upstream').rglob(original.name))
+    assert any(copy.is_file() and copy.read_bytes() == original.read_bytes() for copy in candidates), ('missing unchanged original copy', key, row['path'])
+subprocess.run(['python3', 'tools/carry-emoji-existence.py', '--check'], check=True)
 ledger = json.loads(Path("PLUGIN_SUPPORT.json").read_text())
 assert {p.parent.name for p in reference.glob("plugins/*/plugin.rb")} == {p["plugin"] for p in ledger["plugins"]}
 subprocess.run(["ruby", "reference/generate-client-settings.rb", "--check"], check=True)

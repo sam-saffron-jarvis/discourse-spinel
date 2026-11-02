@@ -1,0 +1,301 @@
+html.discourse-reactions-no-select {
+  -webkit-touch-callout: none; /* Disables long-touch menu */
+
+  @include user-select(none); /* Disable text selection */
+}
+
+.discourse-reactions-list {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+
+  .reactions {
+    display: flex;
+    align-items: center;
+    gap: 0.15em;
+
+    .discourse-reactions-list-emoji {
+      border-radius: 100px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0.2em 0;
+
+      &:nth-of-type(1n + 4) {
+        display: none;
+      }
+
+      .emoji,
+      .d-icon {
+        width: 1em;
+        height: 1em;
+
+        &.desaturated {
+          filter: grayscale(100%);
+
+          &:hover {
+            filter: grayscale(0%);
+          }
+        }
+      }
+    }
+  }
+
+  .users {
+    font-size: $font-down-1;
+    color: var(--primary-medium);
+    margin-left: 0.5em;
+  }
+}
+
+@keyframes fadeIn {
+  0% {
+    opacity: 0;
+  }
+
+  100% {
+    visibility: visible;
+    opacity: 1;
+  }
+}
+
+.discourse-reactions-picker {
+  z-index: calc(z("composer", "content") - 1);
+  position: absolute;
+  visibility: hidden;
+  padding: 15px 0;
+  width: max-content;
+  top: 0;
+
+  &.is-expanded {
+    visibility: visible;
+  }
+
+  .discourse-reactions-picker-container {
+    margin: 0.25em;
+    box-shadow: var(--shadow-card);
+    background-color: var(--secondary);
+    z-index: 1;
+    border-radius: 8px;
+    display: grid;
+    gap: 0.25em;
+
+    .emoji-picker-trigger {
+      gap: 0;
+
+      .d-icon {
+        width: 1.25em;
+        height: 1.25em;
+      }
+    }
+
+    @for $i from 1 through 8 {
+      &.col-#{$i} {
+        grid-template-columns: repeat($i, 1fr);
+      }
+    }
+  }
+
+  .pickable-reaction {
+    // TODO fix this in core
+    padding: 0.25em !important;
+    margin: 0.25em !important;
+    border: 1px solid transparent !important;
+    cursor: not-allowed;
+    border-radius: var(--d-border-radius);
+
+    .emoji,
+    .d-icon {
+      pointer-events: none;
+      height: 1.2em;
+      width: 1.2em;
+    }
+
+    &:not(.can-undo) {
+      background: var(--primary-very-low);
+    }
+
+    &.can-undo {
+      cursor: pointer;
+
+      .discourse-no-touch & {
+        &:hover {
+          background: none !important;
+          border-color: transparent !important;
+          transform: scale(1.5);
+        }
+      }
+    }
+
+    &.is-used {
+      border-color: var(--d-selected) !important;
+      background-color: var(--d-selected);
+    }
+  }
+}
+
+.discourse-reactions-actions {
+  display: inline-flex;
+  justify-content: flex-end;
+  height: 100%;
+
+  &:not(.custom-reaction-used) {
+    .discourse-reactions-counter {
+      line-height: 1;
+
+      + .discourse-reactions-reaction-button {
+        button {
+          padding-left: 0.45em;
+        }
+      }
+    }
+
+    .reactions-counter {
+      padding: 8px 0 8px 10px;
+    }
+  }
+
+  &.can-toggle-reaction {
+    .discourse-reactions-reaction-button .reaction-button,
+    .discourse-reactions-reaction-button {
+      cursor: pointer;
+    }
+  }
+
+  &:not(.can-toggle-reaction) {
+    .discourse-reactions-reaction-button .reaction-button,
+    .discourse-reactions-reaction-button {
+      cursor: not-allowed;
+    }
+  }
+
+  &.has-reacted {
+    &.has-used-main-reaction {
+      .discourse-reactions-reaction-button .reaction-button .d-icon {
+        color: var(--love);
+      }
+    }
+
+    &.can-toggle-reaction {
+      .discourse-no-touch & {
+        .discourse-reactions-reaction-button:hover .reaction-button {
+          .d-icon {
+            color: var(--primary-low-mid);
+          }
+          background: var(--primary-low);
+        }
+      }
+
+      .discourse-reactions-reaction-button {
+        cursor: pointer;
+      }
+    }
+
+    &:not(.can-toggle-reaction) {
+      .discourse-no-touch & {
+        .discourse-reactions-reaction-button:hover .reaction-button {
+          background: var(--primary-low);
+        }
+      }
+    }
+  }
+
+  &:not(.has-reacted) {
+    &:not(.my-post) {
+      .discourse-no-touch & {
+        .discourse-reactions-reaction-button:hover .reaction-button {
+          background: var(--love-low);
+
+          .d-icon {
+            color: var(--love);
+          }
+        }
+      }
+    }
+  }
+}
+
+.discourse-reactions-reaction-button {
+  position: relative;
+  display: flex;
+  touch-action: pan-y;
+
+  .btn-toggle-reaction-like {
+    outline: none;
+    pointer-events: none;
+    background: none;
+  }
+
+  .btn-toggle-reaction-emoji {
+    outline: none;
+    pointer-events: none;
+    background: none;
+    width: 1em;
+    height: 1em;
+  }
+}
+
+.reactions-actions-summary + .show-replies {
+  margin-right: 0;
+  margin-left: var(--space-2);
+}
+
+.discourse-reactions-counter {
+  display: flex;
+  align-items: center;
+  text-align: center;
+  cursor: pointer;
+  border-radius: var(--d-button-border-radius);
+  border: none;
+  background: none;
+  color: inherit;
+  font-size: inherit;
+  font-family: inherit;
+
+  &:focus-visible {
+    outline: none;
+    background: var(--d-post-control-background--hover);
+  }
+
+  .reactions-counter {
+    color: var(--primary-low-mid);
+    display: flex;
+    pointer-events: none;
+    margin-left: 0.5em;
+  }
+
+  &.only-like {
+    .reactions-counter {
+      margin: 0;
+    }
+  }
+}
+
+nav.post-controls .actions {
+  display: inline-flex;
+}
+
+nav.post-controls .actions button {
+  display: inline-flex;
+  align-items: center;
+}
+
+.discourse-reactions-my-reaction {
+  margin-top: 8px;
+  display: inline-flex;
+  align-items: center;
+
+  .reaction-emoji {
+    margin-right: 5px;
+    height: 15px;
+  }
+}
+
+nav.post-controls .actions .reaction-button:focus {
+  background: var(--primary-low);
+  color: var(--primary);
+}
+
+nav.post-controls .actions .reaction-button {
+  margin: 0;
+}

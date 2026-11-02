@@ -36,6 +36,25 @@ client = settings.values.flat_map(&:to_a).filter_map do |name, opts|
     "source_client_flag" => true,
   }
 end
+# Ticket015: only source-client settings needed by the extracted anonymous
+# counter/menu. This is not the complete plugin registry. Never include the
+# server-only excluded-from-like setting in browser preloads.
+plugin_source = File.join(root, "plugins/discourse-reactions/config/settings.yml")
+plugin_names = %w[
+  discourse_reactions_enabled discourse_reactions_like_icon
+  discourse_reactions_reaction_for_like discourse_reactions_enabled_reactions
+  discourse_reactions_desaturated_reaction_panel
+]
+plugin_settings = YAML.safe_load_file(plugin_source).fetch("discourse_reactions")
+plugin_names.each do |name|
+  opts = plugin_settings.fetch(name)
+  abort "unsafe reactions client setting #{name}" unless opts["client"] == true && !opts["secret"] && !opts["themeable"]
+  default = opts.fetch("default")
+  type = default == true || default == false ? "boolean" : "string"
+  client << { "name" => name, "default" => default, "type" => type,
+              "upcoming_change" => nil, "upcoming_change_default_override" => nil,
+              "source_client_flag" => true }
+end
 client << { "name" => "default_locale", "default" => "en", "type" => "string", "source_client_flag" => "SiteSettingExtension.client_settings default" }
 client.sort_by! { |row| row.fetch("name") }
 promotion = settings.values.flat_map(&:to_a).find { |name, _opts| name == "promote_upcoming_changes_on_status" }&.last
@@ -44,7 +63,10 @@ output = {
   "source_path" => "config/site_settings.yml",
   "source_sha256" => Digest::SHA256.file(source).hexdigest,
   "promote_upcoming_changes_on_status_default" => promotion&.fetch("default"),
-  "generation" => "YAML client:true settings only; static defaults/types, never runtime overrides",
+  "generation" => "YAML client:true core settings plus five explicitly selected reactions counter/menu client settings; static defaults/types, never runtime overrides",
+  "plugin_source_path" => "plugins/discourse-reactions/config/settings.yml",
+  "plugin_source_sha256" => Digest::SHA256.file(plugin_source).hexdigest,
+  "plugin_settings" => plugin_names,
   "settings" => client,
 }
 path = File.join(__dir__, "client-settings-contract.json")

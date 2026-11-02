@@ -54,6 +54,24 @@ class NativeDocumentTest < Minitest::Test
     refute_includes worker, "__MINIMAL_BASE_"
   end
 
+  def test_original_plugin_loader_is_paced_and_enabled_only
+    prefix = "/node/jarvis/widgets/discourse-spinel-app"
+    document = NativeDocument.new(prefix)
+    html = document.render({}, { "discourse_reactions_enabled" => true }, "http://127.0.0.1:3529")
+    boot = JSON.parse(html[/<script type="application\/json" id="native-boot-assets">(.*?)<\/script>/m, 1])
+    plugin = boot.fetch("plugins").fetch(0)
+    assert_equal "discourse-reactions", plugin.fetch("name")
+    assert_equal plugin.fetch("entry"), plugin.fetch("modules").last
+    assert plugin.fetch("modules").all? { |path| path.start_with?("#{prefix}/assets/reactions-core/") }
+    assert_includes html, 'link.dataset.pluginName = plugin.name;'
+    assert_operator html.index('for (const plugin of boot.plugins)'), :<, html.index('await import(boot.entry);')
+    refute_match(/<link rel="modulepreload"/, html)
+    assert_includes html, "#{prefix}/assets/native/css/discourse-reactions.css"
+    disabled = document.render({}, { "discourse_reactions_enabled" => false }, "http://127.0.0.1:3529")
+    data = JSON.parse(disabled[/<script type="application\/json" id="native-boot-assets">(.*?)<\/script>/m, 1])
+    assert_equal [], data.fetch("plugins")
+  end
+
   def test_topic_document_uses_real_topic_preload_and_canonical_url
     topic_id = 123
     title = "Actual topic title <safe>"

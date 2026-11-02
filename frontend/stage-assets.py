@@ -26,6 +26,9 @@ DISCOURSE = ROOT / "discourse"
 BUILD = ROOT / "minimal" / "build"
 OUTPUT = BUILD / "assets" / "native"
 CORE = BUILD / "assets" / "discourse"
+CORE_URL_PREFIX = "/assets/discourse/"
+REACTIONS = BUILD / "assets" / "reactions-core"
+PLUGIN_LOCALE = DISCOURSE / "plugins/discourse-reactions/config/locales/client.en.yml"
 CACHE = DISCOURSE / "tmp" / "stylesheet-cache"
 
 
@@ -64,6 +67,7 @@ def verify_existing_stage(strict_sources: bool = False) -> None:
         entries.append((descriptor["locale"]["url"], descriptor["locale"]["sha256"]))
         locale = descriptor["locale"]
         source_entries.extend((locale[key], locale[hash_key]) for key, hash_key in (("source", "source_sha256"), ("date_source", "date_source_sha256")))
+        source_entries.extend((row["path"], row["sha256"]) for row in locale.get("source_files", []))
         entries.append((descriptor["icons"]["sprite_url"], descriptor["icons"]["sha256"]))
         entries.append((descriptor["service_worker"]["url"], descriptor["service_worker"]["sha256"]))
         entries.extend((row["url"], row["sha256"]) for row in descriptor["emoji"]["files"])
@@ -160,8 +164,19 @@ def main() -> None:
     if OUTPUT.exists():
         verify_existing_stage(strict_sources=args.reuse)
         if args.reuse:
-            print("Reused this worktree's staged assets after verifying every staged byte and source hash")
-            return
+            existing = json.loads((OUTPUT / "manifest.json").read_text())
+            core = existing.get("core_ember", {})
+            # A new bounded plugin extraction is an intentional new stage input,
+            # not permission to reuse stale core bytes/locale/CSS silently.
+            selected_manifest = CORE / "manifest/manifest.json"
+            if (selected_manifest.is_file()
+                    and core.get("manifest_url_prefix") == CORE_URL_PREFIX
+                    and core.get("manifest_sha256") == sha(selected_manifest)
+                    and existing["locale"].get("plugin_source_sha256") == sha(PLUGIN_LOCALE)
+                    and existing.get("reactions_manifest_sha256") == sha(REACTIONS / "manifest.json")):
+                print("Reused this worktree's staged assets after verifying every staged byte and source hash")
+                return
+            print("Restaging intact native assets for the explicitly selected reactions extraction")
     temporary = OUTPUT.with_name(".native-stage-tmp")
     if temporary.exists():
         fail(f"refusing to reuse temporary stage: {temporary.relative_to(ROOT)}")
@@ -261,8 +276,8 @@ def main() -> None:
         date_source = DISCOURSE / "config" / "locales" / "server.en.yml"
         locale_output = temporary / "locale" / "en.js"
         locale_output.parent.mkdir(parents=True, exist_ok=True)
-        ruby = r'''require "yaml"; require "json"; client = YAML.load_file(ARGV.fetch(0), aliases: true).fetch("en"); js = client.fetch("js"); formats = YAML.load_file(ARGV.fetch(1), aliases: true).fetch("en").fetch("dates"); puts JSON.generate({"translations" => {"en" => {"js" => js}}, "formats" => formats.slice("short_date_no_year", "short_date", "long_date")})'''
-        result = subprocess.run(["ruby", "-e", ruby, str(locale_source), str(date_source)], check=True, text=True, capture_output=True)
+        ruby = r'''require "yaml"; require "json"; client = YAML.load_file(ARGV.fetch(0), aliases: true).fetch("en"); js = client.fetch("js"); plugin = YAML.load_file(ARGV.fetch(2), aliases: true).fetch("en").fetch("js"); js["discourse_reactions"] = plugin.fetch("discourse_reactions"); formats = YAML.load_file(ARGV.fetch(1), aliases: true).fetch("en").fetch("dates"); puts JSON.generate({"translations" => {"en" => {"js" => js}}, "formats" => formats.slice("short_date_no_year", "short_date", "long_date")})'''
+        result = subprocess.run(["ruby", "-e", ruby, str(locale_source), str(date_source), str(PLUGIN_LOCALE)], check=True, text=True, capture_output=True)
         locale_data = json.loads(result.stdout)
 
         def without_message_formats(value):
@@ -415,9 +430,38 @@ def main() -> None:
             if not (temporary / "images" / "emoji" / "twitter" / name).is_file():
                 fail(f"pinned emoji image missing: {name}")
 
+        reaction_manifest = json.loads((REACTIONS / "manifest.json").read_text())
+        reaction_css = reaction_manifest["stylesheet"]
+        reaction_css_source = REACTIONS / reaction_css["output"]
+        if sha(reaction_css_source) != reaction_css["output_sha256"]:
+            fail("compiled reactions CSS failed its stage hash")
+        copy_file(reaction_css_source, temporary / "css/discourse-reactions.css")
+        css_manifest["discourse-reactions.css"] = {
+            "url": "/assets/native/css/discourse-reactions.css",
+            "sha256": sha(reaction_css_source),
+            "source_files": [{"path": str((DISCOURSE / row["path"]).relative_to(ROOT)), "sha256": row["sha256"]} for row in reaction_css["source_files"]],
+            "adaptation": "Actual pinned plugin common/desktop/mobile Sass through its original read-only Stylesheet compiler; no replacement CSS.",
+        }
+        plugin_js = reaction_manifest["javascript"]
+        def plugin_dependencies(filename, visited=None):
+            visited = set() if visited is None else visited
+            if filename in visited:
+                return []
+            visited.add(filename)
+            row = plugin_js["chunks"][filename]
+            return [child for imported in row["imports"] for child in plugin_dependencies(imported, visited)] + [filename]
+        plugin_modules = plugin_dependencies(plugin_js["entrypoint"])
+        for row in plugin_js["files"]:
+            if sha(REACTIONS / row["path"]) != row["sha256"]:
+                fail("compiled plugin JS failed stage hash: " + row["path"])
         core_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         descriptor = {
             "format": 1,
+            "reactions_manifest_sha256": sha(REACTIONS / "manifest.json"),
+            "plugins": [{"name": "discourse-reactions",
+                         "entry": "/assets/reactions-core/" + plugin_js["entrypoint"],
+                         "modules": ["/assets/reactions-core/" + name for name in plugin_modules],
+                         "scope": "bounded anonymous counter/users-menu only; named registration and counter-only caller adapters"}],
             "source": {
                 "discourse_commit": subprocess.check_output(["git", "-C", str(DISCOURSE), "rev-parse", "HEAD"], text=True).strip(),
                 "discourse_version": re.search(r'STRING = "([^"]+)"', (DISCOURSE / "lib" / "version.rb").read_text(encoding="utf-8")).group(1),
@@ -433,12 +477,13 @@ def main() -> None:
                 "icons_source": str(svg_root.relative_to(ROOT)),
             },
             "core_ember": {
-                "manifest_url_prefix": "/assets/discourse/",
+                "manifest_url_prefix": CORE_URL_PREFIX,
+                "manifest_sha256": sha(manifest_path),
                 "entrypoints": core_manifest.get("entrypoints", {}),
                 "dynamicEntrypoints": core_manifest.get("dynamicEntrypoints", {}),
                 "importMap": core_manifest.get("importMap", {}),
                 "chunks": core_manifest.get("chunks", {}),
-                "note": "URLs are relative to /assets/discourse/; include root/prefix and .js using the original manifest values.",
+                "note": "Unchanged original core Rolldown outputs; selected reactions plugin compiles separately through Plugin::JsCompiler/AssetProcessor. Core URLs use manifest_url_prefix.",
             },
             "css": css_manifest,
             "theme_css": {
@@ -466,7 +511,9 @@ def main() -> None:
                 "date_source": str(date_source.relative_to(ROOT)),
                 "date_source_sha256": sha(date_source),
                 "sha256": sha(locale_output),
-                "limitations": ["English core client YAML only; no plugin/theme/override translations or compiled MessageFormat bundle. The messageFormatData function returns an empty bundle so the I18n loader initializes, but *_MF translations are omitted."],
+                "plugin_source_sha256": sha(PLUGIN_LOCALE),
+                "source_files": [{"path": str(PLUGIN_LOCALE.relative_to(ROOT)), "sha256": sha(PLUGIN_LOCALE)}],
+                "limitations": ["English core client YAML plus original discourse_reactions namespace only; no other plugin/theme/override translations or compiled MessageFormat bundle. The messageFormatData function returns an empty bundle so the I18n loader initializes, but *_MF translations are omitted."],
             },
             "browser_scripts": browser_scripts,
             "service_worker": {

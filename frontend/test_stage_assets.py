@@ -9,6 +9,16 @@ ROOT = Path(__file__).resolve().parents[1]
 STAGE = ROOT / "build" / "assets" / "native"
 manifest = json.loads((STAGE / "manifest.json").read_text(encoding="utf-8"))
 
+assert manifest['core_ember']['manifest_url_prefix'] == '/assets/discourse/'
+core_manifest = ROOT / 'build/assets/discourse/manifest/manifest.json'
+assert manifest['core_ember']['manifest_sha256'] == __import__('hashlib').sha256(core_manifest.read_bytes()).hexdigest()
+locale_text = (STAGE / 'locale/en.js').read_text()
+plugin_css = (STAGE / 'css/discourse-reactions.css').read_text()
+assert '.mobile-view .discourse-reactions-counter{margin:0}' in plugin_css
+assert '.desktop-view' in plugin_css
+assert '"discourse_reactions"' in locale_text and '"aria_label"' in locale_text and '"users_popup"' in locale_text
+assert manifest['locale']['plugin_source_sha256'] == __import__('hashlib').sha256((ROOT.parent / 'discourse/plugins/discourse-reactions/config/locales/client.en.yml').read_bytes()).hexdigest()
+
 assert manifest["theme_css"]["default_theme_id"] == -1
 assert manifest["theme_css"]["available"] is True
 assert manifest["theme_css"]["color_scheme_id"] == -1

@@ -24,13 +24,26 @@ def assert_port_free():
 
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--topic", action="store_true")
+group = parser.add_mutually_exclusive_group()
+group.add_argument("--topic", action="store_true")
+group.add_argument("--reactions", action="store_true")
 args = parser.parse_args()
 assert_port_free()
-shots = ("build/topic-browser-profiler/prefix-desktop-*-click.png" if os.environ.get("MINIMAL_PROFILER") == "1" else "build/topic-browser/prefix-desktop-*-click.png") if args.topic else "build/browser/prefix-desktop.png"
+if args.reactions:
+    shots = "build/reaction-browser/root-desktop-positive-source-fixture-mocked-transport-open.png"
+    label = "reaction-browser-cleanup"
+    command = ["python3", "test/reaction_browser_smoke.py"]
+elif args.topic:
+    enabled = os.environ.get("MINIMAL_PROFILER") == "1"
+    folder = "topic-browser-profiler" if enabled else "topic-browser"
+    shots = f"build/{folder}/prefix-desktop-*-click.png"
+    label = folder + "-cleanup"
+    command = ["python3", "test/topic_browser_smoke.py"]
+else:
+    shots = "build/browser/prefix-desktop.png"
+    label = "browser-cleanup"
+    command = ["python3", "test/browser_smoke.py", "--base-uri", "/node/jarvis/widgets/discourse-spinel-app"]
 previous = {str(path): path.stat().st_mtime_ns for path in Path('.').glob(shots)}
-label = ("topic-browser-profiler-cleanup" if os.environ.get("MINIMAL_PROFILER") == "1" else "topic-browser-cleanup") if args.topic else "browser-cleanup"
-command = ["python3", "test/topic_browser_smoke.py"] if args.topic else ["python3", "test/browser_smoke.py", "--base-uri", "/node/jarvis/widgets/discourse-spinel-app"]
 Path("build").mkdir(exist_ok=True)
 with Path(f"build/{label}.log").open("w") as log:
     child = subprocess.Popen(command, stdout=log, stderr=log)

@@ -3,7 +3,16 @@
   "source_path": "config/site_settings.yml",
   "source_sha256": "f5d22ff1dc5e7afc1d5c136d0160c12443639a1df792ed43553460252db1e3d1",
   "promote_upcoming_changes_on_status_default": "beta",
-  "generation": "YAML client:true settings only; static defaults/types, never runtime overrides",
+  "generation": "YAML client:true core settings plus five explicitly selected reactions counter/menu client settings; static defaults/types, never runtime overrides",
+  "plugin_source_path": "plugins/discourse-reactions/config/settings.yml",
+  "plugin_source_sha256": "15af0c1a896f0ebefa262b5bbd2720f8b03cff5c445b55c661b744c11aaa5401",
+  "plugin_settings": [
+    "discourse_reactions_enabled",
+    "discourse_reactions_like_icon",
+    "discourse_reactions_reaction_for_like",
+    "discourse_reactions_enabled_reactions",
+    "discourse_reactions_desaturated_reaction_panel"
+  ],
   "settings": [
     {
       "name": "about_page_extra_groups",
@@ -730,6 +739,46 @@
       "name": "discourse_connect_overrides_avatar",
       "default": false,
       "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "discourse_reactions_desaturated_reaction_panel",
+      "default": false,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "discourse_reactions_enabled",
+      "default": true,
+      "type": "boolean",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "discourse_reactions_enabled_reactions",
+      "default": "+1|laughing|open_mouth|clap|confetti_ball|hugs",
+      "type": "string",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "discourse_reactions_like_icon",
+      "default": "heart",
+      "type": "string",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "discourse_reactions_reaction_for_like",
+      "default": "heart",
+      "type": "string",
       "upcoming_change": null,
       "upcoming_change_default_override": null,
       "source_client_flag": true
