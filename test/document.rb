@@ -32,3 +32,9 @@ rescue JSON::ParserError
   rejected = true
 end
 check(rejected, "invalid preload JSON fails closed")
+details_on = doc.render({}, { "details_enabled" => true }, "http://127.0.0.1:3529")
+details_off = doc.render({}, { "details_enabled" => false }, "http://127.0.0.1:3529")
+css = "#{prefix}/assets/native/css/discourse-details.css"
+check(details_on.include?(css) && !details_off.include?(css), "native document selects original details CSS only when enabled")
+on_boot = JSON.parse(details_on[/<script type="application\/json" id="native-boot-assets">(.*?)<\/script>/m, 1])
+check(on_boot["plugins"].none? { |plugin| plugin["name"] == "discourse-details" }, "details reader uses existing core HTML behavior without composer initializer")

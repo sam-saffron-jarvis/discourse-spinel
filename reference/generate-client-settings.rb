@@ -56,6 +56,14 @@ plugin_names.each do |name|
               "source_client_flag" => true }
 end
 client << { "name" => "default_locale", "default" => "en", "type" => "string", "source_client_flag" => "SiteSettingExtension.client_settings default" }
+details_source = File.join(root, "plugins/discourse-details/config/settings.yml")
+details_plugin_settings = YAML.safe_load_file(details_source).fetch("plugins")
+details_opts = details_plugin_settings.fetch("details_enabled")
+abort "unsafe details client setting details_enabled" unless details_opts["client"] == true && !details_opts["secret"] && !details_opts["themeable"]
+abort "details_enabled source default must be boolean" unless [true, false].include?(details_opts.fetch("default"))
+client << { "name" => "details_enabled", "default" => details_opts.fetch("default"), "type" => "boolean",
+            "upcoming_change" => nil, "upcoming_change_default_override" => nil,
+            "source_client_flag" => true }
 client.sort_by! { |row| row.fetch("name") }
 promotion = settings.values.flat_map(&:to_a).find { |name, _opts| name == "promote_upcoming_changes_on_status" }&.last
 output = {
@@ -63,10 +71,13 @@ output = {
   "source_path" => "config/site_settings.yml",
   "source_sha256" => Digest::SHA256.file(source).hexdigest,
   "promote_upcoming_changes_on_status_default" => promotion&.fetch("default"),
-  "generation" => "YAML client:true core settings plus five explicitly selected reactions counter/menu client settings; static defaults/types, never runtime overrides",
+  "generation" => "YAML client:true core settings plus five explicitly selected reactions counter/menu settings and discourse-details details_enabled; static defaults/types, never runtime overrides",
   "plugin_source_path" => "plugins/discourse-reactions/config/settings.yml",
   "plugin_source_sha256" => Digest::SHA256.file(plugin_source).hexdigest,
   "plugin_settings" => plugin_names,
+  "details_plugin_source_path" => "plugins/discourse-details/config/settings.yml",
+  "details_plugin_source_sha256" => Digest::SHA256.file(details_source).hexdigest,
+  "details_plugin_settings" => ["details_enabled"],
   "settings" => client,
 }
 path = File.join(__dir__, "client-settings-contract.json")

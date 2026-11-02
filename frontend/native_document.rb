@@ -87,7 +87,11 @@ class NativeDocument
       "entry" => core_asset(entrypoint),
     )
 
-    css_links = descriptor.fetch("css").values.map do |asset|
+    css_links = descriptor.fetch("css").values.filter_map do |asset|
+      # Discourse.find_plugin_css_assets filters disabled plugins. This is only
+      # stylesheet selection: disabling details never strips stored cooked HTML.
+      enabled_setting = asset["enabled_setting"]
+      next if enabled_setting && settings[enabled_setting] != true
       %(<link rel="stylesheet" href="#{attr(prefixed(asset.fetch("url")))}">)
     end.join("\n")
     scripts = descriptor.fetch("browser_scripts")

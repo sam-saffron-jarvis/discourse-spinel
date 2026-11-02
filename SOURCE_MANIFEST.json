@@ -3,7 +3,7 @@
   "upstream": "Discourse",
   "original_revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
   "upstream_license": "GPL-2.0-or-later; Copyright 2014-2026 Civilized Discourse Construction Kit, Inc. and contributors",
-  "scope": "anonymous latest JSON and bounded anonymous topic JSON/content with actual core Ember plus original read-only reactions counter/users-menu; anonymous reactions users-list and per-post summary native routes at task-owned site; no full serializer/plugin/auth parity",
+  "scope": "anonymous latest JSON and bounded anonymous topic JSON/content with actual core Ember, original read-only reactions counter/users-menu and stored-cooked details reader CSS; anonymous reactions users-list and per-post summary native routes at task-owned site; no native cooking/editor/hooks or full serializer/plugin/auth parity",
   "gaps": "GAPS.md",
   "plugin_coverage": "PLUGIN_SUPPORT.json",
   "entries": [
@@ -1612,6 +1612,200 @@
         }
       ],
       "adaptations": "No artwork/font byte edits. Stage manifest records all Twemoji source/output paths and hashes, not only these observed emoji requests; twitter is the legacy public alias for twemoji. Palette font URLs rebased relative to CSS so root and widget prefix use the same bytes. No remote font/avatar/CDN request."
+    },
+    {
+      "destinations": [
+        "frontend/stage-details.py",
+        "frontend/stage-assets.py",
+        "frontend/native_document.rb",
+        "reference/details-sources/",
+        "reference/details-contract.md",
+        "reference/client-settings-contract.json",
+        "test/details_source.rb",
+        "test/details_native.rb",
+        "test/details_source_test.py",
+        "test/details_test.py",
+        "test/details_browser_smoke.py"
+      ],
+      "kind": "bounded stored-cooked anonymous details reader; original Sass and existing unchanged core cooked/stateful modules, not a plugin initializer/cooker port",
+      "license": "MIT discourse-details (reference/details-sources/plugins/discourse-details/LICENSE); GPL-2.0-or-later core source and local adapters",
+      "sources": [
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "plugins/discourse-details/plugin.rb",
+          "sha256": "bf41d9933d7774d5ec0d736e9d8568a96bd49674a487fec76c48d76c4fe30f8a"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "plugins/discourse-details/config/settings.yml",
+          "sha256": "4b6f42b86c21e7f8c4afbb02de019ae6fb9b786f5d896acd2af98624ef95b419"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "plugins/discourse-details/assets/stylesheets/details.scss",
+          "sha256": "0fb51c02cc2d640882a3b8e715c8a21586bbd0cade8f881e9c73cb63754c2003"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "plugins/discourse-details/assets/javascripts/lib/discourse-markdown/details.js",
+          "sha256": "6b4eefc15eda4d7d3a3b17c137bc1240e77672029049b5d5b16aeed13aa0977b"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "plugins/discourse-details/assets/javascripts/initializers/apply-details.js",
+          "sha256": "a1bda1e1a1f3ff3b0eaacd823dcb366f6103b9937b84f620cd81dc9ca3d784da"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "plugins/discourse-details/assets/javascripts/lib/rich-editor-extension.js",
+          "sha256": "501787a7704695b227cbde9fe386ea460d9c17297f5b2868e8017b0d27229edc"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "plugins/discourse-details/test/javascripts/lib/details-cooked-test.js",
+          "sha256": "39a3be2673ac8d8e313f729721ac982ee06669d39dc5feb36d2c25ed9af99616"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "plugins/discourse-details/spec/components/pretty_text_spec.rb",
+          "sha256": "e36d7befa4541d75663da28b23893bf1105ba86706db874318384a9190d41c1a"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "plugins/discourse-details/spec/system/details_spec.rb",
+          "sha256": "b2a16cbde58020932a5292378f75f47f5a84bf945d710ce042618e765d297fe2"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "plugins/discourse-details/spec/system/quoted_details_spec.rb",
+          "sha256": "b1f0f68306cf2d14b9db1b0b9773b0e768f82d48fce83da0193038edd2f58f64"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "plugins/discourse-details/LICENSE",
+          "sha256": "0c7303652f903bc18396cd72ac4b63fda53d8bebe6f161bf192c65f9c7d7d7ba"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "frontend/discourse/app/components/post/cooked-html.gjs",
+          "sha256": "aa2ebd6ef8ce9bd1997af2c61bff3781d5f67e6d242a3c7cbf69098ac567ccff"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "frontend/discourse/app/lib/post-cooked-html-decorators/stateful-html-elements.js",
+          "sha256": "013e80c223867d2e8f951344e01ed7e2774407b83b0bd7bb49a4edf07ad675b8"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "frontend/discourse/app/lib/highlight-html.js",
+          "sha256": "f70f803c10d58ee43a89590fc8a0294880583bd802725556a3aaf839597ed581"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "frontend/discourse/tests/integration/components/post/cooked-html-test.gjs",
+          "sha256": "3b2885852d0e17a09223260ccae259650fc4494b578883b6516b65aab1f0a79e"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "lib/plugin/instance.rb",
+          "sha256": "61fecfea0649aaa2fe6e8ebf67960d268b711e3578419eec855a29473b6ff8ee"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "lib/discourse.rb",
+          "sha256": "1330fdf219417287e80958fae9e90e9a15eff984d298e1203f301ff25f0e6aba"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "lib/stylesheet/compiler.rb",
+          "sha256": "815f245c7e6b0a519a410818664461c88c368420553a55534fb7ddb669bc1aba"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "lib/pretty_text.rb",
+          "sha256": "ad8807406ae750e08bc8b9190724bad324c10d8775adcac7beed269793ecb2cc"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/serializers/basic_post_serializer.rb",
+          "sha256": "b571426b84b4cfee37d5597403469597f5127c7d82f30ae0b9bb49544e423206"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "lib/stylesheet/importer.rb",
+          "sha256": "af5fa071ab91899720aecbfbed3a8a084780077b1c07e0e329f4caf201dec21b"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "lib/asset_processor.rb",
+          "sha256": "e1aad4ca7f55f9d91e83c93f32518dc8a73bde6af8cb1509b09dd25bd3d2b3e0"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/assets/stylesheets/common/foundation/variables.scss",
+          "sha256": "b8586dc1a06c31021f8f1a1b88dd8bb2012ad74a6acdbfc5d18c9a2bd6486e74"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/assets/stylesheets/common/foundation/mixins.scss",
+          "sha256": "127067fdc23deecd674548ac76087bb7d6c8d0c50d27036555f2b95d1224f82b"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/assets/stylesheets/common/foundation/math.scss",
+          "sha256": "1fbcc25049f1b8d2d5c7e53d10d65883155f19d8199b484e32a40c4f5f840884"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/assets/stylesheets/common/foundation/color_transformations.scss",
+          "sha256": "6582bb7d226554bd262ac0d612df4b7480b06875755943052f6d473fceba8120"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/assets/stylesheets/lib/viewport.scss",
+          "sha256": "32a94864e51294d0ec478a2e19b9877a7bf1e30f1a1f67471ca3232e64d97133"
+        },
+        {
+          "origin": "discourse",
+          "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+          "path": "app/assets/stylesheets/lib/breakpoints.scss",
+          "sha256": "25b7d0ba6af563b9ed11ea9e5a7a7dfbbd51324f808ae2f2535c0c00c37d728f"
+        }
+      ],
+      "selected_definitions": [
+        "plugin enabled_site_setting/register_asset and source client:true default",
+        "original complete details.scss through Stylesheet::Compiler.compile_asset/AssetProcessor",
+        "existing PostCookedHtml/stateful-html-elements summary toggle, IDs and per-post state",
+        "source-only PrettyText.cook fixtures and BasicPostSerializer stored cooked getter"
+      ],
+      "adaptations": "No details reader initializer adapter: shipped apply-details only registers composer toolbar and rich editor. Native details_enabled is a source-catalog boolean/live override; original plugin CSS link is selected only when enabled. Stored cooked HTML is neither stripped nor recooked on setting changes; native browser summary toggles remain intrinsic even without plugin CSS. Original Markdown/editor/email/reduce_cooked code remains reference/test-only, not runtime support. Actual source PrettyText.cook fixtures independently pass through freshly compiled native read-only typed CTE topic paths. Positive browser JSON cooked transport is explicitly labeled and separate from live empty-data evidence; no positive live E2E claim or DOM injection."
     },
     {
       "destinations": [

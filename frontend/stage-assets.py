@@ -28,6 +28,7 @@ OUTPUT = BUILD / "assets" / "native"
 CORE = BUILD / "assets" / "discourse"
 CORE_URL_PREFIX = "/assets/discourse/"
 REACTIONS = BUILD / "assets" / "reactions-core"
+DETAILS = BUILD / "assets" / "details-core"
 PLUGIN_LOCALE = DISCOURSE / "plugins/discourse-reactions/config/locales/client.en.yml"
 CACHE = DISCOURSE / "tmp" / "stylesheet-cache"
 
@@ -173,7 +174,8 @@ def main() -> None:
                     and core.get("manifest_url_prefix") == CORE_URL_PREFIX
                     and core.get("manifest_sha256") == sha(selected_manifest)
                     and existing["locale"].get("plugin_source_sha256") == sha(PLUGIN_LOCALE)
-                    and existing.get("reactions_manifest_sha256") == sha(REACTIONS / "manifest.json")):
+                    and existing.get("reactions_manifest_sha256") == sha(REACTIONS / "manifest.json")
+                    and existing.get("details_manifest_sha256") == sha(DETAILS / "manifest.json")):
                 print("Reused this worktree's staged assets after verifying every staged byte and source hash")
                 return
             print("Restaging intact native assets for the explicitly selected reactions extraction")
@@ -442,6 +444,33 @@ def main() -> None:
             "source_files": [{"path": str((DISCOURSE / row["path"]).relative_to(ROOT)), "sha256": row["sha256"]} for row in reaction_css["source_files"]],
             "adaptation": "Actual pinned plugin common/desktop/mobile Sass through its original read-only Stylesheet compiler; no replacement CSS.",
         }
+        details_manifest_path = DETAILS / "manifest.json"
+        if not details_manifest_path.is_file():
+            fail("details stylesheet stage missing; run minimal/frontend/stage-details.py first")
+        details_manifest = json.loads(details_manifest_path.read_text())
+        if details_manifest.get("format") != 1 or details_manifest.get("stage_script_sha256") != sha(ROOT / "minimal/frontend/stage-details.py"):
+            fail("details stylesheet stage is stale or unrecognized; rerun stage-details.py")
+        for row in details_manifest["source_files"]:
+            source = ROOT / row["path"]
+            if not source.is_file() or sha(source) != row["sha256"]:
+                fail(f"details stylesheet source changed; rerun stage-details.py: {row['path']}")
+        processor = DISCOURSE / details_manifest["stylesheet"]["asset_processor_path"]
+        if not processor.is_file() or sha(processor) != details_manifest["stylesheet"]["asset_processor_sha256"]:
+            fail("details stylesheet AssetProcessor cache changed; rerun stage-details.py")
+        details_css = details_manifest["stylesheet"]
+        details_css_source = DETAILS / details_css["path"]
+        if sha(details_css_source) != details_css["sha256"]:
+            fail("compiled details CSS failed its stage hash")
+        copy_file(details_css_source, temporary / "css/discourse-details.css")
+        css_manifest["discourse-details"] = {
+            "url": "/assets/native/css/discourse-details.css",
+            "sha256": sha(details_css_source),
+            "enabled_setting": "details_enabled",
+            "source_files": [{"path": row["path"], "sha256": row["sha256"]} for row in details_manifest["source_files"]],
+            "compiler": details_css["compiler"],
+            "asset_processor_path": details_css["asset_processor_path"],
+            "asset_processor_sha256": details_css["asset_processor_sha256"],
+        }
         plugin_js = reaction_manifest["javascript"]
         def plugin_dependencies(filename, visited=None):
             visited = set() if visited is None else visited
@@ -458,6 +487,7 @@ def main() -> None:
         descriptor = {
             "format": 1,
             "reactions_manifest_sha256": sha(REACTIONS / "manifest.json"),
+            "details_manifest_sha256": sha(DETAILS / "manifest.json"),
             "plugins": [{"name": "discourse-reactions",
                          "entry": "/assets/reactions-core/" + plugin_js["entrypoint"],
                          "modules": ["/assets/reactions-core/" + name for name in plugin_modules],

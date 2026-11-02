@@ -6,3 +6,5 @@ source environment metadata and anonymous layout classes
 relative module imports resolve through prefixed stable URL map
 actual core service worker receives native mount and origin
 invalid preload JSON fails closed
+native document selects original details CSS only when enabled
+details reader uses existing core HTML behavior without composer initializer

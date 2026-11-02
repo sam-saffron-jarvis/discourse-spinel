@@ -1,0 +1,225 @@
+# frozen_string_literal: true
+
+class AssetProcessor
+  # Bump only when theme JS output changes; it rebakes every theme on every site. Plugin builds
+  # also key on the processor's digest, so JS changes there rebuild them without a bump.
+  BASE_COMPILER_VERSION = 121
+
+  BUNDLE =
+    PrecompiledBundle.new(
+      dir: "tmp/asset-processor",
+      filename_prefix: "asset-processor",
+      dependency_globs: %w[
+        pnpm-lock.yaml
+        frontend/asset-processor/**/*.{js,mjs}
+        app/assets/stylesheets/variable-renames.json
+        frontend/discourse/lib/babel-transform-module-renames.js
+        frontend/discourse/lib/discourse-source-imports.mjs
+        frontend/discourse/config/targets.js
+      ],
+    ) do
+      Discourse::Utils.execute_command("pnpm", "-C=frontend/asset-processor", "node", "build.mjs")
+    end
+
+  @mutex = Mutex.new
+  @ctx_init = Mutex.new
+
+  class TranspileError < StandardError
+  end
+
+  class TimeoutError < StandardError
+  end
+
+  def self.booted?
+    !!@ctx
+  end
+
+  def self.append_es6_deprecation(content, file_path)
+    pseudo_random_identifier = "deprecated_gjYVqPLMxe" # Just needs to be unique enough to avoid collisions with real code
+    <<~JS
+      #{content}
+      import #{pseudo_random_identifier} from "discourse/lib/deprecated";
+      #{pseudo_random_identifier}(
+        "The file '#{file_path}' uses the deprecated `.js.es6` extension. Use `.js` instead.",
+        {
+          id: "discourse.es6-extension",
+          reportAtCallSite: true,
+          url: "https://meta.discourse.org/t/398894",
+        }
+      );
+    JS
+  end
+
+  def self.transpile(data, root_path, logical_path, theme_id: nil, extension: nil)
+    processor = new(skip_module: skip_module?(data))
+    processor.perform(data, root_path, logical_path, theme_id: theme_id, extension: extension)
+  end
+
+  def self.skip_module?(data)
+    !!(data.present? && data =~ %r{^// discourse-skip-module$})
+  end
+
+  def self.mutex
+    @mutex
+  end
+
+  def self.load_or_build_processor_source
+    BUNDLE.load_or_build
+  end
+
+  def self.timeout
+    @timeout ||= 15_000
+  end
+
+  def self.timeout=(value)
+    @timeout = value
+    reset_context
+  end
+
+  def self.create_new_context
+    # timeout any eval that takes longer than 15 seconds
+    ctx = MiniRacer::Context.new(timeout: timeout, ensure_gc_after_idle: 2000)
+
+    # General shims
+    ctx.attach(
+      "rails.logger.info",
+      proc do |err|
+        Rails.logger.info(err.to_s)
+        nil
+      end,
+    )
+    ctx.attach(
+      "rails.logger.warn",
+      proc do |err|
+        Rails.logger.warn(err.to_s)
+        nil
+      end,
+    )
+    ctx.attach(
+      "rails.logger.error",
+      proc do |err|
+        Rails.logger.error(err.to_s)
+        nil
+      end,
+    )
+
+    source = load_or_build_processor_source
+
+    ctx.eval(source, filename: "asset-processor.js")
+    ctx.low_memory_notification # GC to free up memory used during init
+
+    ctx
+  end
+
+  def self.reset_context
+    @ctx&.dispose
+    @ctx = nil
+  end
+
+  def self.v8
+    return @ctx if @ctx
+
+    # ensure we only init one of these
+    @ctx_init.synchronize do
+      return @ctx if @ctx
+      @ctx = create_new_context
+    end
+
+    @ctx
+  end
+
+  # Call a method in the global scope of the v8 context. Promise results are
+  # awaited and returned as values.
+  def self.v8_call(*args)
+    mutex.synchronize do
+      result = v8.call_await(*args)
+      v8.low_memory_notification if GlobalSetting.mini_racer_single_threaded
+      result
+    end
+  rescue MiniRacer::ScriptTerminatedError => e
+    timeout_error = TimeoutError.new("Script terminated: timeout after #{timeout / 1000}s")
+    timeout_error.set_backtrace(e.backtrace)
+    raise timeout_error
+  rescue MiniRacer::RuntimeError => e
+    message = e.message
+    begin
+      # Workaround for https://github.com/rubyjs/mini_racer/issues/262
+      possible_encoded_message = message.delete_prefix("Error: ")
+      decoded = JSON.parse("{\"value\": #{possible_encoded_message}}")["value"]
+      message = "Error: #{decoded}"
+    rescue JSON::ParserError
+      message = e.message
+    end
+    transpile_error = TranspileError.new(message)
+    transpile_error.set_backtrace(e.backtrace)
+    raise transpile_error
+  end
+
+  def self.ember_version
+    v8_call("emberVersion")
+  end
+
+  # Identifies the processor source loaded into the V8 context
+  def self.digest
+    v8
+    BUNDLE.loaded_digest
+  end
+
+  def initialize(skip_module: false)
+    @skip_module = skip_module
+  end
+
+  def perform(
+    source,
+    root_path = nil,
+    logical_path = nil,
+    theme_id: nil,
+    extension: nil,
+    generate_map: false
+  )
+    self.class.v8_call(
+      "transpile",
+      source,
+      {
+        skipModule: @skip_module,
+        moduleId: module_name(root_path, logical_path),
+        filename: logical_path || "unknown",
+        extension: extension,
+        themeId: theme_id,
+        generateMap: generate_map,
+      },
+    )
+  end
+
+  def module_name(root_path, logical_path)
+    path = nil
+
+    root_base = File.basename(Rails.root)
+    # If the resource is a plugin, use the plugin name as a prefix
+    if root_path =~ %r{(.*/#{root_base}/plugins/[^/]+)/}
+      plugin_path = "#{Regexp.last_match[1]}/plugin.rb"
+
+      plugin = Discourse.plugins.find { |p| p.path == plugin_path }
+      path = "discourse/plugins/#{plugin.name}/#{logical_path.sub(%r{javascripts/}, "")}" if plugin
+    end
+
+    # We need to strip the app subdirectory to replicate how ember-cli works.
+    path || logical_path&.gsub("app/", "")&.gsub("addon/", "")&.gsub("admin/addon", "admin")
+  end
+
+  def compile_raw_template(source, theme_id: nil)
+    self.class.v8_call("compileRawTemplate", source, theme_id)
+  end
+
+  def terser(tree, opts)
+    self.class.v8_call("minify", tree, opts)
+  end
+
+  def rollup(tree, opts)
+    self.class.v8_call("rollup", tree, opts)
+  end
+
+  def post_css(css:, map:, source_map_file:)
+    self.class.v8_call("postCss", css, map, source_map_file)
+  end
+end

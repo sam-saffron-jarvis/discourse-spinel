@@ -3,7 +3,7 @@
   "source_path": "config/site_settings.yml",
   "source_sha256": "f5d22ff1dc5e7afc1d5c136d0160c12443639a1df792ed43553460252db1e3d1",
   "promote_upcoming_changes_on_status_default": "beta",
-  "generation": "YAML client:true core settings plus five explicitly selected reactions counter/menu client settings; static defaults/types, never runtime overrides",
+  "generation": "YAML client:true core settings plus five explicitly selected reactions counter/menu settings and discourse-details details_enabled; static defaults/types, never runtime overrides",
   "plugin_source_path": "plugins/discourse-reactions/config/settings.yml",
   "plugin_source_sha256": "15af0c1a896f0ebefa262b5bbd2720f8b03cff5c445b55c661b744c11aaa5401",
   "plugin_settings": [
@@ -12,6 +12,11 @@
     "discourse_reactions_reaction_for_like",
     "discourse_reactions_enabled_reactions",
     "discourse_reactions_desaturated_reaction_panel"
+  ],
+  "details_plugin_source_path": "plugins/discourse-details/config/settings.yml",
+  "details_plugin_source_sha256": "4b6f42b86c21e7f8c4afbb02de019ae6fb9b786f5d896acd2af98624ef95b419",
+  "details_plugin_settings": [
+    "details_enabled"
   ],
   "settings": [
     {
@@ -699,6 +704,14 @@
       "name": "desktop_category_page_style",
       "default": "categories_and_latest_topics",
       "type": "string",
+      "upcoming_change": null,
+      "upcoming_change_default_override": null,
+      "source_client_flag": true
+    },
+    {
+      "name": "details_enabled",
+      "default": true,
+      "type": "boolean",
       "upcoming_change": null,
       "upcoming_change_default_override": null,
       "source_client_flag": true

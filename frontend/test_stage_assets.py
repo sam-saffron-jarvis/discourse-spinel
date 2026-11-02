@@ -19,6 +19,18 @@ assert '.desktop-view' in plugin_css
 assert '"discourse_reactions"' in locale_text and '"aria_label"' in locale_text and '"users_popup"' in locale_text
 assert manifest['locale']['plugin_source_sha256'] == __import__('hashlib').sha256((ROOT.parent / 'discourse/plugins/discourse-reactions/config/locales/client.en.yml').read_bytes()).hexdigest()
 
+details_css = (STAGE / 'css/discourse-details.css').read_text(encoding='utf-8')
+details = manifest['css']['discourse-details']
+assert details['enabled_setting'] == 'details_enabled'
+assert details['url'] == '/assets/native/css/discourse-details.css'
+assert details['sha256'] == __import__('hashlib').sha256((STAGE / 'css/discourse-details.css').read_bytes()).hexdigest()
+assert 'details{position:relative}' in details_css
+assert 'summary::before{content:"►"' in details_css
+assert 'details[open]>summary::before,details.open>summary::before{content:"▼"}' in details_css
+assert '.topic-body .cooked .elided summary' in details_css and 'user-select:none' in details_css
+assert '.ProseMirror' in details_css  # complete original CSS, not handwritten reader subset
+assert not any(plugin['name'] == 'discourse-details' for plugin in manifest['plugins'])
+
 assert manifest["theme_css"]["default_theme_id"] == -1
 assert manifest["theme_css"]["available"] is True
 assert manifest["theme_css"]["color_scheme_id"] == -1

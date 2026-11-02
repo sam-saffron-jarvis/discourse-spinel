@@ -27,9 +27,14 @@ parser = argparse.ArgumentParser()
 group = parser.add_mutually_exclusive_group()
 group.add_argument("--topic", action="store_true")
 group.add_argument("--reactions", action="store_true")
+group.add_argument("--details", action="store_true")
 args = parser.parse_args()
 assert_port_free()
-if args.reactions:
+if args.details:
+    shots = "build/details/profile0-root-desktop-positive-source-native-fixture-cooked-transport-open.png"
+    label = "details-browser-cleanup"
+    command = ["python3", "test/details_browser_smoke.py"]
+elif args.reactions:
     shots = "build/reaction-browser/root-desktop-positive-source-fixture-mocked-transport-open.png"
     label = "reaction-browser-cleanup"
     command = ["python3", "test/reaction_browser_smoke.py"]

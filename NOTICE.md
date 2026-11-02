@@ -7,6 +7,13 @@ README. The GPL text is in `LICENSE.txt`. Original source paths, commit and
 SHA-256 hashes, selected definitions and adaptations are in `SOURCE_MANIFEST.json`.
 This is not an unchanged copy of Discourse or a complete plugin runtime.
 
+The unchanged `discourse-details` plugin references and original compiled Sass
+are MIT licensed, Copyright (c) Civilized Discourse Construction Kit, Inc.
+The complete original notice is preserved at
+`reference/details-sources/plugins/discourse-details/LICENSE`; its code, style,
+settings, tests and notice retain source paths and hashes in the source manifests.
+The existing core cooked/stateful reader dependencies retain the core GPL license.
+
 `vendor/pg/` is unchanged runtime source from roundhouse-rb/spinel-pg 0.2.0,
 commit `fe631b4ac4aba68168adf2ecce2c6c21006f7455`, Copyright (c) 2026 Sam Ruby,
 MIT licensed; its full notice is preserved in `vendor/pg/LICENSE`.

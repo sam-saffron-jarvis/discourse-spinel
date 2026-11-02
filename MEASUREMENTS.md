@@ -1,5 +1,53 @@
 # Measured checkpoints
 
+## Ticket016 — original stored-cooked details reader
+
+Base: accepted015 `c971dcdabaafea0152299cdca2a3345198f489a2`.
+No compiler/Discourse/service changes. Native changes are stylesheet selection and
+one source-derived client setting; existing actual topic cooked projection is
+unchanged. This is an expanded reader checkpoint, **not a speedup claim**.
+
+| Measurement | Accepted015 baseline |016 local build |
+|---|---:|---:|
+| Compiler inputs |32 files /265,872 bytes |32 files /266,156 bytes |
+| Project inputs |26 files /159,154 bytes |26 files /159,438 bytes |
+| Native ELF |2,422,880 bytes |2,423,024 bytes |
+| Runtime metadata |279,677 bytes |280,155 bytes |
+| Client settings catalog |395 settings /92,054 bytes |396 settings /92,532 bytes |
+| Browser assets (includes private stage manifests) |5,155 files /73,461,334 bytes |5,158 files /73,474,092 bytes |
+| Staged current-avatar media |334,448 bytes |334,448 bytes |
+
+Same installed Spinel `2026.10.25+1664 (f969b32a7)`. Baseline fresh compile was
+18.581134s /435,868KiB max single-child RSS; one016 observation was18.147195s
+/433,528KiB. These are individual observations, not a benchmark or aggregate RSS.
+Original compiled details CSS is3,597 bytes; no plugin JS graph is added. The
+verified stage also retains compiler/dependency hashes; source references are not
+runtime inputs. `build/016-before.json`, per-target logs and final
+`build/details/report.json` retain artifact identities and evidence hashes.
+
+`make details-test` passes7 actual PrettyText.cook source cases and freshly
+compiled actual native topic CTE cases, with details setting default/true/false,
+source stored getter/stylesheet selection checks and4 fail-closed stage-reuse
+regressions. Actual Chromium passes16 cases: root/prefix × desktop/phone ×
+profiler0/1 × live-native/positive-source-native-cooked-only-transport. Positive
+cases pointer/Enter/Space-toggle real summaries, inspect visibility/original CSS,
+exercise nested/elided behavior, escaped summaries, and route away/other/back
+without state leaks or errors. The owned-browser SIGTERM cleanup regression
+releases its exact native listener. Source/core bytes remain unchanged.
+
+Read-only live source inventory:115 non-deleted posts,0 stored details posts,
+0 details opening tags and0 summaries; details_enabled default/live/client=true.
+Live native root cooked SHA256s compare independently with actual source getter;
+profiler0/1 response bytes match. Live cases open the genuine profiler SQL
+lightbox with actual redacted post/reaction SQL. Positive browser evidence is
+**mocked cooked JSON transport**, never positive live plugin E2E, DOM injection,
+native cooking/editor/email/reduce_cooked support or a full-plugin claim.
+
+Preserved independent targets: reaction-browser-test, reaction-summary-test,
+plugin-test, smoke, profiler-test, boot-test, and latest/topic browser-smoke in
+profiler0/1. Their final logs are `build/016-*.log`. No deployment or live3499/
+Hub/widget mutation; source-tree read-only outside minimal.
+
 ## Ticket011 — distinct anonymous per-post reaction summary
 
 Base: accepted minimal `6f19f7d08bedc276841a2485c289a32737192e6f`.

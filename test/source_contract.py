@@ -51,6 +51,13 @@ for key, row in browser_sources['files'].items():
     candidates.extend(Path('reference/reactions-upstream').rglob(original.name))
     assert any(copy.is_file() and copy.read_bytes() == original.read_bytes() for copy in candidates), ('missing unchanged original copy', key, row['path'])
 subprocess.run(['python3', 'tools/carry-emoji-existence.py', '--check'], check=True)
+details_sources = json.loads(Path('reference/details-sources/manifest.json').read_text())
+assert details_sources['revision'] == manifest['original_revision']
+for row in details_sources['files']:
+    original = reference / row['path']
+    copy = Path(row['copy'])
+    assert hashlib.sha256(original.read_bytes()).hexdigest() == row['sha256'], row['path']
+    assert copy.read_bytes() == original.read_bytes(), row['copy']
 ledger = json.loads(Path("PLUGIN_SUPPORT.json").read_text())
 assert {p.parent.name for p in reference.glob("plugins/*/plugin.rb")} == {p["plugin"] for p in ledger["plugins"]}
 subprocess.run(["ruby", "reference/generate-client-settings.rb", "--check"], check=True)

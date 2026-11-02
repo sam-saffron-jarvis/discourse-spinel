@@ -1,0 +1,30 @@
+import { withPluginApi } from "discourse/lib/plugin-api";
+import { i18n } from "discourse-i18n";
+import richEditorExtension from "../lib/rich-editor-extension.js";
+
+function initializeDetails(api) {
+  api.addComposerToolbarPopupMenuOption({
+    action: function (toolbarEvent) {
+      toolbarEvent.applySurround(
+        "\n" + `[details="${i18n("composer.details_title")}"]` + "\n",
+        "\n[/details]\n",
+        "details_text",
+        { multiline: false }
+      );
+    },
+    icon: "angle-right",
+    label: "details.title",
+    name: "details",
+    shortcut: "Shift+D",
+  });
+
+  api.registerRichEditorExtension(richEditorExtension);
+}
+
+export default {
+  name: "apply-details",
+
+  initialize() {
+    withPluginApi(initializeDetails);
+  },
+};

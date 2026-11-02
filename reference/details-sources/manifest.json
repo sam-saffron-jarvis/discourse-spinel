@@ -1,0 +1,147 @@
+{
+  "format": 1,
+  "revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+  "purpose": "Unchanged source references; only original details Sass is newly compiled for the reader. Existing core cooked/stateful modules already ship in unchanged core Ember. Markdown/editor/hooks remain source-test-only, not runtime.",
+  "files": [
+    {
+      "path": "plugins/discourse-details/plugin.rb",
+      "copy": "reference/details-sources/plugins/discourse-details/plugin.rb",
+      "sha256": "bf41d9933d7774d5ec0d736e9d8568a96bd49674a487fec76c48d76c4fe30f8a"
+    },
+    {
+      "path": "plugins/discourse-details/config/settings.yml",
+      "copy": "reference/details-sources/plugins/discourse-details/config/settings.yml",
+      "sha256": "4b6f42b86c21e7f8c4afbb02de019ae6fb9b786f5d896acd2af98624ef95b419"
+    },
+    {
+      "path": "plugins/discourse-details/assets/stylesheets/details.scss",
+      "copy": "reference/details-sources/plugins/discourse-details/assets/stylesheets/details.scss",
+      "sha256": "0fb51c02cc2d640882a3b8e715c8a21586bbd0cade8f881e9c73cb63754c2003"
+    },
+    {
+      "path": "plugins/discourse-details/assets/javascripts/lib/discourse-markdown/details.js",
+      "copy": "reference/details-sources/plugins/discourse-details/assets/javascripts/lib/discourse-markdown/details.js",
+      "sha256": "6b4eefc15eda4d7d3a3b17c137bc1240e77672029049b5d5b16aeed13aa0977b"
+    },
+    {
+      "path": "plugins/discourse-details/assets/javascripts/initializers/apply-details.js",
+      "copy": "reference/details-sources/plugins/discourse-details/assets/javascripts/initializers/apply-details.js",
+      "sha256": "a1bda1e1a1f3ff3b0eaacd823dcb366f6103b9937b84f620cd81dc9ca3d784da"
+    },
+    {
+      "path": "plugins/discourse-details/assets/javascripts/lib/rich-editor-extension.js",
+      "copy": "reference/details-sources/plugins/discourse-details/assets/javascripts/lib/rich-editor-extension.js",
+      "sha256": "501787a7704695b227cbde9fe386ea460d9c17297f5b2868e8017b0d27229edc"
+    },
+    {
+      "path": "plugins/discourse-details/test/javascripts/lib/details-cooked-test.js",
+      "copy": "reference/details-sources/plugins/discourse-details/test/javascripts/lib/details-cooked-test.js",
+      "sha256": "39a3be2673ac8d8e313f729721ac982ee06669d39dc5feb36d2c25ed9af99616"
+    },
+    {
+      "path": "plugins/discourse-details/spec/components/pretty_text_spec.rb",
+      "copy": "reference/details-sources/plugins/discourse-details/spec/components/pretty_text_spec.rb",
+      "sha256": "e36d7befa4541d75663da28b23893bf1105ba86706db874318384a9190d41c1a"
+    },
+    {
+      "path": "plugins/discourse-details/spec/system/details_spec.rb",
+      "copy": "reference/details-sources/plugins/discourse-details/spec/system/details_spec.rb",
+      "sha256": "b2a16cbde58020932a5292378f75f47f5a84bf945d710ce042618e765d297fe2"
+    },
+    {
+      "path": "plugins/discourse-details/spec/system/quoted_details_spec.rb",
+      "copy": "reference/details-sources/plugins/discourse-details/spec/system/quoted_details_spec.rb",
+      "sha256": "b1f0f68306cf2d14b9db1b0b9773b0e768f82d48fce83da0193038edd2f58f64"
+    },
+    {
+      "path": "plugins/discourse-details/LICENSE",
+      "copy": "reference/details-sources/plugins/discourse-details/LICENSE",
+      "sha256": "0c7303652f903bc18396cd72ac4b63fda53d8bebe6f161bf192c65f9c7d7d7ba"
+    },
+    {
+      "path": "frontend/discourse/app/components/post/cooked-html.gjs",
+      "copy": "reference/details-sources/frontend/discourse/app/components/post/cooked-html.gjs",
+      "sha256": "aa2ebd6ef8ce9bd1997af2c61bff3781d5f67e6d242a3c7cbf69098ac567ccff"
+    },
+    {
+      "path": "frontend/discourse/app/lib/post-cooked-html-decorators/stateful-html-elements.js",
+      "copy": "reference/details-sources/frontend/discourse/app/lib/post-cooked-html-decorators/stateful-html-elements.js",
+      "sha256": "013e80c223867d2e8f951344e01ed7e2774407b83b0bd7bb49a4edf07ad675b8"
+    },
+    {
+      "path": "frontend/discourse/app/lib/highlight-html.js",
+      "copy": "reference/details-sources/frontend/discourse/app/lib/highlight-html.js",
+      "sha256": "f70f803c10d58ee43a89590fc8a0294880583bd802725556a3aaf839597ed581"
+    },
+    {
+      "path": "frontend/discourse/tests/integration/components/post/cooked-html-test.gjs",
+      "copy": "reference/details-sources/frontend/discourse/tests/integration/components/post/cooked-html-test.gjs",
+      "sha256": "3b2885852d0e17a09223260ccae259650fc4494b578883b6516b65aab1f0a79e"
+    },
+    {
+      "path": "lib/plugin/instance.rb",
+      "copy": "reference/details-sources/lib/plugin/instance.rb",
+      "sha256": "61fecfea0649aaa2fe6e8ebf67960d268b711e3578419eec855a29473b6ff8ee"
+    },
+    {
+      "path": "lib/discourse.rb",
+      "copy": "reference/details-sources/lib/discourse.rb",
+      "sha256": "1330fdf219417287e80958fae9e90e9a15eff984d298e1203f301ff25f0e6aba"
+    },
+    {
+      "path": "lib/stylesheet/compiler.rb",
+      "copy": "reference/details-sources/lib/stylesheet/compiler.rb",
+      "sha256": "815f245c7e6b0a519a410818664461c88c368420553a55534fb7ddb669bc1aba"
+    },
+    {
+      "path": "lib/pretty_text.rb",
+      "copy": "reference/details-sources/lib/pretty_text.rb",
+      "sha256": "ad8807406ae750e08bc8b9190724bad324c10d8775adcac7beed269793ecb2cc"
+    },
+    {
+      "path": "app/serializers/basic_post_serializer.rb",
+      "copy": "reference/details-sources/app/serializers/basic_post_serializer.rb",
+      "sha256": "b571426b84b4cfee37d5597403469597f5127c7d82f30ae0b9bb49544e423206"
+    },
+    {
+      "path": "lib/stylesheet/importer.rb",
+      "copy": "reference/details-sources/lib/stylesheet/importer.rb",
+      "sha256": "af5fa071ab91899720aecbfbed3a8a084780077b1c07e0e329f4caf201dec21b"
+    },
+    {
+      "path": "lib/asset_processor.rb",
+      "copy": "reference/details-sources/lib/asset_processor.rb",
+      "sha256": "e1aad4ca7f55f9d91e83c93f32518dc8a73bde6af8cb1509b09dd25bd3d2b3e0"
+    },
+    {
+      "path": "app/assets/stylesheets/common/foundation/variables.scss",
+      "copy": "reference/details-sources/app/assets/stylesheets/common/foundation/variables.scss",
+      "sha256": "b8586dc1a06c31021f8f1a1b88dd8bb2012ad74a6acdbfc5d18c9a2bd6486e74"
+    },
+    {
+      "path": "app/assets/stylesheets/common/foundation/mixins.scss",
+      "copy": "reference/details-sources/app/assets/stylesheets/common/foundation/mixins.scss",
+      "sha256": "127067fdc23deecd674548ac76087bb7d6c8d0c50d27036555f2b95d1224f82b"
+    },
+    {
+      "path": "app/assets/stylesheets/common/foundation/math.scss",
+      "copy": "reference/details-sources/app/assets/stylesheets/common/foundation/math.scss",
+      "sha256": "1fbcc25049f1b8d2d5c7e53d10d65883155f19d8199b484e32a40c4f5f840884"
+    },
+    {
+      "path": "app/assets/stylesheets/common/foundation/color_transformations.scss",
+      "copy": "reference/details-sources/app/assets/stylesheets/common/foundation/color_transformations.scss",
+      "sha256": "6582bb7d226554bd262ac0d612df4b7480b06875755943052f6d473fceba8120"
+    },
+    {
+      "path": "app/assets/stylesheets/lib/viewport.scss",
+      "copy": "reference/details-sources/app/assets/stylesheets/lib/viewport.scss",
+      "sha256": "32a94864e51294d0ec478a2e19b9877a7bf1e30f1a1f67471ca3232e64d97133"
+    },
+    {
+      "path": "app/assets/stylesheets/lib/breakpoints.scss",
+      "copy": "reference/details-sources/app/assets/stylesheets/lib/breakpoints.scss",
+      "sha256": "25b7d0ba6af563b9ed11ea9e5a7a7dfbbd51324f808ae2f2535c0c00c37d728f"
+    }
+  ]
+}

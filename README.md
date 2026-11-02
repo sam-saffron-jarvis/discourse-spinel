@@ -271,6 +271,38 @@ settings/DB seeding or mutations. Existing latest/topic/profiler/boot tests stil
 apply. Only the coordinator may accept or activate a release; this target never
 changes live3499, the widget or Hub.
 
+## Bounded core-plugin read: stored cooked details
+
+Ticket016 adds the shipped **discourse-details reader stylesheet**, not a native
+Markdown cooker or editor. Already-cooked `<details>/<summary>` remains stored
+post content and is rendered by the unchanged core Ember `PostCookedHtml` and
+stateful HTML decorator with native browser toggle behavior. The plugin's actual
+`apply-details` initializer is composer-only, so no reader JS adapter is invented.
+Original complete Sass is compiled through the original Stylesheet/AssetProcessor
+pipeline, with copied source references and dependency hashes. Source-default-true,
+client-visible `details_enabled` selects the CSS link; disabling it does **not**
+strip/rebake stored cooked or disable intrinsic HTML toggles.
+
+```sh
+source ../harness/env.sh
+make details-test
+```
+
+This freshly builds the own native ELF, runs actual source `PrettyText.cook` for
+labeled closed/open/nested/escaping/sanitizer fixtures and independently verifies
+unchanged cooked in freshly compiled SELECT-only CTE native topic responses.
+Actual Chromium pointer/Enter/Space, visibility/original CSS/nested independence
+and route-away/other/back tests cover desktop/phone, root/widget prefix and
+profiler0/1. Evidence under `build/details/` separates real native/live DB data
+(currently no stored details) from **positive cooked-only mocked JSON transport**
+using those source/native-verified fixtures. No DOM injection or positive live
+end-to-end plugin parity claim. Real enabled profiler drilldown still contains
+redacted actual PG SQL; reactions010/011/015, latest/topic and boot+Reload tests
+remain preserved independently. No live writes/seeding/settings changes or runtime
+Ruby/Rails/Node/Python. Unsupported: composer/rich editor, native cooking/Markdown,
+email/reduce_cooked hooks and full plugin/all-core-plugin coverage. See
+`reference/details-contract.md`, `PLUGIN_SUPPORT.json` and `GAPS.md`.
+
 ## Optional native MiniProfiler (development only)
 
 Set `MINIMAL_PROFILER=1` when launching this worktree's native ELF. No profiler

@@ -194,6 +194,18 @@ entries.append({"destinations": ["build/assets/native/images/emoji/twitter/", "b
                 "sources": [source(p, "discourse-emojis", "1.0.47") for p in ["attributions.md", "dist/emoji/twemoji/wave.png", "dist/emoji/twemoji/speaking_head.png"]] +
                            [source(p, "discourse-fonts", "0.0.19") for p in ["lib/discourse_fonts.rb", "vendor/assets/fonts/InterVariable.woff2", "vendor/assets/fonts/JetBrainsMono-Regular.woff2", "vendor/assets/fonts/JetBrainsMono-Bold.woff2"]],
                 "adaptations": "No artwork/font byte edits. Stage manifest records all Twemoji source/output paths and hashes, not only these observed emoji requests; twitter is the legacy public alias for twemoji. Palette font URLs rebased relative to CSS so root and widget prefix use the same bytes. No remote font/avatar/CDN request."})
+details_sources = json.loads(Path("reference/details-sources/manifest.json").read_text())
+entries.append(entry(["frontend/stage-details.py", "frontend/stage-assets.py", "frontend/native_document.rb",
+    "reference/details-sources/", "reference/details-contract.md", "reference/client-settings-contract.json",
+    "test/details_source.rb", "test/details_native.rb", "test/details_source_test.py", "test/details_test.py", "test/details_browser_smoke.py"],
+    "bounded stored-cooked anonymous details reader; original Sass and existing unchanged core cooked/stateful modules, not a plugin initializer/cooker port",
+    [row["path"] for row in details_sources["files"]],
+    ["plugin enabled_site_setting/register_asset and source client:true default",
+     "original complete details.scss through Stylesheet::Compiler.compile_asset/AssetProcessor",
+     "existing PostCookedHtml/stateful-html-elements summary toggle, IDs and per-post state",
+     "source-only PrettyText.cook fixtures and BasicPostSerializer stored cooked getter"],
+    "No details reader initializer adapter: shipped apply-details only registers composer toolbar and rich editor. Native details_enabled is a source-catalog boolean/live override; original plugin CSS link is selected only when enabled. Stored cooked HTML is neither stripped nor recooked on setting changes; native browser summary toggles remain intrinsic even without plugin CSS. Original Markdown/editor/email/reduce_cooked code remains reference/test-only, not runtime support. Actual source PrettyText.cook fixtures independently pass through freshly compiled native read-only typed CTE topic paths. Positive browser JSON cooked transport is explicitly labeled and separate from live empty-data evidence; no positive live E2E claim or DOM injection."))
+entries[-1]["license"] = "MIT discourse-details (reference/details-sources/plugins/discourse-details/LICENSE); GPL-2.0-or-later core source and local adapters"
 entries[0]["sources"].append(source("ext/fast_blank/fast_blank.c", "fast_blank", "1.0.1"))
 entries[0]["selected_definitions"].append("fast_blank1.0.1 rb_str_blank loaded by Discourse (ASCII whitespace + NUL, not Unicode blank_as?)")
 pg_files = sorted(p for p in Path("vendor/pg").rglob("*") if p.is_file())
@@ -206,6 +218,6 @@ entries.append({"destinations": ["bin/discourse.rb", "lib/mini_profiler.rb", "to
                 "adaptations": "Loopback TCP HTTP server over installed Spinel sockets; live pure-native PG client; no Ruby subprocess/proxy/canned response in serving path. Verification uses synchronous read-only Rails runner only, never a final data backend. Optional request-local MiniProfiler integration uses the separately hash-verified MIT native port/client under vendor/rack-mini-profiler/MANIFEST.json; canonical numeric topic names exclude user slugs, bindings and query strings."})
 manifest = {"schema_version": 1, "upstream": "Discourse", "original_revision": PIN,
             "upstream_license": "GPL-2.0-or-later; Copyright 2014-2026 Civilized Discourse Construction Kit, Inc. and contributors",
-            "scope": "anonymous latest JSON and bounded anonymous topic JSON/content with actual core Ember plus original read-only reactions counter/users-menu; anonymous reactions users-list and per-post summary native routes at task-owned site; no full serializer/plugin/auth parity",
+            "scope": "anonymous latest JSON and bounded anonymous topic JSON/content with actual core Ember, original read-only reactions counter/users-menu and stored-cooked details reader CSS; anonymous reactions users-list and per-post summary native routes at task-owned site; no native cooking/editor/hooks or full serializer/plugin/auth parity",
             "gaps": "GAPS.md", "plugin_coverage": "PLUGIN_SUPPORT.json", "entries": entries}
 Path("SOURCE_MANIFEST.json").write_text(json.dumps(manifest, indent=2) + "\n")
