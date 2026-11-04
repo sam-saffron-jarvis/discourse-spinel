@@ -1,0 +1,36 @@
+Set[Set[...]]
+"Set[Set[...]]"
+"[Set[Set[...]]]"
+"Set[Set[...]]"
+"tried to flatten recursive Set"
+[false, true, true]
+"Set[1, 2]"
+"Set[1, 2]"
+true
+[JSON::NestingError, "nesting of 100 is too deep. Did you try to serialize objects with circular references?"]
+"nesting of 100 is too deep. Did you try to serialize objects with circular references?"
+"nesting of 100 is too deep. Did you try to serialize objects with circular references?"
+"nesting of 100 is too deep. Did you try to serialize objects with circular references?"
+"nesting of 100 is too deep. Did you try to serialize objects with circular references?"
+200
+"nesting of 100 is too deep. Did you try to serialize objects with circular references?"
+"[1,{\"a\":2}]"
+"Set[Set[R]]"
+"Set[R]"
+"Set[rescued/Set[B]]"
+true
+[:raised, false]
+false
+"yielded"
+"Set[1, Set[2]]"
+true
+"Set[3]"
+[Set[[...]]]
+Set[[Set[...]]]
+true
+true
+"tried to flatten recursive Set"
+"Set[4, 5]"
+[Set[#<struct Ex a=Q>], {k: 1}]
+true
+"{k: #<struct Ex a=Q>}"

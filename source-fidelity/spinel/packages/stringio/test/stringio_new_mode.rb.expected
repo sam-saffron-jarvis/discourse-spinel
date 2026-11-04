@@ -1,0 +1,9 @@
+"foo"
+""
+"headtail"
+"data"
+"data"
+["w", Errno::EACCES, "Permission denied"]
+["a", Errno::EACCES, "Permission denied"]
+["r+", Errno::EACCES, "Permission denied"]
+"not opened for writing"

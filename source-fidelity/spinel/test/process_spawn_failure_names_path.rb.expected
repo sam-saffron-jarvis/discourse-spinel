@@ -1,0 +1,8 @@
+0
+"Errno::ENOENT: No such file or directory - /this-command-does-not-exist-spinel"
+127
+"Errno::ENOENT: No such file or directory - /this-command-does-not-exist-spinel"
+"Errno::EACCES: Permission denied - /etc/passwd"
+"Errno::ENOENT: No such file or directory - /no-such-directory-spinel"
+127
+true

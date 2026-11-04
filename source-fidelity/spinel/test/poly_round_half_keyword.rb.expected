@@ -1,0 +1,31 @@
+8388609
+2
+3
+2
+3
+3
+2.35
+2.35
+2.35
+-20
+25
+20
+2
+floor: no implicit conversion of Hash into Integer
+ceil: no implicit conversion of Hash into Integer
+truncate: no implicit conversion of Hash into Integer
+bogus: invalid rounding mode: bogus
+foo: unknown keyword: :foo
+foobar: unknown keywords: :foo, :bar
+one: invalid rounding mode: 1
+2
+int0: invalid rounding mode: bogus
+probe kw
+ceil: no implicit conversion of Hash into Integer
+probe pos
+probe kw2
+ceil2: wrong number of arguments (given 2, expected 0..1)
+2
+20
+2.5
+splat: unknown keyword: :zz

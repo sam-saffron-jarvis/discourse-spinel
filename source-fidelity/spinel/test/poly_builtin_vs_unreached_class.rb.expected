@@ -1,0 +1,9 @@
+partition x|?|y?z
+rpartition x?y|?|z
+split ["x", "y", "z"]
+upcase X?Y?Z
+strip x?y?z
+user partition [[1], [2]]
+user rpartition [[3], [4]]
+string beside it x|?|y?z
+string beside it r x?y|?|z

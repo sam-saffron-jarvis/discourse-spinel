@@ -1,0 +1,17 @@
+== strings ==
+set: => 3
+set off: => 2
+bytes: => [97, 98, 99, 120, 121, 0, 0, 0]
+nul: => [65, 0, 66]
+sub: => "\x00Bx"
+enc: => "ASCII-8BIT"
+4arg: => 2
+4arg bytes: => [0, 100, 101, 0, 0, 0, 0, 0]
+empty at end: => ""
+off too big: ArgumentError: The given offset is bigger than the buffer size!
+len too big: ArgumentError: Specified offset+length is bigger than the buffer size!
+neg len: ArgumentError: Length can't be negative!
+soff big: ArgumentError: The given source offset is bigger than the source itself!
+src range: ArgumentError: The computed source range exceeds the size of the source buffer!
+buf range: ArgumentError: Specified offset+length is bigger than the buffer size!
+len0: => 0

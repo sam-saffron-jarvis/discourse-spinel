@@ -1,0 +1,260 @@
+//! Elixir toolchain integration test — emit forcing function.
+//!
+//! Generates the emitted Elixir project and runs `mix compile` in it.
+//! As of Phase D the v2 overlay (`V2.*`) emits unconditionally, so a
+//! default emit covers both the legacy v1 app shell and the v2 stack;
+//! these tests compile (and `mix test`) the whole tree.
+//!
+//! Marked `#[ignore]` since first-ever run downloads Elixir's
+//! build artifacts. Explicit invocation:
+//!
+//!     cargo test --test elixir_toolchain -- --ignored --nocapture
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::Mutex;
+
+#[path = "support/emit_and_run.rs"]
+#[allow(dead_code)]
+mod emit_and_run;
+#[path = "support/i18n_locales_app.rs"]
+#[allow(dead_code)]
+mod i18n_locales_app;
+#[path = "support/record_slice_app.rs"]
+#[allow(dead_code)]
+mod record_slice_app;
+
+use roundhouse::emit::elixir;
+use roundhouse::ingest::ingest_app;
+
+/// Serialize the heavy `mix` work. cargo runs these `#[ignore]` tests in
+/// parallel; several concurrent `mix deps.get` / `mix compile` / `mix test`
+/// runs (esp. the multiple real-blog scratches) contend on Hex fetches and
+/// CPU, causing intermittent compile failures that pass on isolated re-run
+/// (see `project_elixir_ci_intermittent`). A process-wide lock makes the
+/// suite deterministic; the per-test cost is dwarfed by the mix runs.
+static MIX_LOCK: Mutex<()> = Mutex::new(());
+
+/// Acquire the mix serialization lock (poison-tolerant — a panicking test
+/// shouldn't wedge the rest).
+fn mix_guard() -> std::sync::MutexGuard<'static, ()> {
+    MIX_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn scratch_dir(fixture: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("roundhouse-elixir-check-{fixture}"))
+}
+
+fn generate_project(fixture_path: &Path, out: &Path) {
+    if out.exists() {
+        std::fs::remove_dir_all(out).expect("clean scratch");
+    }
+    std::fs::create_dir_all(out).expect("create scratch");
+
+    let mut app = ingest_app(fixture_path).expect("ingest");
+    roundhouse::session::analyze_and_lower(&mut app);
+    let files = elixir::emit(&app);
+
+    for file in &files {
+        let path = out.join(&file.path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("mkdir");
+        }
+        std::fs::write(&path, &file.content).expect("write emitted file");
+    }
+}
+
+fn mix_deps_get(scratch: &Path) {
+    let output = Command::new("mix")
+        .arg("deps.get")
+        .current_dir(scratch)
+        .env("MIX_ENV", "test")
+        // Hex package fetches need a cache; isolate per-test to
+        // avoid parallel `mix local.hex` races on fresh runners.
+        .env("MIX_HOME", scratch.join(".mix"))
+        .output()
+        .expect("run mix deps.get");
+    assert!(
+        output.status.success(),
+        "mix deps.get failed at {}:\n\
+         \n=== stdout ===\n{}\n\
+         \n=== stderr ===\n{}",
+        scratch.display(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+fn assert_mix_compile_passes(fixture: &str, scratch: &Path) {
+    mix_deps_get(scratch);
+    let output = Command::new("mix")
+        .arg("compile")
+        .arg("--warnings-as-errors")
+        .current_dir(scratch)
+        .env("MIX_HOME", scratch.join(".mix"))
+        .output()
+        .expect("run mix compile");
+
+    assert!(
+        output.status.success(),
+        "mix compile failed on emitted {fixture} project at {}:\n\
+         \n=== stdout ===\n{}\n\
+         \n=== stderr ===\n{}",
+        scratch.display(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
+#[ignore]
+fn tiny_blog_mix_compile_passes() {
+    let _g = mix_guard();
+    let fixture = Path::new("fixtures/tiny-blog");
+    let scratch = scratch_dir("tiny-blog");
+    generate_project(fixture, &scratch);
+    assert_mix_compile_passes("tiny-blog", &scratch);
+}
+
+#[test]
+#[ignore]
+fn real_blog_mix_compile_passes() {
+    let _g = mix_guard();
+    let fixture = roundhouse::fixtures::real_blog();
+    let scratch = scratch_dir("real-blog-compile");
+    generate_project(fixture, &scratch);
+    assert_mix_compile_passes("real-blog", &scratch);
+}
+
+#[test]
+#[ignore]
+fn real_blog_mix_test_passes() {
+    // Phase 2 forcing function: emit real-blog, run `mix test`,
+    // assert zero failures. Phase-3 tests are tagged `:skip`.
+    let _g = mix_guard();
+    let fixture = roundhouse::fixtures::real_blog();
+    let scratch = scratch_dir("real-blog-test");
+    generate_project(fixture, &scratch);
+    // The native runtime must execute the shared helper, not merely compile
+    // an unsupported-loop sentinel. Expected labels follow Rails' lexical
+    // /^1(\.0+)?$/ rule, not numeric parsing or our implementation.
+    std::fs::write(
+        scratch.join("test/formatted_pluralize_test.exs"),
+        r#"
+defmodule FormattedPluralizeTest do
+  use ExUnit.Case, async: true
+
+  test "formatted count labels" do
+    for {count, expected} <- [
+      {"1", "1 word"}, {"1.0", "1.0 word"}, {"1.00", "1.00 word"},
+      {"01", "01 words"}, {"1.", "1. words"}, {"10.", "10. words"},
+      {"10.0", "10.0 words"}, {"1.01", "1.01 words"},
+      {"1.0002", "1.0002 words"}, {"1,001", "1,001 words"}, {"", " words"},
+      {"2\n1.0\n", "2\n1.0\n word"}, {"1\r\n", "1\r\n words"},
+      {"1.٠", "1.٠ words"}
+    ] do
+      assert Inflector.pluralize_formatted(count, "word") == expected
+    end
+  end
+end
+"#,
+    )
+    .expect("write formatted-count test");
+    mix_deps_get(&scratch);
+
+    let output = Command::new("mix")
+        .arg("test")
+        .current_dir(&scratch)
+        .env("MIX_HOME", scratch.join(".mix"))
+        .output()
+        .expect("run mix test");
+
+    assert!(
+        output.status.success(),
+        "mix test failed on emitted real-blog at {}:\n\
+         \n=== stdout ===\n{}\n\
+         \n=== stderr ===\n{}",
+        scratch.display(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    eprintln!(
+        "elixir real-blog suite:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+#[ignore]
+fn real_blog_i18n_locales_run() {
+    // The answers `emit_and_run::i18n_locales` checks on CRuby.
+    let _g = mix_guard();
+    let (emitted, errors) = i18n_locales_app::probe_app()
+        .edit("app/models/article.rb", i18n_locales_app::IN_LOCALE, "")
+        .emit(roundhouse::project::BuildTarget::Elixir);
+    assert!(errors.is_empty(), "{errors:?}");
+    std::fs::write(emitted.join("test/i18n_probe_test.exs"), r#"
+defmodule I18nProbeTest do
+  use ExUnit.Case, async: false
+
+  test "locales" do
+    assert Article.lookups() == ["Hello", "Hi <x>", "1 item", "2 items", "Translation missing: en.probe.nope", "Cześć", "fallback 3", "en"]
+    assert Article.polish() == ["1 rzecz", "5 rzeczy", "English only", "Cześć", "Translation missing: pl.probe.nope", "Cześć", "Hi Ola", "pl"]
+    assert to_string(I18n.locale()) == "en"
+    assert [Article.named("pl"), Article.named("en"), Article.named(nil)] == ["Cześć", "Hello", "Hello"]
+    assert [Article.probe_key("greet"), Article.only_key("xx")] == ["Hello", "Translation missing: en.probe.only_xx"]
+    error = assert_raise I18n.InvalidLocale, fn -> Article.named("de") end
+    assert error.message == "\"de\" is not a valid locale"
+  end
+
+  test "another request reads the table the first one loaded" do
+    Article.lookups()
+    assert Task.async(fn -> {Process.get(:i18n_table_loaded), :persistent_term.get(:i18n_table_loaded, nil)} end) |> Task.await() == {nil, true}
+  end
+end
+"#).expect("write probe");
+    mix_deps_get(&emitted);
+    let output = Command::new("mix")
+        .args(["test", "test/i18n_probe_test.exs"])
+        .current_dir(&*emitted)
+        .env("MIX_HOME", emitted.join(".mix"))
+        .output()
+        .expect("run mix test");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[ignore]
+fn real_blog_record_slice_runs() {
+    // The answers `emit_and_run::record_slice` checks on CRuby.
+    let _g = mix_guard();
+    let (emitted, errors) = record_slice_app::probe_app().emit(roundhouse::project::BuildTarget::Elixir);
+    assert!(errors.is_empty(), "{errors:?}");
+    std::fs::write(emitted.join("test/record_slice_probe_test.exs"), r#"
+defmodule RecordSliceProbeTest do
+  use ExUnit.Case, async: false
+
+  test "slice" do
+    assert Article.sliced() == ["2", "Sliced", "7", "1", "Other", "3", "Bound", "5", "4", "A comment body."]
+  end
+end
+"#).expect("write probe");
+    mix_deps_get(&emitted);
+    let output = Command::new("mix")
+        .args(["test", "test/record_slice_probe_test.exs"])
+        .current_dir(&*emitted)
+        .env("MIX_HOME", emitted.join(".mix"))
+        .output()
+        .expect("run mix test");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

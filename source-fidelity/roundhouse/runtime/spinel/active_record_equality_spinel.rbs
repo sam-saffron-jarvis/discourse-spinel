@@ -1,0 +1,8 @@
+# Typing for runtime/spinel/active_record_equality_spinel.rb.
+module ActiveRecord
+  class Base
+    def ==: (untyped other) -> bool
+    def eql?: (untyped other) -> bool
+    def hash: () -> Integer
+  end
+end

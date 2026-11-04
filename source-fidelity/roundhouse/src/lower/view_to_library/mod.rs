@@ -1,0 +1,5541 @@
+//! Lower a `View` (compiled-ERB IR) into a `LibraryClass` whose body is
+//! one `module_function`-style class method per view, with bodies in
+//! spinel-blog shape:
+//!
+//!   io = String.new
+//!   io << ViewHelpers.turbo_stream_from("articles")
+//!   ViewHelpers.content_for_set(:title, "Articles")
+//!   if !articles.empty?
+//!     articles.each { |a| io << Views::Articles.article(a) }
+//!   end
+//!   io
+//!
+//! Helper-call rewrites (`turbo_stream_from` → `ViewHelpers.turbo_stream_from`,
+//! `link_to text, url` → `ViewHelpers.link_to(text, RouteHelpers.<x>_path(...))`,
+//! auto-escape on bare interpolation, …) and render-partial dispatch
+//! happen here so per-target emitters consume canonical IR — the same
+//! rationale as `model_to_library` and `controller_to_library`.
+//!
+//! Scope of this first slice: the helpers needed by `articles/index.html.erb`
+//! (turbo_stream_from, content_for setter, link_to with path-helper URL,
+//! render @collection, `.any?`-style predicates, html_escape on bare
+//! interpolation). FormBuilder/form_with capture, content_for capture,
+//! errors-field predicates, and conditional-class composition land in
+//! follow-on slices once their forcing fixtures are exercised.
+
+mod predicates;
+mod extra_params;
+mod walker;
+pub(crate) mod form_wrapper;
+pub(crate) mod helpers;
+mod partial;
+mod form_with;
+pub(crate) mod form_builder;
+pub(crate) mod turbo_drive;
+pub(crate) mod turbo_frames;
+pub(crate) mod attr_parts;
+
+/// Largest `cached: true` collection that skips the store (`length > N`
+/// takes the concat-cache path). Named for the exclusive bound: length
+/// 8 is uncached, 9 is the first cached size.
+pub const MAX_UNCACHED_COLLECTION_LENGTH: i64 = 8;
+
+use crate::App;
+use crate::dialect::{AccessorKind, LibraryClass, MethodDef, MethodReceiver, Param, View};
+use crate::effect::EffectSet;
+use crate::expr::{Expr, ExprNode, InterpPart, IrHint, LValue, Literal};
+use crate::ident::{ClassId, Symbol, VarId};
+use crate::naming::{camelize_path, last_segment, singularize, snake_case};
+use crate::span::Span;
+
+use self::extra_params::{drop_closure_names, flash_params, rewritten_extras};
+
+pub(crate) use self::extra_params::{flash_param_in_scope, flash_slot_of, local_key_of};
+use self::form_wrapper::{FormWrapperHelper, form_wrapper_helpers};
+use self::walker::walk_body;
+
+/// Bulk entry: lower every view, then type their bodies against a
+/// shared registry so dispatch on framework helpers (ViewHelpers,
+/// RouteHelpers, Inflector), sibling view modules, and model classes
+/// resolves end-to-end. `extras` typically carries the model + view
+/// ClassInfo entries the model lowerer built; this entry adds the
+/// framework runtime stubs (ViewHelpers/RouteHelpers/Inflector/String)
+/// before typing.
+///
+/// For per-view typing-isolated calls (tests/probes that don't have
+/// a registry to share), the single-view entry below still works
+/// and will run its own internal typing pass.
+pub fn lower_views_to_library_classes(
+    views: &[View],
+    app: &App,
+    extras: Vec<(ClassId, crate::analyze::ClassInfo)>,
+) -> Vec<LibraryClass> {
+    let vctx = ViewLowerCtx::new(app);
+    let mut lcs = preliminary_view_classes(views, &vctx);
+    type_view_library_classes(&mut lcs, app, extras);
+    lcs
+}
+
+/// Untyped view classes used only to seed model/controller registries
+/// with `Views::*` method signatures. Body typing happens later in
+/// [`type_view_library_classes`]. Callers that already built a
+/// [`ViewLowerCtx`] should use this instead of a second `ViewLowerCtx::new`
+/// plus a typed `lower` walk — signatures do not need typed bodies.
+pub fn preliminary_view_classes(views: &[View], vctx: &ViewLowerCtx<'_>) -> Vec<LibraryClass> {
+    views
+        .iter()
+        .filter(|v| crate::lower::view::lowers_through_view_path(v))
+        .map(|v| vctx.lower_untyped(v))
+        .collect()
+}
+
+/// Type untyped view LibraryClasses against a merged extras registry.
+/// Mutates `lcs` in place so a preliminary untyped pass can be reused
+/// instead of constructing the classes a second time.
+pub fn type_view_library_classes(
+    lcs: &mut Vec<LibraryClass>,
+    app: &App,
+    extras: Vec<(ClassId, crate::analyze::ClassInfo)>,
+) {
+    // Merge: caller extras + framework runtime stubs + view modules
+    // themselves (so cross-view dispatch like Views::Articles.article
+    // resolves from one view to another).
+    let mut classes: crate::det::HashMap<ClassId, crate::analyze::ClassInfo> =
+        crate::det::HashMap::default();
+    for (id, info) in extras {
+        classes.insert(id, info);
+    }
+    insert_framework_stubs(&mut classes);
+    insert_route_helper_stubs(&mut classes, app);
+    for lc in lcs.iter() {
+        let info = classes.entry(lc.name.clone()).or_default();
+        for m in &lc.methods {
+            if let Some(sig) = &m.signature {
+                if matches!(m.receiver, MethodReceiver::Class) {
+                    info.class_methods.insert(m.name.clone(), sig.clone());
+                    info.class_method_kinds.insert(m.name.clone(), m.kind);
+                } else {
+                    info.instance_methods.insert(m.name.clone(), sig.clone());
+                    info.instance_method_kinds.insert(m.name.clone(), m.kind);
+                }
+            }
+        }
+        // Also register a last-segment alias for the typer's
+        // Const-path resolver.
+        let raw = lc.name.0.as_str();
+        let last = raw.rsplit("::").next().unwrap_or(raw).to_string();
+        if last != raw {
+            let alias_id = ClassId(Symbol::from(last));
+            let entry = classes.entry(alias_id).or_default();
+            for m in &lc.methods {
+                if let Some(sig) = &m.signature {
+                    if matches!(m.receiver, MethodReceiver::Class) {
+                        entry.class_methods.insert(m.name.clone(), sig.clone());
+                        entry.class_method_kinds.insert(m.name.clone(), m.kind);
+                    } else {
+                        entry.instance_methods.insert(m.name.clone(), sig.clone());
+                        entry.instance_method_kinds.insert(m.name.clone(), m.kind);
+                    }
+                }
+            }
+        }
+    }
+
+    // A bare `<x>_path` that is NOT in URL position — campfire's
+    // `rails_blob_path` inside a `data:` hash — never met
+    // `route_helperize`, and reached the emit calling a method nothing
+    // defines. Here, after every pass that pattern-matches the bare
+    // shape in URL position, is the last moment the two spellings can
+    // be made one.
+    crate::lower::route_helper_receiver::qualify_lcs(lcs, app);
+
+    let empty_ivars: crate::det::HashMap<Symbol, crate::ty::Ty> =
+        crate::det::HashMap::default();
+    for lc in lcs.iter_mut() {
+        for method in &mut lc.methods {
+            crate::lower::typing::type_method_body(method, &classes, &empty_ivars);
+        }
+    }
+}
+
+/// Migration entry point: lower views to `LibraryFunction`s, the
+/// canonical post-lowering shape for module-callable artifacts.
+/// Each template becomes one function whose `module_path` matches
+/// the view directory (`["Views", "Articles"]`) and whose `name` is
+/// the template's method name (`"article"`, `"index"`, etc.).
+///
+/// Implemented as a flattener over the existing class-shaped
+/// lowerer — typing, framework stubs, registry merging are all
+/// shared. The shape change happens at the boundary, not in the
+/// body-typing core.
+pub fn lower_views_to_library_functions(
+    views: &[View],
+    app: &App,
+    extras: Vec<(ClassId, crate::analyze::ClassInfo)>,
+) -> Vec<crate::dialect::LibraryFunction> {
+    let lcs = lower_views_to_library_classes(views, app, extras);
+    flatten_lcs_to_functions(&lcs)
+}
+
+/// Pivot LibraryClass methods into LibraryFunctions. Every method
+/// (always class-method on a view module) becomes a standalone
+/// function whose module_path is the LC name split on `::`.
+///
+/// Public so the TS emit can stage migration without changing the
+/// body-typer registry shape — `extras_from_lcs` keeps consuming the
+/// class form, while emit walks the function form.
+pub fn flatten_lcs_to_functions(
+    lcs: &[LibraryClass],
+) -> Vec<crate::dialect::LibraryFunction> {
+    let mut out = Vec::with_capacity(lcs.len());
+    for lc in lcs {
+        let module_path: Vec<Symbol> = lc
+            .name
+            .0
+            .as_str()
+            .split("::")
+            .map(Symbol::from)
+            .collect();
+        for m in &lc.methods {
+            out.push(crate::dialect::LibraryFunction {
+                module_path: module_path.clone(),
+                name: m.name.clone(),
+                params: m.params.clone(),
+                unsupported_formals: m.unsupported_formals,
+                has_anonymous_block: m.has_anonymous_block,
+                body: m.body.clone(),
+                signature: m.signature.clone(),
+                effects: m.effects.clone(),
+                is_async: m.is_async,
+            });
+        }
+    }
+    out
+}
+
+/// Single-view entry point — kept for tests/probes. Runs an internal
+/// body-typing pass with an empty registry; for whole-app emit where
+/// cross-class dispatch matters, use `lower_views_to_library_classes`.
+///
+/// `app` is consulted only for known model names (so view args can be
+/// typed implicitly downstream) and for FK resolution; the lowering is
+/// otherwise pure.
+/// Whole-app inputs the per-view lowering consumes — render-tree
+/// closures, dynamic-partial pools, partial contracts, locals-key
+/// unions, model-derived read sets. Building each of these walks the
+/// entire app, so recomputing them per view made view lowering
+/// quadratic (the mastodon playground transpile blew its 30s budget).
+/// Construct ONCE per app and lower every view through it; the
+/// single-view `lower_view_to_library_class` wrapper stays for
+/// one-off callers (dump_ir, tests).
+pub struct ViewLowerCtx<'a> {
+    app: &'a App,
+    known_models: Vec<String>,
+    closures: std::rc::Rc<crate::det::HashMap<ViewKey, Vec<Symbol>>>,
+    /// See the ViewCtx field of the same name.
+    view_formats: std::rc::Rc<crate::det::HashSet<(ViewKey, ViewKind, String)>>,
+    dyn_pools: std::rc::Rc<crate::det::HashMap<(String, Symbol), Vec<DynPoolEntry>>>,
+    partial_stems: std::rc::Rc<PartialStems>,
+    /// Partials whose body renders a `file_field` — see
+    /// `ViewCtx::multipart_partials`.
+    multipart_partials: std::rc::Rc<crate::det::HashSet<ViewKey>>,
+    partial_extras: std::rc::Rc<crate::det::HashMap<(String, String), Vec<String>>>,
+    /// See [`request_context_views`].
+    request_context: std::rc::Rc<crate::det::HashSet<String>>,
+    locals_keys: crate::det::HashMap<(String, String), Vec<String>>,
+    reference_reads: std::rc::Rc<crate::det::HashSet<String>>,
+    reference_targets: std::rc::Rc<crate::det::HashMap<String, String>>,
+    nilable_scalar_reads: std::rc::Rc<crate::det::HashSet<String>>,
+    html_safe_methods: std::rc::Rc<crate::det::HashSet<String>>,
+    model_singulars: std::rc::Rc<crate::det::HashSet<String>>,
+    slug_models: std::rc::Rc<crate::det::HashSet<String>>,
+    bool_readers: std::rc::Rc<crate::det::HashMap<String, crate::det::HashSet<String>>>,
+    store_readers:
+        std::rc::Rc<crate::det::HashMap<String, crate::det::HashSet<String>>>,
+    partial_form_bindings: crate::det::HashMap<ViewKey, PartialFormBinding>,
+    route_helper_names: std::rc::Rc<crate::det::HashSet<String>>,
+    i18n: std::rc::Rc<crate::i18n::FormI18n>,
+    /// Generated RouteHelpers function name -> how many REQUIRED
+    /// positionals it takes. See the ViewCtx field of the same name.
+    route_helper_arity: std::rc::Rc<crate::det::HashMap<String, usize>>,
+    /// Partials with a `<%# locals: (…) -%>` header, keyed by ViewKey →
+    /// their declared keyword locals (excluding the first/positional
+    /// record). Render call sites consult it to bind provided locals by
+    /// name and to suppress convention closure-threading.
+    strict_locals: std::rc::Rc<crate::det::HashMap<ViewKey, Vec<Param>>>,
+    /// For a partial rendered as a COLLECTION with an explicit name, the
+    /// local its callers bind each element to — `as:` when given, else
+    /// the partial's own base name. Rails' rule, read off the call site;
+    /// absent for every partial nobody renders that way, which then keeps
+    /// the dir-singular convention arg.
+    collection_element_locals: std::rc::Rc<crate::det::HashMap<ViewKey, String>>,
+    /// Helper methods that are a thin wrapper around a BUILDER-YIELDING
+    /// form helper (see [`form_wrapper_helpers`]).
+    form_wrappers: std::rc::Rc<crate::det::HashMap<String, FormWrapperHelper>>,
+    /// See the ViewCtx field of the same name. Off unless the emitter
+    /// opts in with [`ViewLowerCtx::observe_form_with_entry`].
+    form_with_entry: bool,
+}
+
+impl<'a> ViewLowerCtx<'a> {
+    pub fn new(app: &'a App) -> Self {
+        // The GENERATED helpers, surveyed once for both the name set and
+        // the arity map — read off the lowered functions rather than
+        // re-derived from the route table, so the two can't drift.
+        // Arity is the count of REQUIRED positionals: a `(.:format)`
+        // suffix, a Rails optional group, a `scope defaults:` segment and
+        // the query-param keywords all arrive with defaults, and none of
+        // them is an argument a member-path call site has to fill.
+        let route_helpers: Vec<(String, usize)> =
+            crate::lower::lower_routes_to_library_functions(app)
+                .into_iter()
+                .map(|f| {
+                    let required = f
+                        .params
+                        .iter()
+                        .filter(|p| p.default.is_none() && !p.keyword && !p.rest)
+                        .count();
+                    (f.name.as_str().to_string(), required)
+                })
+                .collect();
+        Self {
+            app,
+            known_models: app
+                .models
+                .iter()
+                .map(|m| m.name.0.as_str().to_string())
+                .collect(),
+            closures: std::rc::Rc::new(view_ivar_closures(&app.views, &app.controllers)),
+            view_formats: std::rc::Rc::new(view_formats(&app.views)),
+            dyn_pools: std::rc::Rc::new(dynamic_partial_pools(&app.controllers)),
+            partial_stems: std::rc::Rc::new(PartialStems::of(&app.views)),
+            multipart_partials: std::rc::Rc::new(multipart_partials(&app.views)),
+            partial_extras: std::rc::Rc::new(partial_extras_map(app)),
+            request_context: std::rc::Rc::new(request_context_views(&app.views)),
+            locals_keys: render_locals_keys(&app.views, &app.controllers, &app.library_classes),
+            reference_reads: std::rc::Rc::new(reference_reader_names(app)),
+            reference_targets: std::rc::Rc::new(reference_target_names(app)),
+            nilable_scalar_reads: std::rc::Rc::new(nilable_scalar_reader_names(app)),
+            html_safe_methods: std::rc::Rc::new(
+                app.html_safe_methods.iter().map(|m| m.as_str().to_string()).collect(),
+            ),
+            model_singulars: std::rc::Rc::new(
+                app.models
+                    .iter()
+                    .map(|m| crate::naming::snake_case(m.name.0.as_str()))
+                    .collect(),
+            ),
+            slug_models: std::rc::Rc::new(
+                app.models
+                    .iter()
+                    .filter(|m| {
+                        m.body.iter().any(|item| matches!(
+                            item,
+                            crate::dialect::ModelBodyItem::Method { method, .. }
+                                if method.name.as_str() == "to_param"
+                        ))
+                    })
+                    .map(|m| crate::naming::snake_case(m.name.0.as_str()))
+                    .collect(),
+            ),
+            bool_readers: std::rc::Rc::new(bool_reader_names(app)),
+            store_readers: std::rc::Rc::new(store_reader_names(app)),
+            partial_form_bindings: partial_form_bindings(&app.views),
+            i18n: std::rc::Rc::new(crate::i18n::FormI18n::of(app)),
+            route_helper_names: std::rc::Rc::new(
+                route_helpers.iter().map(|(n, _)| n.clone()).collect(),
+            ),
+            route_helper_arity: std::rc::Rc::new(route_helpers.into_iter().collect()),
+            strict_locals: std::rc::Rc::new(strict_locals_by_key(&app.views)),
+            collection_element_locals: std::rc::Rc::new(collection_element_locals(&app.views, app)),
+            form_wrappers: std::rc::Rc::new(form_wrapper_helpers(app)),
+            form_with_entry: false,
+        }
+    }
+
+    /// Open each template `form_with` site with the
+    /// `ActionView::Base.new.form_with` entry. Only the Ruby family
+    /// ships `ActionView::Base` (`runtime/ruby/action_view/base.rb`):
+    /// the call exists so a mocha spy on the view context observes the
+    /// site, and the strict targets have neither the class nor mocha.
+    pub fn observe_form_with_entry(mut self) -> Self {
+        self.form_with_entry = true;
+        self
+    }
+
+    pub fn lower(&self, view: &View) -> LibraryClass {
+        plain_text(view, build_library_class(view, self, /*type_body=*/ true))
+    }
+
+    pub(crate) fn lower_untyped(&self, view: &View) -> LibraryClass {
+        plain_text(view, build_library_class(view, self, /*type_body=*/ false))
+    }
+}
+
+/// A text/plain template (`.text.erb`, `.txt.erb`) writes `<%= x %>` as
+/// it is: Rails' ERB handler escapes every other format but this one
+/// (`escape_ignore_list`), so the walker's `html_escape` comes back off.
+fn plain_text(view: &View, mut lc: LibraryClass) -> LibraryClass {
+    if !matches!(view.format.as_str(), "text" | "txt") {
+        return lc;
+    }
+    fn unescape(e: &mut Expr) {
+        e.node.for_each_child_mut(&mut |c| unescape(c));
+        let ExprNode::Send { recv: Some(recv), method, args, .. } = &*e.node else { return };
+        let helpers = matches!(&*recv.node, ExprNode::Const { path } if path.iter().map(|p| p.as_str()).eq(["ActionView", "ViewHelpers"]));
+        if !helpers || method.as_str() != "html_escape" || args.len() != 1 {
+            return;
+        }
+        let arg = args[0].clone();
+        let span = e.span;
+        let already_string = matches!(&*arg.node, ExprNode::Send { method, args, .. } if method.as_str() == "to_s" && args.is_empty())
+            || matches!(arg.ty, Some(crate::ty::Ty::Str));
+        *e = if already_string {
+            arg
+        } else {
+            let mut s = Expr::new(span, ExprNode::Send { recv: Some(arg), method: Symbol::from("to_s"), args: vec![], block: None, parenthesized: false });
+            s.ty = Some(crate::ty::Ty::Str);
+            s
+        };
+    }
+    for m in &mut lc.methods {
+        unescape(&mut m.body);
+    }
+    lc
+}
+
+pub fn lower_view_to_library_class(view: &View, app: &App) -> LibraryClass {
+    ViewLowerCtx::new(app).lower(view)
+}
+
+fn build_library_class(view: &View, lx: &ViewLowerCtx, type_body: bool) -> LibraryClass {
+    let app = lx.app;
+    let (dir, base) = split_view_name(view.name.as_str());
+    let view_key = view_key_of(view, &lx.partial_stems);
+    // A top-level template has no graph key, so the stem is asked for
+    // directly.
+    let stem = match base.starts_with('_') {
+        true => lx.partial_stems.stem(&camelize_path(&snake_case(dir)), base),
+        false => base.to_string(),
+    };
+
+    let module_id = view_module_id(dir);
+    let method_name =
+        crate::lower::view::view_method_name_for(&stem, view.format.as_str());
+
+    let known_models: &[String] = &lx.known_models;
+    // Rails binds a collection element to the local named after the
+    // PARTIAL (or `as:`), not after its DIRECTORY: `render partial:
+    // "rooms/opens/user", collection: users` hands the partial a `user`,
+    // where the dir convention says `open`. The two agree for
+    // `articles/_article` and part ways for a partial not named after its
+    // directory — and the CALL side already binds the caller's name
+    // (`emit_partial_each`'s `as_name.unwrap_or(base_name)`), so this half
+    // was the one out of step: `_user`'s body read `user`, which resolved
+    // to the module's own `user` method and recursed.
+    //
+    // Taken from the CALL SITES (`collection_element_locals`), not guessed
+    // from the body: a body-reads-the-stem heuristic also fires on a
+    // BLOCK parameter, which is how `rooms/layouts/_form` — whose
+    // `form_with … do |form|` binds `form` — briefly lost its `yield` arg.
+    //
+    // The arg is a positional param, so a reserved-word `as:` (`as:
+    // :for`) goes through `safe_local`, as its reads do.
+    let arg_name =
+        effective_record_arg(view, &lx.collection_element_locals, known_models, &lx.partial_stems);
+
+    // Rewrite `@ivar` → bare `ivar` everywhere so the inferred arg name
+    // (and any extra params we surface) read as plain locals in the
+    // emitted body. Mirrors the controller-side ivar-to-local pass.
+    // `ivar_locals` names each ivar's local once for the whole view, so
+    // the params below and these reads agree (#753).
+    let closure_raw: Vec<Symbol> = view_key
+        .as_ref()
+        .and_then(|k| lx.closures.get(k).cloned())
+        .unwrap_or_default();
+    let ivar_locals = view_ivar_locals(view, &closure_raw);
+    let keys = view_key.as_ref().and_then(|k| lx.locals_keys.get(k));
+    // Flash rename → ivar rewrite → extras collect, one pipeline shared
+    // with the call-site contracts (see `extra_params::rewritten_extras`).
+    let (rewritten, extra_params) =
+        rewritten_extras(view, &ivar_locals, &arg_name, keys.map(Vec::as_slice), lx.request_context.contains(view.name.as_str()));
+
+    // Rewrite `defined?(name)` marker Sends to `!name.nil?` checks.
+    // Runs AFTER collect_extra_params so the inner Var name has been
+    // captured as a nullable partial parameter. Once the partial's
+    // signature includes `name: nil`, the nil-check captures the
+    // same semantics the author intended ("is this optional local
+    // present?") and downstream emitters don't need target-specific
+    // `defined?` knowledge.
+    let mut rewritten = rewritten;
+    // An app override owns pluralize, including nested ERB calls.
+    // Qualify it before the framework classifier consumes bare Sends.
+    if let Some(owner) = app.helper_method_index.get(&Symbol::from("pluralize")) {
+        fn qualify_pluralize(e: &mut Expr, owner: &ClassId) {
+            e.node.for_each_child_mut(&mut |c| qualify_pluralize(c, owner));
+            if let ExprNode::Send { recv, method, .. } = &mut *e.node {
+                if recv.is_none() && method.as_str() == "pluralize" {
+                    *recv = Some(Expr::new(e.span, ExprNode::Const {
+                        path: owner.0.as_str().split("::").map(Symbol::from).collect(),
+                    }));
+                }
+            }
+        }
+        qualify_pluralize(&mut rewritten, owner);
+    }
+    rewrite_defined_to_nil_check(&mut rewritten);
+    // `local_assigns[:x]` → the bare local `x`. Same place and the same
+    // reason as the line above: `collect_extra_params` has already
+    // recorded the name as a nil-default param, so the read resolves.
+    let keyword_locals: Vec<&str> = view
+        .strict_locals
+        .iter()
+        .flat_map(|sl| sl.iter().skip(1))
+        .map(|p| p.name.as_str())
+        .collect();
+    rewrite_local_assigns_to_locals(&mut rewritten, &keyword_locals);
+
+    // The inferred record arg (e.g. `articles`, `article`) is the
+    // required positional. Free locals discovered downstream
+    // (`notice`, `alert`, …) get a `nil` default so controllers that
+    // don't have a flash to pass can still call `Views::X.action(rec)`
+    // without arity errors. Spinel-blog's hand-written views use
+    // keyword-with-default for these (`notice: nil`); the lowerer
+    // models the same callability with positional-with-nil-default
+    // until kw-args are first-class in `Param`.
+    let nil_default = Expr::new(
+        view.body.span,
+        ExprNode::Lit { value: Literal::Nil },
+    );
+    // View↔controller data contract. Partials and layouts take a single
+    // record/body arg supplied by the render/yield call site (a local, not
+    // an ivar), so they keep the convention-derived `arg_name`. ACTION
+    // views (index/show/…) instead take exactly the @ivars their template
+    // reads, in first-seen order — the controller passes `@<name>` for each
+    // (see controller_to_library's render rewrite). A multi-ivar view like
+    // home/index then receives all of @stories/@page/@show_more/…; a view
+    // that reads exactly its one resource ivar (the blog) gets the same
+    // signature the convention would have produced.
+    let is_partial = base.starts_with('_');
+    let is_layout = dir == "layouts";
+    let is_action_view = !is_partial && !is_layout && !dir.is_empty();
+
+    // Render-tree ivar closure: the ivars this view needs (its own reads ∪
+    // the ivars every partial it renders needs, transitively). Action views
+    // take exactly these as positional params; partials take their record
+    // arg PLUS these (threaded from the rendering view); the controller /
+    // render call sites pass the matching values. Layouts are body-only
+    // for now (their call site is main.rb, not yet threaded).
+    let closures = lx.closures.clone();
+    let dyn_pools = lx.dyn_pools.clone();
+    // `ivar_locals`: closure maps carry RAW ivar names (controller call
+    // sites emit `@for` from them); the view-local identifiers derived
+    // here rename reserved words (`for` → `for_`, or `for__` beside a
+    // `@for_`), position-for-position with the raw list so caller arg
+    // order still matches.
+    let closure_ivars: Vec<String> =
+        closure_raw.iter().map(|s| ivar_local(&ivar_locals, s.as_str())).collect();
+    // A param's type is looked up by its ivar, not by its local name.
+    let ivar_of = |local: &str| -> String {
+        closure_raw
+            .iter()
+            .zip(&closure_ivars)
+            .find(|(_, l)| l.as_str() == local)
+            .map_or_else(|| local.to_string(), |(raw, _)| raw.as_str().to_string())
+    };
+
+    // A partial's locals are its interface: every `locals:` key any call
+    // site passes becomes a trailing nil-default param (sorted; see
+    // render_locals_keys). Names already on the signature as the record
+    // or flash/defined? extras are skipped here.
+    let mut extra_params = extra_params;
+    if is_partial {
+        let keys_map = &lx.locals_keys;
+        if let Some(keys) = view_key.as_ref().and_then(|k| keys_map.get(k).cloned()) {
+            for k in keys {
+                if k != arg_name && !extra_params.contains(&k) {
+                    extra_params.push(k);
+                }
+            }
+        }
+    }
+    // Closure ivars are dropped after append by `drop_closure_names` (raw
+    // key vs `safe_local` name) — for every view kind, not just partials.
+    // An action view's or a layout's `typed` params already include its
+    // closure ivars (above); a `defined?(@x)` marker or a `locals:` key
+    // naming that same ivar must not also append it as a nil-default
+    // extra, or the emitted method takes `x` twice — a duplicate
+    // argument name, which is a Ruby syntax error (#389's sibling: that
+    // one was partials only, this is every kind).
+    drop_closure_names(&mut extra_params, &closure_ivars);
+
+    // A bound form local is NOT interface (see `partial_form_bindings`):
+    // render_locals_keys already filters the locals channel, and this
+    // retain covers the OTHER extras channel — `defined?(f)` in the
+    // partial body (stories/_form_errors guards a builder-dependent
+    // hidden field with it) marks `f` as a defined?-extra in
+    // collect_extra_params.
+    let form_binding = (is_partial)
+        .then(|| view_key.as_ref().and_then(|k| lx.partial_form_bindings.get(k)))
+        .flatten();
+    if let Some(binding) = form_binding {
+        extra_params.retain(|k| k != &binding.form_local);
+    }
+    // An extra is a positional param, and a positional param cannot have
+    // a reserved word as its name (`class`). `safe_local` renames it, the
+    // same way `rewrite_local_assigns_to_locals` renames its reads. Call
+    // sites pass extras by position, so they do not see the new name.
+    let extra_params: Vec<String> =
+        extra_params.iter().map(|k| crate::naming::safe_local(k)).collect();
+    // The flash a partial this view renders reads (`ViewCtx::own_flash`).
+    // A param a render hands a local by its slot's name holds that local
+    // there (`local_key_of`), and a strict-locals partial takes no flash.
+    let own_flash: [Option<String>; 2] = if is_partial && view.strict_locals.is_some() {
+        Default::default()
+    } else {
+        flash_params(&extra_params).map(|param| {
+            param
+                .filter(|n| {
+                    let key = local_key_of(&extra_params, n);
+                    !keys.is_some_and(|keys| keys.iter().any(|k| k == key))
+                })
+                .map(str::to_string)
+        })
+    };
+
+    // Typed primary params: (name, type, required). Extras (notice/alert/…)
+    // are appended afterward as nullable optionals.
+    let mut typed: Vec<(String, crate::ty::Ty)> = Vec::new();
+    if is_action_view {
+        for iv in &closure_ivars {
+            typed.push((iv.clone(), closure_ivar_ty(view, &ivar_of(iv), &known_models, lx.app)));
+        }
+    } else {
+        // Partial/layout: record/body arg from the render/yield call site,
+        // then the threaded closure ivars. Layouts get the same closure
+        // threading as partials — their call site is the Ruby emit path's
+        // layout wrap (`apply_layout_lowering` rewrites each action's
+        // `render(Views::X.y(...))` to pass the controller's @ivars), so a
+        // layout reading @user/@title receives them like any partial. A
+        // layout with an empty closure (the blog) keeps its body-only
+        // signature, so the other targets' `Layouts.application(body)`
+        // dispatch call sites are arity-stable.
+        if !arg_name.is_empty() {
+            typed.push((arg_name.clone(), record_arg_ty(dir, is_layout, &known_models)));
+        }
+        for iv in &closure_ivars {
+            // The record arg already covers a same-named ivar (a `_form`
+            // whose record is `category` and which reads `@category`) —
+            // don't emit a duplicate param. The call site excludes it too.
+            if iv == &arg_name {
+                continue;
+            }
+            typed.push((iv.clone(), closure_ivar_ty(view, &ivar_of(iv), &known_models, lx.app)));
+        }
+        // Layouts render in the controller's view context, where `flash`
+        // is live — thread it as a param when the template reads it bare
+        // (`flash[f]`). The layout wrap passes `@flash`.
+        if is_layout && view_uses_bare_name(&rewritten, "flash") {
+            typed.push(("flash".to_string(), crate::ty::Ty::Untyped));
+        }
+    }
+
+    let mut params: Vec<Param> = Vec::new();
+    for (n, _) in &typed {
+        params.push(Param::positional(Symbol::from(n.as_str())));
+    }
+    for n in &extra_params {
+        params.push(Param::with_default(
+            Symbol::from(n.clone()),
+            nil_default.clone(),
+        ));
+    }
+
+    // Method signature: typed param list so the body-typer (and per-target
+    // type-aware dispatch) resolves `articles.empty?` to Array dispatch,
+    // `article.title` to a model attribute, etc. Primaries typed above;
+    // extras are nullable strings.
+    let mut signature = build_view_signature_from(&typed, &extra_params);
+
+    let mut locals: Vec<String> = typed.iter().map(|(n, _)| n.clone()).collect();
+    locals.extend(extra_params.iter().cloned());
+
+    // Nullable-for-predicates: the `nil`-default extras (notice/alert) PLUS
+    // any Untyped param. `present?`/`blank?` are defined to handle nil
+    // (Rails: `nil.present?` == false), so an Untyped ivar the controller
+    // may leave nil (`@referer ||= request.referer`) must get the nil-safe
+    // `!x.nil? && !x.empty?` form, not a bare `!x.empty?` that crashes on
+    // nil. Blog-neutral: its present?/any? receivers are all Array-typed
+    // collections or already-nullable — never bare Untyped params.
+    let mut nullable: crate::det::HashSet<String> =
+        extra_params.iter().cloned().collect();
+    for (n, ty) in &typed {
+        if matches!(ty, crate::ty::Ty::Untyped) {
+            nullable.insert(n.clone());
+        }
+    }
+
+    // ── Strict-locals override ───────────────────────────────────────
+    // A partial with a `<%# locals: (…) -%>` header declares its locals
+    // interface EXACTLY. Its signature becomes: the FIRST declared local
+    // as the POSITIONAL record (every render call site passes the record
+    // positionally), then the ivar CLOSURE it reads (strict-locals
+    // partials still access `@user`/`@showing_user` — Rails restricts
+    // locals, not ivars — threaded from the caller like any partial),
+    // then the remaining declared locals as KEYWORD params with header
+    // defaults. Body refs to a declared local (`tag`, `comment`) resolve
+    // as that param, not a same-named helper (`ApplicationHelper.tag`);
+    // callers bind provided keyword locals by name, omitted ones default.
+    // Not the declared form local of a bound partial: its `f.*` calls inline at compile time, and a caller has no builder to pass.
+    let strict_without_form = view.strict_locals.as_ref().map(|sl| {
+        sl.iter().filter(|p| form_binding.is_none_or(|b| p.name.as_str() != b.form_local)).cloned().collect::<Vec<Param>>()
+    });
+    if let Some(sl) = strict_without_form.as_ref().filter(|sl| is_partial && !sl.is_empty()) {
+        use crate::ty::{Param as TyParam, ParamKind, Ty};
+        // The record is a positional param, so a reserved-word name
+        // (`for:`) goes through `safe_local`, as its reads do. The
+        // keyword locals keep their names: callers pass them by name.
+        let mut record = sl[0].clone();
+        record.name = Symbol::from(crate::naming::safe_local(record.name.as_str()));
+        let record = &record;
+        let record_name = record.name.as_str().to_string();
+        let kw_locals = &sl[1..];
+        // Closure ivars this partial reads, MINUS every declared local: a
+        // name that's both a declared local and an `@ivar` read (`_threads`
+        // declares `story:` and reads `@story`) collapses to one identifier
+        // after the ivar→local rewrite, so the declared param covers it —
+        // threading it again would emit a duplicate argument name.
+        let declared: crate::det::HashSet<&str> = std::iter::once(record_name.as_str())
+            .chain(kw_locals.iter().map(|p| p.name.as_str()))
+            .collect();
+        let closure: Vec<String> = closure_ivars
+            .iter()
+            .filter(|iv| !declared.contains(iv.as_str()))
+            .cloned()
+            .collect();
+
+        let mut new_params: Vec<Param> = Vec::new();
+        let mut sig_params: Vec<TyParam> = Vec::new();
+        new_params.push(match &record.default {
+            Some(d) => Param::with_default(record.name.clone(), d.clone()),
+            None => Param::positional(record.name.clone()),
+        });
+        sig_params.push(TyParam {
+            name: record.name.clone(),
+            ty: declared_local_ty(view, sl[0].name.as_str(), &known_models, lx.app).into(),
+            kind: ParamKind::Required,
+        });
+        for iv in &closure {
+            new_params.push(Param::positional(Symbol::from(iv.clone())));
+            sig_params.push(TyParam {
+                name: Symbol::from(iv.clone()),
+                ty: closure_ivar_ty(view, &ivar_of(iv), &known_models, lx.app).into(),
+                kind: ParamKind::Required,
+            });
+        }
+        for p in kw_locals {
+            new_params.push(p.clone());
+            let is_bool_default = matches!(
+                &p.default,
+                Some(d) if matches!(&*d.node, ExprNode::Lit { value: Literal::Bool { .. } })
+            );
+            sig_params.push(TyParam {
+                name: p.name.clone(),
+                ty: if is_bool_default {
+                    Ty::Bool.into()
+                } else {
+                    declared_local_ty(view, p.name.as_str(), &known_models, lx.app).into()
+                },
+                // These are Ruby KEYWORD params (`show_story: false`), not
+                // positionals — strict targets (rust unpack_trailing_kwargs,
+                // TS destructured-object def) need the Keyword kind to emit
+                // and call them correctly.
+                kind: ParamKind::Keyword { required: p.default.is_none() },
+            });
+        }
+        // Keywords, not positional extras: a strict partial's callers bind by name, and an omitted one stays nil.
+        if lx.request_context.contains(view.name.as_str()) {
+            for name in ["action_name", "controller_name", "path_parameters"] {
+                if declared.contains(name) {
+                    continue;
+                }
+                new_params.push(Param::keyword(Symbol::from(name), Some(nil_lit())));
+                let ty = if name == "path_parameters" {
+                    Ty::Hash { key: std::sync::Arc::new(Ty::Str), value: std::sync::Arc::new(Ty::Str) }
+                } else {
+                    Ty::Str
+                };
+                sig_params.push(TyParam {
+                    name: Symbol::from(name),
+                    ty: Ty::Union { variants: vec![ty, Ty::Nil].into() }.into(),
+                    kind: ParamKind::Keyword { required: false },
+                });
+            }
+        }
+        params = new_params;
+        // Nullable-for-predicates: nil-defaulted keyword locals PLUS any
+        // Untyped record/closure param. Built BEFORE sig_params is moved
+        // into the signature. Rebuilding (not extending the earlier set) is
+        // correct because params were fully replaced — but it must still
+        // cover the Untyped record/closure the caller may leave nil, or a
+        // body predicate emits a bare `!x.empty?` that crashes on nil. A
+        // bare `false`/`true` keyword default is a concrete Bool, not nil.
+        nullable = kw_locals
+            .iter()
+            .filter(|p| {
+                matches!(&p.default, Some(d)
+                    if matches!(&*d.node, ExprNode::Lit { value: Literal::Nil }))
+            })
+            .map(|p| p.name.as_str().to_string())
+            .collect();
+        for tp in &sig_params {
+            if matches!(*tp.ty, crate::ty::Ty::Untyped) {
+                nullable.insert(tp.name.as_str().to_string());
+            }
+        }
+        signature = Some(Ty::Fn {
+            params: sig_params.into(),
+            block: None,
+            ret: std::sync::Arc::new(Ty::Str),
+            effects: crate::effect::EffectSet::default(),
+        });
+        locals = std::iter::once(record_name.clone())
+            .chain(closure.iter().cloned())
+            .chain(kw_locals.iter().map(|p| p.name.as_str().to_string()))
+            .chain(
+                ["action_name", "controller_name", "path_parameters"]
+                    .into_iter()
+                    .filter(|n| lx.request_context.contains(view.name.as_str()) && !declared.contains(n))
+                    .map(str::to_string),
+            )
+            .collect();
+    }
+
+    let mut ctx = ViewCtx {
+        locals,
+        // Only layouts consult arg_name (emit_yield → the `body` local);
+        // action views don't yield, so an empty name is fine for them.
+        arg_name: if is_action_view { String::new() } else { arg_name.clone() },
+        resource_dir: dir.to_string(),
+        accumulator: "io".to_string(),
+        form_records: Vec::new(),
+        nullable_locals: nullable,
+        reference_reads: lx.reference_reads.clone(),
+        reference_targets: lx.reference_targets.clone(),
+        nilable_scalar_reads: lx.nilable_scalar_reads.clone(),
+        html_safe_methods: lx.html_safe_methods.clone(),
+        model_singulars: lx.model_singulars.clone(),
+        slug_models: lx.slug_models.clone(),
+        bool_readers: lx.bool_readers.clone(),
+        store_readers: lx.store_readers.clone(),
+        route_helper_names: lx.route_helper_names.clone(),
+        i18n: lx.i18n.clone(),
+        route_helper_arity: lx.route_helper_arity.clone(),
+        form_wrappers: lx.form_wrappers.clone(),
+        form_with_entry: lx.form_with_entry,
+        stylesheets: app.stylesheets.clone(),
+        lexxy: app.gem_lock.as_ref().is_some_and(|lock| lock.has("lexxy")),
+        lexxy_editor_adapter: app.gem_lock.as_ref().is_some_and(lexxy_uses_editor_adapter),
+        partial_ivars: closures.clone(),
+        formats: std::iter::once(view.format.as_str())
+            .chain((view.format.as_str() != "html").then_some("html"))
+            .map(str::to_string)
+            .collect(),
+        view_formats: lx.view_formats.clone(),
+        dyn_pools: dyn_pools.clone(),
+        partial_stems: lx.partial_stems.clone(),
+        multipart_partials: lx.multipart_partials.clone(),
+        partial_extras: lx.partial_extras.clone(),
+        strict_locals: lx.strict_locals.clone(),
+        view_name: crate::lower::view::fragment_template_path(view.name.as_str(), view.format.as_str()),
+        ivar_models: std::rc::Rc::new(view_ivar_models(app, &view.name)),
+        str_ivars: std::rc::Rc::new(view_str_ivars(app, &view.name)),
+        ivar_locals: std::rc::Rc::new(ivar_locals),
+        own_flash,
+    };
+
+    // A partial that receives a form builder as a local re-derives the
+    // binding at compile time (`partial_form_bindings`): seed the
+    // FormBuilderBinding so `f.*` calls inline exactly as in the
+    // defining template, substitute `f.object` reads to the record
+    // local, fold `defined?(f)` to true (the binding guarantees the
+    // builder — every caller passes it), and prelude `f_method` (PATCH
+    // for a persisted record, POST otherwise — same derivation the
+    // inline form_with makes; `f.submit`'s default text branches on
+    // it).
+    let mut rewritten = rewritten;
+    let mut prelude: Vec<Expr> = Vec::new();
+    if let Some(binding) = form_binding {
+        let record_var = Symbol::from(binding.record_local.as_str());
+        let form_method_var = Symbol::from("f_method");
+        rewritten = self::form_with::rewrite_form_object_reads(
+            &rewritten,
+            &binding.form_local,
+            &record_var,
+        );
+        rewritten = fold_defined_form_local(&rewritten, &binding.form_local);
+        ctx.form_records.push(FormBuilderBinding {
+            form_param: binding.form_local.clone(),
+            model_name: binding.model_name.clone(),
+            record_var: record_var.clone(),
+            form_method_var: form_method_var.clone(),
+            id_prefix: binding.id_prefix.clone(),
+        });
+        let record_ref = Expr::new(
+            Span::synthetic(),
+            ExprNode::Var { id: VarId(0), name: record_var },
+        );
+        let persisted = send(
+            Some(record_ref),
+            "persisted?",
+            Vec::new(),
+            None,
+            false,
+        );
+        prelude.push(Expr::new(
+            Span::synthetic(),
+            ExprNode::Assign {
+                target: LValue::Var { id: VarId(0), name: form_method_var },
+                value: Expr::new(
+                    Span::synthetic(),
+                    ExprNode::If {
+                        cond: persisted,
+                        then_branch: lit_sym(Symbol::from("patch")),
+                        else_branch: lit_sym(Symbol::from("post")),
+                    },
+                ),
+            },
+        ));
+    }
+
+    let mut body_stmts: Vec<Expr> = Vec::new();
+    body_stmts.push(assign_accumulator_string_new(&ctx.accumulator));
+    body_stmts.extend(prelude);
+    body_stmts.extend(walk_body(&rewritten, &ctx));
+    body_stmts.push(accumulator_result_ref(&ctx.accumulator));
+
+    let mut body = seq(body_stmts);
+    // File-grain catch-all: whatever synthesis the walk-level stamps
+    // didn't reach (`io = String.new`, the trailing `io`, TODO
+    // markers from unrecognized shapes) attributes to the template as
+    // a whole, so an emit-time diagnostic always names the right file.
+    body.inherit_span(view.body.span);
+
+    // View methods render HTML — they're functions in the spinel
+    // sense (return String), so Method is the right kind.
+    let mut method = MethodDef {
+        visibility: crate::dialect::MethodVisibility::Public,
+        unsupported_formals: None,
+        has_anonymous_block: false,
+        name_span: crate::span::Span::synthetic(),
+        name: method_name,
+        receiver: MethodReceiver::Class,
+        params,
+        body,
+        signature,
+        effects: EffectSet::default(),
+        enclosing_class: Some(module_id.0.clone()),
+        kind: AccessorKind::Method,
+        is_async: false,
+            mutates_self: false,
+            block_param: None,
+    };
+
+    // Run the body-typer over the lowered body so per-target emitters
+    // get typed Sends (e.g. `articles.empty?` with recv typed as
+    // `Ty::Array<Article>` so the Array dispatch resolves correctly).
+    // Single-view path uses an empty class registry (sufficient for
+    // primitive Array/String/Hash dispatch); the bulk entry above
+    // re-types with the merged registry for cross-class resolution.
+    if type_body {
+        type_method_body(&mut method);
+    }
+
+    LibraryClass {
+        name: module_id,
+        is_module: true,
+        parent: None,
+        parent_span: Default::default(),
+        includes: Vec::new(),
+        include_spans: Vec::new(),
+        methods: vec![method],
+        nullable_columns: Vec::new(),
+        origin: None,
+        constants: Vec::new(),
+        conditional_definitions: Vec::new(),
+        unknown_calls: Vec::new(),
+        class_ivar_initializers: Vec::new(),
+    }
+}
+
+/// Params — the narrowing-accessor contract over `Roundhouse::
+/// ParamValue` (`runtime/ruby/params.rb`). Registered for the app
+/// lowerer the same way `Db` is; the bodies are ordinary transpiled
+/// Ruby, so this only has to teach the app-side typer the signatures.
+pub fn insert_params_stub(
+    classes: &mut crate::det::HashMap<ClassId, crate::analyze::ClassInfo>,
+) {
+    use crate::lower::typing::fn_sig;
+    use crate::ty::Ty;
+
+    let param_value = Ty::Class {
+        id: ClassId(Symbol::from("Roundhouse::ParamValue")),
+        args: vec![].into(),
+    };
+    let hash = Ty::Hash {
+        key: std::sync::Arc::new(Ty::Str),
+        value: std::sync::Arc::new(param_value),
+    };
+    let mut info = crate::analyze::ClassInfo::default();
+    info.class_methods.insert(
+        Symbol::from("sub"),
+        fn_sig(
+            vec![(Symbol::from("params"), hash.clone()), (Symbol::from("key"), Ty::Str)],
+            hash.clone(),
+        ),
+    );
+    info.class_methods.insert(
+        Symbol::from("str"),
+        fn_sig(
+            vec![
+                (Symbol::from("sub"), hash.clone()),
+                (Symbol::from("key"), Ty::Str),
+                (Symbol::from("fallback"), Ty::Str),
+            ],
+            Ty::Str,
+        ),
+    );
+    info.class_methods.insert(
+        Symbol::from("provided"),
+        fn_sig(
+            vec![(Symbol::from("sub"), hash.clone()), (Symbol::from("key"), Ty::Str)],
+            Ty::Bool,
+        ),
+    );
+    // The scalar readers `from_raw` calls and the multiparameter record
+    // it keeps — Rails' cast on the Ruby family, pass-throughs on the
+    // other targets (each target's `params` runtime).
+    let strs = Ty::Array { elem: std::sync::Arc::new(Ty::Str) };
+    info.class_methods.insert(
+        Symbol::from("scalar_provided"),
+        fn_sig(vec![(Symbol::from("sub"), hash.clone()), (Symbol::from("key"), Ty::Str)], Ty::Bool),
+    );
+    info.class_methods.insert(
+        Symbol::from("scalar"),
+        fn_sig(vec![(Symbol::from("sub"), hash.clone()), (Symbol::from("key"), Ty::Str)], Ty::Str),
+    );
+    info.class_methods.insert(Symbol::from("no_fields"), fn_sig(vec![], strs.clone()));
+    info.class_methods.insert(
+        Symbol::from("multiparameter_fields"),
+        fn_sig(vec![(Symbol::from("sub"), hash.clone()), (Symbol::from("keys"), strs.clone())], strs.clone()),
+    );
+    info.class_methods.insert(
+        Symbol::from("multiparameter_unsupported"),
+        fn_sig(vec![(Symbol::from("sub"), hash), (Symbol::from("keys"), strs.clone())], Ty::Bool),
+    );
+    info.class_methods.insert(
+        Symbol::from("any_of"),
+        fn_sig(vec![(Symbol::from("list"), strs.clone()), (Symbol::from("names"), strs)], Ty::Bool),
+    );
+    for name in [
+        "sub",
+        "str",
+        "provided",
+        "scalar_provided",
+        "scalar",
+        "no_fields",
+        "multiparameter_fields",
+        "multiparameter_unsupported",
+        "any_of",
+    ] {
+        info.class_method_kinds
+            .insert(Symbol::from(name), crate::dialect::AccessorKind::Method);
+    }
+    classes.insert(ClassId(Symbol::from("Params")), info);
+}
+
+/// Db — the per-target primitive persistence shim's typing contract
+/// (backend-agnostic: cruby-gem sqlite, spinel-FFI sqlite, future
+/// siblings all satisfy it; stmt handle opaque-as-Integer, per-target
+/// narrowing at emit). Shared between the app-lowering registry
+/// (`insert_framework_stubs`) and the runtime-transpile pre-seed
+/// (`runtime_src::seed_well_known_classes`) — the raw-SQL connection
+/// facade in runtime/ruby/active_record/connection.rb calls Db
+/// directly, so the runtime body-typer needs the same contract.
+pub fn insert_db_stub(
+    classes: &mut crate::det::HashMap<ClassId, crate::analyze::ClassInfo>,
+) {
+    use crate::lower::typing::fn_sig;
+    use crate::ty::Ty;
+
+    // Db — primitive surface the per-model `_adapter_*` Level-3
+    // emit calls into. Backend-agnostic (sqlite via cruby gem here,
+    // spinel-FFI sqlite planned, postgres/etc. siblings later); every
+    // shim satisfies this contract. Stmt handle is opaque (Integer
+    // here); per-target narrowing happens at emit time. See
+    // project_level_3_adapter_emit.md and runtime/ruby/db.rbs.
+    let mut db_info = crate::analyze::ClassInfo::default();
+    db_info.class_methods.insert(
+        Symbol::from("configure"),
+        fn_sig(vec![(Symbol::from("path"), Ty::Str)], Ty::Nil),
+    );
+    db_info.class_methods.insert(
+        Symbol::from("close"),
+        fn_sig(vec![], Ty::Nil),
+    );
+    db_info.class_methods.insert(
+        Symbol::from("database_path"),
+        fn_sig(vec![], Ty::Str),
+    );
+    // The adapter Rails reports ("sqlite3", "postgresql"): the runtime's
+    // bulk writes pick the database's SQL spelling by it.
+    db_info.class_methods.insert(
+        Symbol::from("adapter_name"),
+        fn_sig(vec![], Ty::Str),
+    );
+    // A write that returns rows (`INSERT … RETURNING`): a statement
+    // handle, read as `prepare`'s is.
+    db_info.class_methods.insert(
+        Symbol::from("exec_returning"),
+        fn_sig(vec![(Symbol::from("sql"), Ty::Str)], Ty::Int),
+    );
+    let hash_config = ClassId(Symbol::from("ActiveRecord::DatabaseConfigurations::HashConfig"));
+    let hash_config_methods = [
+        ("database", Ty::Str),
+        ("adapter", Ty::Str),
+        ("name", Ty::Str),
+        ("env_name", Ty::Str),
+        ("schema_dump", Ty::Str),
+        ("seeds?", Ty::Bool),
+        ("database_tasks?", Ty::Bool),
+    ];
+    for id in [hash_config.clone(), ClassId(Symbol::from("HashConfig"))] {
+        let info = classes.entry(id).or_default();
+        for (name, ty) in &hash_config_methods {
+            info.instance_methods.entry(Symbol::from(*name)).or_insert_with(|| ty.clone());
+        }
+    }
+    // The per-request replay cache, which `ActiveRecord::Base.uncached`
+    // (active_record/connection.rb, ruby family) suspends for a block.
+    for (name, ret) in [
+        ("query_cache_begin", Ty::Nil),
+        ("query_cache_end", Ty::Nil),
+        ("query_cache_enabled?", Ty::Bool),
+    ] {
+        db_info.class_methods.insert(Symbol::from(name), fn_sig(vec![], ret));
+    }
+    db_info.class_methods.insert(
+        Symbol::from("exec"),
+        fn_sig(vec![(Symbol::from("sql"), Ty::Str)], Ty::Nil),
+    );
+    db_info.class_methods.insert(
+        Symbol::from("prepare"),
+        fn_sig(vec![(Symbol::from("sql"), Ty::Str)], Ty::Int),
+    );
+    db_info.class_methods.insert(
+        Symbol::from("step?"),
+        fn_sig(vec![(Symbol::from("stmt"), Ty::Int)], Ty::Bool),
+    );
+    db_info.class_methods.insert(
+        Symbol::from("column_int"),
+        fn_sig(
+            vec![(Symbol::from("stmt"), Ty::Int), (Symbol::from("i"), Ty::Int)],
+            Ty::Int,
+        ),
+    );
+    db_info.class_methods.insert(
+        Symbol::from("column_text"),
+        fn_sig(
+            vec![(Symbol::from("stmt"), Ty::Int), (Symbol::from("i"), Ty::Int)],
+            Ty::Str,
+        ),
+    );
+    // Nullable-column reads: NULL comes back as nil, not the type's
+    // zero. `ty_of_column_slot` types those columns the same way, so
+    // the hydration assignment lines up.
+    db_info.class_methods.insert(
+        Symbol::from("column_int_opt"),
+        fn_sig(
+            vec![(Symbol::from("stmt"), Ty::Int), (Symbol::from("i"), Ty::Int)],
+            Ty::Union { variants: vec![Ty::Int, Ty::Nil].into() },
+        ),
+    );
+    db_info.class_methods.insert(
+        Symbol::from("column_float_opt"),
+        fn_sig(
+            vec![(Symbol::from("stmt"), Ty::Int), (Symbol::from("i"), Ty::Int)],
+            Ty::Union { variants: vec![Ty::Float, Ty::Nil].into() },
+        ),
+    );
+    db_info.class_methods.insert(
+        Symbol::from("column_text_opt"),
+        fn_sig(
+            vec![(Symbol::from("stmt"), Ty::Int), (Symbol::from("i"), Ty::Int)],
+            Ty::Union { variants: vec![Ty::Str, Ty::Nil].into() },
+        ),
+    );
+    db_info.class_methods.insert(
+        Symbol::from("column_bool_opt"),
+        fn_sig(
+            vec![(Symbol::from("stmt"), Ty::Int), (Symbol::from("i"), Ty::Int)],
+            Ty::Union { variants: vec![Ty::Bool, Ty::Nil].into() },
+        ),
+    );
+    // Nullable-column writes: nil renders the SQL keyword NULL.
+    db_info.class_methods.insert(
+        Symbol::from("escape_string_opt"),
+        fn_sig(
+            vec![(Symbol::from("s"), Ty::Union { variants: vec![Ty::Str, Ty::Nil].into() })],
+            Ty::Str,
+        ),
+    );
+    db_info.class_methods.insert(
+        Symbol::from("escape_int_opt"),
+        fn_sig(
+            vec![(Symbol::from("n"), Ty::Union { variants: vec![Ty::Int, Ty::Nil].into() })],
+            Ty::Str,
+        ),
+    );
+    db_info.class_methods.insert(
+        Symbol::from("escape_float_opt"),
+        fn_sig(
+            vec![(Symbol::from("f"), Ty::Union { variants: vec![Ty::Float, Ty::Nil].into() })],
+            Ty::Str,
+        ),
+    );
+    db_info.class_methods.insert(
+        Symbol::from("escape_bool_opt"),
+        fn_sig(
+            vec![(Symbol::from("b"), Ty::Union { variants: vec![Ty::Bool, Ty::Nil].into() })],
+            Ty::Str,
+        ),
+    );
+    db_info.class_methods.insert(
+        Symbol::from("finalize"),
+        fn_sig(vec![(Symbol::from("stmt"), Ty::Int)], Ty::Nil),
+    );
+    db_info.class_methods.insert(
+        Symbol::from("last_insert_rowid"),
+        fn_sig(vec![], Ty::Int),
+    );
+    db_info.class_methods.insert(
+        Symbol::from("changes"),
+        fn_sig(vec![], Ty::Int),
+    );
+    db_info.class_methods.insert(
+        Symbol::from("escape_string"),
+        fn_sig(vec![(Symbol::from("s"), Ty::Str)], Ty::Str),
+    );
+    db_info.class_methods.insert(
+        Symbol::from("escape_int"),
+        fn_sig(vec![(Symbol::from("n"), Ty::Int)], Ty::Str),
+    );
+    db_info.class_methods.insert(
+        Symbol::from("column_count"),
+        fn_sig(vec![(Symbol::from("stmt"), Ty::Int)], Ty::Int),
+    );
+    db_info.class_methods.insert(
+        Symbol::from("column_name"),
+        fn_sig(
+            vec![(Symbol::from("stmt"), Ty::Int), (Symbol::from("i"), Ty::Int)],
+            Ty::Str,
+        ),
+    );
+    // Dynamic per-column read — Int/Float/Str/nil by column affinity;
+    // Untyped is the honest contract for raw SQL.
+    db_info.class_methods.insert(
+        Symbol::from("column_value"),
+        fn_sig(
+            vec![(Symbol::from("stmt"), Ty::Int), (Symbol::from("i"), Ty::Int)],
+            Ty::Untyped,
+        ),
+    );
+    db_info.class_methods.insert(
+        Symbol::from("column_bool"),
+        fn_sig(
+            vec![(Symbol::from("stmt"), Ty::Int), (Symbol::from("idx"), Ty::Int)],
+            Ty::Bool,
+        ),
+    );
+    // `ActiveRecord::Base.transaction`'s per-thread nesting depth
+    // (connection.rb) — boxed behind this accessor instead of a raw
+    // `Thread.current`/`Fiber[]` read so the body-typer resolves it
+    // concretely, same as every other Db call here. See the contract
+    // note in runtime/ruby/db.rbs.
+    db_info.class_methods.insert(
+        Symbol::from("_txn_depth"),
+        fn_sig(vec![], Ty::Int),
+    );
+    db_info.class_methods.insert(
+        Symbol::from("_txn_depth="),
+        fn_sig(vec![(Symbol::from("value"), Ty::Int)], Ty::Int),
+    );
+    // Bit `depth - 1` records whether that frame can be joined. A
+    // fixture transaction is not joinable, so a nested save or
+    // destroy opens a savepoint (connection.rb). Same boxed accessor
+    // as the depth so the body stays concretely typed.
+    db_info.class_methods.insert(
+        Symbol::from("_txn_joinable_bits"),
+        fn_sig(vec![], Ty::Int),
+    );
+    db_info.class_methods.insert(
+        Symbol::from("_txn_joinable_bits="),
+        fn_sig(vec![(Symbol::from("value"), Ty::Int)], Ty::Int),
+    );
+    // Whether the connection holds a transaction — one ActiveRecord
+    // opened or one opened beneath it (connection.rb's
+    // `self.transaction` joins the latter instead of nesting a BEGIN).
+    db_info.class_methods.insert(Symbol::from("transaction_open?"), fn_sig(vec![], Ty::Bool));
+    // The open transaction's enlisted writes (connection.rb's
+    // `_commit_enlisted`), boxed per thread the same way.
+    db_info.class_methods.insert(
+        Symbol::from("_txn_records"),
+        fn_sig(
+            vec![],
+            Ty::Array {
+                elem: std::sync::Arc::new(Ty::Class {
+                    id: ClassId(Symbol::from("ActiveRecord::EnlistedRecord")),
+                    args: vec![].into(),
+                }),
+            },
+        ),
+    );
+    // The work `current_transaction.after_commit` holds for the COMMIT
+    // (connection.rb's `_after_commit`): `^() -> nil` lambdas, boxed per
+    // thread like the records above.
+    db_info.class_methods.insert(
+        Symbol::from("_txn_callbacks"),
+        fn_sig(
+            vec![],
+            Ty::Array {
+                elem: std::sync::Arc::new(Ty::Fn {
+                    params: vec![].into(),
+                    block: None,
+                    ret: std::sync::Arc::new(Ty::Nil),
+                    effects: crate::effect::EffectSet::default(),
+                }),
+            },
+        ),
+    );
+    // The tables inside a `Model.unscoped` block on this thread
+    // (relation.rb's `Relation.unscoped_tables`), boxed per thread like
+    // the transaction state above.
+    db_info.class_methods.insert(
+        Symbol::from("_unscoped_tables"),
+        fn_sig(vec![], Ty::Array { elem: std::sync::Arc::new(Ty::Str) }),
+    );
+    classes.insert(ClassId(Symbol::from("Db")), db_info);
+
+    // MessageDigest — the keyed-digest primitive surface, same
+    // per-target-shim situation as Db above: OpenSSL under CRuby/JRuby,
+    // sp_crypto FFI in the spinel binary, one contract typed here so
+    // action_controller/message_verifier.rb's bodies resolve. See
+    // runtime/ruby/message_digest.rbs. `pbkdf2_sha256` answers RAW
+    // BYTES (an HMAC key is bytes), which is why it types Str and not
+    // some digest-shaped wrapper.
+    let mut digest_info = crate::analyze::ClassInfo::default();
+    for name in ["hmac_sha1_hex", "hmac_sha256_hex", "hmac_sha256"] {
+        digest_info.class_methods.insert(
+            Symbol::from(name),
+            fn_sig(
+                vec![(Symbol::from("key"), Ty::Str), (Symbol::from("msg"), Ty::Str)],
+                Ty::Str,
+            ),
+        );
+    }
+    digest_info.class_methods.insert(
+        Symbol::from("secure_random_bytes"),
+        fn_sig(vec![(Symbol::from("n"), Ty::Int)], Ty::Str),
+    );
+    digest_info.class_methods.insert(
+        Symbol::from("secure_compare"),
+        fn_sig(
+            vec![(Symbol::from("a"), Ty::Str), (Symbol::from("b"), Ty::Str)],
+            Ty::Bool,
+        ),
+    );
+    digest_info.class_methods.insert(
+        Symbol::from("pbkdf2_sha256"),
+        fn_sig(
+            vec![
+                (Symbol::from("secret"), Ty::Str),
+                (Symbol::from("salt"), Ty::Str),
+                (Symbol::from("iters"), Ty::Int),
+                (Symbol::from("dklen"), Ty::Int),
+            ],
+            Ty::Str,
+        ),
+    );
+    // AES-256-GCM, the encrypted cookie jar's cipher: encrypt answers the
+    // ciphertext followed by the tag, decrypt the plaintext or "".
+    let bytes = |n: &str| (Symbol::from(n), Ty::Str);
+    digest_info.class_methods.insert(
+        Symbol::from("aes_256_gcm_encrypt"),
+        fn_sig(vec![bytes("key"), bytes("iv"), bytes("plain")], Ty::Str),
+    );
+    digest_info.class_methods.insert(
+        Symbol::from("aes_256_gcm_decrypt"),
+        fn_sig(vec![bytes("key"), bytes("iv"), bytes("ct"), bytes("tag")], Ty::Str),
+    );
+    classes.insert(ClassId(Symbol::from("MessageDigest")), digest_info);
+
+    // ActiveSupport's temporal intrinsics — the same situation as Db:
+    // one contract, an implementation PER TREE (the spinel Time subset
+    // vs the CRuby/JRuby overlay's stdlib-backed sibling), so neither
+    // implementation sits under `runtime/ruby/` where the framework
+    // runtime's own typing could find it. The synthesized temporal
+    // column readers call `parse_db_time`, `Base#save`'s fill_timestamps
+    // calls `db_now`, the temporal writers call `format_db_time`, and
+    // `_as_json_only` calls `json_time`. See
+    // runtime/ruby/active_support_time_parsing.rbs, which states the
+    // same signatures for a human reader.
+    // Merged into whatever `ActiveSupport` surface is already
+    // registered (`active_support_ext.rbs` contributes blank?/present?/
+    // presence) rather than replacing it — the two halves of one module.
+    let as_info = classes
+        .entry(ClassId(Symbol::from("ActiveSupport")))
+        .or_default();
+    let str_or_nil = || Ty::Union { variants: vec![Ty::Str, Ty::Nil].into() };
+    let time_or_nil = || Ty::Union {
+        variants: vec![
+            Ty::Class { id: ClassId(Symbol::from("Time")), args: vec![].into() },
+            Ty::Nil,
+        ].into(),
+    };
+    as_info.class_methods.insert(
+        Symbol::from("parse_db_time"),
+        fn_sig(vec![(Symbol::from("str"), str_or_nil())], time_or_nil()),
+    );
+    as_info.class_methods.insert(
+        Symbol::from("json_time"),
+        fn_sig(vec![(Symbol::from("str"), str_or_nil())], str_or_nil()),
+    );
+    as_info.class_methods.insert(
+        Symbol::from("format_db_time"),
+        fn_sig(vec![(Symbol::from("value"), Ty::Untyped)], str_or_nil()),
+    );
+    as_info
+        .class_methods
+        .insert(Symbol::from("db_now"), fn_sig(vec![], Ty::Str));
+}
+
+
+/// Framework runtime stubs the view bodies dispatch on. Each helper
+/// returns `Ty::Str` (HTML output) or `Ty::Nil` (side-effecting
+/// helpers like content_for_set). Args are mostly Untyped — refining
+/// per-helper is future work; the Str-typed return is what unblocks
+/// downstream typing.
+/// Register EVERY route helper the app generates as `-> String`.
+///
+/// `insert_framework_stubs` carries a hardcoded stem list ("article",
+/// "comments", …) with a note saying it cannot enumerate them. It can
+/// now: `lower_routes_to_library_functions` is the same source the view
+/// lowerer already reads for `route_helper_names`, and it includes the
+/// per-format variants (`article_json_path`) that the stem list by
+/// construction cannot predict.
+///
+/// `or_insert` so the precise signatures the stem list (and
+/// `extras_from_funcs`) register keep winning; this only fills names
+/// nothing else typed. A helper left untyped is not a compile error at
+/// the IR level — it is a `Value`/`String` mismatch three layers later
+/// in the rust emit, which is how `encode_value(article_json_path(…))`
+/// reached CI.
+pub(crate) fn insert_route_helper_stubs(
+    classes: &mut crate::det::HashMap<ClassId, crate::analyze::ClassInfo>,
+    app: &crate::App,
+) {
+    use crate::dialect::AccessorKind;
+    use crate::lower::typing::fn_sig;
+    use crate::ty::Ty;
+
+    let funcs = crate::lower::lower_routes_to_library_functions(app);
+    if funcs.is_empty() {
+        return;
+    }
+    let info = classes.entry(ClassId(Symbol::from("RouteHelpers"))).or_default();
+    for f in &funcs {
+        let name = Symbol::from(f.name.as_str());
+        info.class_methods.entry(name.clone()).or_insert_with(|| {
+            fn_sig(vec![(Symbol::from("args"), Ty::Untyped)], Ty::Str)
+        });
+        info.class_method_kinds.entry(name).or_insert(AccessorKind::Method);
+    }
+}
+
+pub(crate) fn insert_framework_stubs(
+    classes: &mut crate::det::HashMap<ClassId, crate::analyze::ClassInfo>,
+) {
+    use crate::dialect::AccessorKind;
+    use crate::lower::typing::{fn_sig, fn_sig_with_block};
+    use crate::ty::Ty;
+
+    // Helper: tag every method on a ClassInfo as `Method` (the
+    // default for framework calls — every helper, route generator,
+    // and runtime function takes parens). Called once per stub.
+    let tag_all_method = |info: &mut crate::analyze::ClassInfo| {
+        for name in info.instance_methods.keys().cloned().collect::<Vec<_>>() {
+            info.instance_method_kinds.entry(name).or_insert(AccessorKind::Method);
+        }
+        for name in info.class_methods.keys().cloned().collect::<Vec<_>>() {
+            info.class_method_kinds.entry(name).or_insert(AccessorKind::Method);
+        }
+    };
+
+    // ViewHelpers — every output helper returns String; setters return Nil.
+    let mut vh = crate::analyze::ClassInfo::default();
+    let untyped = Ty::Untyped;
+    let any_hash = Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(Ty::Untyped) };
+    let html_helpers = [
+        "turbo_stream_from",
+        "link_to",
+        "button_to",
+        "html_escape",
+        "builder_text",
+        "builder_attr",
+        "truncate",
+        "word_wrap",
+        "dom_id",
+        "dom_class",
+        "image_tag",
+        "stylesheet_link_tag",
+        "javascript_include_tag",
+        "javascript_importmap_tags",
+        "csrf_meta_tags",
+        "csp_meta_tag",
+        "yield_content",
+        "fields_for",
+        "label",
+        "text_field",
+        "text_area",
+        "select",
+        "submit",
+        "hidden_field",
+        "render",
+        "time_ago_in_words",
+        "number_to_currency",
+        "number_to_human",
+        "number_to_human_size",
+        "number_to_percentage",
+        "number_to_phone",
+        "number_with_delimiter",
+        "number_with_precision",
+        "pluralize",
+        "raw",
+        "safe_join",
+        "tag",
+        "content_tag",
+        "concat",
+        "class_names",
+    ];
+    for name in html_helpers {
+        // Loose signature: variadic kwargs (Untyped) → String. The
+        // precise per-helper arity isn't load-bearing for typing the
+        // call SITE; the body-typer just needs the return type.
+        vh.class_methods.insert(
+            Symbol::from(name),
+            fn_sig(vec![(Symbol::from("args"), untyped.clone())], Ty::Str),
+        );
+    }
+    // Override the loose shim for helpers whose last param is an
+    // explicit `opts = {}` positional Hash. The body-typer's
+    // normalize_trailing_kwargs uses the last param's TYPE to decide
+    // whether a trailing kwargs Hash should flip to an explicit Hash
+    // literal at the call site (Crystal doesn't auto-collect kwargs
+    // into a Hash positional). With `Ty::Untyped`, normalize can't
+    // tell — declare `Ty::Hash` so it can. Helpers with named-
+    // keyword params (truncate, dom_id, ...) keep the loose shim:
+    // their kwargs DON'T flip and bind to the right named slot under
+    // Crystal's named-arg dispatch.
+    let opts_hash_helpers: &[(&str, &[(&str, &Ty)])] = &[
+        ("link_to", &[("text", &untyped), ("href", &Ty::Str), ("opts", &any_hash)]),
+        ("button_to", &[("text", &untyped), ("href", &Ty::Str), ("opts", &any_hash)]),
+        ("stylesheet_link_tag", &[("name", &Ty::Str), ("opts", &any_hash)]),
+    ];
+    for (name, params) in opts_hash_helpers {
+        let param_pairs: Vec<(Symbol, Ty)> = params
+            .iter()
+            .map(|(n, t)| (Symbol::from(*n), (*t).clone()))
+            .collect();
+        vh.class_methods.insert(
+            Symbol::from(*name),
+            fn_sig(param_pairs, Ty::Str),
+        );
+    }
+    // form_with and FormBuilder stubs retired alongside the runtime
+    // classes themselves: the lowerer macro-inlines form_with +
+    // form.label/text_field/text_area/submit at lower time, so no
+    // call site ever names `ViewHelpers.form_with` or
+    // `FormBuilder.<method>` in the lowered output. The body-typer
+    // doesn't need to resolve symbols that can't appear.
+    //
+    // Layout slot helpers — `content_for_get(:title)` / `get_slot(:title)`
+    // return the previously-stored String, or nil when the slot was
+    // never set. Matches the framework Ruby RBS (`String?`) and the
+    // runtime semantics (`@slots.fetch(slot, nil)`). The Option<String>
+    // shape lets the rust coerce path (Family 7) thread through to
+    // `html_escape(content_for_get(:title))` without manual coercions.
+    let option_string = Ty::Union { variants: vec![Ty::Str, Ty::Nil].into() };
+    for name in ["content_for_get", "get_slot"] {
+        vh.class_methods.insert(
+            Symbol::from(name),
+            fn_sig(vec![(Symbol::from("name"), Ty::Sym)], option_string.clone()),
+        );
+    }
+    // form_with macro-inline primitives (Wedge 1b-i). The inlined
+    // form_with expansion calls these as small typed-scalar runtime
+    // helpers rather than baking CSRF/_method bytes into every form
+    // call site; future signed-token / CSP nonce work hooks here.
+    vh.class_methods.insert(
+        Symbol::from("csrf_token_hidden_input"),
+        fn_sig(vec![], Ty::Str),
+    );
+    vh.class_methods.insert(
+        Symbol::from("method_override_input"),
+        fn_sig(vec![(Symbol::from("method"), Ty::Sym)], Ty::Str),
+    );
+    // `optional_value_attr(value: untyped) -> String` — used by the
+    // inlined form.text_field expansion to emit ` value="..."` only
+    // when the record's attribute is non-nil-non-empty. `untyped`
+    // (rather than `String?`) so the call site can pass the
+    // abstract Base#[] return type (`Int64 | String | … | Nil`)
+    // directly without per-column casts.
+    vh.class_methods.insert(
+        Symbol::from("optional_value_attr"),
+        fn_sig(
+            vec![(Symbol::from("value"), Ty::Untyped)],
+            Ty::Str,
+        ),
+    );
+    // `escape_or_empty(value: untyped) -> String` — used by the
+    // inlined form.text_area expansion: returns html_escape(value)
+    // when non-nil, "" when nil. Same untyped rationale as
+    // `optional_value_attr` above.
+    vh.class_methods.insert(
+        Symbol::from("escape_or_empty"),
+        fn_sig(
+            vec![(Symbol::from("value"), Ty::Untyped)],
+            Ty::Str,
+        ),
+    );
+    // The broadcast-render bracket pair — the broadcast lowerings wrap
+    // their SYNTHESIZED renders as
+    // `broadcast_render(begin_broadcast_render, <render>)` so
+    // `csrf_token_hidden_input` omits the token input, matching Rails'
+    // session-less broadcast renderer. Two plain calls (left-to-right
+    // argument evaluation raises the flag before the render runs) —
+    // see the runtime method's comment for why not a block or a proc.
+    vh.class_methods.insert(
+        Symbol::from("begin_broadcast_render"),
+        fn_sig(vec![], Ty::Str),
+    );
+    vh.class_methods.insert(
+        Symbol::from("broadcast_render"),
+        fn_sig(
+            vec![(Symbol::from("_armed"), Ty::Str), (Symbol::from("html"), Ty::Str)],
+            Ty::Str,
+        ),
+    );
+    // `url_for_path(path)` — the URL a jbuilder `<x>_url` answers
+    // (runtime/ruby/action_view/view_helpers.rb). Typed here so the
+    // jbuilder pair that encodes it sees a String, not an unknown the
+    // rust emitter would pass to `encode_value` as a `Value`.
+    vh.class_methods.insert(
+        Symbol::from("url_for_path"),
+        fn_sig(vec![(Symbol::from("path"), Ty::Str)], Ty::Str),
+    );
+    let nil_helpers = ["content_for_set", "content_for", "set_flash", "flash"];
+    for name in nil_helpers {
+        vh.class_methods.insert(
+            Symbol::from(name),
+            fn_sig(vec![(Symbol::from("args"), untyped.clone())], Ty::Nil),
+        );
+    }
+    tag_all_method(&mut vh);
+    // Canonical Rails-style nested path; body-typer's Const-arm
+    // bare-name expansion swaps `Const { path: ["ViewHelpers"] }`
+    // (from app/view source code) to the full path via this registry
+    // entry. Lowerer-synthesized refs (`view_helpers_call`) also
+    // resolve through the same key.
+    classes.insert(ClassId(Symbol::from("ActionView::ViewHelpers")), vh);
+
+    // `ActionView::Base.new.form_with` is the cache-observable entry
+    // planted at each Ruby-family form site (`form_with::form_with_entry`).
+    // The method returns nil; the markup is the expansion that
+    // follows. `.new` already types as an instance of the receiver.
+    // Without this stub the zero-arg call stays `Ty::Var`, and the
+    // lowered real-blog residual is no longer zero.
+    let mut av_base = crate::analyze::ClassInfo::default();
+    av_base.instance_methods.insert(
+        Symbol::from("form_with"),
+        fn_sig(vec![], Ty::Nil),
+    );
+    tag_all_method(&mut av_base);
+    classes.insert(ClassId(Symbol::from("ActionView::Base")), av_base);
+
+    // RouteHelpers — every `_path` / `_url` helper returns String.
+    // Catch-all: the typer's `Class { id }` lookup returns Untyped if
+    // the method isn't in the table; we can't enumerate every
+    // `<resource>_path` here, so we register a single permissive entry
+    // that covers the most common ones used in real-blog. A
+    // catch-all "any method on RouteHelpers returns String" would
+    // need typer support that doesn't exist yet.
+    let mut rh = crate::analyze::ClassInfo::default();
+    let route_stems = [
+        "article", "articles", "comment", "comments", "root",
+        "new_article", "edit_article", "new_comment", "edit_comment",
+        "article_comment", "article_comments", "new_article_comment",
+        "edit_article_comment",
+    ];
+    for stem in route_stems {
+        for suffix in ["path", "url"] {
+            let name = format!("{stem}_{suffix}");
+            rh.class_methods.insert(
+                Symbol::from(name),
+                fn_sig(vec![(Symbol::from("args"), untyped.clone())], Ty::Str),
+            );
+        }
+    }
+    tag_all_method(&mut rh);
+    classes.insert(ClassId(Symbol::from("RouteHelpers")), rh);
+
+    // Inflector — pluralize/singularize.
+    let mut inf = crate::analyze::ClassInfo::default();
+    inf.class_methods.insert(
+        Symbol::from("pluralize"),
+        fn_sig(
+            vec![(Symbol::from("count"), Ty::Int), (Symbol::from("word"), Ty::Str)],
+            Ty::Str,
+        ),
+    );
+    inf.class_methods.insert(
+        Symbol::from("pluralize_formatted"),
+        fn_sig(
+            vec![(Symbol::from("count"), Ty::Str), (Symbol::from("word"), Ty::Str)],
+            Ty::Str,
+        ),
+    );
+    inf.class_methods.insert(
+        Symbol::from("singularize"),
+        fn_sig(vec![(Symbol::from("word"), Ty::Str)], Ty::Str),
+    );
+    tag_all_method(&mut inf);
+    classes.insert(ClassId(Symbol::from("Inflector")), inf);
+
+    // JsonBuilder — encode_value / encode_string. Used by lowered
+    // `*.json.jbuilder` templates (see `jbuilder_to_library`). Both
+    // return String; encode_value takes Untyped because it dispatches
+    // on the dynamic value type at runtime.
+    let mut jb = crate::analyze::ClassInfo::default();
+    jb.class_methods.insert(
+        Symbol::from("encode_value"),
+        fn_sig(vec![(Symbol::from("v"), Ty::Untyped)], Ty::Str),
+    );
+    jb.class_methods.insert(
+        Symbol::from("encode_string"),
+        fn_sig(
+            vec![(Symbol::from("s"), Ty::Union { variants: vec![Ty::Str, Ty::Nil].into() })],
+            Ty::Str,
+        ),
+    );
+    tag_all_method(&mut jb);
+    classes.insert(ClassId(Symbol::from("JsonBuilder")), jb);
+
+    // Db — see `insert_db_stub` (shared with the runtime-transpile
+    // pre-seed; runtime/ruby/active_record/connection.rb calls Db
+    // directly).
+    insert_db_stub(classes);
+
+    // ActiveRecord — the module functions a lowered app body calls
+    // (runtime/ruby/active_record/base.rb). `lower_bound` is the run
+    // lookup in the `includes(:assoc)` distribute the Arel visitor
+    // emits; the controller body is re-typed after that rewrite, and an
+    // unresolved call there would erase the run bounds' Integer to
+    // untyped — which the strict targets then index wrongly.
+    if !classes.contains_key(&ClassId(Symbol::from("ActiveRecord"))) {
+        use crate::lower::typing::fn_sig;
+        let int_array = || crate::ty::Ty::Array { elem: std::sync::Arc::new(crate::ty::Ty::Int) };
+        let mut ar = crate::analyze::ClassInfo::default();
+        ar.class_methods.insert(
+            Symbol::from("lower_bound"),
+            fn_sig(
+                vec![(Symbol::from("sorted"), int_array()), (Symbol::from("value"), crate::ty::Ty::Int)],
+                crate::ty::Ty::Int,
+            ),
+        );
+        classes.insert(ClassId(Symbol::from("ActiveRecord")), ar);
+    }
+
+    // Params — narrowing accessors over the recursive request-params
+    // tree (runtime/ruby/params.rb). The synthesized `<Resource>Params.
+    // from_raw` calls these instead of open-coding `is_a?` narrowing at
+    // each field, so the type test lives in ONE body written in the one
+    // shape every emitter handles rather than in generated code whose
+    // position each emitter has to recognize.
+    insert_params_stub(classes);
+
+    // String — register `new` returning Ty::Str so the lowered
+    // `io = String.new` produces a Str-typed local; downstream
+    // `io << X` then dispatches through the primitive str_method
+    // table (which already covers `<<`). Without this, `io` would
+    // type as Class(String) and `<<` falls through to unregistered-
+    // class behavior.
+    let mut str_class = crate::analyze::ClassInfo::default();
+    str_class.class_methods.insert(
+        Symbol::from("new"),
+        fn_sig(vec![], Ty::Str),
+    );
+    tag_all_method(&mut str_class);
+    classes.insert(ClassId(Symbol::from("String")), str_class);
+
+    // Broadcasts — re-stub here so view-only callers don't need to
+    // remember to add it themselves.
+    let _ = any_hash; // captured by html_helpers above
+    let mut bc = crate::analyze::ClassInfo::default();
+    // Broadcasts.* takes a kwargs bag (`**opts`); see
+    // `model_to_library::broadcasts_class_info` for the rationale on
+    // marking the param `KeywordRest` so the body-typer's
+    // normalize_trailing_kwargs leaves the call's `kwargs: true` flag
+    // alone (preserves the bare named-args call shape across targets).
+    let opts_ty = Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(Ty::Untyped) };
+    let bc_sig = Ty::Fn {
+        params: vec![crate::ty::Param {
+            name: Symbol::from("opts"),
+            ty: opts_ty.into(),
+            kind: crate::ty::ParamKind::KeywordRest,
+        }].into(),
+        block: None,
+        ret: std::sync::Arc::new(Ty::Nil),
+        effects: crate::effect::EffectSet::pure(),
+    };
+    for name in ["prepend", "replace", "remove", "append"] {
+        bc.class_methods.insert(Symbol::from(name), bc_sig.clone());
+    }
+    // `turbo_stream_fragment(action, target, html) -> String` — the
+    // `<turbo-stream>` composer a `.turbo_stream.erb` template lowers
+    // onto. Hand-written per target beside the broadcast methods, so
+    // the markup has one owner rather than a second copy in the lowerer.
+    bc.class_methods.insert(
+        Symbol::from("turbo_stream_fragment"),
+        crate::lower::typing::fn_sig(
+            vec![
+                (Symbol::from("action"), Ty::Str),
+                (Symbol::from("target"), Ty::Str),
+                (Symbol::from("html"), Ty::Str),
+            ],
+            Ty::Str,
+        ),
+    );
+    tag_all_method(&mut bc);
+    classes.insert(ClassId(Symbol::from("Broadcasts")), bc);
+
+    // Importmap — `Importmap.pins -> Array<Record{name: Str, path: Str}>`,
+    // `Importmap.entry -> Str`. The view lowerer's
+    // `JavascriptImportmapTags` rewrite emits Send calls on
+    // `Importmap` (used to be `Importmap::PINS` const access);
+    // the typer needs to resolve them or the body has untyped
+    // sub-expressions and the residual ratchet trips. Each pin is a
+    // record with two fixed fields, mirroring the importmap lowerer
+    // (`importmap_to_library`). Record (rather than `Hash<Sym, Str>`)
+    // keeps `p[:name]` access typed across strict targets — Crystal
+    // parses `{name: ..., path: ...}` as `NamedTuple`, which matches
+    // `Ty::Record` but conflicts with `Hash`.
+    let mut im = crate::analyze::ClassInfo::default();
+    let pin_record_ty = {
+        let mut fields = indexmap::IndexMap::new();
+        fields.insert(Symbol::from("name"), Ty::Str);
+        fields.insert(Symbol::from("path"), Ty::Str);
+        Ty::Record { row: crate::ty::Row { fields: fields.into(), rest: None } }
+    };
+    im.class_methods.insert(
+        Symbol::from("pins"),
+        fn_sig(vec![], Ty::Array { elem: std::sync::Arc::new(pin_record_ty) }),
+    );
+    im.class_methods.insert(
+        Symbol::from("entry"),
+        fn_sig(vec![], Ty::Str),
+    );
+    tag_all_method(&mut im);
+    classes.insert(ClassId(Symbol::from("Importmap")), im);
+
+    // FormBuilder stub retired — see the `form_with` comment above
+    // (form.label/text_field/text_area/submit dispatch inline-
+    // expands at lower time, so the body-typer never resolves
+    // FormBuilder instance methods in a lowered view).
+
+    // ErrorCollection — what `record.errors` returns. `each` yields
+    // a String message (Spinel-shape: errors are stored as flat
+    // String messages, not ActiveModel::Error objects). `empty?`
+    // and `count` cover the common predicates view bodies use.
+    let mut ec = crate::analyze::ClassInfo::default();
+    ec.instance_methods.insert(
+        Symbol::from("each"),
+        fn_sig_with_block(vec![], Some(Ty::Str), Ty::Nil),
+    );
+    ec.instance_methods.insert(Symbol::from("empty?"), fn_sig(vec![], Ty::Bool));
+    ec.instance_methods.insert(Symbol::from("any?"), fn_sig(vec![], Ty::Bool));
+    ec.instance_methods.insert(Symbol::from("count"), fn_sig(vec![], Ty::Int));
+    ec.instance_methods.insert(Symbol::from("size"), fn_sig(vec![], Ty::Int));
+    ec.instance_methods.insert(Symbol::from("length"), fn_sig(vec![], Ty::Int));
+    ec.instance_methods.insert(
+        Symbol::from("full_messages"),
+        fn_sig(vec![], Ty::Array { elem: std::sync::Arc::new(Ty::Str) }),
+    );
+    ec.instance_methods.insert(
+        Symbol::from("[]"),
+        fn_sig(
+            vec![(Symbol::from("attr"), Ty::Sym)],
+            Ty::Array { elem: std::sync::Arc::new(Ty::Str) },
+        ),
+    );
+    tag_all_method(&mut ec);
+    classes.insert(ClassId(Symbol::from("ErrorCollection")), ec);
+
+    // ActionController::Parameters used to be seeded here so the
+    // body-typer could resolve `params.require(...).to_h` chains. As
+    // of the Parameters retirement, `@params` is a plain
+    // `Hash[String, untyped]` and Hash's primitive method surface is
+    // a builtin — no per-class seed needed.
+
+    // ActionDispatch::Flash — what `controller.flash` is post-Phase-
+    // 2.5(b) (was HashWithIndifferentAccess). Typed `notice`/`alert`
+    // fields + HWIA-shape shim methods. Controllers read
+    // `@flash[:notice]` / write `@flash[:notice] = "..."`; the lowerer
+    // emits these as Send-`[]` / Send-`[]=` calls and the typer
+    // resolves them through this stub.
+    let mut flash_cls = crate::analyze::ClassInfo::default();
+    let nullable_str = Ty::Union { variants: vec![Ty::Str, Ty::Nil].into() };
+    flash_cls.instance_methods.insert(
+        Symbol::from("[]"),
+        fn_sig(vec![(Symbol::from("key"), Ty::Sym)], nullable_str.clone()),
+    );
+    flash_cls.instance_methods.insert(
+        Symbol::from("[]="),
+        fn_sig(
+            vec![(Symbol::from("key"), Ty::Sym), (Symbol::from("value"), nullable_str.clone())],
+            nullable_str.clone(),
+        ),
+    );
+    flash_cls.instance_methods.insert(
+        Symbol::from("fetch"),
+        fn_sig(
+            vec![(Symbol::from("key"), Ty::Sym), (Symbol::from("default"), nullable_str.clone())],
+            nullable_str.clone(),
+        ),
+    );
+    flash_cls.instance_methods.insert(
+        Symbol::from("key?"),
+        fn_sig(vec![(Symbol::from("key"), Ty::Sym)], Ty::Bool),
+    );
+    flash_cls.instance_methods.insert(
+        Symbol::from("has_key?"),
+        fn_sig(vec![(Symbol::from("key"), Ty::Sym)], Ty::Bool),
+    );
+    flash_cls.instance_methods.insert(
+        Symbol::from("delete"),
+        fn_sig(vec![(Symbol::from("key"), Ty::Sym)], nullable_str.clone()),
+    );
+    flash_cls.instance_methods.insert(
+        Symbol::from("length"),
+        fn_sig(vec![], Ty::Int),
+    );
+    flash_cls.instance_methods.insert(
+        Symbol::from("size"),
+        fn_sig(vec![], Ty::Int),
+    );
+    flash_cls.instance_methods.insert(
+        Symbol::from("empty?"),
+        fn_sig(vec![], Ty::Bool),
+    );
+    flash_cls.instance_methods.insert(
+        Symbol::from("to_h"),
+        fn_sig(vec![], Ty::Hash { key: std::sync::Arc::new(Ty::Str), value: std::sync::Arc::new(Ty::Str) }),
+    );
+    flash_cls.instance_methods.insert(
+        Symbol::from("notice"),
+        fn_sig(vec![], nullable_str.clone()),
+    );
+    flash_cls.instance_methods.insert(
+        Symbol::from("alert"),
+        fn_sig(vec![], nullable_str.clone()),
+    );
+    tag_all_method(&mut flash_cls);
+    classes.insert(ClassId(Symbol::from("ActionDispatch::Flash")), flash_cls);
+
+    // ActionDispatch::Session — empty for real-blog (no session keys
+    // exercised). Shim methods registered so `@session.length()` and
+    // friends resolve. Values typed Untyped (Hash-backed storage).
+    let mut session_cls = crate::analyze::ClassInfo::default();
+    session_cls.instance_methods.insert(
+        Symbol::from("[]"),
+        fn_sig(vec![(Symbol::from("key"), Ty::Sym)], Ty::Untyped),
+    );
+    session_cls.instance_methods.insert(
+        Symbol::from("[]="),
+        fn_sig(
+            vec![(Symbol::from("key"), Ty::Sym), (Symbol::from("value"), Ty::Untyped)],
+            Ty::Untyped,
+        ),
+    );
+    session_cls.instance_methods.insert(
+        Symbol::from("fetch"),
+        fn_sig(
+            vec![(Symbol::from("key"), Ty::Sym), (Symbol::from("default"), Ty::Untyped)],
+            Ty::Untyped,
+        ),
+    );
+    session_cls.instance_methods.insert(
+        Symbol::from("key?"),
+        fn_sig(vec![(Symbol::from("key"), Ty::Sym)], Ty::Bool),
+    );
+    session_cls.instance_methods.insert(
+        Symbol::from("has_key?"),
+        fn_sig(vec![(Symbol::from("key"), Ty::Sym)], Ty::Bool),
+    );
+    session_cls.instance_methods.insert(
+        Symbol::from("delete"),
+        fn_sig(vec![(Symbol::from("key"), Ty::Sym)], Ty::Untyped),
+    );
+    session_cls.instance_methods.insert(
+        Symbol::from("length"),
+        fn_sig(vec![], Ty::Int),
+    );
+    session_cls.instance_methods.insert(
+        Symbol::from("size"),
+        fn_sig(vec![], Ty::Int),
+    );
+    session_cls.instance_methods.insert(
+        Symbol::from("empty?"),
+        fn_sig(vec![], Ty::Bool),
+    );
+    session_cls.instance_methods.insert(
+        Symbol::from("to_h"),
+        fn_sig(
+            vec![],
+            Ty::Hash { key: std::sync::Arc::new(Ty::Untyped), value: std::sync::Arc::new(Ty::Untyped) },
+        ),
+    );
+    tag_all_method(&mut session_cls);
+    classes.insert(ClassId(Symbol::from("ActionDispatch::Session")), session_cls);
+}
+
+// ── view-name → module / arg / method helpers ────────────────────
+
+pub(crate) fn split_view_name(name: &str) -> (&str, &str) {
+    name.rsplit_once('/').unwrap_or(("", name))
+}
+
+/// Module the view's method lives under: `Views::Articles` for an
+/// `articles/...` view. Empty `dir` (uncommon — top-level view) maps
+/// to the bare `Views` module.
+pub(crate) fn view_module_id(dir: &str) -> ClassId {
+    if dir.is_empty() {
+        return ClassId(Symbol::from("Views"));
+    }
+    let camelized = camelize_path(&snake_case(dir));
+    ClassId(Symbol::from(format!("Views::{camelized}")))
+}
+
+/// Pick the single positional parameter name for a view. Action views
+/// (`articles/index`) take the plural collection (`articles`); show /
+/// new / edit / create / update / destroy + partials take the singular
+/// (`article`). Layouts take `body` (the rendered inner-view string;
+/// bare `yield` in the layout source resolves to this local). Top-
+/// level views with no resource directory fall back to an empty arg
+/// name (no positional param).
+/// Run the body-typer over a method's body so Send dispatch sees
+/// typed receivers. Per-method (no cross-method registry) since
+/// view methods are independent and view-body Send patterns
+/// resolve through primitive method tables (Array / String / Hash)
+/// that don't need a class registry.
+fn type_method_body(method: &mut MethodDef) {
+    // Seed the registry with framework stubs (ViewHelpers,
+    // RouteHelpers, FormBuilder, ...) so the body-typer's bare-Const
+    // expansion can resolve `ViewHelpers.dom_id(...)` to the full
+    // path `ActionView::ViewHelpers.dom_id(...)`. The single-view
+    // lowerer is invoked from the Spinel/Ruby per-view emit path
+    // where no shared cross-class registry exists; without these
+    // stubs, the rewrite fails silently and Ruby gets bare refs
+    // that can't resolve under nested-module lexical scope.
+    let mut classes: crate::det::HashMap<
+        crate::ident::ClassId,
+        crate::analyze::ClassInfo,
+    > = crate::det::HashMap::default();
+    insert_framework_stubs(&mut classes);
+    let typer = crate::analyze::BodyTyper::new(&classes);
+    let mut ctx = crate::analyze::Ctx::default();
+    if let Some(crate::ty::Ty::Fn { params, .. }) = &method.signature {
+        for (param, sig) in method.params.iter().zip(params.iter()) {
+            ctx.local_bindings.insert(param.name.clone(), (*sig.ty).clone());
+        }
+    }
+    if let Some(enclosing) = &method.enclosing_class {
+        ctx.self_ty = Some(crate::ty::Ty::Class {
+            id: crate::ident::ClassId(enclosing.clone()),
+            args: vec![].into(),
+        });
+    }
+    typer.analyze_expr(&mut method.body, &ctx);
+}
+
+/// Build a `Ty::Fn` signature for the synthesized view method.
+/// Lets the body-typer propagate types through the body (so e.g.
+/// `articles.empty?` resolves to Array's `.empty?` dispatch and
+/// renders correctly per-target). Without this, params come through
+/// as `Ty::Untyped` and emit-side type-aware dispatch falls through.
+pub(crate) fn build_view_signature(
+    stem: &str,
+    dir: &str,
+    is_partial: bool,
+    arg_name: &str,
+    extra_params: &[String],
+    known_models: &[String],
+) -> Option<crate::ty::Ty> {
+    use crate::ty::{Param as TyParam, ParamKind, Ty};
+
+    if arg_name.is_empty() && extra_params.is_empty() {
+        return None;
+    }
+
+    let model_class = camelize_path(&crate::naming::singularize_last(dir));
+    let model_known = known_models.iter().any(|m| m == &model_class);
+
+    // Type for the main arg (when present).
+    let arg_ty = if arg_name.is_empty() {
+        None
+    } else if dir == "layouts" {
+        // `body` arg of a layout — the rendered inner HTML.
+        Some(Ty::Str)
+    } else if !is_partial && stem == "index" {
+        // `articles` — Array<Article> when the model is known,
+        // otherwise Array<Untyped>.
+        if model_known {
+            Some(Ty::Array {
+                elem: std::sync::Arc::new(Ty::Class {
+                    id: crate::ident::ClassId(crate::ident::Symbol::from(model_class.as_str())),
+                    args: vec![].into(),
+                }),
+            })
+        } else {
+            Some(Ty::Array { elem: std::sync::Arc::new(Ty::Untyped) })
+        }
+    } else {
+        // Show / edit / new / partial: arg is the model itself.
+        if model_known {
+            Some(Ty::Class {
+                id: crate::ident::ClassId(crate::ident::Symbol::from(model_class.as_str())),
+                args: vec![].into(),
+            })
+        } else {
+            Some(Ty::Untyped)
+        }
+    };
+
+    let mut sig_params: Vec<TyParam> = Vec::new();
+    if let Some(t) = arg_ty {
+        sig_params.push(TyParam {
+            name: crate::ident::Symbol::from(arg_name),
+            ty: t.into(),
+            kind: ParamKind::Required,
+        });
+    }
+    // Extra params (`notice`, `alert`, …) — nullable strings.
+    for n in extra_params {
+        sig_params.push(TyParam {
+            name: crate::ident::Symbol::from(n.as_str()),
+            ty: extra_param_ty(n).into(),
+            kind: ParamKind::Optional,
+        });
+    }
+
+    Some(Ty::Fn {
+        params: sig_params.into(),
+        block: None,
+        ret: std::sync::Arc::new(Ty::Str),
+        effects: crate::effect::EffectSet::default(),
+    })
+}
+
+/// The argument contract an action view expects from its controller: the
+/// read-ivars it takes positionally, plus whether it references the
+/// `action_name`/`controller_name` controller-context helpers (which the
+/// controller then passes as literals — but ONLY to views that use them,
+/// so views/targets that don't gain no extra params).
+#[derive(Default)]
+pub(crate) struct ViewArgs {
+    pub ivars: Vec<Symbol>,
+    pub uses_action_name: bool,
+    pub uses_controller_name: bool,
+    /// The view's `url_for` options hash needs the request's path
+    /// parameters (see `extra_params::collect_extra_params`).
+    pub uses_path_parameters: bool,
+}
+
+/// Map `(view-module, action-stem) -> ViewArgs` for the controller's
+/// render rewrite. Keyed to match `views_module_name(controller)` (which
+/// equals `camelize(snake_case(dir))`) plus the rendered action. Only
+/// HTML, non-partial, non-layout views participate.
+/// Union of `locals:` key names per partial, across every render call
+/// site in the app (views, controller actions, library-class bodies —
+/// lobsters' ApplicationHelper#link_post renders from a helper).
+/// Rails' contract is that a partial's locals are exactly what callers
+/// pass; these names become the partial's trailing nil-default params.
+/// Values are SORTED so every producer (def site, view-side emit map,
+/// controller-side contract map) agrees on positions even when one of
+/// them sees fewer call sites.
+/// `defined?(<form_local>)` → `true` in a bound partial: the binding
+/// exists precisely because every caller passes the builder, so the
+/// guard is statically satisfied (its else-branch — typically a
+/// standalone `form_with` fallback — stays in the tree as dead code
+/// that still lowers through the normal form machinery). `defined?`
+/// ingests as `Send(None, :defined?, [Var(name)])`.
+fn fold_defined_form_local(body: &Expr, form_local: &str) -> Expr {
+    fn walk(e: &Expr, form_local: &str) -> Expr {
+        if let ExprNode::Send { recv: None, method, args, .. } = &*e.node {
+            if method.as_str() == "defined?" && args.len() == 1 {
+                let named = match &*args[0].node {
+                    ExprNode::Var { name, .. } => name.as_str() == form_local,
+                    ExprNode::Send { recv: None, method, args, block: None, .. } => {
+                        method.as_str() == form_local && args.is_empty()
+                    }
+                    _ => false,
+                };
+                if named {
+                    return Expr::new(
+                        e.span,
+                        ExprNode::Lit { value: Literal::Bool { value: true } },
+                    );
+                }
+            }
+        }
+        let mut out = e.clone();
+        out.node.for_each_child_mut(&mut |c| {
+            *c = walk(c, form_local);
+        });
+        out
+    }
+    walk(body, form_local)
+}
+
+/// A partial that receives a form builder as a LOCAL (`render partial:
+/// "stories/form", locals: { story: @story, f: f }` from inside
+/// `form_with model: @story do |f|`). No FormBuilder object exists at
+/// runtime — the macro-inline retirement constructs none, so the `f`
+/// local the render site passes is a NameError waiting to happen — and
+/// the partial's `f.*` calls had no binding to inline against (every
+/// one fell to the default escape path). The binding is re-derived at
+/// COMPILE time instead: the form local seeds the partial's
+/// FormBuilderBinding, `f.*` calls inline exactly as in the defining
+/// template, `f.object` reads substitute to the record local, and the
+/// form local drops out of the partial's interface entirely
+/// (`render_locals_keys` filters it, so neither the param nor the
+/// call-site arg exists).
+///
+/// Requirements, all conservative: a RECORD local must ride alongside
+/// (the locals entry whose value is the form's model expr or
+/// `f.object`) — it doubles as the model_name (lobsters passes
+/// `story: @story` / `story: f.object`; Rails derives the name from
+/// the model class, and the record local names it identically at every
+/// corpus site). Inference is transitive — a bound partial forwarding
+/// its own form local binds the next one (stories/_form →
+/// stories/_form_errors) — and callers must AGREE: conflicting
+/// bindings poison the partial (its `f.*` calls stay honest residue).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PartialFormBinding {
+    pub(crate) form_local: String,
+    pub(crate) record_local: String,
+    pub(crate) model_name: String,
+    /// The defining `form_with`'s `namespace:` — a partial's fields
+    /// belong to that form, so they carry its id prefix too.
+    pub(crate) id_prefix: String,
+}
+
+pub(crate) fn partial_form_bindings(
+    views: &[View],
+) -> crate::det::HashMap<ViewKey, PartialFormBinding> {
+    use crate::det::{HashMap, HashSet};
+
+    // A "simple reference" — the shapes a form's record expr and a
+    // locals value can share (`@story`, a bare local).
+    fn simple_ref(e: &Expr) -> Option<String> {
+        match &*e.node {
+            ExprNode::Ivar { name } => Some(format!("@{}", name.as_str())),
+            ExprNode::Var { name, .. } => Some(name.as_str().to_string()),
+            ExprNode::Send { recv: None, method, args, block: None, .. } if args.is_empty() => {
+                Some(method.as_str().to_string())
+            }
+            _ => None,
+        }
+    }
+
+    fn is_form_object_read(e: &Expr, form_param: &str) -> bool {
+        let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &*e.node else {
+            return false;
+        };
+        method.as_str() == "object"
+            && args.is_empty()
+            && simple_ref(r).is_some_and(|n| n == form_param)
+    }
+
+    /// Collect `(partial key, binding)` edges from render calls under a
+    /// form scope (`form_param` names the builder; `record_refs` the
+    /// spellings that mean "the record").
+    fn render_edges(
+        e: &Expr,
+        own_dir: Option<&str>,
+        form_param: &str,
+        record_refs: &HashSet<String>,
+        id_prefix: &str,
+        stems: &PartialStems,
+        out: &mut Vec<(ViewKey, PartialFormBinding)>,
+    ) {
+        if let ExprNode::Send { recv: None, method, args, .. } = &*e.node {
+            if (method.as_str() == "render" || method.as_str() == "render_to_string")
+                && !args.is_empty()
+            {
+                // The partial's path and its locals hash, from EITHER
+                // spelling. `render partial: "x", locals: { … }` names
+                // both under keywords; the shorthand `render "x", form:
+                // form, bot: @bot` puts the path positionally and the
+                // locals in the trailing kwargs hash. Both are the same
+                // call to Rails, and `render_locals_keys` — the function
+                // that derives the partial's SIGNATURE — has always read
+                // both. Reading only the keyword form here is what left
+                // campfire's `accounts/bots/_form` unbound: its `form.*`
+                // calls stayed as sends against a `form` local that the
+                // signature filter had already removed, so the emitted
+                // partial called its OWN module function `form()` and
+                // died on arity.
+                let (partial_path, locals): (Option<String>, Option<&Vec<(Expr, Expr)>>) =
+                    match &*args[0].node {
+                        ExprNode::Hash { entries, kwargs: true } => {
+                            let mut p = None;
+                            let mut l = None;
+                            for (k, v) in entries {
+                                let key = match &*k.node {
+                                    ExprNode::Lit { value: Literal::Sym { value } } => {
+                                        value.as_str()
+                                    }
+                                    _ => "",
+                                };
+                                match key {
+                                    "partial" => {
+                                        if let ExprNode::Lit {
+                                            value: Literal::Str { value },
+                                        } = &*v.node
+                                        {
+                                            p = Some(value.clone());
+                                        }
+                                    }
+                                    "locals" => {
+                                        if let ExprNode::Hash { entries: le, .. } = &*v.node {
+                                            l = Some(le);
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            (p, l)
+                        }
+                        ExprNode::Lit { value: Literal::Str { value: pname } } => {
+                            let l = args.get(1).and_then(|h| match &*h.node {
+                                ExprNode::Hash { entries, kwargs: true } => Some(entries),
+                                _ => None,
+                            });
+                            (Some(pname.clone()), l)
+                        }
+                        _ => (None, None),
+                    };
+                {
+                    let mut partial: Option<String> = partial_path;
+                    let mut form_local: Option<String> = None;
+                    let mut record_local: Option<String> = None;
+                    if let Some(le) = locals {
+                        for (lk, lv) in le {
+                            let ExprNode::Lit { value: Literal::Sym { value: lname } } =
+                                &*lk.node
+                            else {
+                                continue;
+                            };
+                            if simple_ref(lv).is_some_and(|n| n == form_param) {
+                                form_local = Some(lname.as_str().to_string());
+                            } else if simple_ref(lv)
+                                .is_some_and(|n| record_refs.contains(&n))
+                                || is_form_object_read(lv, form_param)
+                            {
+                                record_local = Some(lname.as_str().to_string());
+                            }
+                        }
+                    }
+                    if form_local.is_none() {
+                        partial = None;
+                    }
+                    if let (Some(p), Some(form_local), Some(record_local)) =
+                        (partial, form_local, record_local)
+                    {
+                        if let Some(key) = partial_name_to_key_from(&p, own_dir, stems) {
+                            let model_name = record_local.clone();
+                            out.push((
+                                key,
+                                PartialFormBinding {
+                                    form_local,
+                                    record_local,
+                                    model_name,
+                                    id_prefix: id_prefix.to_string(),
+                                },
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        e.node.for_each_child(&mut |c| {
+            render_edges(c, own_dir, form_param, record_refs, id_prefix, stems, out)
+        });
+    }
+
+    /// Find `form_with ... do |f|` scopes and collect their render
+    /// edges.
+    fn seed_scopes(
+        e: &Expr,
+        own_dir: Option<&str>,
+        stems: &PartialStems,
+        out: &mut Vec<(ViewKey, PartialFormBinding)>,
+    ) {
+        if let ExprNode::Send { recv: None, method, args, block: Some(block), .. } = &*e.node {
+            if method.as_str() == "form_with" {
+                if let ExprNode::Lambda { extra_params, params, body, .. } = &*block.node {
+                    // A block with optional or keyword parameters is not the
+                    // `|f|` scope this binds; it seeds nothing.
+                    if let Some(form_param) = params.first().filter(|_| extra_params.is_empty()) {
+                        let mut record_refs: HashSet<String> = HashSet::default();
+                        let mut id_prefix = String::new();
+                        for arg in args {
+                            if let ExprNode::Hash { entries, .. } = &*arg.node {
+                                for (k, v) in entries {
+                                    let ExprNode::Lit { value: Literal::Sym { value: key } } =
+                                        &*k.node
+                                    else {
+                                        continue;
+                                    };
+                                    match key.as_str() {
+                                        "model" => {
+                                            if let Some(r) = simple_ref(v) {
+                                                record_refs.insert(r);
+                                            }
+                                        }
+                                        "namespace" => {
+                                            if let Some(ns) =
+                                                self::form_with::str_or_sym_literal(v)
+                                            {
+                                                id_prefix = ns;
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                        render_edges(
+                            body,
+                            own_dir,
+                            form_param.as_str(),
+                            &record_refs,
+                            &id_prefix,
+                            stems,
+                            out,
+                        );
+                    }
+                }
+            }
+        }
+        e.node.for_each_child(&mut |c| seed_scopes(c, own_dir, stems, out));
+    }
+
+    let stems = PartialStems::of(views);
+    let mut edges: Vec<(ViewKey, PartialFormBinding)> = Vec::new();
+    for v in views {
+        let (dir, _) = split_view_name(v.name.as_str());
+        let own = (!dir.is_empty()).then_some(dir);
+        seed_scopes(&v.body, own, &stems, &mut edges);
+    }
+
+    let mut out: HashMap<ViewKey, PartialFormBinding> = HashMap::default();
+    let mut poisoned: HashSet<ViewKey> = HashSet::default();
+    let mut pending = edges;
+    // Transitive closure: a partial that just gained a binding acts as
+    // a form scope for its own render calls. Conflicts poison.
+    while !pending.is_empty() {
+        let mut next: Vec<(ViewKey, PartialFormBinding)> = Vec::new();
+        for (key, binding) in pending.drain(..) {
+            if poisoned.contains(&key) {
+                continue;
+            }
+            match out.get(&key) {
+                Some(existing) if *existing != binding => {
+                    poisoned.insert(key.clone());
+                    out.remove(&key);
+                    continue;
+                }
+                Some(_) => continue,
+                None => {}
+            }
+            out.insert(key.clone(), binding.clone());
+            // Re-scan the newly bound partial's body for forwarded
+            // edges.
+            for v in views {
+                if view_key_of(v, &stems).as_ref() != Some(&key) {
+                    continue;
+                }
+                let (dir, _) = split_view_name(v.name.as_str());
+                let own = (!dir.is_empty()).then_some(dir);
+                let mut refs: HashSet<String> = HashSet::default();
+                refs.insert(binding.record_local.clone());
+                // A forwarded partial inherits the defining form's id
+                // prefix along with its builder.
+                render_edges(
+                    &v.body,
+                    own,
+                    &binding.form_local,
+                    &refs,
+                    &binding.id_prefix,
+                    &stems,
+                    &mut next,
+                );
+            }
+        }
+        pending = next;
+    }
+    out
+}
+
+pub(crate) fn render_locals_keys(
+    views: &[View],
+    controllers: &[crate::dialect::Controller],
+    library_classes: &[crate::dialect::LibraryClass],
+) -> crate::det::HashMap<(String, String), Vec<String>> {
+    use std::collections::BTreeSet;
+    use crate::det::HashMap;
+    use crate::lower::view::RenderPartial;
+    let mut acc: HashMap<(String, String), BTreeSet<String>> = HashMap::default();
+
+    fn scan(
+        e: &Expr,
+        own_dir: Option<&str>,
+        stems: &PartialStems,
+        acc: &mut crate::det::HashMap<(String, String), std::collections::BTreeSet<String>>,
+    ) {
+        if let ExprNode::Send { recv: None, method, args, .. } = &*e.node {
+            if (method.as_str() == "render" || method.as_str() == "render_to_string")
+                && !args.is_empty()
+            {
+                if let ExprNode::Hash { entries, kwargs: true } = &*args[0].node {
+                    let mut partial: Option<String> = None;
+                    let mut keys: Vec<String> = Vec::new();
+                    for (k, v) in entries {
+                        let key = match &*k.node {
+                            ExprNode::Lit { value: Literal::Sym { value } } => value.as_str(),
+                            _ => "",
+                        };
+                        match key {
+                            // `layout:` is the same shape as `partial:` —
+                            // a path plus an optional `locals:` — and its
+                            // block-form call site declares the layout
+                            // partial's interface just as much.
+                            "partial" | "layout" => {
+                                if let ExprNode::Lit { value: Literal::Str { value } } = &*v.node {
+                                    partial = Some(value.clone());
+                                }
+                            }
+                            "locals" => {
+                                if let ExprNode::Hash { entries: le, .. } = &*v.node {
+                                    for (lk, _) in le {
+                                        if let ExprNode::Lit {
+                                            value: Literal::Sym { value },
+                                        } = &*lk.node
+                                        {
+                                            keys.push(value.as_str().to_string());
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if let Some(key) =
+                        partial.and_then(|p| partial_name_to_key_from(&p, own_dir, stems))
+                    {
+                        acc.entry(key).or_default().extend(keys);
+                    }
+                } else if let ExprNode::Lit { value: Literal::Str { value: pname } } =
+                    &*args[0].node
+                {
+                    // Shorthand `render "message", message: m, is_unread: b`
+                    // — partial name as a string literal, locals as the
+                    // trailing kwargs hash. The call-site lowering has
+                    // always parsed this form; only matching the
+                    // `partial:`-keyword form here left shorthand locals
+                    // out of the def signature, so the partial's body
+                    // read them as unbound frees (lobsters inbox
+                    // partials — an AOT compile stop).
+                    let mut keys: Vec<String> = Vec::new();
+                    if let Some(h) = args.get(1) {
+                        if let ExprNode::Hash { entries, kwargs: true } = &*h.node {
+                            for (lk, _) in entries {
+                                if let ExprNode::Lit { value: Literal::Sym { value } } =
+                                    &*lk.node
+                                {
+                                    keys.push(value.as_str().to_string());
+                                }
+                            }
+                        }
+                    }
+                    if let Some(key) = (!keys.is_empty())
+                        .then(|| partial_name_to_key_from(pname, own_dir, stems))
+                        .flatten()
+                    {
+                        acc.entry(key).or_default().extend(keys);
+                    }
+                } else if let Some(dir) = own_dir
+                    && let Some(rp) = crate::lower::view::classify_render_partial(
+                        None,
+                        method.as_str(),
+                        args,
+                        None,
+                        &|_| true,
+                        &|_| false,
+                    )
+                    && let RenderPartial::Collection { locals: Some(locals), .. }
+                    | RenderPartial::Record { locals: Some(locals), .. }
+                    | RenderPartial::Association { locals: Some(locals), .. }
+                    | RenderPartial::TypedCollection { locals: Some(locals), .. } = &rp
+                    && let Some(key) = render_partial_key(&rp, dir, stems)
+                {
+                    // `render @posts, flag: false` — the object form's
+                    // hash is its partial's locals, so its keys are the
+                    // partial's interface as an explicit `locals:` is.
+                    // Views only: a controller's `render @post` is not a
+                    // partial render.
+                    let keys = locals.iter().filter_map(|(lk, _)| match &*lk.node {
+                        ExprNode::Lit { value: Literal::Sym { value } } => Some(value.as_str().to_string()),
+                        _ => None,
+                    });
+                    acc.entry(key).or_default().extend(keys);
+                }
+            }
+        }
+        e.node.for_each_child(&mut |c| scan(c, own_dir, stems, acc));
+    }
+
+    let stems = PartialStems::of(views);
+    for v in views {
+        let (dir, _) = split_view_name(v.name.as_str());
+        let own = (!dir.is_empty()).then_some(dir);
+        scan(&v.body, own, &stems, &mut acc);
+    }
+    for c in controllers {
+        for a in c.actions() {
+            scan(&a.body, None, &stems, &mut acc);
+        }
+    }
+    for lc in library_classes {
+        for m in &lc.methods {
+            scan(&m.body, None, &stems, &mut acc);
+        }
+    }
+    // A form-builder local is NOT interface: the bound partial inlines
+    // every `f.*` call at compile time, so neither the nil-default
+    // param nor the call-site arg should exist (the arg would be a
+    // NameError — no FormBuilder object is ever constructed).
+    for (key, binding) in partial_form_bindings(views) {
+        if let Some(set) = acc.get_mut(&key) {
+            set.remove(&binding.form_local);
+        }
+    }
+    acc.into_iter().map(|(k, v)| (k, v.into_iter().collect())).collect()
+}
+
+/// Per-PARTIAL call contract for CONTROLLER-side partial renders
+/// (`render partial: "commentbox", locals: {comment: c}` inside an
+/// action). Mirrors the partial def-site parameter order exactly:
+/// record (singular of the partial's dir), then the render-tree closure
+/// ivars (minus a record-named one), then the trailing nil-default
+/// extras. The controller rewrite passes the locals value for the
+/// record, `@<name>` for each closure ivar (a same-named local wins),
+/// and locals-or-nil for extras.
+#[derive(Clone, Debug)]
+pub struct PartialCallContract {
+    /// The partial's method — its stem, unless a template beside it
+    /// already answers to that (see [`PartialStems`]).
+    pub method: Symbol,
+    pub record: String,
+    pub closure: Vec<String>,
+    pub extras: Vec<String>,
+    /// A strict-locals partial (`<%# locals: (…) -%>`) takes its
+    /// non-record locals as KEYWORD params (see the strict-locals
+    /// override in the view lowering), not trailing positionals.
+    pub keyword_extras: bool,
+    /// The keyword locals a strict-locals partial declares itself, whose
+    /// header default stands when a caller omits them.
+    pub declared: Vec<String>,
+}
+
+impl PartialCallContract {
+    /// The call's trailing arguments for `extras`.
+    ///
+    /// `locals_lookup` is the render's `locals:` hash; `param_lookup` is
+    /// the enclosing method's params. Positional partials take every
+    /// extra up to the last bound one (nil filling the gaps); a
+    /// strict-locals partial takes just the bound ones, by name.
+    ///
+    /// The first two extras are the flash pair (possibly renamed). When
+    /// `caller_flash` is `Some`, those slots bind by **position**: an
+    /// explicit `locals:` value under the slot's name still wins
+    /// (`local_key_of`), then the caller's flash param for that slot —
+    /// not a same-named ivar local that name lookup would prefer after
+    /// rename.
+    pub fn extras_args(
+        &self,
+        locals_lookup: impl Fn(&str) -> Option<Expr>,
+        param_lookup: impl Fn(&str) -> Option<Expr>,
+        caller_flash: Option<&[String; 2]>,
+        nil: impl Fn() -> Expr,
+        span: crate::span::Span,
+    ) -> Vec<Expr> {
+        let bound: Vec<Option<Expr>> = self
+            .extras
+            .iter()
+            .enumerate()
+            .map(|(i, n)| {
+                let key = if self.keyword_extras { n.as_str() } else { local_key_of(&self.extras, n) };
+                if let (Some(flash), true) = (caller_flash, i < 2) {
+                    locals_lookup(key).or_else(|| param_lookup(&flash[i]))
+                } else {
+                    locals_lookup(key).or_else(|| param_lookup(n))
+                }
+            })
+            .collect();
+        if self.keyword_extras {
+            let entries: Vec<(Expr, Expr)> = self
+                .extras
+                .iter()
+                .zip(bound)
+                .filter_map(|(n, b)| {
+                    let key = Expr::new(
+                        span,
+                        ExprNode::Lit { value: Literal::Sym { value: Symbol::from(n.as_str()) } },
+                    );
+                    b.map(|v| (key, v))
+                })
+                .collect();
+            if entries.is_empty() {
+                return Vec::new();
+            }
+            return vec![Expr::new(span, ExprNode::Hash { entries, kwargs: true })];
+        }
+        let Some(last) = bound.iter().rposition(|b| b.is_some()) else { return Vec::new() };
+        bound.into_iter().take(last + 1).map(|b| b.unwrap_or_else(&nil)).collect()
+    }
+}
+
+pub(crate) fn partial_call_contracts(
+    views: &[View],
+    controllers: &[crate::dialect::Controller],
+    library_classes: &[crate::dialect::LibraryClass],
+) -> crate::det::HashMap<(String, String), PartialCallContract> {
+    let closures = view_ivar_closures(views, controllers);
+    let keys_map = render_locals_keys(views, controllers, library_classes);
+    let stems = PartialStems::of(views);
+    // Same record derivation as `build_library_class` / `partial_extras_map`
+    // so `flash_locals` sees one handed name across def and callers.
+    let (collection_locals, _) = collection_element_locals_from_views(views, &stems);
+    let request_context = request_context_views(views);
+    let form_bindings = partial_form_bindings(views);
+    let mut out = crate::det::HashMap::default();
+    for view in views {
+        let (dir, base) = split_view_name(view.name.as_str());
+        if dir.is_empty() || !base.starts_with('_') {
+            continue;
+        }
+        let module = camelize_path(&snake_case(dir));
+        let key = stems.key(&module, base);
+        let method = crate::lower::view::view_method_name(&key.1);
+        // Contracts are looked up by the name a render spells, which is
+        // all a controller-side call site has.
+        let spelled = (module, base.trim_start_matches('_').to_string());
+        // Strict locals declare the whole contract: the first local is
+        // the positional record, the rest are keywords.
+        let form_local = form_bindings.get(&key).map(|b| b.form_local.as_str());
+        if let Some(sl) = view.strict_locals.as_ref().filter(|sl| sl.iter().any(|p| Some(p.name.as_str()) != form_local)) {
+            // Not the declared form local: the def drops it (`strict_without_form`), so a caller passing it would hand over an unknown keyword.
+            let declared: Vec<String> = sl
+                .iter()
+                .map(|p| p.name.as_str().to_string())
+                .filter(|n| Some(n.as_str()) != form_local)
+                .collect();
+            let closure: Vec<String> = closures
+                .get(&key)
+                .map(|ivs| {
+                    ivs.iter()
+                        .filter(|iv| !declared.iter().any(|d| d == iv.as_str()))
+                        .map(|s| s.as_str().to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            out.insert(
+                spelled,
+                PartialCallContract {
+                    method,
+                    record: declared[0].clone(),
+                    closure,
+                    // The request-context keywords the def adds (`request_context_views`).
+                    extras: declared[1..]
+                        .iter()
+                        .cloned()
+                        .chain(
+                            ["action_name", "controller_name", "path_parameters"]
+                                .into_iter()
+                                .filter(|n| request_context.contains(view.name.as_str()) && !declared.iter().any(|d| d == n))
+                                .map(str::to_string),
+                        )
+                        .collect(),
+                    keyword_extras: true,
+                    declared: declared[1..].to_vec(),
+                },
+            );
+            continue;
+        }
+        let record = effective_record_arg(view, &collection_locals, &[], &stems);
+        let closure_raw: Vec<Symbol> = closures.get(&key).cloned().unwrap_or_default();
+        let ivar_locals = view_ivar_locals(view, &closure_raw);
+        let keys = keys_map.get(&key).map(Vec::as_slice);
+        let (_rewritten, mut extras) = rewritten_extras(view, &ivar_locals, &record, keys, request_context.contains(view.name.as_str()));
+        // The def side names each closure param by `ivar_locals` and
+        // skips the one the record covers. The caller passes `@<ivar>`
+        // for the rest, so the contract keeps the RAW ivar name: the
+        // local (`class__`) is the partial's own spelling.
+        let (closure, closure_locals): (Vec<String>, Vec<String>) = closure_raw
+            .iter()
+            .map(|s| (s.as_str().to_string(), ivar_local(&ivar_locals, s.as_str())))
+            .filter(|(_, local)| local != &record)
+            .unzip();
+        if let Some(keys) = keys_map.get(&key) {
+            for k in keys {
+                if k != &record && !extras.contains(k) {
+                    extras.push(k.clone());
+                }
+            }
+        }
+        drop_closure_names(&mut extras, &closure_locals);
+        out.insert(
+            spelled,
+            PartialCallContract { method, record, closure, extras, keyword_extras: false, declared: Vec::new() },
+        );
+    }
+    out
+}
+
+pub(crate) fn action_view_ivar_map(
+    views: &[crate::dialect::View],
+    controllers: &[crate::dialect::Controller],
+    models: &[crate::dialect::Model],
+) -> crate::det::HashMap<(String, String), ViewArgs> {
+    // The controller passes an action view its full render-tree ivar
+    // closure (its own reads ∪ its partials' needs, including dynamic-
+    // partial pools), matching the view's generated params — so an ivar a
+    // deep partial reads (e.g. @user) is threaded even when the action
+    // view itself doesn't read it.
+    let closures = view_ivar_closures(views, controllers);
+    let json_closures = crate::lower::jbuilder_to_library::jbuilder_ivar_closures(views, models);
+    let stems = PartialStems::of(views);
+    let request_context = request_context_views(views);
+    let mut out = crate::det::HashMap::default();
+    for v in views {
+        let (dir, base) = split_view_name(v.name.as_str());
+        if dir == "layouts" || base.starts_with('_') {
+            continue;
+        }
+        // `json` joins the ERB formats HERE and not in
+        // `renders_through_view_path`: that predicate is the ingest/emit
+        // MATCHED PAIR for templates rendered through the ERB path, and
+        // a jbuilder template is emitted by a different lowerer
+        // entirely. What it shares is this question — which controller
+        // ivars does the render call site have to pass — and answering
+        // it for json is what lets a jbuilder view read an ivar the
+        // NAME CONVENTION would not have guessed. campfire's
+        // autocomplete index renders `@page.records`, and `@page` is
+        // assigned inside a runtime method, so there is no
+        // controller-side assignment for the fallback to find either:
+        // the call site passed nothing and the def took one argument.
+        if !crate::lower::view::lowers_through_view_path(v) && !v.jbuilder {
+            continue;
+        }
+        // Top-level templates (`views/not_found.erb`-style trees) key
+        // under the empty module — `Views.<stem>` — so controller-side
+        // `render "not_found"` resolves them through the same contract
+        // lookup as controller-scoped views.
+        let module = if dir.is_empty() {
+            String::new()
+        } else {
+            camelize_path(&snake_case(dir))
+        };
+        // Key by the FORMAT-QUALIFIED stem, matching the lowered method
+        // name. Keying a `.turbo_stream.erb` under the bare stem would
+        // make the html render's contract lookup find it — and the html
+        // branch would then emit a call to a `Views::X.<action>` that
+        // doesn't exist, instead of the MissingTemplate raise Rails
+        // gives for an html request to a turbo_stream-only action.
+        // Key by the RAW stem, format-qualified for a non-html view.
+        // NOT `view_method_name_for` — that also applies the reserved-word
+        // `_` prefix (`new` → `_new`), and the render rewrite looks this
+        // up by the raw action name, so prefixing here turns every
+        // `new`/`edit`-shaped action into a contract miss and a spurious
+        // MissingTemplate raise.
+        let stem = if v.format.as_str() == "html" {
+            base.to_string()
+        } else {
+            format!("{base}_{}", v.format.as_str())
+        };
+        let key = (module, stem);
+        // A json view's closure is the jbuilder render tree's
+        // (`jbuilder_ivar_closures`: its own reads and those of the
+        // partials it renders, which it passes on); `view_ivar_closures`
+        // walks the ERB tree, and a format-blind key would find an html
+        // twin's there. The jbuilder lowerer derives its PARAMS from the
+        // same map, so the two sides cannot disagree about arity.
+        // The closure map is keyed the way `build_library_class` reads
+        // it — `view_key_of`, the UNQUALIFIED stem — so a non-html view
+        // must be looked up that way too. Reading it under the
+        // format-qualified contract key missed, fell back to the ivars
+        // in READ order, and the call passed them in a different order
+        // than the lowered view declares (lobsters' `stories.rss.builder`
+        // got `@title` where it takes `stories`).
+        let ivars = if v.jbuilder {
+            json_closures.get(&v.name).cloned()
+        } else {
+            view_key_of(v, &stems)
+                .and_then(|k| closures.get(&k))
+                .or_else(|| closures.get(&key))
+                .cloned()
+        }
+        .unwrap_or_else(|| view_read_ivars(&v.body));
+        out.insert(
+            key,
+            ViewArgs {
+                ivars,
+                uses_action_name: view_uses_bare_name(&v.body, "action_name") || request_context.contains(v.name.as_str()),
+                uses_controller_name: view_uses_bare_name(&v.body, "controller_name") || request_context.contains(v.name.as_str()),
+                uses_path_parameters: view_uses_url_options_hash(&v.body) || request_context.contains(v.name.as_str()),
+            },
+        );
+    }
+    out
+}
+
+/// True when the view body references `name` as a bare identifier — a
+/// no-recv/no-arg Send (`action_name`) or a Var (`action_name` already
+/// lowered to a local). Used to surface controller-context helpers
+/// (action_name/controller_name) as view params only when actually used.
+/// True when the view body holds a `url_for` options hash in a URL
+/// argument (`link_to "Next", {controller: controller_name, action:
+/// action_name, page: @page + 1}`), the shape `lower_url_option_helpers`
+/// resolves. Same collector, so the two cannot disagree.
+pub(crate) fn view_uses_url_options_hash(body: &Expr) -> bool {
+    let mut sets = Vec::new();
+    crate::lower::routes_to_library::collect_url_option_key_sets(body, &mut sets);
+    !sets.is_empty()
+}
+
+/// A URL a view builds from a Hash known only at run time (`link_to
+/// "Page 2", @moderation_params.merge(page: 2)`): not a literal Hash,
+/// which `emit_url_options_hash` resolves, but a value the analyzer
+/// typed as a Hash.
+pub(crate) fn dynamic_url_hash(url: &Expr) -> bool {
+    // Not only a Hash: `url_for` reads request parameters (`params.merge(page: 2)`) the same way.
+    !matches!(&*url.node, ExprNode::Hash { .. })
+        && match url.ty.as_ref().map(crate::ty::Ty::peel_nilable) {
+            Some(crate::ty::Ty::Hash { .. }) => true,
+            Some(crate::ty::Ty::Class { id, .. }) => id.0.as_str() == "ActionController::Parameters",
+            _ => false,
+        }
+}
+
+/// Does the view link to a [`dynamic_url_hash`] URL? Such a view reads
+/// the request's controller, action and path parameters.
+pub(crate) fn view_uses_dynamic_url_hash(body: &Expr) -> bool {
+    fn walk(e: &Expr) -> bool {
+        if let ExprNode::Send { recv: None, method, args, block, .. } = &*e.node {
+            let url = if block.is_some() && matches!(method.as_str(), "link_to" | "button_to") {
+                args.first()
+            } else {
+                match crate::lower::view::classify_view_helper(method.as_str(), args) {
+                    Some(crate::lower::view::ViewHelperKind::LinkTo { url, .. })
+                    | Some(crate::lower::view::ViewHelperKind::LinkToIf { url, .. })
+                    | Some(crate::lower::view::ViewHelperKind::ButtonTo { target: url, .. }) => Some(url),
+                    _ => None,
+                }
+            };
+            // A conditional URL resolves branch by branch (`emit_url_arg`).
+            fn any_branch(url: &Expr) -> bool {
+                match &*url.node {
+                    ExprNode::If { then_branch, else_branch, .. } => any_branch(then_branch) || any_branch(else_branch),
+                    _ => dynamic_url_hash(url),
+                }
+            }
+            if url.is_some_and(any_branch) {
+                return true;
+            }
+        }
+        let mut found = false;
+        e.node.for_each_child(&mut |c| found = found || walk(c));
+        found
+    }
+    walk(body)
+}
+
+/// The views that need the request's controller, action and path
+/// parameters for a [`dynamic_url_hash`] URL or a recalled route segment
+/// (`route_param_recall`): those reading one, and those rendering a
+/// partial that does, so the values reach the partial.
+pub(crate) fn request_context_views(views: &[View]) -> crate::det::HashSet<String> {
+    let mut out: crate::det::HashSet<String> = views
+        .iter()
+        .filter(|v| view_uses_dynamic_url_hash(&v.body) || view_uses_bare_name(&v.body, "path_parameters"))
+        .map(|v| v.name.as_str().to_string())
+        .collect();
+    let pools = crate::det::HashMap::default();
+    let stems = PartialStems::of(views);
+    loop {
+        let needed: crate::det::HashSet<ViewKey> = views
+            .iter()
+            .filter(|v| out.contains(v.name.as_str()) && split_view_name(v.name.as_str()).1.starts_with('_'))
+            .filter_map(|v| view_key_of(v, &stems))
+            .collect();
+        let more: Vec<String> = views
+            .iter()
+            .filter(|v| !out.contains(v.name.as_str()))
+            .filter(|v| {
+                let (dir, _) = split_view_name(v.name.as_str());
+                render_partial_keys(&v.body, dir, &pools, &stems).iter().any(|k| needed.contains(k))
+            })
+            .map(|v| v.name.as_str().to_string())
+            .collect();
+        if more.is_empty() {
+            return out;
+        }
+        out.extend(more);
+    }
+}
+
+pub(crate) fn view_uses_bare_name(body: &Expr, name: &str) -> bool {
+    fn walk(e: &Expr, name: &str) -> bool {
+        let hit = match &*e.node {
+            ExprNode::Var { name: n, .. } => n.as_str() == name,
+            ExprNode::Send { recv: None, method, args, block, .. } => {
+                method.as_str() == name && args.is_empty() && block.is_none()
+            }
+            _ => false,
+        };
+        if hit {
+            return true;
+        }
+        let mut found = false;
+        e.node.for_each_child(&mut |c| {
+            if !found {
+                found = walk(c, name);
+            }
+        });
+        found
+    }
+    walk(body, name)
+}
+
+/// A view's identity key for the render graph / closure map:
+/// `(module, stem)` matching `views_module_name(controller)` ==
+/// `camelize(snake_case(dir))` plus the rendered action/partial name.
+pub(crate) type ViewKey = (String, String);
+
+/// The stem each partial goes by: its base name without the underscore,
+/// except for a partial whose method a template in the same directory
+/// already defines — `posts/_show` beside `posts/show`, or `_new` beside
+/// `new` (both `_new`, see `view_method_name`).
+///
+/// Rails tells those two apart by the underscore: `render "show"` finds
+/// the partial, the action's render finds the template. A stem has no
+/// underscore, so the pair would share one `ViewKey` and one
+/// `Views::Posts.show` — a method defined twice, which spinel refuses and
+/// CRuby settles by keeping whichever file loads last. The partial of
+/// such a pair goes by `show_partial` instead (one more `_partial` while
+/// any template in the directory, or a partial renamed before it,
+/// already defines a method that name would), for its method and its
+/// key alike; every other partial keeps its stem, so an app without a
+/// pair lowers exactly as before.
+///
+/// Every site resolving a partial name to its key or method goes through
+/// here, so the def and its callers cannot disagree.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PartialStems(crate::det::HashMap<ViewKey, String>);
+
+impl PartialStems {
+    pub(crate) fn of(views: &[View]) -> Self {
+        use crate::det::{HashMap, HashSet};
+        use std::collections::BTreeMap;
+        // Every method a template defines in its module under `stem`:
+        // ERB's format-qualified name, plus the `_into` variant the buffer
+        // pass adds beside it when it can (`buffer_variant`), or
+        // jbuilder's `<stem>_json`.
+        let methods = |v: &View, stem: &str| -> Vec<Symbol> {
+            if v.jbuilder {
+                match v.analysis_only {
+                    true => Vec::new(),
+                    false => vec![Symbol::from(format!("{stem}_json"))],
+                }
+            } else if crate::lower::view::lowers_through_view_path(v) {
+                let m = crate::lower::view::view_method_name_for(stem, v.format.as_str());
+                let into = crate::lower::view_buffer_passing::INTO_SUFFIX;
+                let variant = buffer_variant(v).then(|| Symbol::from(format!("{m}{into}")));
+                std::iter::once(m).chain(variant).collect()
+            } else {
+                Vec::new()
+            }
+        };
+        // Keyed by the MODULE a directory emits into, not the directory:
+        // `product-item/` and `product_item/` are both `Views::ProductItem`.
+        let mut templates: HashSet<(String, Symbol)> = HashSet::default();
+        // Every name each module already answers to, partial or not.
+        let mut taken: HashMap<String, HashSet<Symbol>> = HashMap::default();
+        // Each partial's formats, in name order so allocation is stable.
+        let mut partials: BTreeMap<(String, &str), Vec<&View>> = BTreeMap::new();
+        for v in views {
+            let (dir, base) = split_view_name(v.name.as_str());
+            let module = camelize_path(&snake_case(dir));
+            let stem = base.trim_start_matches('_');
+            let own = methods(v, stem);
+            let names = taken.entry(module.clone()).or_default();
+            names.insert(Symbol::from(stem));
+            names.extend(own.iter().cloned());
+            match base.starts_with('_') {
+                true => partials.entry((module, stem)).or_default().push(v),
+                false => templates.extend(own.into_iter().map(|m| (module.clone(), m))),
+            }
+        }
+        let mut renamed = HashMap::default();
+        for ((module, stem), formats) in partials {
+            let collides = formats
+                .iter()
+                .flat_map(|v| methods(v, stem))
+                .any(|m| templates.contains(&(module.clone(), m)));
+            if !collides {
+                continue;
+            }
+            // Clear of every name in the module, including the ones
+            // given out before this one.
+            let names = taken.entry(module.clone()).or_default();
+            let mut candidate = format!("{stem}_partial");
+            while names.contains(&Symbol::from(candidate.as_str()))
+                || formats.iter().flat_map(|v| methods(v, &candidate)).any(|m| names.contains(&m))
+            {
+                candidate.push_str("_partial");
+            }
+            names.insert(Symbol::from(candidate.as_str()));
+            names.extend(formats.iter().flat_map(|v| methods(v, &candidate)));
+            renamed.insert((module, stem.to_string()), candidate);
+        }
+        Self(renamed)
+    }
+
+    /// The stem of the partial `base` (`"show"` or `"_show"`) in `module`.
+    pub(crate) fn stem(&self, module: &str, base: &str) -> String {
+        let stem = base.trim_start_matches('_');
+        self.0
+            .get(&(module.to_string(), stem.to_string()))
+            .cloned()
+            .unwrap_or_else(|| stem.to_string())
+    }
+
+    pub(crate) fn key(&self, module: &str, base: &str) -> ViewKey {
+        (module.to_string(), self.stem(module, base))
+    }
+
+    /// The method a caller outside the view lowering names the partial
+    /// `base` in `dir` by (`users`, `"mention"` → `mention`).
+    pub(crate) fn method(&self, dir: &str, base: &str) -> Symbol {
+        crate::lower::view::view_method_name(&self.stem(&camelize_path(&snake_case(dir)), base))
+    }
+}
+
+/// Whether the buffer pass gives an ERB template an `_into` variant. It
+/// forwards no keyword or rest parameter (`view_buffer_passing`), and a
+/// strict-locals partial takes every local after its record as a
+/// keyword (`build_library_class`), so only one declaring a single local
+/// keeps the variant.
+fn buffer_variant(v: &View) -> bool {
+    let is_partial = split_view_name(v.name.as_str()).1.starts_with('_');
+    v.strict_locals.as_ref().filter(|_| is_partial).is_none_or(|locals| locals.len() <= 1)
+}
+
+/// Per-PARTIAL extras list ((module, method) → collect_extra_params
+/// output), so a render call site carrying an explicit `locals:` hash
+/// can bind values to the partial's trailing extra params positionally.
+/// Mirrors the def-site computation in build_library_class exactly —
+/// same ivar rewrite, same trim, same collector — so the orders can't
+/// drift.
+pub(super) fn partial_extras_map(
+    app: &App,
+) -> crate::det::HashMap<(String, String), Vec<String>> {
+    let known_models: Vec<String> =
+        app.models.iter().map(|m| m.name.0.as_str().to_string()).collect();
+    let closures = view_ivar_closures(&app.views, &app.controllers);
+    let keys_map = render_locals_keys(&app.views, &app.controllers, &app.library_classes);
+    let stems = PartialStems::of(&app.views);
+    let collection_locals = collection_element_locals(&app.views, app);
+    let request_context = request_context_views(&app.views);
+    let mut out: crate::det::HashMap<(String, String), Vec<String>> =
+        crate::det::HashMap::default();
+    for view in &app.views {
+        let (dir, base) = split_view_name(view.name.as_str());
+        if dir.is_empty() || !base.starts_with('_') {
+            continue;
+        }
+        let key = stems.key(&camelize_path(&snake_case(dir)), base);
+        let arg_name = effective_record_arg(view, &collection_locals, &known_models, &stems);
+        let closure_raw: Vec<Symbol> = closures.get(&key).cloned().unwrap_or_default();
+        let ivar_locals = view_ivar_locals(view, &closure_raw);
+        let keys = keys_map.get(&key).map(Vec::as_slice);
+        let (_rewritten, mut extras) = rewritten_extras(view, &ivar_locals, &arg_name, keys, request_context.contains(view.name.as_str()));
+        // locals-key params — mirrors the def site's append exactly.
+        let closure: Vec<String> =
+            closure_raw.iter().map(|s| ivar_local(&ivar_locals, s.as_str())).collect();
+        if let Some(keys) = keys_map.get(&key) {
+            for k in keys {
+                if k != &arg_name && !extras.contains(k) {
+                    extras.push(k.clone());
+                }
+            }
+        }
+        drop_closure_names(&mut extras, &closure);
+        out.insert(key, extras);
+    }
+    // Mirror the def site's bound-form-local drop (the defined?-extras
+    // channel re-adds it here otherwise, and the call site would pass
+    // an arg the def no longer has).
+    for (key, binding) in partial_form_bindings(&app.views) {
+        if let Some(extras) = out.get_mut(&key) {
+            extras.retain(|k| k != &binding.form_local);
+        }
+    }
+    out
+}
+
+/// The partials whose body calls `<form>.file_field` on any receiver
+/// (the builder arrives as a local of whatever name the caller chose).
+fn multipart_partials(views: &[View]) -> crate::det::HashSet<ViewKey> {
+    fn has_file_field(e: &Expr) -> bool {
+        if matches!(&*e.node, ExprNode::Send { recv: Some(_), method, .. } if method.as_str() == "file_field") {
+            return true;
+        }
+        let mut found = false;
+        e.node.for_each_child(&mut |child| {
+            if !found && has_file_field(child) {
+                found = true;
+            }
+        });
+        found
+    }
+    let stems = PartialStems::of(views);
+    views
+        .iter()
+        .filter(|v| {
+            let (_dir, base) = split_view_name(v.name.as_str());
+            base.starts_with('_') && has_file_field(&v.body)
+        })
+        .filter_map(|v| view_key_of(v, &stems))
+        .collect()
+}
+
+/// Which of a key's views a render looks up. `view_key_of` drops the
+/// partial's `_`, so `_show.html.erb` and `show.turbo_stream.erb` share
+/// `("Articles", "show")`; Rails resolves `render "show"` among partials
+/// only and `render template:` among templates only.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(super) enum ViewKind {
+    Partial,
+    Template,
+}
+
+/// Each lowered view's key with its kind and format. The key is
+/// format-blind — `_note.html.erb` and `_note.turbo_stream.erb` share one
+/// ivar closure, which both definitions take and every caller passes — so
+/// the variant a render calls is told apart here (`ViewCtx::render_format`).
+fn view_formats(views: &[View]) -> crate::det::HashSet<(ViewKey, ViewKind, String)> {
+    let stems = PartialStems::of(views);
+    views
+        .iter()
+        .filter(|v| crate::lower::view::lowers_through_view_path(v))
+        .filter_map(|v| {
+            let (_dir, base) = split_view_name(v.name.as_str());
+            let kind = if base.starts_with('_') { ViewKind::Partial } else { ViewKind::Template };
+            Some((view_key_of(v, &stems)?, kind, v.format.as_str().to_string()))
+        })
+        .collect()
+}
+
+fn view_key_of(v: &View, stems: &PartialStems) -> Option<ViewKey> {
+    let (dir, base) = split_view_name(v.name.as_str());
+    if dir.is_empty() {
+        return None;
+    }
+    let module = camelize_path(&snake_case(dir));
+    Some(match base.starts_with('_') {
+        true => stems.key(&module, base),
+        false => (module, base.to_string()),
+    })
+}
+
+/// Ruby-emit-path layout wrap factory: the Expr for
+///
+/// ```ruby
+/// Views::Layouts.application(<inner>, @<ivar>…, @flash?, @flash[:notice], @flash[:alert])
+/// ```
+///
+/// mirroring the layout signature `build_library_class` constructs
+/// (body, closure ivars, flash-if-used, then the uniform notice/alert
+/// extras). None when the app has no `layouts/application` html view.
+/// Consumed by `emit::ruby::library::apply_layout_lowering`, which
+/// rewrites each action's `render(Views::X.y(...))` — the controller
+/// seam where the @ivars a layout reads are statically in scope. (The
+/// generic dispatch previously wrapped layouts body-only; a layout
+/// reading @user had no way to receive it there.)
+pub fn layout_wrap_expr(app: &crate::App, inner: Expr) -> Option<Expr> {
+    layout_wrap_expr_with(app, &view_ivar_closures(&app.views, &app.controllers), inner)
+}
+
+/// `layout_wrap_expr` over closures the caller computed once for every render it wraps.
+pub(crate) fn layout_wrap_expr_with(
+    app: &crate::App,
+    closures: &crate::det::HashMap<ViewKey, Vec<Symbol>>,
+    inner: Expr,
+) -> Option<Expr> {
+    let key: ViewKey = ("Layouts".to_string(), "application".to_string());
+    let stems = PartialStems::of(&app.views);
+    let layout = app.views.iter().find(|v| {
+        v.format.as_str() == "html" && view_key_of(v, &stems).as_ref() == Some(&key)
+    })?;
+    let ivars = closures.get(&key).cloned().unwrap_or_default();
+    let span = inner.span;
+    let ivar = |name: &Symbol| Expr::new(span, ExprNode::Ivar { name: name.clone() });
+    let flash_slot = |slot: &str| {
+        Expr::new(
+            span,
+            ExprNode::Send {
+                recv: Some(Expr::new(
+                    span,
+                    ExprNode::Ivar { name: Symbol::from("flash") },
+                )),
+                method: Symbol::from("[]"),
+                args: vec![Expr::new(
+                    span,
+                    ExprNode::Lit { value: Literal::Sym { value: Symbol::from(slot) } },
+                )],
+                block: None,
+                parenthesized: true,
+            },
+        )
+    };
+    let mut args: Vec<Expr> = vec![inner];
+    for iv in &ivars {
+        args.push(ivar(iv));
+    }
+    if view_uses_bare_name(&layout.body, "flash") {
+        args.push(ivar(&Symbol::from("flash")));
+    }
+    args.push(flash_slot("notice"));
+    args.push(flash_slot("alert"));
+    Some(Expr::new(
+        span,
+        ExprNode::Send {
+            recv: Some(Expr::new(
+                span,
+                ExprNode::Const {
+                    path: vec![Symbol::from("Views"), Symbol::from("Layouts")],
+                },
+            )),
+            method: Symbol::from("application"),
+            args,
+            block: None,
+            parenthesized: true,
+        },
+    ))
+}
+
+/// Transitive instance-variable closure per view: the ivars a view NEEDS
+/// = the ivars its own template reads ∪ the ivars every partial it renders
+/// needs (recursively). This is the typed alternative to a dynamic
+/// assigns-bag — each needed ivar threads through as a typed positional
+/// param (view params + partial call-site args both read this map, so they
+/// agree). Dynamic partial names (`render partial: @x`) can't be resolved
+/// statically, so that subtree's needs aren't folded in (those renders are
+/// nil-guarded by the caller). Keyed for every html view (action +
+/// partial).
+pub(crate) fn view_ivar_closures(
+    views: &[View],
+    controllers: &[crate::dialect::Controller],
+) -> crate::det::HashMap<ViewKey, Vec<Symbol>> {
+    use std::collections::BTreeSet;
+    use crate::det::HashMap;
+    let pools = dynamic_partial_pools(controllers);
+    let stems = PartialStems::of(views);
+    let mut closure: HashMap<ViewKey, BTreeSet<Symbol>> = HashMap::default();
+    let mut edges: HashMap<ViewKey, Vec<ViewKey>> = HashMap::default();
+    for v in views {
+        if !crate::lower::view::lowers_through_view_path(v) {
+            continue;
+        }
+        let Some(key) = view_key_of(v, &stems) else { continue };
+        let (dir, _) = split_view_name(v.name.as_str());
+        let reads: BTreeSet<Symbol> = view_read_ivars(&v.body).into_iter().collect();
+        closure.entry(key.clone()).or_default().extend(reads);
+        let mut child_keys = render_partial_keys(&v.body, dir, &pools, &stems);
+        // A `render partial: @above` folds every pooled candidate partial's
+        // ivar needs into this view, so the dispatch's arms have their
+        // closure args threaded as params here. The pool entries' ivar-
+        // valued locals (`locals: {tag: @tag}`) count as reads of THIS
+        // view — the arm rebinds them onto the partial's declared locals.
+        let (dyn_keys, dyn_locals_ivars) = dynamic_render_edges(&v.body, dir, &pools, &stems);
+        child_keys.extend(dyn_keys);
+        closure.entry(key.clone()).or_default().extend(dyn_locals_ivars);
+        edges.entry(key).or_default().extend(child_keys);
+    }
+    // Fixpoint: propagate each partial's needs up to every view that
+    // renders it, until no set grows.
+    loop {
+        let mut changed = false;
+        let keys: Vec<ViewKey> = edges.keys().cloned().collect();
+        for key in keys {
+            let children = edges.get(&key).cloned().unwrap_or_default();
+            let mut add: BTreeSet<Symbol> = BTreeSet::new();
+            for child in &children {
+                if let Some(c) = closure.get(child) {
+                    add.extend(c.iter().cloned());
+                }
+            }
+            let entry = closure.entry(key).or_default();
+            for s in add {
+                if entry.insert(s) {
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    closure
+        .into_iter()
+        .map(|(k, set)| (k, set.into_iter().collect()))
+        .collect()
+}
+
+/// For each partial rendered as an explicitly-named COLLECTION, the local
+/// its call sites bind the element to.
+///
+/// Rails' rule is `as:` when given, else the PARTIAL's base name — not
+/// the directory singular the arg convention otherwise infers. Only the
+/// `CollectionNamed` shape needs recording: the bare `render articles`
+/// and association forms bind the collection's singular, which is what
+/// the convention already produces.
+///
+/// A partial two call sites bind DIFFERENTLY has no single right answer,
+/// so it is dropped and keeps the convention arg.
+fn collection_element_locals(
+    views: &[View],
+    app: &App,
+) -> crate::det::HashMap<ViewKey, String> {
+    let stems = PartialStems::of(views);
+    let (mut out, conflicted) = collection_element_locals_from_views(views, &stems);
+    // The partials the FRAMEWORK renders, whose call site is Action
+    // Text's `render_action_text_attachment` — `render(partial:
+    // attachment.to_attachable_partial_path, object: attachment, as:
+    // attachment.model_name.element)`. Same rule as a collection
+    // render, same reason it is not guessed from the body: the local
+    // is the class's element (`user`, `opengraph_embed`), which for
+    // campfire's `action_text/attachables/_opengraph_embed` is neither
+    // the directory's singular (`attachable`) nor anything the body
+    // could be trusted to reveal. An app call site that says otherwise
+    // wins, as it does for a collection.
+    for binding in crate::lower::attachable::attachable_partial_bindings(app) {
+        let key = partial_name_to_key(&binding.partial, "", &stems);
+        if conflicted.contains(&key) {
+            continue;
+        }
+        out.entry(key).or_insert(binding.local);
+    }
+    out
+}
+
+/// Collection `as:` / element locals from view bodies only (no attachable
+/// framework bindings). Shared by `partial_call_contracts`, which has no
+/// `App`, and `collection_element_locals`.
+fn collection_element_locals_from_views(
+    views: &[View],
+    stems: &PartialStems,
+) -> (
+    crate::det::HashMap<ViewKey, String>,
+    crate::det::HashSet<ViewKey>,
+) {
+    use crate::det::{HashMap, HashSet};
+    let mut out: HashMap<ViewKey, String> = HashMap::default();
+    let mut conflicted: HashSet<ViewKey> = HashSet::default();
+    for view in views {
+        let (dir, _) = split_view_name(view.name.as_str());
+        collect_collection_element_locals(&view.body, dir, stems, &mut out, &mut conflicted);
+    }
+    (out, conflicted)
+}
+
+/// The record arg a view / partial takes: an unambiguous collection
+/// element local (`as:`) when every call site agrees, else the directory
+/// convention. Def site, `partial_call_contracts`, and `partial_extras_map`
+/// all use this so `flash_locals` hands the same name.
+fn effective_record_arg(
+    view: &View,
+    collection_locals: &crate::det::HashMap<ViewKey, String>,
+    known_models: &[String],
+    stems: &PartialStems,
+) -> String {
+    let (dir, base) = split_view_name(view.name.as_str());
+    let stem = base.trim_start_matches('_');
+    view_key_of(view, stems)
+        .and_then(|k| collection_locals.get(&k).cloned())
+        .map(|local| crate::naming::safe_local(&local))
+        .unwrap_or_else(|| infer_view_arg(stem, dir, base.starts_with('_'), known_models))
+}
+
+fn collect_collection_element_locals(
+    e: &Expr,
+    dir: &str,
+    stems: &PartialStems,
+    out: &mut crate::det::HashMap<ViewKey, String>,
+    conflicted: &mut crate::det::HashSet<ViewKey>,
+) {
+    if let ExprNode::Send { recv, method, args, block, .. } = &*e.node {
+        if let Some(crate::lower::view::RenderPartial::CollectionNamed {
+            partial,
+            as_name,
+            ..
+        }) = crate::lower::view::classify_render_partial(
+            recv.as_ref(),
+            method.as_str(),
+            args,
+            block.as_ref(),
+            &|_| true,
+            &|_| false,
+        ) {
+            let key = partial_name_to_key(partial, dir, stems);
+            let local = as_name
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| {
+                    let base = partial.rsplit('/').next().unwrap_or(partial);
+                    base.trim_start_matches('_').to_string()
+                });
+            if conflicted.contains(&key) {
+                return;
+            }
+            match out.get(&key) {
+                Some(existing) if *existing != local => {
+                    out.remove(&key);
+                    conflicted.insert(key);
+                }
+                Some(_) => {}
+                None => {
+                    out.insert(key, local);
+                }
+            }
+        }
+    }
+    e.node.for_each_child(&mut |c| {
+        collect_collection_element_locals(c, dir, stems, out, conflicted)
+    });
+}
+
+/// The partial views a body renders, as `ViewKey`s — for the render graph.
+/// Resolves the same render shapes `classify_render_partial` recognizes;
+/// unresolvable (dynamic) partial names are skipped.
+fn render_partial_keys(
+    body: &Expr,
+    dir: &str,
+    pools: &crate::det::HashMap<(String, Symbol), Vec<DynPoolEntry>>,
+    stems: &PartialStems,
+) -> Vec<ViewKey> {
+    let mut out = Vec::new();
+    collect_render_keys(body, dir, pools, stems, &mut out);
+    out
+}
+
+fn collect_render_keys(
+    e: &Expr,
+    dir: &str,
+    pools: &crate::det::HashMap<(String, Symbol), Vec<DynPoolEntry>>,
+    stems: &PartialStems,
+    out: &mut Vec<ViewKey>,
+) {
+    if let ExprNode::Send { recv, method, args, block, .. } = &*e.node {
+        if let Some(rp) = crate::lower::view::classify_render_partial(
+            recv.as_ref(),
+            method.as_str(),
+            args,
+            block.as_ref(),
+            &|_| true,
+            &|n| pools.contains_key(&(dir.to_string(), Symbol::from(n))),
+        ) {
+            // Options-ivar renders (`render @above`) fold in via
+            // `dynamic_render_edges`, not the static key path.
+            if let Some(k) = render_partial_key(&rp, dir, stems) {
+                out.push(k);
+            }
+        }
+    }
+    if let Some(k) = turbo_stream_partial_key(e, dir, stems) {
+        out.push(k);
+    }
+    e.node.for_each_child(&mut |c| collect_render_keys(c, dir, pools, stems, out));
+}
+
+/// The partial a `turbo_stream.<action> target, partial: "x"` call
+/// renders, which the walker lowers through the same partial call a
+/// `render` gets, so it is an edge like any other.
+///
+/// Not the positional form (`turbo_stream.append target, @message`): the
+/// walker renders `@message`'s partial only when it is a record, which
+/// it tells from a String by analyzed types this graph does not have.
+/// An edge for a String would thread an unrelated partial's ivars into
+/// the caller.
+fn turbo_stream_partial_key(e: &Expr, dir: &str, stems: &PartialStems) -> Option<ViewKey> {
+    let ExprNode::Send { recv, method, args, block: None, .. } = &*e.node else { return None };
+    let ts = self::helpers::turbo_stream_partial(recv.as_ref(), method.as_str(), args)?;
+    Some(partial_name_to_key(ts.partial, dir, stems))
+}
+
+/// Resolve a template-name string to its `(module, method)` ViewKey.
+/// A slash form (`"stories/show"`) names an explicit module; a bare
+/// name (`"show"`) resolves relative to `dir` (the rendering view's
+/// directory). An action template's key is its name; a partial's is
+/// [`partial_name_to_key`]'s.
+pub(super) fn template_name_to_key(name: &str, dir: &str) -> ViewKey {
+    let (d, n) = name.rsplit_once('/').unwrap_or((dir, name));
+    (camelize_path(&snake_case(d)), n.trim_start_matches('_').to_string())
+}
+
+/// Resolve a partial-name string to its `(module, method)` ViewKey, the
+/// way Rails' relative-partial-path lookup does (see
+/// [`template_name_to_key`]), under the stem `stems` gives the partial.
+pub(super) fn partial_name_to_key(name: &str, dir: &str, stems: &PartialStems) -> ViewKey {
+    let (d, n) = name.rsplit_once('/').unwrap_or((dir, name));
+    stems.key(&camelize_path(&snake_case(d)), n)
+}
+
+/// [`partial_name_to_key`] for a render outside any view directory
+/// (`own_dir` None: a controller or library body), where only a slash
+/// form names a partial.
+fn partial_name_to_key_from(
+    name: &str,
+    own_dir: Option<&str>,
+    stems: &PartialStems,
+) -> Option<ViewKey> {
+    (name.contains('/') || own_dir.is_some())
+        .then(|| partial_name_to_key(name, own_dir.unwrap_or(""), stems))
+}
+
+fn render_partial_key(
+    rp: &crate::lower::view::RenderPartial<'_>,
+    dir: &str,
+    stems: &PartialStems,
+) -> Option<ViewKey> {
+    use crate::lower::view::RenderPartial;
+    Some(match rp {
+        RenderPartial::Collection { name, .. } => {
+            stems.key(&camelize_path(&snake_case(name)), &singularize(name))
+        }
+        // `render @message` — Rails' `to_partial_path`: the record's
+        // own name, in its PLURAL directory (`messages/_message`). The
+        // key has to be spelled the same way `emit_render_partial`
+        // spells the call, or the partial's ivar closure is threaded
+        // into a module nothing renders.
+        RenderPartial::Record { name, .. } => {
+            stems.key(&camelize_path(&crate::naming::pluralize_snake(name)), name)
+        }
+        RenderPartial::Association { method, .. } => {
+            stems.key(&camelize_path(&snake_case(method)), &singularize(method))
+        }
+        RenderPartial::Named { partial, .. } | RenderPartial::CollectionNamed { partial, .. } => {
+            partial_name_to_key(partial, dir, stems)
+        }
+        RenderPartial::TypedCollection { partial, .. } => partial_name_to_key(partial, dir, stems),
+        // A full-template render is a render-graph edge like any other:
+        // the caller's closure must cover the action view's.
+        RenderPartial::Template { name } => template_name_to_key(name, dir),
+        // `render layout: "rooms/layouts/new" do … end` — an edge like any
+        // other named partial: the caller's closure must cover the
+        // layout's, since the layout body reads the caller's ivars.
+        RenderPartial::LayoutBlock { layout, .. } => partial_name_to_key(layout, dir, stems),
+        // A dynamic name resolves to a POOL of keys, not one — folded into
+        // the render graph separately (see `dynamic_render_edges`).
+        RenderPartial::DynamicNamed { .. } => return None,
+    })
+}
+
+/// The controller's convention view directory: the class name minus its
+/// `Controller` suffix, snake-cased (`HomeController` → `home`). Matches
+/// the `dir` component of that controller's view names and each view's
+/// `resource_dir`, so a dynamic-partial pool keyed by dir lines up with
+/// the rendering view.
+fn controller_view_dir(name: &ClassId) -> String {
+    let s = name.0.as_str();
+    snake_case(s.strip_suffix("Controller").unwrap_or(s))
+}
+
+/// One pooled candidate partial for a dynamic-render ivar: the name a
+/// controller assigns plus the `locals:` sub-hash of the options form
+/// (empty for bare-string assigns). Locals keep only the value shapes a
+/// dispatch arm can re-express — ivar reads (threaded into the rendering
+/// view's closure) and literals; any other shape is dropped and the
+/// declared local falls to its header default.
+#[derive(Clone)]
+pub(crate) struct DynPoolEntry {
+    pub(crate) name: String,
+    pub(crate) locals: Vec<(Symbol, Expr)>,
+}
+
+/// For each `(view-dir, ivar)`, the partial options a controller assigns
+/// to `@<ivar>` — the pool a `render partial: @<ivar>` can resolve to at
+/// runtime. Collected from every action body's `@x = "literal"` /
+/// `@x = {partial: "literal", …}` writes. Only consulted when a view
+/// actually renders `@<ivar>` dynamically, so over-collection (every
+/// string ivar, not just the rendered ones) is inert. Empty for the blog
+/// (no such assignments → no dynamic-partial dispatch anywhere).
+pub(crate) fn dynamic_partial_pools(
+    controllers: &[crate::dialect::Controller],
+) -> crate::det::HashMap<(String, Symbol), Vec<DynPoolEntry>> {
+    use std::collections::BTreeMap;
+    use crate::det::HashMap;
+    let mut acc: HashMap<(String, Symbol), BTreeMap<String, Vec<(Symbol, Expr)>>> =
+        HashMap::default();
+    for c in controllers {
+        let dir = controller_view_dir(&c.name);
+        for action in c.actions() {
+            collect_ivar_str_assigns(&action.body, &dir, &mut acc);
+        }
+    }
+    acc.into_iter()
+        .map(|(k, m)| {
+            (
+                k,
+                m.into_iter()
+                    .map(|(name, locals)| DynPoolEntry { name, locals })
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+/// Map each strict-locals partial to its FULL declared locals (record
+/// first, then the keyword tail). Keyed by the same ViewKey space as
+/// `partial_name_to_key`, so a render site resolving a partial name can
+/// look up whether the target declares strict locals, which closure
+/// ivars to suppress, and which names it binds by keyword. Consumers
+/// skip index 0 (the positional record) when binding keywords.
+fn strict_locals_by_key(views: &[View]) -> crate::det::HashMap<ViewKey, Vec<Param>> {
+    let stems = PartialStems::of(views);
+    let bindings = partial_form_bindings(views);
+    let mut out = crate::det::HashMap::default();
+    for v in views {
+        let Some(sl) = v.strict_locals.as_ref() else { continue };
+        let Some(key) = view_key_of(v, &stems) else { continue };
+        let form_local = bindings.get(&key).map(|b| b.form_local.as_str());
+        let declared: Vec<_> = sl.iter().filter(|p| Some(p.name.as_str()) != form_local).cloned().collect();
+        // Not an empty contract: the definition skips strict lowering for one, and a caller reading it as strict would bind nothing.
+        if !declared.is_empty() {
+            out.insert(key, declared);
+        }
+    }
+    out
+}
+
+fn collect_ivar_str_assigns(
+    e: &Expr,
+    dir: &str,
+    acc: &mut crate::det::HashMap<
+        (String, Symbol),
+        std::collections::BTreeMap<String, Vec<(Symbol, Expr)>>,
+    >,
+) {
+    if let ExprNode::Assign { target: LValue::Ivar { name }, value } = &*e.node {
+        if let Some(entry) = partial_options_from_assign_value(name, value) {
+            let slot = acc
+                .entry((dir.to_string(), name.clone()))
+                .or_default()
+                .entry(entry.name)
+                .or_default();
+            // Several actions can assign the same partial name; merge
+            // their locals, first-seen value winning per local name.
+            for (k, v) in entry.locals {
+                if !slot.iter().any(|(n, _)| n == &k) {
+                    slot.push((k, v));
+                }
+            }
+        }
+    }
+    e.node.for_each_child(&mut |c| collect_ivar_str_assigns(c, dir, acc));
+}
+
+/// The partial options a controller assigns to a dynamic-render ivar
+/// (`@above`/`@below`), in either shape upstream lobsters uses:
+/// the bare string (`@above = "stories/subnav"`) or the options-hash
+/// (`@above = {partial: "stories/subnav", locals: {…}}`). The `locals:`
+/// sub-hash keeps symbol-keyed ivar-read and literal values — the shapes
+/// a dispatch arm can rebind (`{tag: @tag}` reads as the threaded `tag`
+/// local at the arm); any other value shape is dropped and that local
+/// falls to the partial's header default.
+/// The ivar a controller stores a computed `locals:` value in for the
+/// view to read (`@above = {partial: "newest_by_user", locals:
+/// {newest_by_user: by_user}}` stores `by_user` in `@above_newest_by_user`);
+/// `emit::ruby::library`'s collapse of the assignment writes it.
+pub(crate) fn dynamic_local_ivar(ivar: &Symbol, local: &Symbol) -> Symbol {
+    Symbol::from(format!("{}_{}", ivar.as_str(), local.as_str()))
+}
+
+fn partial_options_from_assign_value(ivar: &Symbol, value: &Expr) -> Option<DynPoolEntry> {
+    match &*value.node {
+        ExprNode::Lit { value: Literal::Str { value: s } } => {
+            Some(DynPoolEntry { name: s.as_str().to_string(), locals: Vec::new() })
+        }
+        ExprNode::Hash { entries, .. } => {
+            let name = entries.iter().find_map(|(k, v)| {
+                let is_partial = matches!(
+                    &*k.node,
+                    ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "partial"
+                );
+                match (is_partial, &*v.node) {
+                    (true, ExprNode::Lit { value: Literal::Str { value: s } }) => {
+                        Some(s.as_str().to_string())
+                    }
+                    _ => None,
+                }
+            })?;
+            let locals = entries
+                .iter()
+                .find_map(|(k, v)| {
+                    let is_locals = matches!(
+                        &*k.node,
+                        ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "locals"
+                    );
+                    match (is_locals, &*v.node) {
+                        (true, ExprNode::Hash { entries: locals_entries, .. }) => Some(
+                            locals_entries
+                                .iter()
+                                .filter_map(|(lk, lv)| {
+                                    let lname = match &*lk.node {
+                                        ExprNode::Lit { value: Literal::Sym { value } } => {
+                                            value.clone()
+                                        }
+                                        _ => return None,
+                                    };
+                                    // Not dropped when computed (a local, a call): the controller keeps it in an ivar of its own.
+                                    let value = if matches!(&*lv.node, ExprNode::Ivar { .. } | ExprNode::Lit { .. }) {
+                                        lv.clone()
+                                    } else {
+                                        Expr::new(lv.span, ExprNode::Ivar { name: dynamic_local_ivar(ivar, &lname) })
+                                    };
+                                    Some((lname, value))
+                                })
+                                .collect::<Vec<_>>(),
+                        ),
+                        _ => None,
+                    }
+                })
+                .unwrap_or_default();
+            Some(DynPoolEntry { name, locals })
+        }
+        _ => None,
+    }
+}
+
+/// The render-graph edges a view's DYNAMIC partials contribute, plus the
+/// ivars the pool entries' `locals:` values read: for each `render
+/// partial: @<ivar>` in the body, every pooled name for `(dir, ivar)`
+/// resolves to a partial ViewKey (so the closure fixpoint folds each
+/// candidate's ivar needs into the rendering view), and each ivar-valued
+/// local (`locals: {tag: @tag}`) is a read of the rendering view too —
+/// the dispatch arm rebinds it onto the partial's declared local.
+fn dynamic_render_edges(
+    body: &Expr,
+    dir: &str,
+    pools: &crate::det::HashMap<(String, Symbol), Vec<DynPoolEntry>>,
+    stems: &PartialStems,
+) -> (Vec<ViewKey>, Vec<Symbol>) {
+    let mut keys = Vec::new();
+    let mut locals_ivars = Vec::new();
+    collect_dynamic_edges(body, dir, pools, stems, &mut keys, &mut locals_ivars);
+    (keys, locals_ivars)
+}
+
+fn collect_dynamic_edges(
+    e: &Expr,
+    dir: &str,
+    pools: &crate::det::HashMap<(String, Symbol), Vec<DynPoolEntry>>,
+    stems: &PartialStems,
+    keys: &mut Vec<ViewKey>,
+    locals_ivars: &mut Vec<Symbol>,
+) {
+    if let ExprNode::Send { recv, method, args, block, .. } = &*e.node {
+        if let Some(crate::lower::view::RenderPartial::DynamicNamed { ivar, .. }) =
+            crate::lower::view::classify_render_partial(
+                recv.as_ref(),
+                method.as_str(),
+                args,
+                block.as_ref(),
+                &|_| true,
+                &|n| pools.contains_key(&(dir.to_string(), Symbol::from(n))),
+            )
+        {
+            if let Some(entries) = pools.get(&(dir.to_string(), Symbol::from(ivar))) {
+                for entry in entries {
+                    keys.push(partial_name_to_key(&entry.name, dir, stems));
+                    for (_, v) in &entry.locals {
+                        if let ExprNode::Ivar { name } = &*v.node {
+                            locals_ivars.push(name.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    e.node.for_each_child(&mut |c| {
+        collect_dynamic_edges(c, dir, pools, stems, keys, locals_ivars)
+    });
+}
+
+/// The instance variables an action view READS, in first-seen order.
+/// This is the view↔controller contract: an action view's parameters are
+/// exactly these ivars and the controller passes `@<name>` for each, so a
+/// multi-ivar template (home/index reads @stories, @page, …) gets them
+/// all — not just one convention-named record. Computed on the ORIGINAL
+/// view body (before `rewrite_ivars_to_locals`) and by the controller
+/// render rewrite on the same body, so both sides agree on the list/order.
+pub(crate) fn view_read_ivars(body: &Expr) -> Vec<Symbol> {
+    let mut seen: std::collections::BTreeSet<Symbol> = Default::default();
+    let mut out: Vec<Symbol> = Vec::new();
+    collect_read_ivars(body, &mut seen, &mut out);
+    out
+}
+
+fn collect_read_ivars(
+    e: &Expr,
+    seen: &mut std::collections::BTreeSet<Symbol>,
+    out: &mut Vec<Symbol>,
+) {
+    if let ExprNode::Ivar { name } = &*e.node {
+        if seen.insert(name.clone()) {
+            out.push(name.clone());
+        }
+    }
+    e.node.for_each_child(&mut |c| collect_read_ivars(c, seen, out));
+}
+
+/// Type for a single read-ivar param by name: `@articles`/`@stories`
+/// (plural, singularize-camelizes to a known model) → `Array[Model]`;
+/// `@article`/`@story` (singular known model) → `Model`; anything else
+/// (`@page`, `@root_path`, …) → `Untyped`. Mirrors the convention typing
+/// `build_view_signature` applies to the single arg, but per-ivar.
+/// Type for a partial's declared local: the analyzer's render-site fact
+/// when it has one, else the name-based convention guess.
+///
+/// Ordering is deliberate. `ivar_ty` resolves a NAME to a model
+/// (`user` → `User`, `stories` → `Array[Story]`), which covers the
+/// overwhelming majority of Rails locals and is what every target has
+/// been emitting. It cannot cover a local whose name isn't a model —
+/// lobsters' `new_message`, bound from a `@new_message` the controller
+/// set to `Message.new` — and those silently became `untyped`. The
+/// analyzer already knew the type from the render site, so consult it,
+/// but only where the convention yields nothing: preferring the
+/// render-site type outright would let one loosely-typed call site
+/// widen a param that the naming convention types correctly today,
+/// which is a much larger blast radius across seven targets than this
+/// gap warrants.
+fn declared_local_ty(
+    view: &View,
+    name: &str,
+    known_models: &[String],
+    app: &App,
+) -> crate::ty::Ty {
+    let by_name = ivar_ty(name, known_models);
+    let at_render = app
+        .partial_local_types
+        .get(&view.name)
+        .and_then(|locals| locals.get(&Symbol::from(name)))
+        .filter(|t| !matches!(t, crate::ty::Ty::Untyped))
+        .filter(|t| !mentions_relation(t))
+        .cloned();
+    // The name is a convention; a render site handing a String is a
+    // fact, and it wins over that convention. lobsters' `helpers/
+    // _link_post` names its URL local `link` — which is also a model.
+    if let Some(crate::ty::Ty::Str) = at_render {
+        return crate::ty::Ty::Str;
+    }
+    if !matches!(by_name, crate::ty::Ty::Untyped) {
+        return by_name;
+    }
+    at_render.unwrap_or(by_name)
+}
+
+/// A threaded closure ivar's param type: the naming convention first,
+/// as for a declared local ([`declared_local_ty`]), and where it yields
+/// nothing, the type the analyzer computed for that ivar in this view
+/// (`App::view_ivar_types`). lobsters' story page threads
+/// `@merged_stories` — `[@story, @story.merged_stories.….includes(…)]
+/// .flatten`, an `Array[Story]` — whose NAME singularizes to no model,
+/// so the param was `untyped` and every read inside the loop
+/// (`ms.comments.build`) was gradual.
+fn closure_ivar_ty(view: &View, name: &str, known_models: &[String], app: &App) -> crate::ty::Ty {
+    let by_name = ivar_ty(name, known_models);
+    if !matches!(by_name, crate::ty::Ty::Untyped) {
+        return by_name;
+    }
+    app.view_ivar_types
+        .get(&view.name)
+        .and_then(|ivars| ivars.get(&Symbol::from(name)))
+        .filter(|t| !matches!(t, crate::ty::Ty::Untyped | crate::ty::Ty::Var { .. }))
+        .filter(|t| !mentions_relation(t))
+        .cloned()
+        .unwrap_or(by_name)
+}
+
+/// Does this type mention an unspecialized `Relation`? Such a type is
+/// not emittable — a `Relation` reaching emit is the "chains must
+/// specialize to SQL first" gap, and stamping one into a signature
+/// renders a placeholder class name that no target defines. `untyped`
+/// is strictly better there, so the render-site fact is declined.
+fn mentions_relation(ty: &crate::ty::Ty) -> bool {
+    use crate::ty::Ty;
+    match ty {
+        Ty::Relation { .. } => true,
+        Ty::Array { elem } => mentions_relation(elem),
+        Ty::Union { variants } => variants.iter().any(mentions_relation),
+        _ => false,
+    }
+}
+
+/// This view's ivar name → model snake-singular, for every ivar the
+/// analyzer typed as a model class (`App::view_ivar_types`). The
+/// singular is what Rails' `param_key` yields, so a form built on
+/// `@edit_user` names its fields `user[...]` the way Rails does. Ivars
+/// whose type is anything else (a collection, a scalar, untyped) are
+/// left out — the caller falls back to its own convention.
+/// This view's ivars the analyzer typed `String` (`App::view_ivar_types`).
+fn view_str_ivars(app: &App, view_name: &Symbol) -> crate::det::HashSet<String> {
+    app.view_ivar_types
+        .get(view_name)
+        .map(|ivars| {
+            ivars
+                .iter()
+                .filter(|(_, ty)| matches!(ty, crate::ty::Ty::Str))
+                .map(|(name, _)| name.as_str().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn view_ivar_models(app: &App, view_name: &Symbol) -> crate::det::HashMap<String, String> {
+    let Some(ivars) = app.view_ivar_types.get(view_name) else {
+        return crate::det::HashMap::default();
+    };
+    ivars
+        .iter()
+        .filter_map(|(name, ty)| match ty {
+            crate::ty::Ty::Class { id, .. } => {
+                Some((name.as_str().to_string(), snake_case(id.0.as_str())))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+pub(crate) fn ivar_ty(name: &str, known_models: &[String]) -> crate::ty::Ty {
+    use crate::ty::Ty;
+    let cam = camelize_path(&crate::naming::singularize_last(name));
+    if known_models.iter().any(|m| m == &cam) {
+        let model = Ty::Class {
+            id: crate::ident::ClassId(crate::ident::Symbol::from(cam.as_str())),
+            args: vec![].into(),
+        };
+        if crate::naming::singularize(name) != name {
+            Ty::Array { elem: std::sync::Arc::new(model) }
+        } else {
+            model
+        }
+    } else {
+        Ty::Untyped
+    }
+}
+
+/// Type of a partial/layout's record arg: a layout's `body` is the
+/// rendered-HTML String; a partial's record is the singular model for its
+/// directory (`stories/_listdetail` → `Story`), else Untyped.
+pub(crate) fn record_arg_ty(dir: &str, is_layout: bool, known_models: &[String]) -> crate::ty::Ty {
+    use crate::ty::Ty;
+    if is_layout {
+        return Ty::Str;
+    }
+    let model_class = camelize_path(&crate::naming::singularize_last(dir));
+    if known_models.iter().any(|m| m == &model_class) {
+        Ty::Class {
+            id: crate::ident::ClassId(crate::ident::Symbol::from(model_class.as_str())),
+            args: vec![].into(),
+        }
+    } else {
+        Ty::Untyped
+    }
+}
+
+/// Build a view method's `Ty::Fn` from its typed primary params (record
+/// arg and/or threaded ivars) followed by the nullable extra params
+/// (notice/alert/action_name/…).
+/// A trailing extra's type: nullable, and a String except for the request's
+/// path parameters (`ActionController::Base#path_parameters`), which the
+/// `url_for` options lowering recalls segments from.
+fn extra_param_ty(name: &str) -> crate::ty::Ty {
+    use crate::ty::Ty;
+    let value = if name == "path_parameters" {
+        Ty::Hash { key: Ty::Str.into(), value: Ty::Str.into() }
+    } else {
+        Ty::Str
+    };
+    Ty::Union { variants: vec![value, Ty::Nil].into() }
+}
+
+pub(crate) fn build_view_signature_from(
+    typed: &[(String, crate::ty::Ty)],
+    extra_params: &[String],
+) -> Option<crate::ty::Ty> {
+    use crate::ty::{Param as TyParam, ParamKind, Ty};
+    if typed.is_empty() && extra_params.is_empty() {
+        return None;
+    }
+    let mut sig_params: Vec<TyParam> = Vec::new();
+    for (n, t) in typed {
+        sig_params.push(TyParam {
+            name: crate::ident::Symbol::from(n.as_str()),
+            ty: t.clone().into(),
+            kind: ParamKind::Required,
+        });
+    }
+    for n in extra_params {
+        sig_params.push(TyParam {
+            name: crate::ident::Symbol::from(n.as_str()),
+            ty: extra_param_ty(n).into(),
+            kind: ParamKind::Optional,
+        });
+    }
+    Some(Ty::Fn {
+        params: sig_params.into(),
+        block: None,
+        ret: std::sync::Arc::new(Ty::Str),
+        effects: crate::effect::EffectSet::default(),
+    })
+}
+
+pub(crate) fn infer_view_arg(stem: &str, dir: &str, is_partial: bool, known_models: &[String]) -> String {
+    // A hyphenated directory (`product-item`) is no identifier.
+    infer_view_arg_raw(stem, dir, is_partial, known_models).replace('-', "_")
+}
+
+fn infer_view_arg_raw(stem: &str, dir: &str, is_partial: bool, _known_models: &[String]) -> String {
+    if dir.is_empty() {
+        return String::new();
+    }
+    if dir == "layouts" {
+        return "body".to_string();
+    }
+    if is_partial {
+        return singularize(last_segment(dir));
+    }
+    match stem {
+        "index" => last_segment(dir).to_string(),
+        _ => singularize(last_segment(dir)),
+    }
+}
+
+// ── ivar → local rewrite ─────────────────────────────────────────
+
+/// One view's ivar name → the local that stands for it in the lowered
+/// method (`class` → `class_`). See [`ivar_local_names`].
+pub(crate) type IvarLocals = crate::det::HashMap<String, String>;
+
+/// Name a local for each of one view's ivars. An ivar keeps its own
+/// name unless it is a reserved word, which gets a trailing `_` as in
+/// `safe_local` (`@class` → `class_`), and then one more `_` while that
+/// name is another ivar of the same set: a view that reads `@class` and
+/// `@class_` takes `class__` and `class_`, not `class_` twice (#753).
+///
+/// Every site where one of the view's ivars becomes a local reads this
+/// map — the parameter list, the body rewrite, and the arguments the
+/// view passes to the partials it renders — so they agree.
+pub(crate) fn ivar_local_names<'a>(ivars: impl IntoIterator<Item = &'a str>) -> IvarLocals {
+    let mut names: Vec<&str> = Vec::new();
+    for n in ivars {
+        if !names.contains(&n) {
+            names.push(n);
+        }
+    }
+    let mut taken: crate::det::HashSet<String> =
+        names.iter().map(|n| n.to_string()).collect();
+    let mut out = IvarLocals::default();
+    for n in &names {
+        let mut local = crate::naming::safe_local(n);
+        if local != *n {
+            while taken.contains(&local) {
+                local.push('_');
+            }
+            taken.insert(local.clone());
+        }
+        out.insert(n.to_string(), local);
+    }
+    out
+}
+
+/// The local `ivar` reads as under `locals`; an ivar the map does not
+/// name (a helper body spliced into the view) falls back to
+/// `safe_local`.
+pub(crate) fn ivar_local(locals: &IvarLocals, ivar: &str) -> String {
+    locals.get(ivar).cloned().unwrap_or_else(|| crate::naming::safe_local(ivar))
+}
+
+/// The rename map for `view`: its render-tree closure (the ivars its
+/// parameters carry) plus every ivar its own body reads or writes.
+fn view_ivar_locals(view: &View, closure: &[Symbol]) -> IvarLocals {
+    fn collect<'a>(e: &'a Expr, out: &mut Vec<&'a str>) {
+        match &*e.node {
+            ExprNode::Ivar { name }
+            | ExprNode::Assign { target: LValue::Ivar { name }, .. }
+            | ExprNode::OpAssign { target: LValue::Ivar { name }, .. } => out.push(name.as_str()),
+            _ => {}
+        }
+        e.node.for_each_child(&mut |c| collect(c, out));
+    }
+    let mut names: Vec<&str> = closure.iter().map(|s| s.as_str()).collect();
+    collect(&view.body, &mut names);
+    ivar_local_names(names)
+}
+
+/// Rewrite every `@ivar` read (and Ivar-LValue assign) under `expr`
+/// into a bare `Var` named by `locals`. The inferred view arg + any
+/// extra params resolve to those rewritten Vars in the emitted body.
+pub(super) fn rewrite_ivars_to_locals(expr: &Expr, locals: &IvarLocals) -> Expr {
+    let r = |e: &Expr| rewrite_ivars_to_locals(e, locals);
+    let new_node = match &*expr.node {
+        ExprNode::Ivar { name } => ExprNode::Var {
+            id: VarId(0),
+            name: Symbol::from(ivar_local(locals, name.as_str())),
+        },
+        // An ivar ASSIGNMENT is left as one. A template that writes
+        // `@page_title` is writing the view context Rails shares with
+        // the layout and every helper mixed into it — the local this
+        // used to produce was read by nothing, so campfire's
+        // `<title>` said "Campfire" on every page while
+        // `rooms/show.html.erb` set it to the room's name one frame
+        // earlier. `walker::walk_stmt` splits it into the local (so a
+        // later read in the SAME template still resolves) plus the
+        // write-through the emit routes to the controller seam that
+        // already answers the helper-side READ.
+        ExprNode::Assign { target: LValue::Ivar { name }, value } => ExprNode::Assign {
+            target: LValue::Ivar { name: name.clone() },
+            value: r(value),
+        },
+        ExprNode::Assign { target, value } => ExprNode::Assign {
+            target: rewrite_lvalue(target, locals),
+            value: r(value),
+        },
+        ExprNode::Send { recv, method, args, block, parenthesized } => ExprNode::Send {
+            recv: recv.as_ref().map(r),
+            method: method.clone(),
+            args: args.iter().map(r).collect(),
+            block: block.as_ref().map(r),
+            parenthesized: *parenthesized,
+        },
+        ExprNode::Seq { exprs } => ExprNode::Seq {
+            exprs: exprs.iter().map(r).collect(),
+        },
+        ExprNode::If { cond, then_branch, else_branch } => ExprNode::If {
+            cond: r(cond),
+            then_branch: r(then_branch),
+            else_branch: r(else_branch),
+        },
+        ExprNode::BoolOp { op, surface, left, right } => ExprNode::BoolOp {
+            op: *op,
+            surface: *surface,
+            left: r(left),
+            right: r(right),
+        },
+        ExprNode::Array { elements, style } => ExprNode::Array {
+            elements: elements.iter().map(r).collect(),
+            style: *style,
+        },
+        ExprNode::Hash { entries, kwargs } => ExprNode::Hash {
+            entries: entries
+                .iter()
+                .map(|(k, v)| (r(k), r(v)))
+                .collect(),
+            kwargs: *kwargs,
+        },
+        ExprNode::Lambda { rest_param, extra_params, params, block_param, body, block_style } => ExprNode::Lambda { rest_param: rest_param.clone(),
+            // A default (`|label = @page_title|`) reads the view local too.
+            extra_params: extra_params
+                .iter()
+                .map(|p| {
+                    let mut p = p.clone();
+                    p.default = p.default.as_ref().map(r);
+                    p
+                })
+                .collect(),
+            params: params.clone(),
+            block_param: block_param.clone(),
+            body: r(body),
+            block_style: *block_style,
+        },
+        ExprNode::StringInterp { parts } => ExprNode::StringInterp {
+            parts: parts
+                .iter()
+                .map(|p| match p {
+                    InterpPart::Text { value } => InterpPart::Text { value: value.clone() },
+                    InterpPart::Expr { expr } => InterpPart::Expr {
+                        expr: r(expr),
+                    },
+                })
+                .collect(),
+        },
+        // Template-level `<% while subtree %>` bodies (lobsters' users
+        // tree) and `<% x ||= … %>` statements read ivars too — without
+        // these arms an `@ivar` inside survives to the emitted module,
+        // where no ivar exists.
+        ExprNode::While { cond, body, until_form } => ExprNode::While {
+            cond: r(cond),
+            body: r(body),
+            until_form: *until_form,
+        },
+        ExprNode::OpAssign { target, op, value } => ExprNode::OpAssign {
+            target: rewrite_lvalue(target, locals),
+            op: *op,
+            value: r(value),
+        },
+        // Not a verbatim clone: `case`/`when` arms (lobsters' search parse tree) read ivars too.
+        other => {
+            let mut node = other.clone();
+            node.for_each_child_mut(&mut |c| *c = r(c));
+            node
+        }
+    };
+    let mut out = Expr::new(expr.span, new_node);
+    // `@article.class::STATES` stays a path (`expr::CONST_PATH`).
+    out.decisions |= expr.decisions & crate::expr::CONST_PATH;
+    // Not a fresh, untyped node: the i18n lowering's `[]` names and values are typed `Array[String]`
+    out.ty = expr.ty.clone();
+    out
+}
+
+fn rewrite_lvalue(lv: &LValue, locals: &IvarLocals) -> LValue {
+    let r = |e: &Expr| rewrite_ivars_to_locals(e, locals);
+    match lv {
+        LValue::Var { id, name } => LValue::Var { id: *id, name: name.clone() },
+        LValue::Ivar { name } => LValue::Var {
+            id: VarId(0),
+            name: Symbol::from(ivar_local(locals, name.as_str())),
+        },
+        LValue::Attr { recv, name } => LValue::Attr {
+            recv: r(recv),
+            name: name.clone(),
+        },
+        LValue::Index { recv, index } => LValue::Index {
+            recv: r(recv),
+            index: r(index),
+        },
+        LValue::Const { path } => LValue::Const { path: path.clone() },
+    }
+}
+
+/// Rewrite every `Send(None, :defined?, [Var(name)])` under `expr` to
+/// `Send(Send(Var(name), :nil?, []), :!, [])` — i.e., `!name.nil?`.
+/// Post-order walk: rewrite children first, then test the current
+/// node so nested `defined?` (rare in ERB) lower bottom-up.
+///
+/// The author's intent in writing `defined?(name)` in a partial is
+/// "is the (optional) local `name` present"; once `name` is collected
+/// as a nullable parameter (default `nil`) by `collect_extra_params`,
+/// the nil-check captures the same semantics. Downstream emitters
+/// then handle a plain Send chain instead of needing target-specific
+/// `defined?` keyword knowledge.
+/// `local_assigns[:name]` → the bare local `name`.
+///
+/// Rails' `local_assigns` is the hash of locals a partial was actually
+/// rendered with, and indexing it is how a template reads an OPTIONAL
+/// local without a NameError on the ones no caller passed. The lowering
+/// already models an optional local as a nil-default parameter — the very
+/// thing `defined?(name)` marks — so the read IS that parameter.
+///
+/// Left alone, `local_assigns` has nothing to resolve to in a module
+/// function and took the page down with a NameError; campfire's
+/// `rooms/layouts/_new` reads a `view_transition_name` no call site
+/// passes, which is exactly the case the spelling exists for.
+///
+/// A reserved-word local read (`binding.local_variable_get(:for)`, which
+/// ingest turns into the local `for`) is the same kind of read.
+///
+/// The read uses the name that the partial's `def` binds. A keyword
+/// local (`keywords`, the strict locals after the first) keeps its name,
+/// because callers pass it by that name. Every other local is a
+/// positional param named by `safe_local` (`for` → `for_`).
+pub(crate) fn rewrite_local_assigns_to_locals(expr: &mut Expr, keywords: &[&str]) {
+    expr.node
+        .for_each_child_mut(&mut |c| rewrite_local_assigns_to_locals(c, keywords));
+    let reserved_read = match &*expr.node {
+        ExprNode::Var { name, .. } if crate::naming::is_reserved_local(name.as_str()) => {
+            Some(name.as_str().to_string())
+        }
+        _ => None,
+    };
+    if let Some(name) = local_assigns_key(expr).or(reserved_read) {
+        let name = if keywords.contains(&name.as_str()) {
+            name
+        } else {
+            crate::naming::safe_local(&name)
+        };
+        *expr = Expr::new(expr.span, ExprNode::Var { id: VarId(0), name: Symbol::from(name) });
+    }
+}
+
+/// The local a `local_assigns[:name]` / `local_assigns["name"]` read
+/// names. `None` for a computed key — there is no static parameter to
+/// resolve that to.
+pub(crate) fn local_assigns_key(expr: &Expr) -> Option<String> {
+    let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &*expr.node
+    else {
+        return None;
+    };
+    if method.as_str() != "[]" || args.len() != 1 {
+        return None;
+    }
+    // Prism parses the bare name as an implicit-self Send in a template
+    // body; a `Var` shows up once scope analysis has bound it.
+    let is_local_assigns = match &*recv.node {
+        ExprNode::Send { recv: None, method, args, block: None, .. } => {
+            method.as_str() == "local_assigns" && args.is_empty()
+        }
+        ExprNode::Var { name, .. } => name.as_str() == "local_assigns",
+        _ => false,
+    };
+    if !is_local_assigns {
+        return None;
+    }
+    match &*args[0].node {
+        ExprNode::Lit { value: Literal::Sym { value } } => Some(value.as_str().to_string()),
+        ExprNode::Lit { value: Literal::Str { value } } => Some(value.clone()),
+        _ => None,
+    }
+}
+
+fn rewrite_defined_to_nil_check(expr: &mut Expr) {
+    // Recurse into children first.
+    match &mut *expr.node {
+        ExprNode::Lit { .. }
+        | ExprNode::Var { .. }
+        | ExprNode::Ivar { .. }
+        | ExprNode::Const { .. }
+        | ExprNode::Retry
+        | ExprNode::Redo
+        | ExprNode::ForwardArgs
+        | ExprNode::ForwardKeywords
+        | ExprNode::Defined { .. }
+        | ExprNode::SelfRef => {}
+        ExprNode::ForwardKeywordsWithPairs { entries } => {
+            for (key, value) in entries {
+                rewrite_defined_to_nil_check(key);
+                rewrite_defined_to_nil_check(value);
+            }
+        }
+        ExprNode::Hash { entries, .. } => {
+            for (k, v) in entries {
+                rewrite_defined_to_nil_check(k);
+                rewrite_defined_to_nil_check(v);
+            }
+        }
+        ExprNode::Array { elements, .. } => {
+            for el in elements {
+                rewrite_defined_to_nil_check(el);
+            }
+        }
+        ExprNode::StringInterp { parts } => {
+            for part in parts {
+                if let InterpPart::Expr { expr } = part {
+                    rewrite_defined_to_nil_check(expr);
+                }
+            }
+        }
+        ExprNode::BoolOp { left, right, .. } => {
+            rewrite_defined_to_nil_check(left);
+            rewrite_defined_to_nil_check(right);
+        }
+        ExprNode::Let { value, body, .. } => {
+            rewrite_defined_to_nil_check(value);
+            rewrite_defined_to_nil_check(body);
+        }
+        ExprNode::Lambda { body, .. } => rewrite_defined_to_nil_check(body),
+        ExprNode::MethodRef { recv, .. } => {
+            if let Some(r) = recv {
+                rewrite_defined_to_nil_check(r);
+            }
+        }
+        ExprNode::Apply { fun, args, block } => {
+            rewrite_defined_to_nil_check(fun);
+            for a in args {
+                rewrite_defined_to_nil_check(a);
+            }
+            if let Some(b) = block {
+                rewrite_defined_to_nil_check(b);
+            }
+        }
+        ExprNode::Send { recv, args, block, .. } => {
+            if let Some(r) = recv {
+                rewrite_defined_to_nil_check(r);
+            }
+            for a in args {
+                rewrite_defined_to_nil_check(a);
+            }
+            if let Some(b) = block {
+                rewrite_defined_to_nil_check(b);
+            }
+        }
+        ExprNode::If { cond, then_branch, else_branch } => {
+            rewrite_defined_to_nil_check(cond);
+            rewrite_defined_to_nil_check(then_branch);
+            rewrite_defined_to_nil_check(else_branch);
+        }
+        ExprNode::Case { scrutinee, arms } => {
+            rewrite_defined_to_nil_check(scrutinee);
+            for arm in arms {
+                if let Some(g) = arm.guard.as_mut() {
+                    rewrite_defined_to_nil_check(g);
+                }
+                rewrite_defined_to_nil_check(&mut arm.body);
+            }
+        }
+        ExprNode::CaseMatch { scrutinee, arms, else_body } => {
+            rewrite_defined_to_nil_check(scrutinee);
+            for arm in arms {
+                arm.pattern.for_each_expr_mut(&mut |e| rewrite_defined_to_nil_check(e));
+                if let Some((_, g)) = arm.guard.as_mut() {
+                    rewrite_defined_to_nil_check(g);
+                }
+                rewrite_defined_to_nil_check(&mut arm.body);
+            }
+            if let Some(e) = else_body {
+                rewrite_defined_to_nil_check(e);
+            }
+        }
+        ExprNode::MatchPredicate { value, pattern } | ExprNode::MatchRequired { value, pattern } => {
+            rewrite_defined_to_nil_check(value);
+            pattern.for_each_expr_mut(&mut |e| rewrite_defined_to_nil_check(e));
+        }
+        ExprNode::Seq { exprs } => {
+            for e in exprs {
+                rewrite_defined_to_nil_check(e);
+            }
+        }
+        ExprNode::Assign { target, value }
+        | ExprNode::OpAssign { target, value, .. } => {
+            rewrite_defined_to_nil_check(value);
+            if let LValue::Attr { recv, .. } = target {
+                rewrite_defined_to_nil_check(recv);
+            }
+            if let LValue::Index { recv, index } = target {
+                rewrite_defined_to_nil_check(recv);
+                rewrite_defined_to_nil_check(index);
+            }
+        }
+        ExprNode::Yield { args } => {
+            for a in args {
+                rewrite_defined_to_nil_check(a);
+            }
+        }
+        ExprNode::Raise { value } => rewrite_defined_to_nil_check(value),
+        ExprNode::RescueModifier { expr, fallback } => {
+            rewrite_defined_to_nil_check(expr);
+            rewrite_defined_to_nil_check(fallback);
+        }
+        ExprNode::Return { value } => rewrite_defined_to_nil_check(value),
+        ExprNode::Super { args } => {
+            if let Some(arglist) = args {
+                for a in arglist {
+                    rewrite_defined_to_nil_check(a);
+                }
+            }
+        }
+        ExprNode::Next { value } | ExprNode::Break { value } => {
+            if let Some(v) = value {
+                rewrite_defined_to_nil_check(v);
+            }
+        }
+        ExprNode::Splat { value } | ExprNode::KeywordSplat { value } => {
+            rewrite_defined_to_nil_check(value)
+        }
+        ExprNode::MultiAssign { value, .. } => rewrite_defined_to_nil_check(value),
+        ExprNode::While { cond, body, .. } => {
+            rewrite_defined_to_nil_check(cond);
+            rewrite_defined_to_nil_check(body);
+        }
+        ExprNode::Range { begin, end, .. } => {
+            if let Some(b) = begin {
+                rewrite_defined_to_nil_check(b);
+            }
+            if let Some(e) = end {
+                rewrite_defined_to_nil_check(e);
+            }
+        }
+        ExprNode::BeginRescue { body, rescues, else_branch, ensure, .. } => {
+            rewrite_defined_to_nil_check(body);
+            for r in rescues {
+                rewrite_defined_to_nil_check(&mut r.body);
+            }
+            if let Some(eb) = else_branch {
+                rewrite_defined_to_nil_check(eb);
+            }
+            if let Some(en) = ensure {
+                rewrite_defined_to_nil_check(en);
+            }
+        }
+        ExprNode::Cast { value, .. } => rewrite_defined_to_nil_check(value),
+    }
+
+    // Now test the current node. Match `Send(None, :defined?,
+    // [Var(name)])` exactly.
+    let is_defined_send = matches!(
+        &*expr.node,
+        ExprNode::Send { recv: None, method, args, block: None, .. }
+            if method.as_str() == "defined?"
+                && args.len() == 1
+                && matches!(&*args[0].node, ExprNode::Var { .. })
+    );
+    if !is_defined_send {
+        return;
+    }
+    // Extract the inner Var and synthesize `!var.nil?`.
+    let var_expr = if let ExprNode::Send { args, .. } = &*expr.node {
+        args[0].clone()
+    } else {
+        return;
+    };
+    let span = expr.span;
+    let nil_check = Expr::new(
+        span,
+        ExprNode::Send {
+            recv: Some(var_expr),
+            method: Symbol::from("nil?"),
+            args: vec![],
+            block: None,
+            parenthesized: true,
+        },
+    );
+    expr.node = Box::new(ExprNode::Send {
+        recv: Some(nil_check),
+        method: Symbol::from("!"),
+        args: vec![],
+        block: None,
+        parenthesized: false,
+    });
+}
+
+// ── FormBuilder binding ──────────────────────────────────────────
+
+/// Per-form_with state threaded through the inner block walk so
+/// `form.label`/`form.text_field` macro-expansion can synthesize
+/// the right attribute names and record-attribute reads at lower
+/// time. Populated by `form_with::emit_form_with_inline` when
+/// entering the block; consumed by
+/// `form_builder::emit_form_builder_inline` when a `form.X` Send is
+/// encountered during the walk.
+#[derive(Clone)]
+pub(super) struct FormBuilderBinding {
+    /// The block param name (e.g. "form" from `do |form|`). The
+    /// walker matches a `Send { recv: Some(Var(form_param)), … }`
+    /// against this to detect macro-call sites.
+    pub(super) form_param: String,
+    /// Form-prefix string used in `<input name="<model_name>[…]">`
+    /// and `<label for="<model_name>_<field>">`. Derived from the
+    /// resource dir's singular (or the child class's name for the
+    /// polymorphic-array nested-resource form).
+    pub(super) model_name: String,
+    /// Local Var to dispatch attribute readers on (e.g. `article` →
+    /// `article.title` for the value attr). For simple `model: <var>`
+    /// shapes this reuses the source local; for complex shapes
+    /// (`model: Comment.new`, `model: [parent, Class.new]`) the
+    /// inline expansion synthesizes a fresh `<form_param>_record`
+    /// local at form_with entry and stores its name here.
+    pub(super) record_var: Symbol,
+    /// Local Var holding the form method Symbol (`:patch` or `:post`).
+    /// Synthesized as `<form_param>_method` at form_with entry.
+    /// `form.submit`'s default-text expansion reads this to choose
+    /// "Update X" (patch) vs "Create X" (post).
+    pub(super) form_method_var: Symbol,
+    /// `form_with namespace:` — Rails prefixes every generated id with
+    /// it (`edit_user_user_username`) so two forms for the same record
+    /// on one page don't collide. Field NAMES are untouched. Empty for
+    /// the common un-namespaced form.
+    pub(super) id_prefix: String,
+}
+
+/// The `id` Rails generates for a form field: the namespace prefix (when
+/// the form declared one), the object name, and the field, joined by
+/// underscores. A model-less form ids by field alone.
+pub(super) fn field_id(id_prefix: &str, model_name: &str, field: &str) -> String {
+    let sanitized = sanitize_object_name(model_name);
+    let mut parts: Vec<&str> = Vec::with_capacity(3);
+    if !id_prefix.is_empty() {
+        parts.push(id_prefix);
+    }
+    if !sanitized.is_empty() {
+        parts.push(&sanitized);
+    }
+    parts.push(field);
+    parts.join("_")
+}
+
+/// Rails' `Tags::Base#sanitized_object_name`: the object NAME carries
+/// brackets (`account[settings]` after a `fields_for`), the `id` may
+/// not, so every character that is not id-legal becomes `_` and a
+/// trailing `_` is dropped — `account[settings]` → `account_settings`,
+/// which is exactly the id Rails renders.
+///
+/// A no-op for a plain object name, which is every name a form without
+/// `fields_for` produces. It exists because the alternative — carrying
+/// a second, pre-sanitized name on the binding — makes the two spellings
+/// separately assignable, and they are not: Rails DERIVES one from the
+/// other, and so does this.
+fn sanitize_object_name(name: &str) -> String {
+    // Rails: `gsub(/\]\[|[^-a-zA-Z0-9:.]/, "_").sub(/_$/, "")`.
+    // Transcribed rather than approximated, both halves load-bearing:
+    // the `][` ALTERNATIVE matches first, so a two-level name
+    // (`a[b][c]`) collapses that pair to ONE underscore (`a_b_c`, not
+    // `a_b__c`), and the trailing trim removes exactly ONE — a name
+    // that genuinely ends in `_` keeps the rest.
+    let collapsed = name.replace("][", "_");
+    let mut out = String::with_capacity(collapsed.len());
+    for c in collapsed.chars() {
+        if c.is_ascii_alphanumeric() || matches!(c, '-' | ':' | '.') {
+            out.push(c);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.ends_with('_') {
+        out.pop();
+    }
+    out
+}
+
+// ── ViewCtx ──────────────────────────────────────────────────────
+
+#[derive(Clone)]
+#[allow(dead_code)] // arg_name + resource_dir read in follow-on slices.
+pub(super) struct ViewCtx {
+    pub(super) locals: Vec<String>,
+    pub(super) arg_name: String,
+    pub(super) resource_dir: String,
+    /// Name of the local that accumulates output via `<<`. The
+    /// top-level method body uses `io`; inside `form_with do |form|
+    /// … end` blocks (and other capture-style helpers) the inner
+    /// walk uses a fresh `body` so the captured string can be
+    /// returned to the wrapping helper. Threaded through walk_body
+    /// → walk_stmt → emit_io_append so every accumulator append
+    /// resolves to the right local.
+    pub(super) accumulator: String,
+    /// FormBuilder bindings active at this scope. Populated when
+    /// entering a `form_with` block. The macro-inline form.X
+    /// dispatch (form_builder.rs) reads these to expand
+    /// `form.text_field :title` into direct HTML accumulation
+    /// (`<input name="<model_name>[<field>]" ... value=...>`).
+    pub(super) form_records: Vec<FormBuilderBinding>,
+    /// Locals known to be nullable — the view's extra_params with a
+    /// `nil` default (`notice`, `alert`, …). When a predicate
+    /// (`recv.present?`, `recv.empty?`, …) targets one of these,
+    /// rewrite to the nil-safe form `!recv.nil? && !recv.empty?` so
+    /// the body doesn't NoMethodError when callers omit the kwarg.
+    pub(super) nullable_locals: crate::det::HashSet<String>,
+    /// Record-reference reader names — every `belongs_to`/`has_one`
+    /// association name across the app's models. `rewrite_predicates`
+    /// consults this (plus the `_id` suffix) to lower `present?`/`blank?`
+    /// on a reference read to the nil test instead of the `empty?` form
+    /// (`story.domain.present?` → `!story.domain.nil?`).
+    pub(super) reference_reads: std::rc::Rc<crate::det::HashSet<String>>,
+    /// Single-record association reader name → target-model snake
+    /// singular (`reference_target_names`). `emit_url_arg` resolves a
+    /// `link_to text, story.user` URL argument polymorphically to
+    /// `RouteHelpers.user_path(story.user)` through this.
+    pub(super) reference_targets:
+        std::rc::Rc<crate::det::HashMap<String, String>>,
+    /// Method names whose result is html-safe by construction —
+    /// their body ends in `.html_safe` (`App::html_safe_methods`,
+    /// recorded by `lower::html_safe`). A bare interpolation of one
+    /// skips the auto-escape wrap; escaping it would ship literal
+    /// `&lt;span&gt;` markup, which is what `hat.to_html_label` does.
+    pub(super) html_safe_methods: std::rc::Rc<crate::det::HashSet<String>>,
+    /// Nilable-scalar reader names through a record: typed_store
+    /// attributes with no default (nil when unset). Emptiness
+    /// predicates on these get the nil-safe forms (see
+    /// `rewrite_predicates`). Empty for apps without the DSL.
+    pub(super) nilable_scalar_reads: std::rc::Rc<crate::det::HashSet<String>>,
+    /// Snake-singular names of the app's models (`comment`, `story`).
+    /// `form_with url: <bare record>` consults this to resolve the
+    /// form action polymorphically at COMPILE time (`persisted?` →
+    /// member path, else collection path) instead of deferring to the
+    /// runtime `url_for`, whose `is_a?`-dispatch shape is
+    /// CRuby-overlay-only.
+    pub(super) model_singulars: std::rc::Rc<crate::det::HashSet<String>>,
+    /// Snake-singular names of models that OVERRIDE `to_param`
+    /// (lobsters' Story→short_id, Domain→domain). The form-action
+    /// member arm passes `record.to_param` for these — Rails fills
+    /// the `:id` segment from `to_param`, and the route helper's
+    /// param is String-typed. Non-slug models pass `record.id`
+    /// (Integer param) so strict targets keep a typed scalar.
+    pub(super) slug_models: std::rc::Rc<crate::det::HashSet<String>>,
+    /// Per-model bool-reader names (`bool_reader_names`): Boolean
+    /// columns + bool typed_store attrs. `f.check_box` grounds its
+    /// checked state through these (typed ternary instead of the
+    /// runtime `checked_box_attr` seam).
+    pub(super) bool_readers:
+        std::rc::Rc<crate::det::HashMap<String, crate::det::HashSet<String>>>,
+    /// Per-model NON-COLUMN attribute readers (`store_reader_names`):
+    /// typed_store + `attribute`-DSL names. A form field's value read
+    /// routes through the synthesized reader for these instead of the
+    /// record's `[]` indexer, which knows only schema columns.
+    pub(super) store_readers:
+        std::rc::Rc<crate::det::HashMap<String, crate::det::HashSet<String>>>,
+    /// Generated RouteHelpers function names. The form-action
+    /// persisted?-ternary emits only the arms whose helper EXISTS
+    /// (lobsters' domains has a member route but no collection —
+    /// `RouteHelpers.domains_path` would be an undefined method).
+    /// Empty in single-view test harnesses → both arms (the
+    /// pre-gating shape).
+    pub(super) route_helper_names: std::rc::Rc<crate::det::HashSet<String>>,
+    /// The app's translations for form labels and submit text.
+    pub(super) i18n: std::rc::Rc<crate::i18n::FormI18n>,
+    /// Generated RouteHelpers function name -> how many REQUIRED
+    /// positionals it takes (`article_path` 1, `articles_path` 0).
+    ///
+    /// The member arm of a resource form — and every record-in-URL
+    /// position — assumes its `<singular>_path` takes an `:id`. A
+    /// SINGULAR Rails resource (`resource :account`, `resource
+    /// :profile`) breaks that: the member helper is the whole route and
+    /// has no dynamic segment, so `RouteHelpers.account_path(account.id)`
+    /// is `wrong number of arguments (given 1, expected 0)`. Rails
+    /// tolerates the extra argument (its non-optimized `url_for` path
+    /// just has nowhere to put it); a generated function does not.
+    ///
+    /// Empty in single-view test harnesses, where `member_path_call`
+    /// keeps the argument — the same "no route table, assume the
+    /// pre-gating shape" convention `route_helper_names` uses.
+    pub(super) route_helper_arity: std::rc::Rc<crate::det::HashMap<String, usize>>,
+    /// Helper methods that wrap a builder-yielding form helper
+    /// (`form_wrapper_helpers`). A call site passing a block is spliced
+    /// to the wrapped call so the form-builder macro-inline can see
+    /// both halves at once.
+    pub(super) form_wrappers: std::rc::Rc<crate::det::HashMap<String, FormWrapperHelper>>,
+    /// Begin each `form_with` expansion with the
+    /// `ActionView::Base.new.form_with` entry (Ruby family only — see
+    /// `form_with::form_with_entry`).
+    pub(super) form_with_entry: bool,
+    /// Stylesheet logical names ingested from `app/assets/stylesheets/`
+    /// + `app/assets/builds/`. Used by the `stylesheet_link_tag(:app,
+    /// ...)` expansion: a `:app` symbol arg fans out to one call per
+    /// stylesheet, mirroring how Rails' Propshaft resolves `:app`.
+    pub(super) stylesheets: Vec<String>,
+    /// The app's rich-text editor is Lexxy — the `lexxy` gem is in its
+    /// Gemfile.lock. Rails' `rich_text_area` then renders one
+    /// `<lexxy-editor>` holding the call's block, where Trix renders a
+    /// hidden input beside an empty `<trix-editor>` (the gem swaps the
+    /// helper; `form_builder::emit_rich_text_area` follows it).
+    pub(super) lexxy: bool,
+    /// Lexxy renders through Rails' `ActionText::Editor` adapter, which
+    /// drops the Trix-era `input="…_trix_input…"` attribute (see
+    /// [`lexxy_uses_editor_adapter`]).
+    pub(super) lexxy_editor_adapter: bool,
+    /// Render-tree ivar closure (`view_ivar_closures`), shared across this
+    /// view's scopes. `emit_render_partial` looks up a rendered partial's
+    /// needed ivars here and passes them as call-site args (the caller's
+    /// own locals — its closure ⊇ the partial's, so it always has them).
+    pub(super) partial_ivars: std::rc::Rc<crate::det::HashMap<ViewKey, Vec<Symbol>>>,
+    /// The formats a render here looks a view up in, in order: this
+    /// view's own, as Rails prepends the rendering template's format to
+    /// the lookup, then html. `formats:` and the `turbo_stream` builder
+    /// replace the list.
+    pub(super) formats: Vec<String>,
+    /// Every lowered view's key, kind and format (`view_formats`), so a
+    /// render can tell which of `formats` its partial or template has a
+    /// variant in.
+    pub(super) view_formats:
+        std::rc::Rc<crate::det::HashSet<(ViewKey, ViewKind, String)>>,
+    /// Partials whose body renders a `file_field` (`multipart_partials`).
+    /// A `form_with` block that renders one of these is a multipart
+    /// form exactly as if the field were in the block itself — Rails'
+    /// builder carries the flag across the partial boundary — so
+    /// `form_with::block_has_file_field` looks the rendered partial up
+    /// here.
+    pub(super) multipart_partials: std::rc::Rc<crate::det::HashSet<ViewKey>>,
+    /// Dynamic-partial pools, `(view-dir, ivar) -> [pool entries]`
+    /// (`dynamic_partial_pools`): each entry is a partial-name literal a
+    /// controller assigns plus its options-form `locals:`. `emit_render_
+    /// partial` reads this for a `render partial: @<ivar>` DynamicNamed
+    /// dispatch: each pooled name resolves to a `Views::X.method` arm,
+    /// binding the entry's locals onto a strict-locals target's declared
+    /// interface. Empty for apps without dynamic partials (the blog), so
+    /// the dispatch never fires.
+    pub(super) dyn_pools:
+        std::rc::Rc<crate::det::HashMap<(String, Symbol), Vec<DynPoolEntry>>>,
+    /// The stem each rendered partial's key and method go by
+    /// ([`PartialStems`]).
+    pub(super) partial_stems: std::rc::Rc<PartialStems>,
+    /// Per-partial extras list (`partial_extras_map`): the trailing
+    /// nil-default params (notice/alert/defined?-marked locals) in def
+    /// order. `emit_render_partial` binds an explicit `locals:` hash's
+    /// values to these positions.
+    pub(super) partial_extras:
+        std::rc::Rc<crate::det::HashMap<(String, String), Vec<String>>>,
+    /// Strict-locals partials → their KEYWORD locals (`strict_locals_by_key`).
+    /// `emit_render_partial` consults it to (a) suppress convention
+    /// closure-threading for these partials (they take only declared
+    /// locals) and (b) emit a provided `locals:` value as a keyword arg
+    /// bound by name.
+    pub(super) strict_locals:
+        std::rc::Rc<crate::det::HashMap<ViewKey, Vec<Param>>>,
+    /// THIS view's ivar/local name → model snake-singular, from
+    /// `App::view_ivar_types` (`edit_user` → `user`). `form_with model:
+    /// @edit_user` names its fields after the record's model exactly as
+    /// Rails' `param_key` does; without the fact the name convention
+    /// yields nothing and the form falls back to the view directory.
+    /// Only names whose type is a KNOWN MODEL appear.
+    /// This view's own name (`messages/_message`), the constant half
+    /// of a `<% cache %>` key. Two cache sites in different templates
+    /// can key on the SAME record — campfire's `_message` and a
+    /// `_message` in a turbo-stream refresh both cache `[message,
+    /// "presentation-v2"]` — so the site has to be in the key or one
+    /// would serve the other's markup. A non-html variant carries its
+    /// format (`messages/_message.turbo_stream`,
+    /// `fragment_template_path`) for the same reason.
+    pub(super) view_name: String,
+    pub(super) ivar_models:
+        std::rc::Rc<crate::det::HashMap<String, String>>,
+    /// This view's ivars the analyzer typed `String` — markup a
+    /// controller rendered ahead (`@message_html = render_to_string …`).
+    /// `turbo_stream.append target, @message_html` sends it as given
+    /// rather than rendering a partial named after it.
+    pub(super) str_ivars: std::rc::Rc<crate::det::HashSet<String>>,
+    /// THIS view's ivar → local rename (`view_ivar_locals`). A site
+    /// that turns one of the view's ivars into a local (an ivar write
+    /// in the template, the closure args of a partial render) reads it
+    /// through [`ViewCtx::ivar_local`], so it names the same local the
+    /// params and the body rewrite do.
+    pub(super) ivar_locals: std::rc::Rc<IvarLocals>,
+    /// THIS view's flash params (`flash_params`), `notice` then `alert`,
+    /// where they hold the request's flash — what a partial it renders
+    /// reads for its own (`locals_extra_args`). A template's and a
+    /// layout's always do: the controller and the layout wrap pass the
+    /// flash. A partial's do by the same rule one render up, except a
+    /// param some render hands a local by its name, which holds that
+    /// local there. A strict-locals partial has none, and a block param
+    /// or an assigned local of the same name clears it in its scope
+    /// (`ViewCtx::shadow_flash`).
+    pub(super) own_flash: [Option<String>; 2],
+}
+
+/// Every `belongs_to`/`has_one` association name across the app's models
+/// — the single-record readers whose result is a record or nil (see
+/// `ViewCtx::reference_reads`). has_many names stay out: collections keep
+/// the `empty?`-based predicate forms.
+/// Non-bool `typed_store` attribute names with no default across the
+/// app's models — readers that yield nil when the attribute is unset.
+/// Bool attributes stay out (their read sites are truthiness tests,
+/// and the synthesized `<name>?` predicate handles the Rails form).
+fn nilable_scalar_reader_names(app: &App) -> crate::det::HashSet<String> {
+    let mut out = crate::det::HashSet::default();
+    for m in &app.models {
+        for (_col, attrs) in crate::lower::typed_store::typed_store_decls(&m.body) {
+            for a in attrs {
+                if !a.is_bool && a.nilable() {
+                    out.insert(a.name.as_str().to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Per-model bool-reader names (model snake-singular → reader set):
+/// Boolean schema columns plus bool `typed_store` attrs. `f.check_box`
+/// grounds its checked state through these — a bool reader reduces the
+/// runtime `checked_box_attr` seam to a plain ternary on the typed
+/// reader.
+fn bool_reader_names(
+    app: &App,
+) -> crate::det::HashMap<String, crate::det::HashSet<String>> {
+    let mut out = crate::det::HashMap::default();
+    for m in &app.models {
+        let mut set = crate::det::HashSet::default();
+        if let Some(table) = app.schema.tables.get(&m.table.0) {
+            for col in &table.columns {
+                if matches!(col.col_type, crate::schema::ColumnType::Boolean) {
+                    set.insert(col.name.as_str().to_string());
+                }
+            }
+        }
+        for (_store, attrs) in crate::lower::typed_store::typed_store_decls(&m.body) {
+            for a in attrs {
+                if a.is_bool {
+                    set.insert(a.name.as_str().to_string());
+                }
+            }
+        }
+        for (name, ty) in crate::lower::model_to_library::attribute_api_decls(&m.body) {
+            if ty.as_str() == "boolean" {
+                set.insert(name.as_str().to_string());
+            }
+        }
+        out.insert(crate::naming::snake_case(m.name.0.as_str()), set);
+    }
+    out
+}
+
+/// Per-model NON-COLUMN attribute readers: `typed_store` attributes
+/// (lobsters' `User` keeps `homepage`, `github_username` and a dozen
+/// more inside its serialized `settings` column) plus `attribute`-DSL
+/// names. A form field reads its value through the record's `[]`
+/// indexer, which only knows schema columns — one of these reads back
+/// nil there, so the field renders with no `value=` and the settings
+/// page showed every stored preference as blank. These go through the
+/// synthesized READER instead.
+fn store_reader_names(
+    app: &App,
+) -> crate::det::HashMap<String, crate::det::HashSet<String>> {
+    let mut out = crate::det::HashMap::default();
+    for m in &app.models {
+        let mut set = crate::det::HashSet::default();
+        for (_store, attrs) in crate::lower::typed_store::typed_store_decls(&m.body) {
+            for a in attrs {
+                set.insert(a.name.as_str().to_string());
+            }
+        }
+        for (name, _ty) in crate::lower::model_to_library::attribute_api_decls(&m.body) {
+            set.insert(name.as_str().to_string());
+        }
+        // A real column of the same name wins — the indexer knows it,
+        // and the indexer is what applies the column's cast.
+        if let Some(table) = app.schema.tables.get(&m.table.0) {
+            for col in &table.columns {
+                set.remove(col.name.as_str());
+            }
+        }
+        out.insert(crate::naming::snake_case(m.name.0.as_str()), set);
+    }
+    out
+}
+
+fn reference_reader_names(app: &App) -> crate::det::HashSet<String> {
+    use crate::dialect::Association;
+    let mut out = crate::det::HashSet::default();
+    for m in &app.models {
+        for a in m.associations() {
+            match a {
+                Association::BelongsTo { name, .. } | Association::HasOne { name, .. } => {
+                    out.insert(name.as_str().to_string());
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+/// Single-record association reader name → target-model snake singular
+/// (`invited_by_user` → `user`), across the app's models. Consumed by
+/// `emit_url_arg`: a `link_to text, story.user`-style URL argument
+/// resolves polymorphically to `RouteHelpers.user_path(story.user)` —
+/// the record rides whole so the route helper's `to_param` picks up a
+/// custom implementation (lobsters' User#to_param is `username`).
+/// A name two models point at DIFFERENT targets is dropped as
+/// ambiguous rather than guessed.
+fn reference_target_names(app: &App) -> crate::det::HashMap<String, String> {
+    use crate::dialect::Association;
+    let mut out = crate::det::HashMap::default();
+    let mut ambiguous = crate::det::HashSet::default();
+    for m in &app.models {
+        for a in m.associations() {
+            let (name, target) = match a {
+                Association::BelongsTo { name, target, .. }
+                | Association::HasOne { name, target, .. } => (name, target),
+                _ => continue,
+            };
+            let key = name.as_str().to_string();
+            let val = crate::naming::snake_case(target.0.as_str());
+            match out.get(&key) {
+                Some(existing) if existing != &val => {
+                    ambiguous.insert(key);
+                }
+                _ => {
+                    out.insert(key, val);
+                }
+            }
+        }
+    }
+    for k in ambiguous {
+        out.remove(&k);
+    }
+    out
+}
+
+impl ViewCtx {
+    /// The local this view's `@ivar` reads as (see `ivar_local_names`).
+    pub(super) fn ivar_local(&self, ivar: &str) -> String {
+        ivar_local(&self.ivar_locals, ivar)
+    }
+
+    pub(super) fn is_local(&self, n: &str) -> bool {
+        self.locals.iter().any(|x| x == n)
+    }
+    /// True when `@<n>` is assigned a partial-options value in some
+    /// controller action (a bare partial-name string or a `{partial: …}`
+    /// hash), so a bare `render @<n>` should dispatch over the pool
+    /// instead of rendering `@<n>` as a record collection.
+    pub(super) fn is_options_ivar(&self, n: &str) -> bool {
+        self.dyn_pools
+            .contains_key(&(self.resource_dir.clone(), Symbol::from(n)))
+    }
+    pub(super) fn with_locals(&self, more: impl IntoIterator<Item = String>) -> Self {
+        let mut next = self.clone();
+        for n in more {
+            next.shadow_flash(&n);
+            if !next.locals.iter().any(|x| x == &n) {
+                next.locals.push(n);
+            }
+        }
+        next
+    }
+
+    /// This scope from `stmt` on, when it assigns a local named as one of
+    /// the flash params (`<% notice = "Local" %>`, at any depth): the
+    /// param holds that local from there, as a block param does.
+    pub(super) fn after_assigning(&self, stmt: &Expr) -> Option<Self> {
+        let hit: Vec<String> =
+            self.own_flash.iter().flatten().filter(|f| assigns_local(stmt, f)).cloned().collect();
+        (!hit.is_empty()).then(|| {
+            let mut next = self.clone();
+            for n in &hit {
+                next.shadow_flash(n);
+            }
+            next
+        })
+    }
+
+    /// A local named as a flash param shadows it, so a partial rendered
+    /// in its scope gets nil for that slot (`locals_extra_args`), never
+    /// the local: Rails reads the request's flash there, which only the
+    /// param held.
+    fn shadow_flash(&mut self, name: &str) {
+        for slot in &mut self.own_flash {
+            if slot.as_deref() == Some(name) {
+                *slot = None;
+            }
+        }
+    }
+
+    /// This scope with renders looking partials up in exactly `formats`.
+    pub(super) fn in_formats(&self, formats: &[&str]) -> Self {
+        Self { formats: formats.iter().map(|f| f.to_string()).collect(), ..self.clone() }
+    }
+
+    /// This scope for a `render` called with `args`: its `formats:`
+    /// option replaces the lookup for that render and all it renders, a
+    /// layout's block included (`ActionView::Base#in_rendering_context`).
+    pub(super) fn for_render(&self, args: &[Expr]) -> Self {
+        match crate::lower::view::render_formats_option(args) {
+            Some(formats) => self.in_formats(&formats),
+            None => self.clone(),
+        }
+    }
+
+    /// The format of the `(module, stem)` variant of `kind` a render here
+    /// reaches: the first of `formats` the view has one in. The html one
+    /// is the fallback a Turbo request leaves in Rails' lookup — its
+    /// `Accept` lists `text/html`, and the `turbo_stream` builder adds
+    /// `:html`. With none, html too: the name every call site had before
+    /// formats were told apart, for a view `view_formats` does not index.
+    pub(super) fn render_format(&self, kind: ViewKind, module: &str, stem: &str) -> &str {
+        let key = (module.to_string(), stem.to_string());
+        self.formats
+            .iter()
+            .find(|f| self.view_formats.contains(&(key.clone(), kind, (*f).clone())))
+            .map_or("html", String::as_str)
+    }
+
+    /// The method a render of the `(module, stem)` view of `kind` calls,
+    /// named as `build_library_class` names the variant `render_format`
+    /// picks.
+    pub(super) fn render_method(&self, kind: ViewKind, module: &str, stem: &str) -> Symbol {
+        crate::lower::view::view_method_name_for(stem, self.render_format(kind, module, stem))
+    }
+}
+
+/// Whether `e` assigns the local `name` anywhere in it: `=`, `||=` and
+/// the other compound forms, or a multiple assignment.
+fn assigns_local(e: &Expr, name: &str) -> bool {
+    let is_it = |t: &LValue| matches!(t, LValue::Var { name: n, .. } if n.as_str() == name);
+    let mut found = match &*e.node {
+        ExprNode::Assign { target, .. } | ExprNode::OpAssign { target, .. } => is_it(target),
+        ExprNode::MultiAssign { targets, .. } => targets.iter().any(is_it),
+        _ => false,
+    };
+    e.node.for_each_child(&mut |c| found = found || assigns_local(c, name));
+    found
+}
+
+// ── small IR constructors ────────────────────────────────────────
+
+/// `<accumulator> = String.new` — synthesized once per template body.
+/// The accumulator name comes from the active ViewCtx (`io` at top
+/// level; `body` inside `form_with` blocks).
+///
+/// Tagged with `IrHint::StringBuilderInit` so non-Ruby emitters that
+/// have a more idiomatic accumulator form (Crystal `String::Builder`,
+/// Go `strings.Builder`, TS array+join) can pick it up. Ruby/Spinel/
+/// Rust ignore the hint (their canonical form already matches).
+pub(super) fn assign_accumulator_string_new(name: &str) -> Expr {
+    let string_const = Expr::new(
+        Span::synthetic(),
+        ExprNode::Const { path: vec![Symbol::from("String")] },
+    );
+    let new_call = send(Some(string_const), "new", Vec::new(), None, false);
+    let mut e = Expr::new(
+        Span::synthetic(),
+        ExprNode::Assign {
+            target: LValue::Var { id: VarId(0), name: Symbol::from(name) },
+            value: new_call,
+        },
+    );
+    e.set_hint(Some(IrHint::StringBuilderInit));
+    e
+}
+
+/// `<accumulator> << <arg>` — the per-step append. Always emits with
+/// `<<` (a binary operator the Ruby emit_send_base rewrites to infix
+/// form), so the source comes out as `io << arg`, not `io.<<(arg)`.
+///
+/// Tagged with `IrHint::StringBuilderAppend` so emitters can pick the
+/// target-idiomatic append form (Go `WriteString`, TS array `push`).
+pub(super) fn accumulator_append_call(arg: Expr, ctx: &ViewCtx) -> Expr {
+    let mut e = send(
+        Some(var_ref(Symbol::from(ctx.accumulator.as_str()))),
+        "<<",
+        vec![arg],
+        None,
+        false,
+    );
+    e.set_hint(Some(IrHint::StringBuilderAppend));
+    e
+}
+
+/// Terminal `<accumulator>` reference at the tail of a view function
+/// body — returns the accumulated string. Distinct from `var_ref` so
+/// only this site picks up `IrHint::StringBuilderResult`; generic Var
+/// references to `io` elsewhere stay untagged.
+pub(super) fn accumulator_result_ref(name: &str) -> Expr {
+    let mut e = var_ref(Symbol::from(name));
+    e.set_hint(Some(IrHint::StringBuilderResult));
+    e
+}
+
+pub(crate) fn view_helpers_call(method: &str, args: Vec<Expr>) -> Expr {
+    // Constant-fold `html_escape("literal")`. The escape is deterministic
+    // and the literal never changes, so escaping static class strings and
+    // button labels on every request is pure waste — the spinel profile
+    // showed the regex escaper (`re_exec`) running per request, mostly on
+    // compile-time constants. Emit the pre-escaped literal instead. This is
+    // byte-identical to the runtime call it replaces: the same 5-char set
+    // as `ViewHelpers::HTML_ESCAPES` (`& < > " '`), which is also Rails',
+    // so `compare` is unaffected. Only bare String literals fold; dynamic
+    // args (article.title, …) keep the runtime call.
+    if method == "html_escape" && args.len() == 1 {
+        if let ExprNode::Lit { value: Literal::Str { value } } = &*args[0].node {
+            return lit_str(html_escape_fold(value));
+        }
+    }
+    let recv = Expr::new(
+        Span::synthetic(),
+        ExprNode::Const { path: vec![Symbol::from("ActionView"), Symbol::from("ViewHelpers")] },
+    );
+    // Trailing-kwargs vs explicit-Hash decision happens in the body
+    // typer's `normalize_trailing_kwargs` — it consults the receiver
+    // class's resolved method signature and flips `kwargs: true →
+    // false` only for callees declared with positional Hash params
+    // (link_to / button_to / stylesheet_link_tag etc. take `opts =
+    // {}`). Keyword-param helpers (truncate, etc.) keep `kwargs:
+    // true` so they bind to the right named slot.
+    send(Some(recv), method, args, None, true)
+}
+
+/// `ActionView::ViewHelpers.url_for_path(RouteHelpers.<stem>_path(args))`
+/// — the grounding for bare `<x>_url` helpers in ERB views.
+/// `url_for_path` is the shared URL seam used by jbuilder too: Ruby-family
+/// views preserve `Rails.application.domain` overrides and normalize the
+/// scheme's standard port, while strict targets keep the path because
+/// their views have no request context. Shared by ERB helper rewriting,
+/// the form-action resolver, and the URL-position classifier.
+pub(crate) fn absolute_url_interp(stem: &str, args: Vec<Expr>) -> Expr {
+    let path_call = route_helpers_call(&format!("{stem}_path"), args);
+    view_helpers_call("url_for_path", vec![path_call])
+}
+
+/// `Rails.application.<method>` — the framework-default readers
+/// (`protocol`, `domain`) every absolute URL is grounded against.
+pub(crate) fn rails_application_call(method: &str) -> Expr {
+    let rails_app = send(
+        Some(Expr::new(
+            Span::synthetic(),
+            ExprNode::Const { path: vec![Symbol::from("Rails")] },
+        )),
+        "application",
+        Vec::new(),
+        None,
+        false,
+    );
+    send(Some(rails_app), method, Vec::new(), None, false)
+}
+
+pub(super) fn route_helpers_call(method: &str, args: Vec<Expr>) -> Expr {
+    let recv = Expr::new(
+        Span::synthetic(),
+        ExprNode::Const { path: vec![Symbol::from("RouteHelpers")] },
+    );
+    send(Some(recv), method, args, None, true)
+}
+
+/// A MEMBER route helper call: `RouteHelpers.<name>_path(<member>)`,
+/// with the member argument dropped when the generated helper takes no
+/// required positional.
+///
+/// One home for the five places that build a record-in-URL call (the
+/// three `form_with` action arms, the bare-record URL arg, and the
+/// association-reader arm). Each of them had the id/`to_param`/whole-
+/// record choice already right and the ARITY question not asked at all,
+/// which is a singular Rails resource's whole failure mode — see
+/// `ViewCtx::route_helper_arity`.
+///
+/// A helper the map does not know keeps the argument: an unknown name is
+/// either a harness with no route table or a helper this pass is not the
+/// oracle for, and dropping an argument there would silently change a
+/// working URL.
+pub(super) fn member_path_call(ctx: &ViewCtx, name: &str, member: Expr) -> Expr {
+    let takes_member = ctx.route_helper_arity.get(name).is_none_or(|n| *n > 0);
+    route_helpers_call(name, if takes_member { vec![member] } else { Vec::new() })
+}
+
+/// A `Send` constructor that makes the parenthesized flag explicit on
+/// the call site. The Ruby emitter ignores the flag for zero-arg calls
+/// (always emits `recv.method`), so it's safe to pass `true` for any
+/// helper Send regardless of arity.
+pub(super) fn send(
+    recv: Option<Expr>,
+    method: &str,
+    args: Vec<Expr>,
+    block: Option<Expr>,
+    parenthesized: bool,
+) -> Expr {
+    Expr::new(
+        Span::synthetic(),
+        ExprNode::Send {
+            recv,
+            method: Symbol::from(method),
+            args,
+            block,
+            parenthesized,
+        },
+    )
+}
+
+/// The bare name an expression reads as, if any — a local, an ivar, or
+/// a receiver-less zero-arg send (which is how an ERB-ingested body
+/// spells a template local, and how a helper's own reader parses;
+/// prism cannot prove the difference). The shape behind every
+/// name-based signal in this pipeline.
+pub(crate) fn bare_record_name(e: &Expr) -> Option<String> {
+    match &*e.node {
+        ExprNode::Var { name, .. } => Some(name.as_str().to_string()),
+        ExprNode::Ivar { name } => Some(name.as_str().to_string()),
+        ExprNode::Send { recv: None, method, args, block: None, .. } if args.is_empty() => {
+            Some(method.as_str().to_string())
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn lit_str(s: String) -> Expr {
+    Expr::new(
+        Span::synthetic(),
+        ExprNode::Lit { value: Literal::Str { value: s } },
+    )
+}
+
+/// Apply `ViewHelpers::HTML_ESCAPES` at compile time. Single pass over the
+/// input so an introduced `&` is never re-escaped — matching the runtime
+/// `s.gsub(/[&<>"']/, HTML_ESCAPES)` byte-for-byte (and Rails').
+pub(super) fn html_escape_fold(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+pub(super) fn lit_sym(s: Symbol) -> Expr {
+    Expr::new(
+        Span::synthetic(),
+        ExprNode::Lit { value: Literal::Sym { value: s } },
+    )
+}
+
+pub(super) fn nil_lit() -> Expr {
+    Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil })
+}
+
+pub(super) fn var_ref(name: Symbol) -> Expr {
+    Expr::new(Span::synthetic(), ExprNode::Var { id: VarId(0), name })
+}
+
+pub(super) fn seq(exprs: Vec<Expr>) -> Expr {
+    Expr::new(Span::synthetic(), ExprNode::Seq { exprs })
+}
+
+/// Placeholder for unrecognized template shapes — keeps the lowered
+/// output well-formed Ruby (a no-op string append) so the file parses.
+/// The tag is purely advisory; callers can grep for it to find gaps.
+/// The accumulator-aware path uses `walk_stmt`'s ctx, but this helper
+/// has none in scope, so it falls back to the default `io` accumulator.
+/// Acceptable since today's gaps either land at the top level or
+/// inside scopes that still have an `io` shadow at runtime.
+/// The view walker's catch-all: a template statement it cannot lower
+/// becomes an empty append, so the emitted view still parses.
+///
+/// It also FILES the drop. The `tag` used to be discarded (`let _ =
+/// tag`), which made this the one place in the pipeline where modeling
+/// debt left no ledger line: campfire's `<% turbo_page_requires_reload
+/// %>` — a turbo-rails helper that adds a `<meta name="turbo-visit-
+/// control">` to the page head — vanished from `sessions/new` with the
+/// emit reporting nothing at all. A page that silently loses a tag is
+/// worse than one that fails, because nothing points at it.
+///
+/// Warning, not Error: the surrounding template still renders, and
+/// every one of these has rendered for as long as the walker has had a
+/// catch-all. The invariant this restores is that the count is
+/// VISIBLE.
+pub(super) fn todo_io_append(tag: &str, span: crate::span::Span) -> Expr {
+    crate::emit::diagnostics::push(crate::lower::residue_diagnostic(
+        "view_walker",
+        tag,
+        span,
+        "statement shape not lowered",
+        format!(
+            "template statement dropped ({tag}) — it contributes no output and \
+             runs no side effect in the emitted view"
+        ),
+    ));
+    noop_io_append()
+}
+
+/// `io << ""` — a statement that keeps an arm non-empty while rendering
+/// nothing. The catch-all's body without its ledger line, for statements
+/// that genuinely have nothing to drop (a bare literal).
+pub(super) fn noop_io_append() -> Expr {
+    send(
+        Some(var_ref(Symbol::from("io"))),
+        "<<",
+        vec![lit_str(String::new())],
+        None,
+        false,
+    )
+}
+
+// ── tests ────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn module_id_for_articles_dir() {
+        let id = view_module_id("articles");
+        assert_eq!(id.0.as_str(), "Views::Articles");
+    }
+
+    #[test]
+    fn a_hyphenated_view_directory_yields_a_valid_constant_and_local() {
+        assert_eq!(view_module_id("product-item").0.as_str(), "Views::ProductItem");
+        assert_eq!(infer_view_arg("_default", "product-item", true, &[]), "product_item");
+    }
+
+    #[test]
+    fn arg_name_index_is_plural() {
+        let n = infer_view_arg("index", "articles", false, &[]);
+        assert_eq!(n, "articles");
+    }
+
+    #[test]
+    fn arg_name_partial_is_singular() {
+        let n = infer_view_arg("article", "articles", true, &[]);
+        assert_eq!(n, "article");
+    }
+
+    #[test]
+    fn arg_name_show_is_singular() {
+        let n = infer_view_arg("show", "articles", false, &[]);
+        assert_eq!(n, "article");
+    }
+}
+
+/// Does Lexxy render through Rails' `ActionText::Editor` adapter?
+///
+/// The gem decides at boot (`Lexxy.supports_editor_adapter?`): it uses
+/// the adapter when `ActionText::Editor#editor_tag` takes a block, which
+/// is rails/rails#56926, and otherwise its own `action_text_tag.rb`
+/// (the one that writes `input="<id>_trix_input_<record>"`). Ingest
+/// sees no gem source, so the lockfile stands in: Lexxy 0.9.24 or later
+/// (the first with the adapter) over Action Text 8.2 or later. That is
+/// exact for every released Rails; the one window it misreads is a
+/// Rails main revision between the 8.2.0.alpha bump and #56926 (campfire
+/// 90b33002's rails 1a02651), which renders the old tag.
+pub(crate) fn lexxy_uses_editor_adapter(lock: &crate::gems::Lockfile) -> bool {
+    fn at_least(version: Option<&str>, min: &[u64]) -> bool {
+        let Some(v) = version else { return false };
+        let parts: Vec<u64> = v
+            .split(|c: char| c == '.' || c == '-')
+            .map_while(|p| p.parse().ok())
+            .collect();
+        for (i, want) in min.iter().enumerate() {
+            let got = parts.get(i).copied().unwrap_or(0);
+            if got != *want {
+                return got > *want;
+            }
+        }
+        true
+    }
+    at_least(lock.version_of("lexxy"), &[0, 9, 24]) && at_least(lock.version_of("actiontext"), &[8, 2])
+}

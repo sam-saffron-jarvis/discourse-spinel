@@ -1,0 +1,12 @@
+bare synchronized
+scoped synchronized
+Thread::Mutex
+Thread::Mutex
+#<Thread::Mutex
+#<Thread::Mutex
+#<Thread::Mutex
+7
+Thread::Queue
+#<Thread::Queue
+Thread::ConditionVariable
+#<Thread::ConditionVariable

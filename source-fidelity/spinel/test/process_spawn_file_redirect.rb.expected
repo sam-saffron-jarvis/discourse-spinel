@@ -1,0 +1,25 @@
+0
+"valuable input\n"
+"valuable input\n"
+0
+"oops\n"
+Errno::ENOENT
+No such file or directory - DIR/absent.txt
+false
+Errno::ENOENT
+No such file or directory - DIR/nodir/x.txt
+0
+0
+0
+false
+"from child\nfrom parent\n"
+"to-out\n"
+"to-err\n"
+false
+"to-io\n"
+"to-file\n"
+0
+in Errno::ENOTDIR Not a directory - DIR/notdir/x
+out Errno::ENOTDIR Not a directory - DIR/notdir/x
+Errno::ENAMETOOLONG 625
+Errno::ENOENT 634 cccccccccccc

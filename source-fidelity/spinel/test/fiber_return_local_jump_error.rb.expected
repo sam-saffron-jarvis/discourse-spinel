@@ -1,0 +1,21 @@
+["unexpected return", 7]
+"method kept running"
+ensure ran
+8
+"after"
+nil
+42
+["thread", 5]
+"after"
+3
+5
+10
+["break from proc-closure", 6]
+break ensure ran
+7
+["thread break", 8]
+"after"
+100
+4
+7
+"after"

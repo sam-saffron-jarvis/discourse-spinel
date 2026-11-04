@@ -1,0 +1,11 @@
+[package]
+name = "zlib"
+sources = ["sp_zlib.c"]   # carried C is declared, not discovered (#4362)
+
+# Pre-installed spin package: ships with the compiler, versioned with it.
+#
+# DEFLATE, zlib and gzip in the package's own C (sp_zlib.c). NOT a binding to
+# the system libz, and the file says why at the top: a host with libz.so.1 and
+# no zlib.h would fail an availability probe and drop the package, giving a
+# green `make test` that never ran a line of it. Nothing here needs the
+# distribution's clock the way openssl's trust store does.

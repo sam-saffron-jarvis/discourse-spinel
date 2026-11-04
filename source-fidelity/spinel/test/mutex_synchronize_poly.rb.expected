@@ -1,0 +1,10 @@
+8000
+42
+rescued inside
+relocked
+undefined method 'synchronize' for nil
+guard 1
+0
+10
+rescued again
+10

@@ -1,0 +1,1825 @@
+#!/usr/bin/env ruby
+# scripts/lobsters-report — render a lobsters bench run to self-contained HTML.
+#
+# The lobsters counterpart to scripts/bench-report: where that renders the
+# blog throughput matrix, this renders one scripts/bench-lobsters run —
+# route parity, the frozen 114-visit sequence timing, and the
+# roundhouse-vs-Rails comparison — into a single static page.
+#
+# CONSOLIDATION: the primary input is the LANE layout that
+# `bench-lobsters LANES…` writes — matrix.json at the run root plus one
+# subdir per lane (rails/rails-int/ruby/ruby-int/jruby) — rendered as
+# three sections: (1) headline + runtime × JIT matrix (stability folded
+# in), (2) per-endpoint breakdown (chart = each stack's best config, all
+# lanes in the table), (3) coverage & parity — the attestation that the
+# timing sections measured a complete app surface per emit target. The
+# pre-orchestrator LEGACY layout (summary.json at the root, optional
+# matrix/ + jruby/ symlinks) still renders so archived runs and
+# single-lane dev runs re-render unchanged.
+#
+# Usage:
+#   scripts/lobsters-report [PATH] [OUT.html]
+#
+#   PATH defaults to bench/results/lobsters/latest. It may be either the
+#   run directory or the summary.json inside it. OUT defaults to
+#   index.html alongside summary.json, so the page publishes next to the
+#   raw artifacts already served at roundbench.showcase.party/lobsters/.
+#
+# Pure stdlib; inline SVG charts; no JS, no CDN. Open the file directly,
+# archive it, or serve it statically — the chart artifacts outlive any
+# chart library's CDN. Degrades gracefully: a parity-only run (no
+# rails.json / sequence_timing, as before P6 landed) still renders, just
+# without the timing and comparison sections.
+
+require 'json'
+require 'time'
+
+arg = ARGV[0] || File.join(__dir__, '..', 'bench', 'results', 'lobsters', 'latest')
+arg = File.expand_path(arg)
+run_path = File.directory?(arg) ? arg : File.dirname(arg)
+out = ARGV[1] || File.join(run_path, 'index.html')
+
+# Optional sidecar files. The comparison/matrix/jruby sections only
+# render when their data is present.
+def sibling(dir, name)
+  path = File.join(dir, name)
+  File.exist?(path) ? JSON.parse(File.read(path)) : nil
+rescue JSON::ParserError
+  nil
+end
+
+# Two layouts render through this one page:
+#  - LANE layout (bench-lobsters LANES…): matrix.json at the run root and
+#    one subdir per lane; the `ruby` lane is the canonical emit.
+#  - LEGACY layout: summary.json at the run root plus optional matrix/
+#    and jruby/ links (the pre-orchestrator nightly) — kept so archived
+#    runs re-render unchanged.
+lanes_mode = File.exist?(File.join(run_path, 'matrix.json'))
+if lanes_mode
+  matrix = sibling(run_path, 'matrix.json') or abort "unparseable matrix.json in #{run_path}"
+  prim   = %w[ruby ruby-int].find { |id| File.exist?(File.join(run_path, id, 'summary.json')) }
+  # A run whose emit lanes ALL died still has to render. Aborting here
+  # would leave the previously published page in place — so a lane that
+  # SEGVs would quietly go on showing yesterday's numbers as though they
+  # were today's, which is the worst outcome available. Render the page
+  # with no emit data; the trust banner and the matrix's dead rows are
+  # then the whole story, which is exactly what happened.
+  emit_missing = prim.nil?
+  prim ||= 'ruby'
+  input   = File.join(run_path, prim, 'summary.json')
+  summary = emit_missing ? {} : JSON.parse(File.read(input))
+  # Rails baseline at the SAME JIT level as the primary emit lane.
+  rails = sibling(File.join(run_path, prim == 'ruby' ? 'rails' : 'rails-int'), 'rails.json')
+  # Lane env carries the interpreter (the headline's JIT label); the
+  # run-root env carries the orchestration command — merge, root wins.
+  env = (sibling(File.join(run_path, prim), 'env.json') || {}).merge(sibling(run_path, 'env.json') || {})
+  env = nil if env.empty?
+  jruby     = sibling(File.join(run_path, 'jruby'), 'summary.json')
+  jruby_env = jruby && sibling(File.join(run_path, 'jruby'), 'env.json')
+  # The AOT lane is an emit target like the others, so the coverage
+  # attestation has to count it. Without this the section asserted "200 on
+  # every emit target" while reading only the CRuby and JRuby lanes — a
+  # claim wider than its evidence, and false the moment the spinel lane
+  # regressed (16/26 routes 500 on spinel 0ccc3ceb).
+  spinel    = sibling(File.join(run_path, 'spinel'), 'summary.json')
+else
+  emit_missing = false
+  prim  = nil
+  input = File.directory?(arg) ? File.join(arg, 'summary.json') : arg
+  File.exist?(input) or abort "no summary.json at #{input}"
+  summary = JSON.parse(File.read(input))
+  rails = sibling(run_path, 'rails.json')
+  env   = sibling(run_path, 'env.json')
+  # Sibling lanes linked into the run dir by the pre-orchestrator nightly.
+  # Read strictly through the in-dir links — never the shared `latest`
+  # pointers — so re-rendering an archived run can't pull another night's
+  # data into its page.
+  matrix    = sibling(File.join(run_path, 'matrix'), 'matrix.json')
+  jruby     = sibling(File.join(run_path, 'jruby'),  'summary.json')
+  jruby_env = jruby && sibling(File.join(run_path, 'jruby'), 'env.json')
+  spinel    = sibling(File.join(run_path, 'spinel'), 'summary.json')
+end
+
+jruby_pass = jruby && (jruby['pass'] || (jruby['routes'] || []).count { |r| r['ok'] })
+jruby_total = jruby && (jruby['total'] || (jruby['routes'] || []).size)
+spinel_pass  = spinel && (spinel['pass']  || (spinel['routes'] || []).count { |r| r['ok'] })
+spinel_total = spinel && (spinel['total'] || (spinel['routes'] || []).size)
+# In the lane layout the jruby lane runs the SAME in-memory frozen
+# sequence as everyone else — it lives in the matrix, the per-endpoint
+# table, and the parity table. The standalone file-backed section (and
+# its caveats) only applies to the legacy layout's separate run.
+jruby_seq = lanes_mode && jruby && jruby['sequence_timing']
+legacy_jruby = !lanes_mode && jruby
+
+routes   = summary['routes'] || []
+timing   = summary['sequence_timing']
+run_dir  = File.basename(run_path)
+
+# Content parity: the primary emit lane's rendered bodies against the Rails
+# lane's, compared as parsed documents (scripts/lobsters-content-diff). nil
+# when the run had no Rails lane to compare against — which the page must
+# say, because "not compared" and "compared and matched" are different
+# claims and only one of them is an attestation.
+# Hoisted: the trust banner reads these rows long before the matrix
+# section renders them.
+mrows    = matrix && (matrix['rows'] || [])
+# THE RETIRED HEAP-SENSITIVITY CELLS ARE DROPPED HERE, not just at the source.
+# They were the same binary crossed over GC configuration and a retained-heap
+# ballast, and they existed to show that spinel's whole-heap mark charged this
+# workload for a live set it never touched. matz/spinel@d3b1400d made the
+# generational mark the DEFAULT, so the plain `spinel` row is now that
+# configuration and the others have nothing left to say.
+#
+# The filter is here rather than only in bench-lobsters because the two move
+# on different clocks: this page is rendered on every Pages build from
+# whatever matrix.json the bench box last published, so a run predating the
+# retirement would otherwise keep the rows alive — and a ballast row, whose
+# vs-Rails ratio the aggregator used to suppress by hand, would now render one
+# that divides unequal work. Archived runs re-render as the page reads today.
+RETIRED_LANES = %w[spinel-gc spinel-ballast spinel-gc-ballast].freeze
+mrows = mrows.reject { |r| RETIRED_LANES.include?(r['id']) || r['ballast'].to_i > 0 } if mrows
+# The declared-gap ledger, read from the same file scripts/bench-lobsters
+# stamps into matrix.json. Rendering it here rather than trusting the matrix
+# keeps the REASONS (which the matrix does not carry) beside the routes.
+GAPS_FILE = File.expand_path("../bench/lobsters/declared-gaps.json", __dir__)
+DECLARED_GAPS = (File.exist?(GAPS_FILE) ?
+  (JSON.parse(File.read(GAPS_FILE))["declared_gaps"] || []) : [])
+GAP_BY_ROUTE = DECLARED_GAPS.to_h { |g| [g["route"], g] }
+# content-parity.json keys routes by DUMPED BODY NAME; the ledger keys them
+# by template. Map one to the other through any lane summary that carries
+# both, so the two files can each stay in their own vocabulary.
+def deferred_body_names(run_path)
+  Dir[File.join(run_path, "*", "summary.json")].each do |f|
+    routes = (JSON.parse(File.read(f))["routes"] rescue nil) or next
+    names = routes.select { |r| GAP_BY_ROUTE.key?(r["template"]) }.filter_map { |r| r["body"] }
+    return names unless names.empty?
+  end
+  []
+end
+
+DEFERRED_BODIES = lanes_mode ? deferred_body_names(run_path) : []
+content  = lanes_mode ? sibling(File.join(run_path, prim), 'content-parity.json') : nil
+jr_content = lanes_mode ? sibling(File.join(run_path, 'jruby'), 'content-parity.json') : nil
+# The AOT lane's content parity. bench-lobsters diffs every emit lane
+# against the Rails oracle and publishes one of these per lane, but the
+# page used to render only the primary lane's — so the AOT lane's fidelity
+# existed as a file on the server and as one line in the trust banner,
+# with no route list, no token counts and no hunks anywhere. Which is the
+# lane whose fidelity is least settled.
+sp_content = lanes_mode ? sibling(File.join(run_path, 'spinel'), 'content-parity.json') : nil
+
+# ── formatting ───────────────────────────────────────────────────────
+
+def fmt_int(n)  ; n.to_i.to_s.reverse.scan(/\d{1,3}/).join(',').reverse ; end
+def fmt_dec(n, p = 1) ; format("%.#{p}f", n.to_f) ; end
+
+# JIT state from a RUBY_DESCRIPTION. The headline lane inherits the ambient
+# RUBYOPT (unlike the matrix, which pins YJIT per lane), so the page must
+# say which JIT level each measurement actually ran — nil when unknown.
+# A lane timed by the Rails replay (the Rails oracle, and Rails running the
+# futamura emit) writes rails.json; the emit lanes write summary.json.
+def lane_file(r) = %w[rails futamura].include?(r['kind']) ? 'rails.json' : 'summary.json'
+
+def jit_label(desc) ; desc && (desc.include?('+YJIT') ? '+YJIT' : 'no JIT') ; end
+
+# Coefficient of variation (%) across a lane's timed iterations — the
+# "is the median masking noise?" number, one per lane.
+def cv_pct(iter_ms)
+  return nil unless iter_ms && iter_ms.size > 1
+  mean = iter_ms.sum / iter_ms.size.to_f
+  return nil unless mean > 0
+  Math.sqrt(iter_ms.map { |v| (v - mean)**2 }.sum / iter_ms.size) / mean * 100
+end
+def esc(s) ; s.to_s.gsub('&', '&amp;').gsub('<', '&lt;').gsub('>', '&gt;') ; end
+
+def kv_table(rows)
+  out = +"<table>\n<tbody>\n"
+  rows.each do |k, v|
+    next if v.nil? || v.to_s.empty?
+    out << "<tr><th>#{k}</th><td>#{v}</td></tr>\n"
+  end
+  out << "</tbody></table>\n"
+end
+
+# ── SVG primitives (shared shape with scripts/bench-report) ───────────
+
+def svg_open(w, h)
+  %(<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 #{w} #{h}" ) +
+  %(width="#{w}" height="#{h}" font-family="-apple-system,system-ui,sans-serif" font-size="12">)
+end
+def svg_close ; '</svg>' ; end
+
+def t(x, y, s, anchor: 'start', size: 12, weight: nil, fill: '#222')
+  a = %(text-anchor="#{anchor}" font-size="#{size}" fill="#{fill}")
+  a << %( font-weight="#{weight}") if weight
+  %(<text x="#{x}" y="#{y}" #{a}>#{esc(s)}</text>)
+end
+def r(x, y, w, h, fill:, stroke: nil)
+  s = stroke ? %( stroke="#{stroke}") : ''
+  %(<rect x="#{x}" y="#{y}" width="#{w}" height="#{h}" fill="#{fill}"#{s}/>)
+end
+def l(x1, y1, x2, y2, stroke: '#ddd', sw: 1, dash: nil)
+  d = dash ? %( stroke-dasharray="#{dash}") : ''
+  %(<line x1="#{x1}" y1="#{y1}" x2="#{x2}" y2="#{y2}" stroke="#{stroke}" stroke-width="#{sw}"#{d}/>)
+end
+
+COLOR_RH    = '#7d4cdb'   # roundhouse (matches spinel/violet family in bench-report)
+COLOR_RAILS = '#cc342d'   # Rails (ruby red)
+COLOR_JR    = '#5382a1'   # JRuby (steel blue, matches bench-report's jruby)
+COLOR_SP    = '#1f8a70'   # Roundhouse AOT / spinel (teal — a different
+                          # HUE from roundhouse's violet, not a shade of
+                          # it: the two are the same emit on different
+                          # runtimes, and the chart's job is telling them
+                          # apart at a glance
+COLOR_OK    = '#2e7d32'
+COLOR_FAIL  = '#c0392b'
+
+# ── vs-Rails comparison: horizontal ms/iter bars, lower is better ─────
+#
+# Bars are linear (not log) — the whole point is the visible size ratio,
+# and both stacks sit within one decade. A min–max whisker rides each bar
+# so the median isn't mistaken for a point estimate.
+
+def compare_bars(rows, left_pad: 90)
+  width    = 760
+  right    = 110
+  plot_w   = width - left_pad - right
+  row_h    = 34
+  gap      = 14
+  top      = 14
+  height   = top + (row_h + gap) * rows.size + 24
+
+  max_v = rows.map { |r| r[:max] || r[:median] }.max.to_f * 1.12
+  max_v = 1.0 unless max_v.finite? && max_v > 0
+
+  buf = +svg_open(width, height)
+  rows.each_with_index do |row, i|
+    y  = top + i * (row_h + gap)
+    bw = (row[:median].to_f / max_v * plot_w).round
+    buf << t(left_pad - 8, y + row_h * 0.62, row[:label], anchor: 'end', weight: 'bold')
+    buf << r(left_pad, y, [bw, 1].max, row_h, fill: row[:color])
+    buf << t(left_pad + [bw, 1].max + 8, y + row_h * 0.62,
+             "#{fmt_dec(row[:median], 1)} ms", fill: '#222', weight: 'bold')
+    if row[:note]
+      buf << t(left_pad + [bw, 1].max + 8, y + row_h * 0.62 + 13, row[:note], fill: '#777', size: 10)
+    end
+    # min–max whisker across the bar's vertical mid-line
+    if row[:min] && row[:max]
+      ymid = y + row_h / 2.0
+      x1 = left_pad + (row[:min].to_f / max_v * plot_w)
+      x2 = left_pad + (row[:max].to_f / max_v * plot_w)
+      buf << l(x1, ymid, x2, ymid, stroke: '#00000055', sw: 1)
+      [x1, x2].each { |x| buf << l(x, ymid - 5, x, ymid + 5, stroke: '#00000055', sw: 1) }
+    end
+    if row[:iters]
+      buf << t(left_pad + 8, y + row_h * 0.62 + 13, "n=#{row[:iters]}", fill: '#ffffffcc', size: 10)
+    end
+  end
+  buf << svg_close
+  buf
+end
+
+# ── memory footprint: boot baseline + in-run growth, stacked ─────────
+#
+# Two numbers per lane, and the SPLIT is the story. The baseline is what
+# the stack costs standing still — framework loaded, fixture DB seeded,
+# before a single visit. The growth on top is what replaying the
+# sequence retains. A lone peak bar hides which of the two a stack is
+# losing on, and they have different remedies.
+#
+# Bars are linear and share one scale: the size ratio is the point.
+
+def memory_bars(rows, left_pad: 160)
+  width  = 760
+  right  = 96
+  plot_w = width - left_pad - right
+  row_h  = 26
+  gap    = 24
+  top    = 14
+  height = top + (row_h + gap) * rows.size + 4
+
+  max_v = rows.map { |r| r[:peak].to_f }.max.to_f * 1.08
+  max_v = 1.0 unless max_v.finite? && max_v > 0
+
+  buf = +svg_open(width, height)
+  rows.each_with_index do |row, i|
+    y     = top + i * (row_h + gap)
+    bootw = [(row[:boot].to_f / max_v * plot_w).round, 1].max
+    peakw = [(row[:peak].to_f / max_v * plot_w).round, 1].max
+    groww = [peakw - bootw, 0].max
+    buf << t(left_pad - 8, y + row_h * 0.7, row[:label], anchor: 'end', weight: 'bold')
+    # Solid = baseline, translucent = growth: one hue per lane, so the
+    # split reads without a second color to decode.
+    buf << r(left_pad, y, bootw, row_h, fill: row[:color])
+    buf << r(left_pad + bootw, y, groww, row_h, fill: "#{row[:color]}59")
+    buf << t(left_pad + peakw + 8, y + row_h * 0.7, "#{fmt_int(row[:peak].round)} MB", weight: 'bold')
+    buf << t(left_pad, y + row_h + 12,
+             "#{fmt_int(row[:boot].round)} MB baseline + #{fmt_int((row[:peak] - row[:boot]).round)} MB growth",
+             fill: '#777', size: 10)
+  end
+  buf << svg_close
+  buf
+end
+
+# ── frozen-sequence stability: one column per timed iteration ─────────
+#
+# Columns are scaled within a tight band around the observed spread (not
+# from zero) so run-to-run jitter is legible; the dashed line marks the
+# median. This is the "is the number stable?" chart.
+
+def iter_columns(iter_ms, median:, min:, max:, color: COLOR_RH)
+  return '' if iter_ms.nil? || iter_ms.empty?
+  width    = 760
+  left_pad = 44
+  right    = 12
+  plot_w   = width - left_pad - right
+  top      = 14
+  plot_h   = 150
+  bot      = 24
+  height   = top + plot_h + bot
+
+  lo = min * 0.985
+  hi = max * 1.015
+  span = (hi - lo)
+  span = 1.0 unless span.finite? && span > 0
+  colw = plot_w.to_f / iter_ms.size
+  bw   = [colw - 2, 1].max
+
+  buf = +svg_open(width, height)
+  # y ticks: min / median / max
+  [[min, '#888'], [median, color], [max, '#888']].each do |v, c|
+    yy = top + plot_h - (v - lo) / span * plot_h
+    dash = (v == median) ? '4 3' : nil
+    buf << l(left_pad, yy, width - right, yy, stroke: (v == median ? color : '#eee'), dash: dash)
+    buf << t(left_pad - 6, yy + 4, fmt_dec(v, 0), anchor: 'end', fill: c, size: 10)
+  end
+  iter_ms.each_with_index do |v, i|
+    x  = left_pad + i * colw
+    bh = (v - lo) / span * plot_h
+    bh = 1 if bh < 1
+    yy = top + plot_h - bh
+    buf << r(x + (colw - bw) / 2, yy, bw, bh, fill: "#{color}99")
+  end
+  buf << t(left_pad, top + plot_h + 16, "iteration 1", fill: '#999', size: 10)
+  buf << t(width - right, top + plot_h + 16, "iteration #{iter_ms.size}", anchor: 'end', fill: '#999', size: 10)
+  buf << svg_close
+  buf
+end
+
+# ── per-endpoint rails vs roundhouse: paired log-scaled bars ─────────
+#
+# Two bars per endpoint (rails red, roundhouse violet), rows sorted by
+# Rails ms descending so the endpoints that dominate the sequence sit on
+# top. Log scale because endpoint latencies span 0.1–30+ ms.
+
+# One entry per lane the chart can draw, in draw order. A series list
+# rather than a keyword per lane: the AOT lane was the second addition and
+# a third boolean would have meant threading `nbars` arithmetic through
+# five more places.
+PAIRED_SERIES = [
+  [:rails, COLOR_RAILS, 'rails'],
+  [:rh,    COLOR_RH,    'roundhouse'],
+  [:sp,    COLOR_SP,    'roundhouse AOT'],
+  [:jr,    COLOR_JR,    'jruby'],
+].freeze
+
+def paired_hbar(rows, keys)
+  series = PAIRED_SERIES.select { |k, _, _| keys.include?(k) }
+  vals = rows.flat_map { |r| series.map { |k, _, _| r[k] } }.compact.select { |v| v > 0 }
+  return '' if vals.empty?
+  min_dec = [Math.log10(vals.min).floor, 0].min
+  max_dec = [Math.log10(vals.max).ceil, min_dec + 1].max
+
+  nbars    = series.size
+  width    = 760
+  left_pad = 190
+  right    = 70
+  plot_w   = width - left_pad - right
+  barh     = 8
+  inner    = 2
+  gap      = 9
+  group_h  = barh * nbars + inner * (nbars - 1) + gap
+  top      = 22
+  bot      = 26
+  height   = top + group_h * rows.size + bot
+
+  buf = +svg_open(width, height)
+  # legend — laid out from each label's own width so a longer lane name
+  # can't overlap the next swatch.
+  lx = left_pad
+  series.each do |_, color, label|
+    buf << r(lx, 6, 12, 10, fill: color)
+    buf << t(lx + 16, 15, label, fill: '#333', size: 11)
+    lx += 16 + label.length * 6 + 18
+  end
+
+  (min_dec..max_dec).each do |d|
+    x = left_pad + (d - min_dec).to_f / (max_dec - min_dec) * plot_w
+    buf << l(x, top, x, height - bot, stroke: '#eee')
+    buf << t(x, height - bot + 14, fmt_int(10 ** d), anchor: 'middle', fill: '#888', size: 10)
+  end
+  buf << t(width - 2, height - bot + 14, 'ms', anchor: 'end', fill: '#aaa', size: 10)
+
+  scale = ->(v) do
+    lv = Math.log10([v, 10.0 ** min_dec].max)
+    [((lv - min_dec) / (max_dec - min_dec) * plot_w).round, 1].max
+  end
+
+  rows.each_with_index do |row, i|
+    y = top + i * group_h
+    label_y = y + (barh * nbars + inner * (nbars - 1)) / 2.0 + 3
+    buf << t(left_pad - 6, label_y, row[:key], anchor: 'end', size: 10, fill: '#333')
+    series.each_with_index do |(key, color, _), s|
+      v = row[key]
+      next unless v && v > 0
+      buf << r(left_pad, y + (barh + inner) * s, scale.call(v), barh, fill: color)
+    end
+    if row[:ratio]
+      buf << t(width - right + 4, label_y, "#{fmt_dec(row[:ratio], 1)}×",
+               fill: (row[:ratio] >= 1 ? COLOR_OK : COLOR_FAIL), size: 10, weight: 'bold')
+    end
+  end
+  buf << svg_close
+  buf
+end
+
+# ── per-route latency: log-scaled horizontal bars ────────────────────
+#
+# Route timings span two-plus decades (sub-ms static pages up to /u), so
+# a log scale is the only honest fit. Decades are derived from the data
+# and allowed below 1 ms.
+
+def route_hbar(routes, metric:, unit:, fmt:)
+  vals = routes.map { |c| c[metric].to_f }.reject { |v| v <= 0 }
+  return '' if vals.empty?
+  min_dec = [Math.log10(vals.min).floor, 3].min
+  max_dec = [Math.log10(vals.max).ceil, min_dec + 1].max
+
+  width    = 760
+  left_pad = 190
+  right    = 90
+  plot_w   = width - left_pad - right
+  row_h    = 16
+  gap      = 3
+  top      = 8
+  bot      = 26
+  height   = top + (row_h + gap) * routes.size + bot
+
+  buf = +svg_open(width, height)
+  (min_dec..max_dec).each do |d|
+    x = left_pad + (d - min_dec).to_f / (max_dec - min_dec) * plot_w
+    buf << l(x, top, x, height - bot, stroke: '#eee')
+    buf << t(x, height - bot + 14, fmt_int(10 ** d), anchor: 'middle', fill: '#888', size: 10)
+  end
+  buf << t(width - 2, height - bot + 14, unit, anchor: 'end', fill: '#aaa', size: 10)
+
+  routes.sort_by { |c| -c[metric].to_f }.each_with_index do |c, i|
+    y = top + i * (row_h + gap)
+    v = c[metric].to_f
+    lv = Math.log10([v, 10.0 ** min_dec].max)
+    bar = ((lv - min_dec) / (max_dec - min_dec) * plot_w).round
+    bar = [bar, 1].max
+    fill = c['ok'] == false ? COLOR_FAIL : COLOR_RH
+    buf << t(left_pad - 6, y + row_h * 0.8, c['route'], anchor: 'end', size: 10, fill: '#333')
+    buf << r(left_pad, y, bar, row_h, fill: fill)
+    buf << t(left_pad + bar + 5, y + row_h * 0.8, fmt.call(v), fill: '#444', size: 10)
+  end
+  buf << svg_close
+  buf
+end
+
+# ── page ─────────────────────────────────────────────────────────────
+
+pass  = summary['pass']  || routes.count { |r| r['ok'] }
+total = summary['total'] || routes.size
+thin  = summary['thin']  || routes.count { |r| r['thin'] }
+all_pass = pass == total && total > 0
+
+# Headline per-iteration statistic: the mean when the lane recorded one
+# (ruby-bench's own reported number — "Average of last N, non-warmup
+# iters"), the median for lanes measured before ms_per_iter_mean existed.
+# Distribution detail (min–max, iteration columns) and per-route medians
+# keep their own labelled statistics.
+hl_seq = ->(t) { t && (t['ms_per_iter_mean'] || t['ms_per_iter_median'])&.to_f }
+hl_row = ->(r) { r && (r['ms_mean'] || r['ms_median'])&.to_f }
+speedup = nil
+if rails && timing && hl_seq.(rails).to_f > 0 && hl_seq.(timing).to_f > 0
+  speedup = hl_seq.(rails) / hl_seq.(timing)
+end
+
+# Sections are numbered in render order but the timing/comparison ones
+# only appear when their data is present, so hand out numbers as we go.
+@section = 0
+def section_no ; @section += 1 ; end
+
+styles = <<~CSS
+  body { font-family: -apple-system, system-ui, sans-serif; color: #222;
+         max-width: 880px; margin: 2em auto; padding: 0 1em; line-height: 1.5; }
+  h1 { font-size: 1.6em; margin-bottom: 0.2em; }
+  h2 { font-size: 1.2em; margin-top: 2em; border-bottom: 1px solid #ddd;
+       padding-bottom: 0.2em; }
+  h3 { font-size: 1.0em; color: #555; margin: 1.4em 0 0.4em; }
+  .meta { color: #666; font-size: 0.9em; margin-bottom: 1em; }
+  .methodology { background: #f7f7f7; border-left: 3px solid #ccc;
+                 padding: 0.6em 1em; font-size: 0.92em; }
+  .methodology code { background: #ececec; padding: 0.05em 0.3em;
+                      border-radius: 3px; font-size: 0.9em; }
+  .caveat { color: #777; font-size: 0.9em; font-style: italic; }
+  .badges { margin: 0.8em 0 0.4em; }
+  .badge { display: inline-block; padding: 0.25em 0.7em; border-radius: 999px;
+           font-size: 0.9em; font-weight: 600; margin-right: 0.5em; }
+  .badge.pass { background: #e7f4e8; color: #2e7d32; }
+  .badge.fail { background: #fdecea; color: #c0392b; }
+  .badge.speed { background: #efe9fb; color: #5b32b0; }
+  table { border-collapse: collapse; font-size: 0.88em; margin: 0.4em 0; }
+  th, td { padding: 4px 10px; border-bottom: 1px solid #eee; }
+  th { text-align: left; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  td.ok  { color: #2e7d32; font-weight: 600; }
+  td.no  { color: #c0392b; font-weight: 600; }
+  details summary { cursor: pointer; color: #555; padding: 0.4em 0; }
+  .legend { font-size: 0.85em; color: #666; }
+  .alarm { border: 2px solid #b00; background: #fff4f4; border-radius: 6px;
+           padding: 0.9em 1.1em; margin: 1.2em 0; }
+  .alarm h2 { margin: 0 0 0.4em; font-size: 1.05em; color: #b00; border: none; padding: 0; }
+  .gaps { border: 1px solid #d8d8d8; background: #fafafa; border-radius: 6px;
+          padding: 0.9em 1.1em; margin: 1.2em 0; }
+  .gaps h2 { margin: 0 0 0.4em; font-size: 1.05em; color: #555; border: none; padding: 0; }
+  .gaps table { font-size: 0.86em; }
+  .gaps .why { margin: 0.6em 0 0; font-size: 0.9em; color: #444; }
+  .gapmark { font-size: 0.78em; color: #7a5c00; background: #fdf4dc;
+             border-radius: 3px; padding: 0.05em 0.4em; white-space: nowrap; }
+  .alarm ul { margin: 0.5em 0 0; padding-left: 1.3em; }
+  .alarm .why { margin: 0.6em 0 0; font-size: 0.9em; color: #444; }
+  svg { display: block; margin: 0.4em auto; max-width: 100%; }
+CSS
+
+html = +"<!doctype html>\n<html lang=en>\n<head>\n<meta charset=utf-8>\n"
+html << %(<meta name="viewport" content="width=device-width, initial-scale=1">\n)
+html << "<title>Lobsters bench — #{run_dir}</title>\n<style>#{styles}</style>\n</head>\n<body>\n"
+
+html << "<h1>Lobsters benchmark results</h1>\n"
+prov = ''
+prov << " · #{summary['generated_at']}" if summary['generated_at']
+if env && env['roundhouse_commit']
+  prov << %( · <code>#{env['roundhouse_commit'][0, 12]}</code>)
+  prov << ' <strong>+dirty</strong>' if env['roundhouse_dirty']
+end
+# The AOT lane is drawn on the headline charts, so the compiler that built it
+# belongs in the headline too — not only behind the provenance <details>. An
+# AOT bar that moved because spinel moved is otherwise indistinguishable from
+# one that moved because the emit did.
+# Pull the SHA out by SHAPE, not by position. `spinel --version` was
+# "spinel <sha>" and this took the last token; matz/spinel fd0bc35e (PR
+# #3798) appended the C compiler, so it became "spinel <sha> [cc (Ubuntu
+# 13.3.0-6ubuntu2~24.04.1) 13.3.0]" and the headline started stamping the
+# run with "spinel 13.3.0]" — the gcc version, wearing the spinel label,
+# in the one line every reader sees. It degraded silently because a
+# version-shaped string in a version-shaped slot looks right.
+sp_ver = (spinel && spinel.dig('aot', 'spinel')) || env&.dig('spinel')
+if sp_ver && (sp_hash = sp_ver[/\b[0-9a-f]{7,40}\b/] || sp_ver.split(/\s+/)[1])
+  prov << %( · spinel <code>#{esc(sp_hash[0, 12])}</code>)
+end
+html << %(<div class="meta">Run <code>#{run_dir}</code>#{prov}</div>\n)
+
+# ── Trust banner ─────────────────────────────────────────────────────
+# The performance numbers on this page are a claim that work was done.
+# This banner is what makes that claim falsifiable: it appears whenever
+# any lane's output was wrong OR was never checked, and it disappears on
+# its own when every lane is verified clean. Its ABSENCE is the signal —
+# so "not checked" must raise it just as loudly as "checked and wrong",
+# or a run with no oracle would render as a clean bill of health.
+#
+# Three inputs, all already produced by the run:
+#   content parity   — does this lane render what Rails renders?
+#   failed_visits    — did the timed sequence itself see non-200s? (a lane
+#                      that answers nothing answers very fast)
+#   lane state       — did the lane die before producing anything?
+trouble = []
+(mrows || []).each do |r|
+  lane_name = "#{r['label']} #{r['jit']}".strip
+  if r['state'] && r['state'] != 'ok'
+    trouble << [lane_name, "produced no data — #{r['state']} at #{r['stage']}" +
+                      (r['detail'].to_s.empty? ? '' : ": #{r['detail']}")]
+    next
+  end
+  next if r['kind'] == 'rails'   # Rails IS the oracle; it is not compared to itself
+  if r['content_total'].nil?
+    trouble << [lane_name, 'content was never compared — no Rails lane in this run to compare against']
+  elsif r['content_differs'].to_i > 0
+    # Declared gaps are known missing capability, not an unexplained
+    # difference. They still cost the lane its parity score -- the counts
+    # below are untouched -- but listing them here would say the numbers
+    # are untrustworthy for a reason we already understand and have
+    # written down. Undeclared differences are exactly that alarm.
+    undeclared = r['content_undeclared']
+    declared   = r['content_gaps'] || []
+    if undeclared.nil?
+      # matrix.json predates the declared-gap fields. Fall back to the old
+      # undifferentiated message: an absent key means "not classified", and
+      # treating that as "nothing undeclared" would silently drop the alarm
+      # on exactly the runs that have no ledger to justify dropping it.
+      diff_names = (r['content_routes'] || []).map { |x| x['route'] }.first(6).join(', ')
+      trouble << [lane_name, "renders #{r['content_equivalent']}/#{r['content_total']} routes equivalent to Rails" +
+                        (diff_names.empty? ? '' : " — differs on #{diff_names}")]
+    elsif undeclared.any?
+      trouble << [lane_name, "renders #{r['content_equivalent']}/#{r['content_total']} routes equivalent to Rails" +
+                        " — differs on #{undeclared.first(6).join(', ')}" +
+                        (declared.empty? ? '' : " (plus #{declared.size} declared gap#{declared.size == 1 ? '' : 's'})")]
+    end
+  end
+  if r['failed_visits'].to_i > 0
+    trouble << [lane_name, "#{r['failed_visits']} of the timed sequence's visits did not return 200 — " \
+                      'failing visits short-circuit, so this lane\'s ms/iter is faster than real work']
+  end
+end
+
+# EVERY ratio on this page divides one lane's ms/iter by another's. That is
+# only meaningful if the lanes replayed the SAME visits. When a deferral
+# reaches some lanes and not others -- a stale checkout on the bench box, a
+# lane that ran before a fix landed -- the counts diverge and the ratio
+# silently absorbs the difference as speed.
+#
+# Not hypothetical: a run published 4.26x while Rails replayed 114 visits
+# against the emit lanes' 106. The eight extra were the two deferred routes,
+# worth 38 ms/iter of Rails work the emit never did -- 8% of Rails' total.
+# The honest figure was 3.93x. Nothing on the page said so.
+#
+# This cannot be repaired at render time (the lanes are already measured),
+# so it is reported rather than corrected, and it is deliberately loud.
+visit_counts = (mrows || []).select { |r| r['ms_median'] }.filter_map { |r|
+  ["#{r['label']} #{r['jit']}".strip, r['visits'].to_i] if r['visits']
+}.uniq
+if visit_counts.map(&:last).uniq.size > 1
+  spread = visit_counts.map { |n, v| "#{n} #{v}" }.join(', ')
+  trouble << ['All lanes', "replayed DIFFERENT visit counts (#{spread}) — every ratio on this " \
+              'page divides lanes that did not do the same work, so the speed figures are ' \
+              'invalid, not merely noisy. A lane most likely ran before a deferral change ' \
+              'reached it; re-run with every lane on the same commit.']
+end
+
+if trouble.any?
+  html << %(<div class="alarm">\n)
+  html << "<h2>The performance numbers on this page are not trustworthy</h2>\n"
+  html << "<ul>\n"
+  trouble.each { |ln, why| html << "<li><strong>#{esc(ln)}</strong> — #{esc(why)}</li>\n" }
+  html << "</ul>\n"
+  html << %(<p class="why">Timings below are still shown, and are still real measurements of what the code did — but what the code did was not what Rails does, so they do not measure the same work and must not be compared. This banner is generated from the run's own data and disappears by itself once every lane renders what Rails renders on every route IN SCOPE, and every timed visit returns 200. Routes deferred out of scope are listed below with the reason; they are excluded from the timed sequence in every lane, including Rails, so the lanes still measure the same work.</p>\n)
+  html << "</div>\n"
+end
+
+# The declared-gap ledger. Deliberately NOT inside the red banner and
+# deliberately not a substitute for it: these routes are still counted as
+# failures everywhere else on the page. This says only which failures are
+# understood, so an unimplemented capability stops looking like a defect
+# nobody has diagnosed.
+if DECLARED_GAPS.any?
+  html << %(<div class="gaps">\n)
+  html << "<h2>#{DECLARED_GAPS.size} route#{DECLARED_GAPS.size == 1 ? '' : 's'} the AOT lane is known not to render</h2>\n"
+  html << "<table>\n<thead><tr><th>route</th><th>why</th><th>closes with</th><th>since</th></tr></thead>\n<tbody>\n"
+  DECLARED_GAPS.each do |g|
+    html << "<tr><td><code>#{esc(g['route'])}</code></td>"
+    html << "<td>#{esc(g['reason'])}</td>"
+    html << "<td>#{esc(g['closes_with'])}</td>"
+    html << "<td class=\"num\">#{esc(g['since'])}</td></tr>\n"
+  end
+  html << "</tbody>\n</table>\n"
+  html << %(<p class="why">These are counted as failures in every number on this page — the parity badge above still reads them as not rendering what Rails renders. Listing them here separates a capability we have not built from a difference nobody has explained; both are failures, and only one is a surprise.</p>\n)
+  html << "</div>\n"
+end
+
+# Badges are what gets skimmed and quoted, so they carry the STRONG
+# oracle and name their lanes. They used to do neither: two of the three
+# counted HTTP 200s — which this page's own methodology calls a weak
+# oracle, "a 200 that renders half a page is still a 200" — and the speed
+# badge named neither side of its own division. A run whose AOT lane was
+# at 21/26 content parity advertised "spinel 25/26 routes" directly under
+# a banner saying the numbers were not trustworthy. Status coverage still
+# exists; it lives in the coverage section, which is about coverage.
+mlanes = (mrows || []).select { |r| r['ms_median'] }
+prim_row  = mlanes.find { |r| r['id'] == prim } || mlanes.find { |r| r['kind'] != 'rails' }
+rails_row = mlanes.find { |r| r['kind'] == 'rails' && r['yjit'] == prim_row&.dig('yjit') } ||
+            mlanes.find { |r| r['kind'] == 'rails' }
+html << %(<div class="badges">)
+compared = mlanes.select { |r| r['kind'] != 'rails' && r['content_total'] }
+if compared.any?
+  compared.each do |r|
+    ok = r['content_equivalent'].to_i == r['content_total'].to_i
+    scope    = r['content_scope'] || r['content_total']
+    deferred = r['content_deferred'].to_i
+    html << %(<span class="badge #{ok ? 'pass' : 'fail'}">#{esc(r['label'])} #{esc(r['jit'])} )
+    html << %(#{r['content_equivalent']}/#{scope} content parity)
+    html << %( · #{deferred} deferred) if deferred > 0
+    html << %(</span>\n)
+  end
+else
+  # No oracle in this run. The badge has to say that rather than showing a
+  # 200-count that reads like a clean bill of health.
+  html << %(<span class="badge #{all_pass ? 'pass' : 'fail'}">#{pass}/#{total} return 200 — content never compared</span>\n)
+end
+html << %(<span class="badge fail">#{thin} thin</span>\n) if thin.to_i > 0
+if speedup
+  # Name both sides. This is roundhouse's primary emit lane against Rails
+  # at the SAME JIT level, which the prose said and the badge did not.
+  lhs = prim_row ? "#{prim_row['label']} #{prim_row['jit']}" : 'roundhouse'
+  rhs = rails_row ? "Rails #{rails_row['jit']}" : 'Rails'
+  html << %(<span class="badge speed">#{fmt_dec(speedup, 2)}× — #{esc(lhs)} vs #{esc(rhs)}</span>\n)
+end
+# A lane below full parity gets its RESTRICTED ratio here, not its
+# headline one: the headline is partly earned by rendering less, and this
+# row is exactly where that distinction is most likely to be missed.
+mlanes.select { |r| r['vs_rails_parity'] }.each do |r|
+  html << %(<span class="badge speed">#{esc(r['label'])} #{esc(r['jit'])} )
+  html << %(#{fmt_dec(r['vs_rails_parity'], 2)}× over the #{r['parity_routes']} routes it renders correctly</span>\n)
+end
+html << "</div>\n"
+
+# Sibling artifacts published alongside this page.
+artifact_names = if lanes_mode
+  # The emitted trees ride along as tarballs so a compiler author can
+  # reproduce a lane's numbers without a roundhouse checkout: the AOT tree
+  # is what spinel compiled, and the CRuby tree is the lane it is being
+  # compared against. Each carries a REPRODUCE.md with the SHAs and the
+  # exact commands. Existence-filtered below, so a run without them is fine.
+  %w[matrix.json env.json spinel-tree.tgz ruby-tree.tgz] +
+    mrows.map { |r| File.join(r['id'], lane_file(r)) }
+else
+  %w[summary.json summary.md rails.json sequence.json env.json emit.log
+     matrix/matrix.json jruby/summary.json jruby/summary.md]
+end
+artifacts = artifact_names.select { |f| File.exist?(File.join(run_path, f)) }
+unless artifacts.empty?
+  html << %(<div class="meta">Artifacts: #{artifacts.map { |f| %(<a href="#{f}"><code>#{f}</code></a>) }.join(' · ')}</div>\n)
+end
+
+# ── methodology ──────────────────────────────────────────────────────
+
+vpi   = timing&.dig('visits_per_iter') || rails&.dig('visits_per_iter')
+db    = summary['db']
+memnote = summary['memory'] ? 'an in-memory SQLite seeded at boot' : 'a file-backed SQLite'
+html << <<~METHOD
+  <div class="methodology">
+    <strong>Methodology — ruby-bench's, deliberately.</strong> Every lane times under the ruby-bench harness rule: 15 full-sequence warmup iterations discarded from the stats, then more until at least the minimum timed iterations are recorded AND total wall clock — warmup included, as upstream counts it — reaches the minimum seconds. The reported figure is the <strong>average ms per iteration over the non-warmup iterations</strong>, the statistic ruby-bench itself prints; the median stays in each lane's JSON as a robustness cross-check. #{vpi ? "The stability and comparison numbers replay a <strong>frozen #{vpi}-visit sequence</strong> (versioned at <code>bench/lobsters/frozen-sequence.json</code>) so every run — and the Rails baseline — walks the identical path." : ''} Both stacks serve from #{memnote}#{db ? " (<code>#{esc(db)}</code>)" : ''}, the shape the ruby-bench lobsters benchmark runs. The per-route table further down replays each distinct route once, before warmup, to verify status, bytes and content — it publishes no latency; each lane's pre-warmup single shot stays in its summary JSON as a diagnostic.
+    #{matrix ? %(<p>The <strong>runtime × JIT matrix</strong> section re-runs the same frozen sequence once per interpreter × JIT lane — in-process, in-memory, single-threaded — so its rows differ only in the runtime under test.</p>) : ''}
+    #{legacy_jruby ? %(<p>The <strong>JRuby lane</strong> replays the JRuby-emitted app in its own run: file-backed (no in-memory backup on the JDBC adapter) and timing the full route set — its numbers trend against earlier JRuby runs, not against the in-memory sections.</p>) : ''}
+    <p>Every lane runs <code>ANALYZE</code> once after seeding its in-memory copy (a departure from stock ruby-bench, whose fixture DB carries no <code>sqlite_stat1</code>): without planner statistics SQLite misplans the hottest-stories SELECT under /rss, /hottest, and /recent — a full-table walk plus sort instead of reading <code>hotness_idx</code> to the LIMIT, ~100× the query cost — and both stacks pay that same planner accident. Statistics restore the plan a production database would have; both lanes get identical stats, so the comparison is unchanged in kind and fairer in degree.</p>
+    <p class="caveat">This measures one specific reference app (the ruby-bench lobsters fixture), not arbitrary Rails workloads. The Rails baseline runs the <em>real</em> Rails lobsters over the same sequence; the roundhouse cell serves the same routes from the Roundhouse-emitted framework.</p>
+  </div>
+METHOD
+
+# ── Section: vs Rails (legacy layout only — the lane layout's headline
+# lives at the top of the matrix section, since they are one dataset) ──
+
+if rails && timing && !lanes_mode
+  html << "<h2>#{section_no}. Roundhouse vs Rails</h2>\n"
+  html << %(<p>Milliseconds per iteration of the frozen #{vpi}-visit sequence — <strong>lower is better</strong>. The whisker spans each stack's min–max across its timed iterations.</p>\n)
+  html << compare_bars([
+    { label: ["rails #{rails['rails']}", jit_label(rails['ruby'])].compact.join(' '), color: COLOR_RAILS,
+      median: hl_seq.(rails), min: rails['ms_per_iter_min'],
+      max: rails['ms_per_iter_max'], iters: rails['iterations'] },
+    { label: ['roundhouse', jit_label(env&.dig('ruby'))].compact.join(' '), color: COLOR_RH,
+      median: hl_seq.(timing), min: timing['ms_per_iter_min'],
+      max: timing['ms_per_iter_max'], iters: timing['iterations'] },
+  ], left_pad: 160)
+  if speedup
+    html << %(<p><strong>#{fmt_dec(speedup, 2)}× faster than Rails</strong> — )
+    html << %(#{fmt_dec(hl_seq.(timing), 1)} ms/iter#{timing['ms_per_iter_mean'] ? ' (avg)' : ''} vs Rails' #{fmt_dec(hl_seq.(rails), 1)} ms/iter.</p>\n)
+  end
+end
+
+# ── Section: runtime × JIT matrix (from matrix/matrix.json) ──────────
+
+# Lane identity helpers, hoisted above the section that first uses them:
+# the memory section further down keys off the same colors and labels, and
+# a lane must not change appearance between the two.
+#
+# Colors keyed by lane id (matches the blog bench vocabulary); the
+# kind/yjit fallback covers matrix.json files that predate lane ids.
+mcolor = { 'rails' => COLOR_RAILS, 'rails-int' => '#e89c93', 'rails-jruby' => '#46707f',
+           'ruby' => COLOR_RH, 'ruby-int' => '#b9a3ea', 'jruby' => COLOR_JR,
+           'futamura' => '#d68a00' }
+lane_color = ->(r) do
+  mcolor[r['id']] ||
+    (r['kind'] == 'rails' ? (r['yjit'] ? COLOR_RAILS : '#e89c93')
+                          : (r['yjit'] ? COLOR_RH    : '#b9a3ea'))
+end
+lane_jit = ->(r) { r['jit'] || (r['yjit'] ? '+YJIT' : 'no JIT') }
+
+if mrows && !mrows.empty?
+  # Rows with no ms_median are lanes that died. They are kept OUT of the
+  # chart and the derived insights (there is nothing to plot and nothing
+  # to divide) but listed under the table, so the page still says the
+  # lane was asked for and what became of it.
+  mdead   = mrows.reject { |r| r['ms_median'] }
+  mlive   = mrows.select { |r| r['ms_median'] }
+  msorted = mlive.sort_by { |r| hl_row.(r) }
+  mby_key = mlive.to_h { |r| [[r['kind'], r['yjit']], r] }
+
+  # In the lane layout this section IS the headline — the vs-Rails number
+  # is the same-JIT pair of these rows, so it opens the section rather
+  # than duplicating as a chart of its own.
+  if lanes_mode && speedup
+    # Say which rows carry the claims. Five lanes in one table reads as
+    # five equal results; they are not. Rails +YJIT is the baseline, the
+    # primary emit lane is the like-for-like comparison against it, and
+    # AOT is a different runtime for the same emit. The no-JIT pair is
+    # there to size the JIT's contribution, not to be quoted.
+    html << "<h2>#{section_no}. Roundhouse vs Rails — runtime × JIT</h2>\n"
+    aot_row = mlanes.find { |r| r['runtime'] == 'spinel' }
+    nojit   = mlanes.count { |r| r['yjit'] == false }
+    # "three of them the claim" only when there ARE extra rows to set aside;
+    # with exactly the three it is a contradiction.
+    html << %(<p class="legend"><strong>#{mlanes.size} lanes#{nojit > 0 ? ', three of them the claim' : ''}.</strong> )
+    html << %(<em>#{esc(rails_row ? "Rails #{rails_row['jit']}" : 'Rails +YJIT')}</em> is the baseline; )
+    html << %(<em>#{esc(prim_row ? "#{prim_row['label']} #{prim_row['jit']}" : 'roundhouse +YJIT')}</em> is the like-for-like comparison against it — same runtime, same JIT, so the only variable is the code; )
+    html << if aot_row
+      %(<em>#{esc("#{aot_row['label']} #{aot_row['jit']}")}</em> is the same emit through a different runtime, and is#{aot_row['content_differs'].to_i > 0 ? ' not at full content parity' : ' at full content parity'}. )
+    else
+      %(the AOT lane did not run. )
+    end
+    html << %(The #{nojit} no-JIT row#{nojit == 1 ? '' : 's'} size the JIT's contribution and are not the headline.</p>\n) if nojit > 0
+
+    html << %(<p><strong>#{fmt_dec(speedup, 2)}× faster than Rails</strong> — #{fmt_dec(hl_seq.(timing), 1)} ms/iter#{timing['ms_per_iter_mean'] ? ' (avg)' : ''} vs Rails' #{fmt_dec(hl_seq.(rails), 1)}, both stacks CRuby with YJIT. The full field:</p>\n)
+    # A drifting lane's ms/iter is a function of how long the run happened
+    # to be, so any ratio drawn from it moves with --time. The drift column
+    # already reports this; the CLAIM needs it too, because that is where a
+    # number gets quoted away from its column.
+    drifty = mlanes.select { |r| r['drift_pct'] && r['drift_pct'].abs >= 5 }
+    if drifty.any?
+      html << %(<p class="caveat"><strong>These ratios depend on run length.</strong> )
+      html << drifty.map { |r|
+        d = r['drift_pct']
+        "#{esc(r['label'])} #{esc(r['jit'])} #{d > 0 ? 'slowed' : 'sped up'} #{fmt_dec(d.abs, 1)}% across its own timed run"
+      }.join('; ')
+      html << %(, so its ms/iter — and every multiplier drawn from it — would read differently at a different <code>--time</code>. Upward drift on the AOT lane is live-heap growth raising mark cost; downward drift on a JIT lane is warmup that has not finished.</p>\n)
+    end
+  else
+    html << "<h2>#{section_no}. Runtime × JIT matrix</h2>\n"
+  end
+  html << <<~P
+    <p>Every lane replays the same frozen sequence <strong>in-process, in-memory, single-threaded</strong> — no HTTP server, no load generator — so the only variable across rows is the interpreter × JIT under test (the <a href="https://railsatscale.com/2023-08-25-we-turned-lobsters-into-a-rails-benchmark-for-yjit/">ruby-bench lobsters-for-YJIT</a> shape). Lower is better; whiskers span each lane's min–max.</p>
+  P
+  html << compare_bars(msorted.map { |r|
+    { label: "#{r['label']} #{lane_jit.(r)}", color: lane_color.(r),
+      median: hl_row.(r), min: r['ms_min'], max: r['ms_max'],
+      iters: r['iters'],
+      note: (r['vs_rails'] && r['kind'] != 'rails' ? "#{fmt_dec(r['vs_rails'], 2)}× vs Rails" : nil) }
+  }, left_pad: 160)
+
+  insights = []
+  %w[rails emit].each do |kind|
+    on, off = mby_key[[kind, true]], mby_key[[kind, false]]
+    next unless on && off && hl_row.(on).to_f > 0
+    name = kind == 'rails' ? 'Rails' : 'Roundhouse'
+    insights << "<strong>#{name}</strong> gains #{fmt_dec(hl_row.(off) / hl_row.(on), 2)}× from YJIT (#{fmt_dec(hl_row.(off), 1)} → #{fmt_dec(hl_row.(on), 1)} ms/iter)"
+  end
+  [true, false].each do |yj|
+    rl, em = mby_key[['rails', yj]], mby_key[['emit', yj]]
+    next unless rl && em && hl_row.(em).to_f > 0
+    insights << "<strong>Roundhouse</strong> is #{fmt_dec(hl_row.(rl) / hl_row.(em), 2)}× faster than Rails #{yj ? 'with YJIT' : 'without a JIT'} (#{fmt_dec(hl_row.(rl), 1)} → #{fmt_dec(hl_row.(em), 1)} ms/iter)"
+  end
+  rj_row = mlive.find { |r| r['id'] == 'rails-jruby' }
+  je_row = mlive.find { |r| r['id'] == 'jruby' }
+  if rj_row && je_row && hl_row.(je_row).to_f > 0
+    insights << "On the JVM, <strong>Roundhouse</strong> is #{fmt_dec(hl_row.(rj_row) / hl_row.(je_row), 2)}× faster than Rails (#{fmt_dec(hl_row.(rj_row), 1)} → #{fmt_dec(hl_row.(je_row), 1)} ms/iter)"
+    rl_y = mby_key[['rails', true]]
+    if rl_y && hl_row.(rl_y).to_f > 0
+      insights << "<strong>Rails itself</strong> runs #{fmt_dec(hl_row.(rj_row) / hl_row.(rl_y), 2)}× slower on JRuby than on CRuby+YJIT (#{fmt_dec(hl_row.(rl_y), 1)} → #{fmt_dec(hl_row.(rj_row), 1)} ms/iter)"
+    end
+  end
+  html << "<ul>\n#{insights.map { |i| "<li>#{i}</li>" }.join("\n")}\n</ul>\n" unless insights.empty?
+
+  # Per-lane iteration series (lane layout): a CV column in the table
+  # and collapsible stability strips — the old standalone stability
+  # section, folded in so it scales with the lane count.
+  lane_iters = {}
+  if lanes_mode
+    mlive.each do |r|
+      data = sibling(File.join(run_path, r['id']), lane_file(r))
+      t = lane_file(r) == 'rails.json' ? data : data && data['sequence_timing']
+      im = t && t['iter_ms']
+      lane_iters[r['id']] = im if im && im.size > 1
+    end
+  end
+  cv_col = !lane_iters.empty?
+
+  # This table is TIME ONLY. Memory gets its own section further down —
+  # a peak-RSS column here sat directly beside "vs Rails" and invited
+  # reading that time ratio as a memory one (3.61x and 2.71x on the same
+  # row: close enough that the misreading is silent).
+  # Drift is a different failure from noise and needs its own column. A
+  # noisy lane's median is still its median; a DRIFTING lane's median is a
+  # function of how long the run happened to be, so the headline ratio
+  # moves with --time for no better reason.
+  drift_col = mlive.any? { |r| r['drift_pct'] }
+  # A lane below full content parity has a headline ratio that is not
+  # measuring the same work as its baseline: a route it renders as a
+  # fraction of the page is fast for a reason that is not speed. The
+  # restricted column re-runs the ratio over only the routes that lane
+  # renders equivalently to Rails, on BOTH sides of the division. Present
+  # only when some lane is below parity — at full parity it would just
+  # restate the column beside it.
+  par_col = mlive.any? { |r| r['vs_rails_parity'] }
+  html << "<table>\n<thead><tr><th>stack</th><th>JIT</th><th>#{mlive.any? { |r| r['ms_mean'] } ? 'avg ms/iter' : 'ms/iter'}</th><th>min–max</th>#{cv_col ? '<th>CV</th>' : ''}#{drift_col ? '<th>drift</th>' : ''}<th>iters</th><th>vs Rails</th>#{par_col ? '<th>vs Rails<br>(parity only)</th>' : ''}</tr></thead>\n<tbody>\n"
+  msorted.each do |r|
+    html << "<tr>"
+    html << %(<td><strong>#{esc(r['label'])}</strong></td>)
+    html << %(<td>#{lane_jit.(r)}</td>)
+    html << %(<td class="num">#{fmt_dec(hl_row.(r), 2)}</td>)
+    html << %(<td class="num">#{fmt_dec(r['ms_min'], 1)}–#{fmt_dec(r['ms_max'], 1)}</td>)
+    if cv_col
+      cv = cv_pct(lane_iters[r['id']])
+      html << %(<td class="num">#{cv ? "#{fmt_dec(cv, 1)}%" : '—'}</td>)
+    end
+    if drift_col
+      d = r['drift_pct']
+      cls = d && d.abs >= 5 ? 'num no' : 'num'
+      html << %(<td class="#{cls}">#{d ? "#{d > 0 ? '+' : ''}#{fmt_dec(d, 1)}%" : '—'}</td>)
+    end
+    html << %(<td class="num">#{r['iters']}</td>)
+    html << %(<td class="num">#{r['vs_rails'] ? "#{fmt_dec(r['vs_rails'], 2)}×" : '—'}</td>)
+    if par_col
+      if (vp = r['vs_rails_parity'])
+        html << %(<td class="num"><strong>#{fmt_dec(vp, 2)}×</strong><br><span class="legend">#{r['parity_routes']} routes</span></td>)
+      else
+        html << %(<td class="num">—</td>)
+      end
+    end
+    html << "</tr>\n"
+  end
+  # Lanes that were asked for and produced nothing. Listed in the same
+  # table as the ones that worked: a run where a lane died is a different
+  # run from one where it was never configured, and the table is where a
+  # reader looks to tell them apart.
+  mdead.each do |r|
+    why = "#{r['state'] || 'failed'}#{r['stage'].to_s.empty? ? '' : " at #{r['stage']}"}"
+    why << ": #{r['detail']}" unless r['detail'].to_s.empty?
+    span = 4 + (cv_col ? 1 : 0) + (drift_col ? 1 : 0) + (par_col ? 1 : 0)
+    html << "<tr>"
+    html << %(<td><strong>#{esc(r['label'])}</strong></td>)
+    html << %(<td>#{lane_jit.(r)}</td>)
+    html << %(<td class="num no" colspan="#{span}"><strong>NO DATA</strong> — #{esc(why)}</td>)
+    html << "</tr>\n"
+  end
+  html << "</tbody></table>\n"
+  # Which SQLite build each lane queried, from the lane's own runtime
+  # (`select sqlite_version()` through its own linked library). SQLite is
+  # "the same C code in every lane" only if the versions say so: the
+  # interpreted lanes run the sqlite3 gem's bundled build while the AOT
+  # binary links the system one, and /top — the purest query route —
+  # profiled at ~94% inside libsqlite3. A version gap there is a library
+  # delta wearing a runtime delta's clothes, so a match is attested and a
+  # mismatch is named where the ratios are read.
+  sqlv = mlive.filter_map { |r| r['sqlite'] }.uniq
+  if sqlv.size > 1
+    per = mlive.map { |r| "#{r['label']} #{lane_jit.(r)}: #{r['sqlite'] || 'unrecorded'}" }.join(' · ')
+    html << %(<p class="caveat"><strong>The lanes did not query the same SQLite build</strong> — #{esc(per)}. On query-heavy routes a cross-lane delta is partly a SQLite-version difference, not a runtime difference: /top runs ~94% inside libsqlite3, and on identical builds its AOT-vs-YJIT gap disappears. Ratios on render-dominated routes are unaffected.</p>\n)
+  elsif sqlv.size == 1
+    missing = mlive.count { |r| !r['sqlite'] }
+    html << %(<p class="legend">Every lane#{missing > 0 ? " that recorded it (#{mlive.size - missing}/#{mlive.size})" : ''} queried SQLite #{esc(sqlv.first)} at runtime.</p>\n)
+  end
+  # WHICH COLLECTOR the AOT lane ran, stated HERE, beside the numbers it
+  # shaped — a caveat elsewhere doesn't qualify this table. The value is the
+  # lane's own runtime report (GCCONFIG line), not the harness's environment,
+  # so the label can't drift from the run.
+  #
+  # This used to be a warning that the generational mark was opt-in, printed
+  # beside a second set of rows that ran it. matz/spinel@d3b1400d made it the
+  # DEFAULT, so there is one configuration left and the page states it once:
+  # what remains worth saying is that the number came from a spinel new enough
+  # to have it, which a reader cannot get from the version string alone.
+  gc_rows = mlive.select { |r| r['gc'] }
+  gc_minor = gc_rows.select { |r| r['gc'] == 'minor' }
+  gc_whole = gc_rows.reject { |r| r['gc'] == 'minor' }
+  unless gc_whole.empty?
+    # 'default' is what a lane reported BEFORE d3b1400d, when the default was
+    # the whole-heap mark — archived runs re-render with that word and it now
+    # means the opposite of what it says, so it is spelled out rather than shown.
+    per = gc_whole.map { |r|
+      "#{r['label']} #{lane_jit.(r)}: #{r['gc'] == 'default' ? 'the pre-d3b1400d default' : r['gc']}"
+    }.join(' · ')
+    html << %(<p class="caveat"><strong>Whole-heap marking</strong> — #{esc(per)}. spinel has marked generationally by default since <code>d3b1400d</code>; a lane that reports otherwise ran with <code>SPINEL_GC_MINOR=0</code> or on a binary predating it, and its number is not the collector anyone ships.</p>\n)
+  end
+  unless gc_minor.empty?
+    per = gc_minor.map { |r|
+      tc = r.dig('gc_stat', 'timed', 'cycles')
+      fu = r.dig('gc_stat', 'timed', 'full')
+      "#{r['label']} #{lane_jit.(r)}#{tc ? ": #{tc} collections in the timed loop#{fu ? ", #{fu} of them whole-heap" : ''}" : ''}"
+    }.join(' · ')
+    html << %(<p class="legend">The AOT lane marks generationally — spinel's default collector since <code>d3b1400d</code>, attested by the binary's own counters rather than by what the harness exported. #{esc(per)}.</p>\n)
+  end
+  jr_note = if mlive.any? { |r| r['id'] == 'jruby' }
+    mlive.any? { |r| r['id'] == 'rails-jruby' } ?
+      ' The JVM rows pair with each other: Roundhouse JRuby\'s ratio is vs Rails on JRuby.' :
+      ' The JRuby row compares against Rails +YJIT — Rails\' best CRuby configuration.'
+  else
+    ''
+  end
+  if par_col
+    below = mlive.select { |r| r['vs_rails_parity'] }
+    html << %(<p class="caveat"><strong>Two ratios, because one lane is not rendering what Rails renders.</strong> )
+    html << below.map { |r|
+      "#{esc(r['label'])} #{esc(r['jit'])} is at #{r['content_equivalent']}/#{r['content_total']} content parity; " \
+      "over the #{r['parity_routes']} routes it renders equivalently it is " \
+      "<strong>#{fmt_dec(r['vs_rails_parity'], 2)}×</strong> " \
+      "(#{fmt_dec(r['parity_ms_median'], 1)} ms/iter vs #{fmt_dec(r['parity_base_ms'], 1)}), " \
+      "against #{fmt_dec(r['vs_rails'], 2)}× over the whole sequence"
+    }.join('; ')
+    html << %(. Both sides of the restricted division cover the same routes. The unrestricted number is not wrong, but part of it is earned by rendering less.</p>\n)
+  end
+  drifters = mlive.select { |r| r['drift_pct'] && r['drift_pct'].abs >= 5 }
+  if drifters.any?
+    html << %(<p class="caveat"><strong>Drifting lane#{drifters.size > 1 ? 's' : ''}:</strong> )
+    html << drifters.map { |r|
+      "#{esc(r['label'])} #{esc(r['jit'])} #{r['drift_pct'] > 0 ? 'slowed' : 'sped up'} " \
+      "#{fmt_dec(r['drift_pct'].abs, 1)}% between the first and last quarter of its own timed iterations"
+    }.join('; ')
+    html << %(. A drifting lane's median depends on how long the run was, so its ratio is not a stable number — read it as a range, not a point. Lanes that hold steady drift under 1%.</p>\n)
+  end
+
+  # What YJIT was doing WHILE the clock ran. Non-zero deltas mean the timed
+  # window was not steady state, which is the mechanism behind a drifting
+  # lane rather than a restatement of it.
+  yj = mlive.select { |r| r.dig('yjit_stats', 'delta') }
+  if yj.any?
+    html << "<details>\n<summary>YJIT during the timed window</summary>\n"
+    html << "<table>\n<thead><tr><th>lane</th><th>code region</th><th>iseqs compiled</th>"
+    html << "<th>invalidations</th><th>code GCs</th><th>compile time</th></tr></thead>\n<tbody>\n"
+    yj.each do |r|
+      d = r['yjit_stats']['delta']; a = r['yjit_stats']['after']
+      used = [a['inline_code_size'].to_i + a['outlined_code_size'].to_i, 0].max
+      html << "<tr><td><strong>#{esc(r['label'])} #{esc(r['jit'])}</strong></td>"
+      html << %(<td class="num">#{fmt_int(used / 1024)} KiB / #{fmt_int(a['code_region_size'].to_i / 1024)} KiB</td>)
+      %w[compiled_iseq_count invalidation_count code_gc_count].each do |k|
+        v = d[k].to_i
+        html << %(<td class="num #{v > 0 ? 'no' : ''}">#{v > 0 ? "+#{fmt_int(v)}" : '0'}</td>)
+      end
+      html << %(<td class="num">+#{fmt_dec(d['compile_time_ns'].to_i / 1_000_000.0, 1)} ms</td>)
+      html << "</tr>\n"
+    end
+    html << "</tbody></table>\n"
+    html << %(<p class="legend">Deltas across the timed iterations only — warmup is excluded, so a zero row means YJIT had finished its work before the clock started. Non-zero <code>iseqs compiled</code> means new code was still being generated while being measured; <code>invalidations</code> means compiled code was being thrown away and redone; a non-zero <code>code GCs</code> means the code region filled and YJIT reclaimed it, after which previously-compiled paths must be compiled again.</p>\n)
+    html << "</details>\n"
+  end
+
+  cv_note = cv_col ? ' CV = per-lane standard deviation ÷ mean across the timed iterations.' : ''
+  html << %(<p class="legend">“vs Rails” is a <strong>speed</strong> ratio — Rails' ms/iter ÷ this row's, at the same JIT level — so 3× means three times faster. Memory is a separate section below.#{jr_note}#{cv_note}</p>\n)
+  if (rjc = mlive.find { |r| r['id'] == 'rails-jruby' })
+    html << %(<p class="caveat"><code>Rails JRuby</code> is the stock-Rails-on-the-JVM baseline: the same app from a patched fixture — Rails #{esc(rjc['rails'] || '8.0.x')} (the AR-JDBC prerelease adapter pins it one minor behind the CRuby lanes), markdown through the same commonmark-java shim the Roundhouse JRuby lane uses, and a JRuby <code>Time.new</code> call-site bug worked around in an initializer.</p>\n)
+  end
+
+  strips = msorted.filter_map { |r| (im = lane_iters[r['id']]) ? [r, im] : nil }
+  unless strips.empty?
+    html << "<details>\n<summary>Per-lane iteration stability (#{strips.size} lanes)</summary>\n"
+    strips.each do |r, im|
+      html << "<h3>#{esc(r['label'])} #{lane_jit.(r)} — #{fmt_dec(r['ms_median'], 1)} ms/iter median over #{im.size} iterations (#{r['warmup']} warmup)</h3>\n"
+      html << iter_columns(im, median: r['ms_median'], min: r['ms_min'], max: r['ms_max'],
+                           color: lane_color.(r))
+    end
+    html << %(<p class="legend">Each column is one timed iteration, scaled within a tight band around the lane's spread; the dashed line is the median.</p>\n)
+    html << "</details>\n"
+  end
+
+  prov = [matrix['generated_at'], matrix['host'] && "host <code>#{esc(matrix['host'])}</code>"].compact.join(' · ')
+  if lanes_mode
+    html << %(<p class="caveat">Lanes measured #{prov} — one process per lane, JIT pinned per lane.</p>\n) unless prov.empty?
+  else
+    # Legacy layout: the headline was a SEPARATE run inheriting ambient
+    # RUBYOPT — tie it to its same-JIT matrix row; the cross-JIT gap is
+    # real, not jitter.
+    head_note = ''
+    if speedup && env&.dig('ruby')
+      head_yjit = env['ruby'].include?('+YJIT')
+      if mby_key[['emit', head_yjit]]
+        head_note = %( The headline comparison above ran #{head_yjit ? 'with YJIT' : 'without a JIT'} on both stacks, so it corresponds to the #{head_yjit ? '+YJIT' : 'no-JIT'} rows here; small differences from those rows are run-to-run jitter.)
+      end
+    end
+    html << %(<p class="caveat">Matrix lanes measured #{prov} — one process per lane over the same emit tree.#{head_note}</p>\n) unless prov.empty?
+  end
+end
+
+# ── Section: per-endpoint breakdown ──────────────────────────────────
+
+rh_pr = timing && timing['per_route']
+rl_pr = rails && rails['per_route']
+jr_pr = jruby_seq && jruby_seq['per_route']
+# The no-JIT lanes' per-endpoint medians (lane layout): table-only columns
+# — the chart stays at one series per stack's best configuration. Skipped
+# when the primary emit lane IS ruby-int (they'd duplicate the main columns).
+rl_int_pr = prim == 'ruby' ? sibling(File.join(run_path, 'rails-int'), 'rails.json')&.dig('per_route') : nil
+rh_int_pr = prim == 'ruby' ? sibling(File.join(run_path, 'ruby-int'), 'summary.json')&.dig('sequence_timing', 'per_route') : nil
+rl_jvm_pr = lanes_mode ? sibling(File.join(run_path, 'rails-jruby'), 'rails.json')&.dig('per_route') : nil
+# The AOT lane, as a CHART series rather than a table-only column: it is a
+# different runtime for the same emit, and where it wins and loses is not
+# uniform — the whole point of a per-endpoint view.
+sp_pr = lanes_mode ? sibling(File.join(run_path, 'spinel'), 'summary.json')&.dig('sequence_timing', 'per_route') : nil
+# Route templates whose timed visits are served from an APPLICATION-level
+# cache — lobsters' users#tree wraps its whole page body in
+# Rails.cache.fetch with a 24h TTL, so every lane's steady-state medians
+# for /u measure cache hits, and a reader comparing them to any full
+# render is comparing different work. Detection is data-driven, from the
+# AOT lane: with no JIT to warm, its pre-warmup single shot (the parity
+# pass, kept in the lane summary as a diagnostic) and its sequence median
+# agree on every route (measured <= 3.1x, first-touch effects) except
+# where an app cache intervenes (measured 43x) — 10x sits in the wide gap
+# between those bands. The CRuby lane cannot detect this: its single shot
+# also pays YJIT warmup, a 20-50x gap on routes that cache nothing.
+cache_served_tmpl = {}
+if spinel && sp_pr
+  (spinel['routes'] || []).each do |r|
+    t = r['template'] || r['route']
+    seq = sp_pr.dig(t, 'ms_median')&.to_f
+    cache_served_tmpl[t] = true if seq && seq > 0 && r['ms'].to_f / seq > 10
+  end
+end
+cached_mark = lambda do |tmpl|
+  next '' unless cache_served_tmpl[tmpl]
+  %( <span class="gapmark" title="every lane's timed visits to this route serve from a cache in the app itself (Rails.cache, 24h TTL) — these medians measure cache hits, in every lane; the one cache-miss render is far costlier">cached</span>)
+end
+if rh_pr && rl_pr && !rh_pr.empty?
+  shared = rh_pr.keys.select { |k| rl_pr.key?(k) }
+  rh_iters = timing['iterations'].to_i
+  breakdown = shared.map do |k|
+    rl = rl_pr[k]['ms_median'].to_f
+    rh = rh_pr[k]['ms_median'].to_f
+    { key: k, rails: rl, rh: rh,
+      jr: jr_pr&.dig(k, 'ms_median')&.to_f,
+      sp: sp_pr&.dig(k, 'ms_median')&.to_f,
+      rails_int: rl_int_pr&.dig(k, 'ms_median')&.to_f,
+      rh_int:    rh_int_pr&.dig(k, 'ms_median')&.to_f,
+      rails_jvm: rl_jvm_pr&.dig(k, 'ms_median')&.to_f,
+      ratio: rh > 0 ? rl / rh : nil,
+      # OWN WORK: a low percentile of this route's own visits — the ones
+      # where no collection landed inside the timing window. The median
+      # includes whatever cleanup fired during the visit no matter whose
+      # garbage it reclaimed, and since collection arrival is roughly
+      # uniform while its cost is heap-proportional and route-independent,
+      # that bias scales as 1/own-cost. On lobsters it inflates the cheapest
+      # routes by over 100% and the most expensive by 1%.
+      rails_own: rl_pr[k]['ms_p25']&.to_f,
+      rh_own:    rh_pr[k]['ms_p25']&.to_f,
+      sp_own:    sp_pr&.dig(k, 'ms_p25')&.to_f,
+      # THE FLOOR: the fastest visit this route recorded. p25 corrects for
+      # collection arrival only when fewer than a quarter of a route's visits
+      # collect, and on this workload that does not hold everywhere — /replies
+      # sits at p25 0.217 against a floor of 0.099, because MORE than a
+      # quarter of its visits eat a mark. Where the floor is far below p25,
+      # p25 is still pricing collections and the floor is the better estimate
+      # of what the code costs (matz/spinel#3513).
+      rails_floor: rl_pr[k]['ms_min']&.to_f,
+      rh_floor:    rh_pr[k]['ms_min']&.to_f,
+      sp_floor:    sp_pr&.dig(k, 'ms_min')&.to_f,
+      per_iter: rh_iters > 0 ? (rh_pr[k]['n'].to_f / rh_iters).round : nil }
+  end.sort_by { |r| -r[:rails] }
+
+  sp_col  = sp_pr && breakdown.any? { |b| b[:sp] }
+  jr_col  = jr_pr && breakdown.any? { |b| b[:jr] }
+  rli_col = rl_int_pr && breakdown.any? { |b| b[:rails_int] }
+  rhi_col = rh_int_pr && breakdown.any? { |b| b[:rh_int] }
+  rjv_col = rl_jvm_pr && breakdown.any? { |b| b[:rails_jvm] }
+  drawn = [:rails, :rh]
+  drawn << :sp if sp_col
+  drawn << :jr if jr_col
+  chart_note = if drawn.size > 2
+    lanes = drawn.map { |k| PAIRED_SERIES.find { |s| s[0] == k }[2] }
+    " The chart draws #{lanes.join(', ')}" \
+      "#{rli_col || rhi_col ? '; the no-JIT lanes appear as extra columns in the table below' : ''}."
+  else
+    ''
+  end
+  # What AOT compilation buys OVER the transpiled-Ruby lane, as opposed to
+  # over Rails. Both vs-Rails ratios include the transpile, so the reader
+  # cannot separate the two without dividing them.
+  aot_delta_note = begin
+    rh_row = (mrows || []).find { |x| x['kind'] == 'emit' && x['runtime'] == 'cruby' && x['yjit'] }
+    sp_row = (mrows || []).find { |x| x['runtime'] == 'spinel' }
+    if rh_row && sp_row && hl_row.(rh_row).to_f > 0 && hl_row.(sp_row).to_f > 0
+      d = hl_row.(rh_row) / hl_row.(sp_row)
+      %(<p class="caveat">Both headline ratios include the transpile. Isolating the two: transpiling accounts for the bulk of the win, and AOT compilation adds a further <strong>#{fmt_dec(d, 2)}×</strong> over the same emit running on CRuby+YJIT — in aggregate only, since AOT is faster on the heavy routes and slower on the cheap ones, where per-request fixed costs dominate.</p>)
+    else
+      ''
+    end
+  end
+  html << "<h2>#{section_no}. Per-endpoint breakdown</h2>\n"
+  html << <<~P
+    <p>Where the overall #{speedup ? "#{fmt_dec(speedup, 2)}× " : ''}win comes from — each endpoint's median latency over every timed visit of the frozen sequence#{drawn.size > 2 ? ', per lane' : ', Rails vs roundhouse'}. Bars are log-scaled; the <strong>ratio</strong> at the right is Rails ÷ roundhouse#{drawn.size > 2 ? ' (both CRuby +YJIT)' : ''} (green = roundhouse faster).#{chart_note}</p>#{aot_delta_note}
+    <p class="caveat">A diagnostic breakdown, not a re-derivation: per-endpoint medians don't sum to the sequence median (GC and ordering don't decompose linearly), and the sub-millisecond rows sit near clock resolution — trust the ranking, not the third decimal.</p>
+  P
+  # The AOT lane's per-endpoint numbers need the parity caveat attached
+  # HERE, not left to a later section: on a route it renders incompletely
+  # it is fast at less work, and a bar is exactly the shape that hides
+  # that. Named routes rather than a general warning, so the reader knows
+  # which bars to discount and which are honest.
+  if sp_col && sp_content
+    sp_diff = (sp_content['routes'] || [])
+                .reject { |r| %w[identical equivalent oracle-failed].include?(r['verdict']) }
+                .sort_by { |r| -r['diff_tokens'].to_i }
+    unless sp_diff.empty?
+      worst = sp_diff.first(4).map { |r| "<code>#{esc(r['route'])}</code>" }.join(', ')
+      html << %(<p class="caveat"><strong>Read the AOT bars against #{sp_content['identical'] + sp_content['equivalent']}/#{sp_content['comparable'] || sp_content['total']} content parity, not in isolation.</strong> #{sp_diff.size} of its routes render something other than what Rails renders (worst by differing tokens: #{worst}), and a route that renders less is faster for a reason that is not speed. The lanes drawn beside it are at full parity. Per-route detail in the content-parity section below.</p>\n)
+    end
+  end
+  html << paired_hbar(breakdown, drawn)
+
+  # Show own-work only where it CHANGES the reading. A row whose median is
+  # within 10% of its own work is dominated by its own cost and the extra
+  # number is clutter; the annotation then appears on exactly the rows a
+  # reader should discount, which is the whole point of having it.
+  # The floor gets the same treatment one level down: it is printed only when
+  # it is materially below p25, i.e. only where p25 is ITSELF still pricing
+  # collections. On a route whose visits mostly run clean the three numbers
+  # collapse to one, which is the reading "this median is the route's cost".
+  ms_cell = lambda do |med, own, floor|
+    return '—' unless med
+    return fmt_dec(med, 2) unless own && med > 0 && (med - own) / med > 0.10
+    extra = if floor && own > 0 && (own - floor) / own > 0.10
+              %(<br><span class="legend">floor #{fmt_dec(floor, 2)}</span>)
+            else
+              ''
+            end
+    %(#{fmt_dec(med, 2)}<br><span class="legend">own #{fmt_dec(own, 2)}</span>#{extra})
+  end
+  html << "<details>\n<summary>Per-endpoint table (#{breakdown.size} endpoints)</summary>\n"
+  html << "<table>\n<thead><tr><th>endpoint</th><th>rails</th>#{rli_col ? '<th>rails no-JIT</th>' : ''}#{rjv_col ? '<th>rails JRuby</th>' : ''}<th>roundhouse</th>#{rhi_col ? '<th>roundhouse no-JIT</th>' : ''}#{sp_col ? '<th>AOT</th>' : ''}#{jr_col ? '<th>jruby</th>' : ''}<th>ratio</th><th>visits/iter</th></tr></thead>\n<tbody>\n"
+  breakdown.each do |b|
+    rcls = b[:ratio].nil? ? '' : (b[:ratio] >= 1 ? 'ok' : 'no')
+    html << "<tr>"
+    html << %(<td><code>#{esc(b[:key])}</code>#{cached_mark.(b[:key])}</td>)
+    html << %(<td class="num">#{ms_cell.(b[:rails], b[:rails_own], b[:rails_floor])}</td>)
+    html << %(<td class="num">#{b[:rails_int] ? fmt_dec(b[:rails_int], 2) : '—'}</td>) if rli_col
+    html << %(<td class="num">#{b[:rails_jvm] ? fmt_dec(b[:rails_jvm], 2) : '—'}</td>) if rjv_col
+    html << %(<td class="num">#{ms_cell.(b[:rh], b[:rh_own], b[:rh_floor])}</td>)
+    html << %(<td class="num">#{b[:rh_int] ? fmt_dec(b[:rh_int], 2) : '—'}</td>) if rhi_col
+    html << %(<td class="num">#{b[:sp] ? ms_cell.(b[:sp], b[:sp_own], b[:sp_floor]) : '—'}</td>) if sp_col
+    html << %(<td class="num">#{b[:jr] ? fmt_dec(b[:jr], 2) : '—'}</td>) if jr_col
+    html << %(<td class="num #{rcls}">#{b[:ratio] ? "#{fmt_dec(b[:ratio], 2)}×" : '—'}</td>)
+    html << %(<td class="num">#{b[:per_iter]}</td>)
+    html << "</tr>\n"
+  end
+  html << "</tbody></table>\n"
+  # AOT-vs-YJIT counted twice: by median, and on own work. These disagree, and
+  # the disagreement is the point — a route's median is set partly by where it
+  # sits in the frozen sequence relative to collection boundaries, so counting
+  # "routes where AOT is slower" off medians counts arrival as if it were code.
+  # Reordering the sequence would move rows without a line of code changing.
+  # Both numbers are shown because they answer different questions: the median
+  # is what the route costs in a running server, the floor is what its code
+  # costs (matz/spinel#3513).
+  if sp_col
+    cmp = breakdown.select { |b| b[:sp]&.positive? && b[:rh]&.positive? }
+    slow_med = cmp.count { |b| b[:sp] > b[:rh] }
+    fl = cmp.select { |b| b[:sp_floor]&.positive? && b[:rh_floor]&.positive? }
+    slow_floor = fl.count { |b| b[:sp_floor] > b[:rh_floor] }
+    flipped = fl.select { |b| b[:sp] > b[:rh] && b[:sp_floor] <= b[:rh_floor] }
+                .sort_by { |b| -(b[:sp] / b[:rh]) }
+    # A run whose per_route rows predate ms_min has NO floor data, and the
+    # own-work half then reads "0 of 0", i.e. "nothing is genuinely slower" —
+    # a far stronger claim than the absence of data supports. Say the median
+    # count alone there.
+    if cmp.any? && fl.empty?
+      html << %(<p class="caveat"><strong>AOT is slower than the same emit on CRuby+YJIT on #{slow_med} of #{cmp.size} endpoints by median.</strong> This run predates the per-route floor, so how much of that is collection arrival rather than code cannot be separated here.</p>\n)
+    elsif cmp.any?
+      html << %(<p class="caveat"><strong>AOT is slower than the same emit on CRuby+YJIT on #{slow_med} of #{cmp.size} endpoints by median, but only #{slow_floor} of #{fl.size} on own work.</strong> )
+      if flipped.any?
+        names = flipped.first(5).map { |b|
+          "<code>#{esc(b[:key])}</code> #{fmt_dec(b[:sp] / b[:rh], 2)}×&nbsp;→&nbsp;#{fmt_dec(b[:sp_floor] / b[:rh_floor], 2)}×" }.join(', ')
+        html << %(The difference is collection arrival, not code — #{names}#{flipped.size > 5 ? ", and #{flipped.size - 5} more" : ''} lose on the median and win on the floor. )
+      end
+      html << %(Routes that lose on <em>both</em> are the ones where the emitted code is genuinely behind.</p>\n)
+    end
+  end
+  if sp_col || jr_col || rli_col || rhi_col || rjv_col
+    html << %(<p class="legend">All lane columns are median ms per visit; ratio = rails ÷ roundhouse (the +YJIT pair)#{sp_col ? '. The AOT column is the spinel-compiled binary — same emit, different runtime, and not at full content parity (see above)' : ''}. A route marked <strong>cached</strong> serves its timed visits from a cache in the app itself (lobsters keeps some whole pages for 24h), in every lane — those medians price a cache hit, not the render. An <strong>own</strong> figure appears where a route's median runs more than 10% above its own work (p25 of its visits) — the gap is collection triggered during that visit but caused by the heap the whole sequence built, so it belongs to the lane rather than to the route. It is largest on the cheapest routes, which is where the median is least trustworthy as a per-route cost. A <strong>floor</strong> figure appears below that where p25 is <em>itself</em> more than 10% above the fastest visit recorded: p25 only removes collection cost when fewer than a quarter of a route's visits collect, and where more than a quarter do, p25 is still pricing marks. The floor is one sample and therefore noisy downward — read it as a bound, not a measurement.</p>\n)
+  end
+  html << "</details>\n"
+end
+
+# ── Section: frozen-sequence stability (legacy layout only — the lane
+# layout folds this into the matrix section's CV column + strips) ──────
+
+if timing && timing['iter_ms'] && !lanes_mode
+  n = timing['iter_ms'].size
+  html << "<h2>#{section_no}. Frozen-sequence stability</h2>\n"
+  caption = "#{fmt_dec(timing['ms_per_iter_median'], 1)} ms/iter median over #{n} iterations " \
+            "(min #{fmt_dec(timing['ms_per_iter_min'], 1)}, max #{fmt_dec(timing['ms_per_iter_max'], 1)}, " \
+            "#{timing['warmup']} warmup). Each column is one timed iteration; the dashed line is the median."
+  html << "<p>#{caption}</p>\n"
+  if timing['failed_visits'].to_i > 0
+    html << %(<p class="caveat">#{timing['failed_visits']} visit(s) failed during timing#{timing['partial'] ? ' — partial run' : ''}.</p>\n)
+  end
+  html << iter_columns(timing['iter_ms'],
+                       median: timing['ms_per_iter_median'],
+                       min: timing['ms_per_iter_min'],
+                       max: timing['ms_per_iter_max'])
+end
+
+# ── Section: memory footprint ────────────────────────────────────────
+#
+# Its own section rather than a column in the timing table: the ratios
+# are different ratios, and side by side they read as one. Sits before
+# the parity attestation because it is a result, not an attestation.
+
+mem_rows = (mrows || []).select { |r| r['ms_median'] && (r['rss_peak_kb'] || r['rss_final_kb']) }
+unless mem_rows.empty?
+  mb   = ->(kb) { kb.to_f / 1024.0 }
+  peak = ->(r) { mb.(r['rss_peak_kb'] || r['rss_final_kb']) }
+  boot = ->(r) { r['rss_boot_kb'] ? mb.(r['rss_boot_kb']) : nil }
+  msort = mem_rows.sort_by { |r| peak.(r) }
+
+  html << "<h2>#{section_no}. Memory footprint</h2>\n"
+  html << <<~P
+    <p>Peak resident memory of each lane's replay process — <strong>lower is better</strong>. Because the lanes replay <em>in-process</em>, each one measures itself (<code>VmHWM</code> from <code>/proc/self/status</code>), so this is the whole stack: interpreter, framework, the in-memory fixture DB, and whatever the timed run retains on top.</p>
+    <p>The bar splits at the point the sequence starts. The solid segment is the <strong>baseline</strong> — everything loaded and seeded, before a single visit. The translucent segment is <strong>growth</strong> across the timed run. The two say different things: baseline is what the stack costs to stand up, growth is what serving retains.</p>
+  P
+  # Same unearned-advantage problem the timing bars have, and until now
+  # the only one of the two with no caveat anywhere on the page: a lane
+  # that does not render five routes also does not RETAIN their objects,
+  # so part of its footprint advantage is the missing work rather than a
+  # leaner stack. Named lanes, so a reader knows which bars to discount.
+  mem_unver = msort.select { |r| r['kind'] != 'rails' && r['content_differs'].to_i > 0 }
+  if mem_unver.any?
+    html << %(<p class="caveat"><strong>)
+    html << mem_unver.map { |r|
+      "#{esc(r['label'])} #{esc(r['jit'])} is at #{r['content_equivalent']}/#{r['content_total']} content parity"
+    }.join('; ')
+    html << %(.</strong> Peak memory is measured over the same sequence as the timings, so a lane that renders less also allocates and retains less — read its bar the way you read its ms/iter, not as a like-for-like footprint.</p>\n)
+  end
+  html << memory_bars(msort.map { |r|
+    { label: "#{r['label']} #{lane_jit.(r)}", color: lane_color.(r),
+      boot: boot.(r) || peak.(r), peak: peak.(r) }
+  })
+
+  # Same-JIT memory pairings, mirroring the timing section's insights.
+  # Every ratio here is explicitly named as a memory ratio — the whole
+  # reason this is a separate section.
+  mem_by = mem_rows.to_h { |r| [[r['kind'], r['yjit']], r] }
+  mem_insights = []
+  %w[rails emit].each do |kind|
+    on, off = mem_by[[kind, true]], mem_by[[kind, false]]
+    next unless on && off && peak.(off) > 0
+    name  = kind == 'rails' ? 'Rails' : 'Roundhouse'
+    delta = peak.(on) - peak.(off)
+    next unless delta > 0
+    speed = hl_row.(off).to_f > 0 && hl_row.(on).to_f > 0 ? hl_row.(off) / hl_row.(on) : nil
+    mem_insights << "<strong>#{name}</strong> pays #{fmt_dec(delta, 0)} MB (+#{fmt_dec(delta / peak.(off) * 100, 0)}%) in peak memory for YJIT" \
+                    "#{speed ? ", buying #{fmt_dec(speed, 2)}× the speed" : ''}"
+  end
+  [true, false].each do |yj|
+    rl, em = mem_by[['rails', yj]], mem_by[['emit', yj]]
+    next unless rl && em && peak.(em) > 0
+    line = "<strong>Roundhouse</strong> peaks #{fmt_dec(peak.(rl) / peak.(em), 2)}× lower than Rails #{yj ? 'with YJIT' : 'without a JIT'} (#{fmt_dec(peak.(rl), 0)} → #{fmt_dec(peak.(em), 0)} MB)"
+    if boot.(rl) && boot.(em) && boot.(em) > 0
+      line += ", and starts #{fmt_dec(boot.(rl) / boot.(em), 2)}× lower before serving anything (#{fmt_dec(boot.(rl), 0)} → #{fmt_dec(boot.(em), 0)} MB)"
+    end
+    mem_insights << line
+  end
+  # Growth is the number a peak-only column would have hidden.
+  rl_y, em_y = mem_by[['rails', true]], mem_by[['emit', true]]
+  if rl_y && em_y && boot.(rl_y) && boot.(em_y)
+    g_rl, g_em = peak.(rl_y) - boot.(rl_y), peak.(em_y) - boot.(em_y)
+    if g_em > 0 && g_rl > 0
+      mem_insights << "Across the timed run <strong>Rails</strong> retains #{fmt_dec(g_rl / g_em, 1)}× more than Roundhouse (#{fmt_dec(g_rl, 0)} MB of growth against #{fmt_dec(g_em, 0)} MB) — a separate fact from the baseline gap, and the one a peak-only number hides"
+    end
+  end
+  html << "<ul>\n#{mem_insights.map { |i| "<li>#{i}</li>" }.join("\n")}\n</ul>\n" unless mem_insights.empty?
+
+  boot_col = mem_rows.any? { |r| r['rss_boot_kb'] }
+  html << "<table>\n<thead><tr><th>stack</th><th>JIT</th>#{boot_col ? '<th>baseline</th>' : ''}<th>peak</th>#{boot_col ? '<th>growth</th>' : ''}<th>vs Rails (memory)</th></tr></thead>\n<tbody>\n"
+  msort.each do |r|
+    base = mem_by[['rails', r['yjit']]]
+    html << "<tr>"
+    html << %(<td><strong>#{esc(r['label'])}</strong></td>)
+    html << %(<td>#{lane_jit.(r)}</td>)
+    html << %(<td class="num">#{boot.(r) ? "#{fmt_int(boot.(r).round)} MB" : '—'}</td>) if boot_col
+    html << %(<td class="num">#{fmt_int(peak.(r).round)} MB</td>)
+    if boot_col
+      html << %(<td class="num">#{boot.(r) ? "+#{fmt_int((peak.(r) - boot.(r)).round)} MB" : '—'}</td>)
+    end
+    ratio = base && peak.(r) > 0 ? peak.(base) / peak.(r) : nil
+    html << %(<td class="num">#{ratio ? "#{fmt_dec(ratio, 2)}×" : '—'}</td>)
+    html << "</tr>\n"
+  end
+  html << "</tbody></table>\n"
+  jvm_mem = mem_rows.any? { |r| r['runtime'] == 'jruby' }
+  html << %(<p class="legend">“vs Rails (memory)” is peak RSS ÷ peak RSS at the same JIT level — <strong>not</strong> the speed ratio in the matrix table above; the two differ. Baseline is sampled after the in-memory fixture DB is seeded, and it is <em>not</em> a common floor across lanes — each stack loads its own framework, so subtracting one lane's baseline from another's peak is meaningless.#{jvm_mem ? ' JVM lanes run under a fixed heap (<code>-Xmx</code>=<code>-Xms</code>), so their numbers are a configured budget rather than an organically-grown working set.' : ''}</p>\n)
+end
+
+# ── Section: route parity ────────────────────────────────────────────
+
+# In the lane layout the jruby lane replayed the same routes — render its
+# parity as extra columns so cross-runtime coverage reads off one table.
+jr_routes = lanes_mode && jruby ? (jruby['routes'] || []).to_h { |r| [r['route'], r] } : {}
+sp_routes = lanes_mode && spinel ? (spinel['routes'] || []).to_h { |r| [r['route'], r] } : {}
+
+if lanes_mode
+  # This section is the COVERAGE ATTESTATION, not a performance chart:
+  # it certifies that the timing sections above measured a complete
+  # application surface, per emit target. (The old single-shot latency
+  # chart invited performance readings of noisy one-shot numbers that
+  # the medians above answer properly — dropped.)
+  jr_all = !jr_routes.empty? && jruby_pass == jruby_total
+  sp_all = !sp_routes.empty? && spinel_pass == spinel_total
+  # Name the targets actually checked. "Every emit target" is only true of
+  # the lanes this section read, so the claim is built from those lanes
+  # rather than asserted over all of them.
+  checked = ['CRuby']
+  checked << 'JRuby' unless jr_routes.empty?
+  checked << 'spinel AOT' unless sp_routes.empty?
+  # "Coverage", not "parity": these are HTTP 200s. The content-parity
+  # section further down uses the same word for document equivalence, and
+  # the two numbers differ — a lane can return 200 on every route and
+  # render five of them wrong. Two adjacent headings using one word for
+  # two oracles put the weaker number first and made it look like the
+  # stronger one.
+  html << "<h2>#{section_no}. Coverage — HTTP 200 (#{pass}/#{total}#{jr_routes.empty? ? '' : " · jruby #{jruby_pass}/#{jruby_total}"}#{sp_routes.empty? ? '' : " · spinel #{spinel_pass}/#{spinel_total}"})</h2>\n"
+  if all_pass && (jr_routes.empty? || jr_all) && (sp_routes.empty? || sp_all)
+    html << <<~P
+      <p>What the numbers above are numbers <em>of</em>: every distinct route the benchmark exercises returns <strong>200 on #{checked.size == 1 ? 'the %s emit target' % checked[0] : 'every emit target (%s)' % checked.join(', ')}</strong> — the timing sections measure a complete application, not a working subset. A failing cell here would invalidate that lane's rows above.</p>
+    P
+    html << if content
+      ce = content['identical'] + content['equivalent']
+      %(<p>Status is a weak oracle, though — a 200 that renders half a page is still a 200 — so the bodies are also compared against Rails' as parsed documents. <strong>#{ce}/#{content['total']} routes render content equivalent to Rails.</strong> See the section below for what "equivalent" is defined to mean and what the remainder are.</p>\n)
+    else
+      %(<p class="caveat">Content was <em>not</em> compared for this run — no Rails lane ran, so there was no oracle to compare against. These cells attest that each route answered, not that it answered correctly.</p>\n)
+    end
+  else
+    fails = []
+    fails << "#{total - pass} route(s) fail on the CRuby lane" unless all_pass
+    fails << "#{jruby_total - jruby_pass} route(s) fail on the jruby lane" unless jr_routes.empty? || jr_all
+    fails << "#{spinel_total - spinel_pass} route(s) fail on the spinel AOT lane" unless sp_routes.empty? || sp_all
+    html << %(<p><strong>Incomplete coverage:</strong> #{fails.join('; ')} — the failing routes' visits short-circuit cheaply, so treat the affected lane's timing rows above as optimistic. Details in the table.</p>\n)
+  end
+else
+  html << "<h2>#{section_no}. Route parity (#{pass}/#{total})</h2>\n"
+  html << %(<p>Every distinct benchmark route, replayed once. Bars are log-scaled single-shot latency; #{all_pass ? 'all routes return 200' : 'red bars are non-200 routes'}.</p>\n)
+  html << route_hbar(routes, metric: 'ms', unit: 'ms', fmt: ->(v) { "#{fmt_dec(v, 1)} ms" })
+end
+
+# The parity table's job is parity — what each route answered and how much
+# of it — not latency. The pre-warmup single shot each lane records for
+# these rows stays in the lane summary JSON as a diagnostic (and feeds the
+# cache detector above), but publishing it beside the ruby-bench-rule
+# numbers invited reading it as a per-visit cost, which it is not.
+html << "<details open>\n<summary>Per-route table (#{routes.size} routes)</summary>\n"
+html << "<table>\n<thead><tr><th>route</th><th>status</th><th>bytes</th>#{jr_routes.empty? ? '' : '<th>jruby</th>'}#{sp_routes.empty? ? '' : '<th>AOT</th><th>AOT bytes</th>'}</tr></thead>\n<tbody>\n"
+routes.each do |c|
+  status_cls = c['ok'] == false ? 'no' : 'ok'
+  html << "<tr>"
+  # The ledger keys by TEMPLATE; this table's rows are concrete paths.
+  # /hottest matched by string luck, /u/michell_wiegand never matched
+  # /u/:username — so the one row whose 500 the ledger exists to explain
+  # was the one row it left unlabelled.
+  gap_note = GAP_BY_ROUTE[c['template'] || c['route']] ? ' <span class="gapmark" title="declared gap — see the ledger above">declared gap</span>' : ''
+  html << %(<td><code>#{esc(c['route'])}</code>#{c['thin'] ? ' <span class="no">(thin)</span>' : ''}#{gap_note}#{cached_mark.(c['template'] || c['route'])}</td>)
+  html << %(<td class="num #{status_cls}">#{c['status']}</td>)
+  html << %(<td class="num">#{fmt_int(c['bytes'])}</td>)
+  unless jr_routes.empty?
+    if (j = jr_routes[c['route']])
+      jcls = j['ok'] == false ? 'no' : 'ok'
+      # Response sizes should track the CRuby lane (bodies are byte-
+      # identical mod CSRF token + clock); flag drift beyond noise.
+      bytes_note = (j['bytes'].to_i - c['bytes'].to_i).abs > 64 ? %( <span class="no">(#{fmt_int(j['bytes'])} B)</span>\n) : ''
+      html << %(<td class="num #{jcls}">#{j['status']}#{bytes_note}</td>)
+    else
+      html << %(<td class="num">—</td>)
+    end
+  end
+  unless sp_routes.empty?
+    if (s = sp_routes[c['route']])
+      scls = s['ok'] == false ? 'no' : 'ok'
+      # No byte-drift note: the AOT lane serves a FILE-backed DB rather than
+      # the in-memory copy the others use, so body sizes are not expected to
+      # track the CRuby lane the way JRuby's do.
+      html << %(<td class="num #{scls}">#{s['status']}</td>)
+      # Bytes, not just status. A route can answer 200 and render a
+      # fraction of the page — the AOT lane's /threads is 2.5 KB against
+      # the oracle's 58 — and a status-only column is blind to exactly
+      # that. Flagged when it falls short of the CRuby lane by more than
+      # a tenth, which is far outside the DB-shape noise.
+      sbytes = s['bytes'].to_i
+      thin = c['bytes'].to_i > 0 && sbytes < c['bytes'].to_i * 0.9
+      html << %(<td class="num#{thin ? ' no' : ''}">#{fmt_int(sbytes)}</td>)
+    else
+      html << %(<td class="num">—</td><td class="num">—</td>)
+    end
+  end
+  html << "</tr>\n"
+end
+html << "</tbody></table>\n"
+if lanes_mode
+  drift = jr_routes.empty? ? '' : ' jruby cells flag a response size that drifts more than 64 bytes from the CRuby lane\'s.'
+  spn = sp_routes.empty? ? '' : ' An AOT byte count is flagged when it falls more than 10% short of the CRuby lane\'s — a 200 that renders a fraction of the page.'
+  cachen = cache_served_tmpl.empty? ? '' : ' A route marked <strong>cached</strong> serves its timed visits from a cache in the app itself (lobsters keeps some whole pages for 24h), in every lane.'
+  html << %(<p class="legend">This table verifies parity — what each route answered and how much of it — not speed; the timing sections above are the performance numbers.#{cachen}#{drift}#{spn}</p>\n)
+end
+# WHY a route failed, not just that it did. The lane summaries carry the
+# reason on the route (`BENCHERR NotImplementedError: gem facade:
+# Markdowner.to_html is stubbed`), and the page used to drop it — so it
+# reported a failure whose cause was one field away, and a reader had to
+# open the JSON to learn that all of them are one root.
+failing = []
+routes.each do |c|
+  failing << ['CRuby', c['route'], c['error']] if c['ok'] == false
+end
+sp_routes.each_value do |s|
+  failing << ['AOT', s['route'], s['error']] if s['ok'] == false
+end
+jr_routes.each_value do |j|
+  failing << ['jruby', j['route'], j['error']] if j['ok'] == false
+end
+failing.reject! { |_, _, e| e.to_s.strip.empty? }
+unless failing.empty?
+  # Grouped by reason: several failing routes sharing one cause is the
+  # useful shape (six /u/:username visits, one stubbed gem), and a list
+  # repeating the same sentence hides it.
+  html << "<p class=\"caveat\"><strong>Why they fail</strong> — grouped by reason, because a shared cause is one fix:</p>\n"
+  html << "<table>\n<thead><tr><th>lane</th><th>route(s)</th><th>reason</th></tr></thead>\n<tbody>\n"
+  failing.group_by { |lane, _, err| [lane, err] }.each do |(lane, err), group|
+    rs = group.map { |_, route, _| "<code>#{esc(route)}</code>" }.join(', ')
+    html << %(<tr><td>#{esc(lane)}</td><td>#{rs}</td><td><code>#{esc(err.to_s.sub(/\ABENCHERR /, ''))}</code></td></tr>\n)
+  end
+  html << "</tbody></table>\n"
+end
+html << "</details>\n"
+
+# One non-primary emit lane's content parity, as an <h3> inside the
+# content-parity section: count, the routes that differ (token counts +
+# first hunk), and the lane's OWN normalization ledger.
+#
+# The ledger is per-lane on purpose. It differs between lanes — the AOT
+# lane masks 31 CSRF tokens where the CRuby lane masks 29, because the
+# lanes serve different numbers of forms — and this file's standing rule
+# is that a comparison states what it forgave. Reusing the primary lane's
+# ledger here would be stating the wrong one.
+def content_lane_block(content, lane_label, lane_dir)
+  ce  = content['identical'] + content['equivalent']
+  all_diff = (content['routes'] || [])
+               .reject { |r| %w[identical equivalent oracle-failed].include?(r['verdict']) }
+               .sort_by { |r| -r['diff_tokens'].to_i }
+  # Deferred routes leave this count for the same reason they leave the
+  # badge: they are out of scope, not failing. They are still listed below
+  # under their own heading so the section shows what they actually do.
+  deferred_here, diff_routes = all_diff.partition { |r| DEFERRED_BODIES.include?(r['route']) }
+  cmp = (content['comparable'] || content['total']).to_i - deferred_here.size
+  out = +"<h3>#{esc(lane_label)} — #{ce}/#{cmp}</h3>\n"
+  out << %(<span class="badge #{diff_routes.empty? ? 'pass' : 'fail'}">#{ce}/#{cmp} routes render what Rails renders</span>\n)
+  if diff_routes.empty?
+    out << %(<p>Same oracle, same token-stream comparison, same result as the lane above.</p>\n)
+    return out
+  end
+  # Ordered by differing tokens, biggest first — the page's job here is to
+  # say where the work is, and token count is the closest thing to a size
+  # for "how wrong".
+  out << %(<p>Compared against the same Rails oracle, by the same token-stream rules. Ordered by size of difference.</p>\n)
+  out << "<table>\n<thead><tr><th>route</th><th>differing tokens</th><th>first difference</th></tr></thead>\n<tbody>\n"
+  diff_routes.each do |r|
+    h = (r['hunks'] || []).first
+    cell =
+      if h
+        lines = (h['ref'] || []).map { |t| "- #{esc(t)}" } + (h['cand'] || []).map { |t| "+ #{esc(t)}" }
+        "<pre>#{lines.first(4).join("\n")}</pre>"
+      else
+        '—'
+      end
+    out << %(<tr><td><code>#{esc(r['route'])}</code></td><td class="num no">#{fmt_int(r['diff_tokens'])}</td><td>#{cell}</td></tr>\n)
+  end
+  out << "</tbody></table>\n"
+  out << %(<p class="legend"><code>-</code> is Rails, <code>+</code> is the emit. Full hunks in <code>#{esc(lane_dir)}/content-parity.md</code>.</p>\n)
+  ledger = (content['rule_ledger'] || []).reject { |r| r['applications'].to_i.zero? }
+  if ledger.any?
+    out << "<details>\n<summary>Normalization ledger — #{esc(lane_label)}</summary>\n"
+    out << "<table>\n<thead><tr><th>rule</th><th>kind</th><th>applications</th></tr></thead>\n<tbody>\n"
+    ledger.each do |r|
+      out << %(<tr><td><code>#{esc(r['name'])}</code></td><td>#{esc(r['kind'])}</td><td class="num">#{fmt_int(r['applications'])}</td></tr>\n)
+    end
+    out << "</tbody></table>\n</details>\n"
+  end
+  out
+end
+
+# ── Section: content parity ──────────────────────────────────────────
+# The upgrade from "answered" to "answered correctly". Rails renders the
+# oracle; both sides' bodies are parsed and diffed as token streams, so the
+# comparison is blind to indentation, attribute order, void-element
+# spelling and character-reference spelling — and to nothing else.
+#
+# The normalization ledger is published rather than summarized away. A
+# comparison that quietly forgives things is worth less than no comparison
+# at all, so the page states exactly what was forgiven and how often.
+if content
+  ce = content['identical'] + content['equivalent']
+  # Denominator is the routes the ORACLE could render. A route Rails itself
+  # failed proves nothing either way, so it is neither credited nor charged
+  # — but it is named below, because a shrinking denominator that nobody
+  # mentions is how a parity claim quietly stops meaning anything.
+  stale = (content['routes'] || []).select { |r| r['verdict'] == 'oracle-failed' }
+  # Deferred routes come out of BOTH the differing list and the denominator,
+  # the same subtraction content_lane_block makes. Computed inline here, so
+  # leaving it out made this heading contradict the badge at the top of the
+  # page — the one place a reader is most likely to notice and least likely
+  # to be able to explain.
+  diff_all = (content['routes'] || []).reject { |r| %w[identical equivalent oracle-failed].include?(r['verdict']) }
+  deferred_here, diff_routes = diff_all.partition { |r| DEFERRED_BODIES.include?(r['route']) }
+  cmp = (content['comparable'] || content['total']).to_i - deferred_here.size
+  # The heading names its LANE. This section scores the primary emit lane,
+  # and it used to say a bare "(26/26)" directly under a coverage heading
+  # advertising "spinel 25/26" — so a reader could carry the primary lane's
+  # parity onto a lane that was at 17/26.
+  prim_label = (mrows.find { |r| r['id'] == prim } || {})
+                 .then { |r| [r['label'], r['jit']].compact.join(' ') }
+  prim_label = prim if prim_label.strip.empty?
+  # Every compared lane in the heading, not just the primary one. With the
+  # AOT lane at 21/26 the old heading still read "(26/26)", putting the
+  # best lane's number where the section's number goes.
+  other_parity = (mrows || []).select { |r| r['ms_median'] && r['kind'] != 'rails' &&
+                                            r['content_total'] && r['id'] != prim }
+                              .map { |r| ", #{esc(r['label'])} #{esc(r['jit'])} #{r['content_equivalent']}/#{r['content_scope'] || r['content_total']}" }
+                              .join
+  html << "<h2>#{section_no}. Content parity vs Rails — #{esc(prim_label)} #{ce}/#{cmp}#{other_parity}</h2>\n"
+  html << %(<span class="badge #{diff_routes.empty? ? 'pass' : 'fail'}">#{ce}/#{cmp} routes render what Rails renders</span>\n)
+  if stale.any?
+    html << %(<p class="caveat"><strong>#{stale.size} route(s) not compared</strong> — Rails itself did not return 200 for #{stale.map { |r| "<code>#{esc(r['route'])}</code>" }.join(', ')}, so there was no expected output. They are excluded from the count above rather than scored against a broken oracle.</p>\n)
+  end
+  html << <<~P
+    <p>Every parity route is fetched from real Rails and from the emit, and both bodies are parsed into a canonical token stream and diffed there. That makes the comparison blind to four things that are not differences — indentation and formatting whitespace between block elements, attribute order, void-element spelling (<code>&lt;img&gt;</code> vs <code>&lt;img /&gt;</code>), and character-reference spelling (<code>&amp;#39;</code> vs <code>&amp;apos;</code>) — and blind to nothing else.</p>
+  P
+  # Why not just compare response sizes: find the route with the widest byte
+  # gap among those the parse proved EQUIVALENT, and let it make the case.
+  # Derived, not asserted, so it stays true as the emit changes — which it
+  # has. This used to read "all of the difference is whitespace", true when
+  # the ERB compiler kept the indentation and newline that erubi's trim mode
+  # drops from every `<% %>` line (`/u` was 292,443 bytes against Rails'
+  # 173,576, a 68% gap). That is fixed, so the residual gap is no longer
+  # attributable to any one cause and the copy no longer names one; the
+  # 5% floor means this paragraph simply disappears once the emit converges.
+  widest = (content['routes'] || [])
+             .select { |r| %w[identical equivalent].include?(r['verdict']) && r['ref_bytes'].to_i > 0 }
+             .max_by { |r| (r['cand_bytes'].to_i - r['ref_bytes'].to_i).abs / r['ref_bytes'].to_f }
+  if widest && (gap = ((widest['cand_bytes'] - widest['ref_bytes']).abs * 100.0 / widest['ref_bytes']).round) >= 5
+    html << %(<p>Comparing response <em>sizes</em> instead would be weaker than it looks. <code>/#{esc(widest['route'])}</code> is #{fmt_int(widest['ref_bytes'])} bytes from Rails and #{fmt_int(widest['cand_bytes'])} from the emit — a #{gap}% gap — and the two are the same document, differing only in the formatting the token stream is deliberately blind to.</p>\n)
+  end
+  if diff_routes.any?
+    html << "<table>\n<thead><tr><th>route</th><th>differing tokens</th><th>first difference</th></tr></thead>\n<tbody>\n"
+    diff_routes.each do |r|
+      h = (r['hunks'] || []).first
+      cell =
+        if h
+          lines = (h['ref'] || []).map { |t| "- #{esc(t)}" } + (h['cand'] || []).map { |t| "+ #{esc(t)}" }
+          "<pre>#{lines.first(4).join("\n")}</pre>"
+        else
+          '—'
+        end
+      html << %(<tr><td><code>#{esc(r['route'])}</code></td><td class="num no">#{fmt_int(r['diff_tokens'])}</td><td>#{cell}</td></tr>\n)
+    end
+    html << "</tbody></table>\n"
+    html << %(<p class="legend">Each route's first differing hunk; <code>-</code> is Rails, <code>+</code> is the emit. Full hunks in <code>#{esc(prim)}/content-parity.md</code>.</p>\n)
+  end
+  ledger = (content['rule_ledger'] || []).reject { |r| r['applications'].to_i.zero? }
+  if ledger.any?
+    html << "<details>\n<summary>Normalization ledger (what the comparison forgives, and how often)</summary>\n"
+    html << "<table>\n<thead><tr><th>rule</th><th>kind</th><th>applications</th><th>why</th></tr></thead>\n<tbody>\n"
+    ledger.each do |r|
+      html << %(<tr><td><code>#{esc(r['name'])}</code></td><td>#{esc(r['kind'])}</td>)
+      html << %(<td class="num">#{fmt_int(r['applications'])}</td><td>#{esc(r['why'])}</td></tr>\n)
+    end
+    html << "</tbody></table>\n"
+    html << %(<p class="legend"><strong>mask</strong> — varies per run or per session by construction and carries no information. <strong>known</strong> — a genuine, understood difference from Rails, folded so it does not drown the signal but counted here so it cannot be forgotten.</p>\n)
+    html << "</details>\n"
+  end
+  # Every OTHER emit lane's parity, each with the same detail the primary
+  # lane gets: the count, the differing routes with their token counts and
+  # first hunk, and its own normalization ledger. A one-line "jruby lane:
+  # N/M" was all this used to be, and the AOT lane didn't even get that —
+  # its 9 differing routes lived only in a published file nothing read.
+  [[sp_content, 'Roundhouse AOT', 'spinel'],
+   [jr_content, 'Roundhouse JRuby', 'jruby']].each do |lane_content, lane_label, lane_dir|
+    next unless lane_content
+    html << content_lane_block(lane_content, lane_label, lane_dir)
+  end
+end
+
+# ── Section: JRuby lane (legacy layout only — in the lane layout the ──
+# jruby lane lives in the matrix / per-endpoint / parity sections) ─────
+
+if legacy_jruby
+  jt = jruby['sequence_timing'] || jruby['timing']
+  html << "<h2>#{section_no}. JRuby lane (#{jruby_pass}/#{jruby_total})</h2>\n"
+  metric = if jruby['sequence_timing']
+    "the frozen #{jt['visits_per_iter']}-visit sequence"
+  elsif jt
+    "the full route set (#{jt['routes_per_iter']} routes per iteration)"
+  else
+    'route parity only'
+  end
+  html << <<~P
+    <p>The same lobsters app emitted with <code>--target jruby</code> and replayed in-process under JRuby, in its own run. This lane is <strong>file-backed</strong> — the JDBC SQLite adapter has no in-memory backup — and times #{metric}, so its numbers trend against earlier JRuby runs rather than comparing with the in-memory sections above.</p>
+  P
+  facts = [['route parity', "#{jruby_pass}/#{jruby_total} routes return 200"]]
+  if jt
+    facts += [
+      ['ms/iter (median)', "#{fmt_dec(jt['ms_per_iter_median'], 1)} ms"],
+      ['min–max',          "#{fmt_dec(jt['ms_per_iter_min'], 1)}–#{fmt_dec(jt['ms_per_iter_max'], 1)} ms"],
+      ['iterations',       jt['iterations']],
+      ['warmup',           jt['warmup'] && "#{jt['warmup']} discarded iterations (JRuby's JIT warms slowly on this metric)"],
+    ]
+    facts << ['partial', 'yes — failing routes short-circuit cheaply; not comparable to a full-parity run'] if jt['partial']
+  end
+  facts << ['runtime', jruby_env&.dig('ruby') && "<code>#{esc(jruby_env['ruby'])}</code>"]
+  facts << ['java opts', jruby_env&.dig('java_opts') && "<code>#{esc(jruby_env['java_opts'])}</code>"]
+  facts << ['measured', jruby['generated_at']]
+  html << kv_table(facts)
+  jbad = (jruby['routes'] || []).reject { |r| r['ok'] }
+  unless jbad.empty?
+    html << %(<p class="caveat">Non-200 routes: #{jbad.map { |r| "<code>#{esc(r['route'])}</code> (#{r['status']})" }.join(', ')}.</p>\n)
+  end
+end
+
+# ── environment appendix ─────────────────────────────────────────────
+# Numbered like every other section. As an unheaded <details> its inner
+# <h3>Run/Stacks/Sequence followed the content-parity section directly, so
+# the page read as though provenance were part of the parity discussion.
+
+html << "<h2>#{section_no}. Environment &amp; provenance</h2>\n"
+html << %(<details id="environment">\n<summary>Run, stacks, sequence</summary>\n)
+# A commit is the truth only when the tree that produced it was clean, so an
+# uncommitted-changes flag is shown beside the hash rather than left in the
+# JSON for someone to notice.
+def commit_cell(hash, dirty)
+  return nil unless hash
+  cell = +"<code>#{hash}</code>"
+  cell << ' <strong>+ uncommitted changes</strong>' if dirty
+  cell
+end
+
+html << "<h3>Run</h3>\n"
+html << kv_table([
+  ['command',    env&.dig('command') && "<code>#{esc(env['command'])}</code>"],
+  ['source',     env&.dig('src') && "<code>#{esc(env['src'])}</code>"],
+  ['commit',     commit_cell(env&.dig('roundhouse_commit'), env&.dig('roundhouse_dirty'))],
+  ['fixture commit', commit_cell(env&.dig('lobsters_commit'), env&.dig('lobsters_dirty'))],
+  ['captured',   env&.dig('generated_at') || summary['generated_at']],
+  ['database',   db && "<code>#{esc(db)}</code>"],
+  ['seed',       summary['seed']],
+  ['story / comment', [summary['story_id'], summary['comment_id']].compact.join(' / ')],
+])
+html << "<h3>Stacks</h3>\n"
+html << kv_table([
+  ['roundhouse ruby', env&.dig('ruby') && "<code>#{esc(env['ruby'])}</code>"],
+  ['rails ruby',      rails&.dig('ruby') && "<code>#{esc(rails['ruby'])}</code>"],
+  ['rails',           rails&.dig('rails')],
+])
+
+# The AOT lane's toolchain and build facts. Both were already recorded and
+# neither was ever rendered, so the page reported spinel-compiled timings
+# without naming the compiler, and swallowed the C warning count entirely.
+# Prefer the spinel lane's own reading — it is captured next to that lane's
+# build, so it names the compiler that produced the binary being timed —
+# and fall back to the run-level probe.
+aot = (spinel && spinel['aot']) || {}
+aot_rows = [
+  ['spinel (AOT)', (aot['spinel'] || env&.dig('spinel')) &&
+                   "<code>#{esc(aot['spinel'] || env['spinel'])}</code>"],
+  ['C compiler',   (aot['cc'] || env&.dig('cc')) &&
+                   "<code>#{esc(aot['cc'] || env['cc'])}</code>"],
+  ['AOT compile',  aot['build_seconds'] && "#{aot['build_seconds']} s"],
+  ['binary',       aot['binary_bytes'] &&
+                   "#{(aot['binary_bytes'] / 1024.0 / 1024.0).round(1)} MiB"],
+  # Surfaced, not hidden: a C warning in generated code is a signal about the
+  # emitter or the compiler, and a count that only ever sat in JSON was a
+  # signal nobody read. Kept apart from spinel's own analysis warnings, which
+  # are modeling debt and run one per model — folding the two together buries
+  # the handful that describe the generated C.
+  ['C warnings',      aot['c_warnings']],
+  ['spinel warnings', aot['spinel_warnings']],
+]
+if aot_rows.any? { |_, v| !v.nil? && !v.to_s.empty? }
+  html << "<h3>AOT toolchain</h3>\n"
+  html << kv_table(aot_rows)
+end
+
+host_rows = [
+  ['host',   env&.dig('host') && "<code>#{esc(env['host'])}</code>"],
+  ['cpu',    env&.dig('cpu') && esc(env['cpu'])],
+  ['cores',  env&.dig('cpu_cores')],
+  ['kernel', env&.dig('kernel') && "<code>#{esc(env['kernel'])}</code>"],
+]
+if host_rows.any? { |_, v| !v.nil? && !v.to_s.empty? }
+  html << "<h3>Host</h3>\n"
+  html << kv_table(host_rows)
+end
+if timing || rails
+  html << "<h3>Sequence</h3>\n"
+  html << kv_table([
+    ['visits/iter',       vpi],
+    ['warmup',            timing&.dig('warmup') || rails&.dig('warmup')],
+    ['roundhouse iters',  timing&.dig('iterations')],
+    ['rails iters',       rails&.dig('iterations')],
+  ])
+end
+html << "</details>\n"
+
+html << %(<hr><p class="meta">Generated #{Time.now.utc.iso8601} from <code>#{File.basename(input)}</code>.</p>\n)
+html << "</body>\n</html>\n"
+
+File.write(out, html)
+$stderr.puts "wrote #{out} (#{html.bytesize} bytes)"

@@ -1,0 +1,654 @@
+#!/usr/bin/env ruby
+# scripts/lobsters-replay — drive an emitted lobsters app through the
+# ruby-bench benchmark route set, in-process, and report per-route parity.
+#
+# Runs from INSIDE the emitted tree (cwd = the transpiled app dir) and
+# drives Main.run_rack directly — never one-shot CGI (roundhouse#61:
+# per-request processes can't carry an in-memory DB or a warm heap, and
+# that's the shape the real benchmark measures).
+#
+# The route set mirrors ruby-bench/benchmarks/lobsters/route_generator.rb:
+# one representative visit per distinct route shape, ALL logged in (the
+# benchmark authenticates first and asserts HTTP 200 on every visit).
+# Status alone lies — a 200 with a near-empty body is a failure in
+# disguise — so bodies are size-checked and reported.
+#
+# Usage (normally via scripts/bench-lobsters):
+#   cd build/transpiled-lobsters-ruby && \
+#     ruby ../../scripts/lobsters-replay --json OUT.json --md OUT.md [--time N]
+#
+#   --json PATH   write machine-readable summary
+#   --md PATH     write markdown summary
+#   --time N      after the parity pass, run N timed iterations of the
+#                 full route sequence and report ms/iter, preceded by
+#                 --warmup discarded iterations. A dev trend line only —
+#                 NOT the ruby-bench metric (that replays the frozen
+#                 114-visit RNG sequence via --sequence) — and marked
+#                 partial while any route still fails.
+#   --sequence F  P6 mode: after the parity pass, replay the frozen
+#                 114-visit sequence in F (scripts/lobsters-rails-replay
+#                 --seq-out dumps it) under the ruby-bench timing rule:
+#                 --warmup N iterations discarded from the stats (default
+#                 15), then iterate until >= --time N timed iters (default
+#                 10) AND total wall clock INCLUDING warmup >= --min-time S
+#                 seconds (default 10) — upstream counts total_time from
+#                 iteration 1. Headline = mean over the timed iters, the
+#                 statistic ruby-bench reports. Keep the loop in sync with
+#                 scripts/lobsters-rails-replay — the numbers are only
+#                 comparable if both sides do identical work.
+#   --warmup N    warmup iterations discarded before timing, for both
+#                 --sequence (default 15) and --time (default 0). Give
+#                 JRuby a nonzero warmup — its JIT needs it before the
+#                 numbers stabilize.
+#   --min-time S  minimum timed seconds for --sequence (default 10)
+#   --dump DIR    write each parity-pass response body to DIR (P7
+#                 content-diff input; filename = route with / -> _)
+#   --db PATH     benchmark DB (default storage/bench.sqlite3)
+#   --memory      serve from an in-memory SQLite seeded from --db at
+#                 boot — the exact shape the real benchmark runs
+#                 (benchmark.rb copies production.sqlite3 into :memory:
+#                 on every boot). CRuby seeds via SQLite3::Backup; JRuby
+#                 via the JDBC driver's restore() (the same online-backup
+#                 C API). Uses a shared-cache URI
+#                 (file:…?mode=memory&cache=shared) because Db.configure
+#                 opens a POOL of connections: plain ":memory:" would
+#                 give each pool handle its own empty database.
+#   --quiet       suppress per-route progress lines
+#
+# Exit code = number of failing routes (0 = full parity).
+#
+# Gems the emitted tree needs at runtime: sqlite3, bcrypt (hard),
+# htmlentities, rotp (guarded requires in main.rb).
+
+require "stringio"
+require "json"
+
+opts = { db: "storage/bench.sqlite3" }
+args = ARGV.dup
+until args.empty?
+  case (a = args.shift)
+  when "--json"  then opts[:json]  = args.shift
+  when "--md"    then opts[:md]    = args.shift
+  when "--time"  then opts[:time]  = Integer(args.shift)
+  when "--db"    then opts[:db]    = args.shift
+  when "--memory" then opts[:memory] = true
+  when "--defer"     then opts[:defer]     = File.expand_path(args.shift)
+  when "--sequence" then opts[:sequence] = args.shift
+  when "--warmup"   then opts[:warmup]   = Integer(args.shift)
+  when "--min-time" then opts[:min_time] = Integer(args.shift)
+  when "--dump"  then opts[:dump]  = args.shift
+  when "--quiet" then opts[:quiet] = true
+  else abort "lobsters-replay: unknown arg #{a}"
+  end
+end
+
+# ── self-RSS ─────────────────────────────────────────────────────────
+# The lobsters lanes run the benchmark IN-PROCESS, so this process IS
+# the thing under measurement — there is no server to sample from the
+# outside the way scripts/bench walks a target's process tree. Linux
+# exposes both the current working set (VmRSS) and the high-water mark
+# since exec (VmHWM); one lane is one process, so VmHWM IS this run's
+# peak. macOS has no /proc — `ps` gives the current value only, so peak
+# comes back nil there rather than guessed. Keep in lockstep with
+# scripts/lobsters-rails-replay so both sides report the same shape.
+def rss_kb
+  if File.exist?("/proc/self/status")
+    File.read("/proc/self/status")[/^VmRSS:\s+(\d+) kB/, 1]&.to_i
+  else
+    `ps -o rss= -p #{Process.pid}`.strip.to_i.nonzero?
+  end
+rescue StandardError
+  nil
+end
+
+def rss_peak_kb
+  return nil unless File.exist?("/proc/self/status")
+  File.read("/proc/self/status")[/^VmHWM:\s+(\d+) kB/, 1]&.to_i
+rescue StandardError
+  nil
+end
+
+DB_FILE = File.expand_path(opts[:db], Dir.pwd)
+abort "lobsters-replay: no DB at #{DB_FILE} (stage it first)" unless File.exist?(DB_FILE)
+
+# Shared-cache named in-mem DB: one database shared by every connection
+# in this process (the pool's handles + the seeding connection below),
+# alive as long as any of them stays open — the pool does.
+MEM_URI = "file:lobsters_bench?mode=memory&cache=shared"
+
+ENV["BLOG_DB"] ||= opts[:memory] ? MEM_URI : DB_FILE
+ENV["REMOTE_ADDR"] ||= "127.0.0.1"
+
+require File.expand_path("main", Dir.pwd)
+Main.configure_default_adapter!
+
+if opts[:memory]
+  # Seed the in-mem DB the way benchmark.rb does: page-level backup from
+  # the file DB. This REPLACES the whole destination database, so the
+  # empty tables Schema DDL just created are simply superseded.
+  #
+  # Then ANALYZE: the fixture DB ships with no sqlite_stat1, and without
+  # planner statistics SQLite misplans the hottest-stories SELECT (the
+  # engine under /rss, /hottest, /recent) — merged_story_id index +
+  # temp-btree sort over the whole table instead of walking hotness_idx
+  # to the LIMIT: 5.1ms vs 0.05ms per query. A production database has
+  # statistics; a benchmark seeded from a bare fixture measures a planner
+  # accident without them. Keep this in lockstep with
+  # scripts/lobsters-rails-replay — BOTH lanes must get identical stats
+  # or the comparison is dishonest.
+  if RUBY_ENGINE == "jruby"
+    # Same seed through the JDBC driver: org.sqlite.core.DB exposes
+    # SQLite's online-backup C API, and restore() is Backup with source
+    # and destination swapped. A fresh connection on the same shared-cache
+    # URI joins the pool's in-mem DB; the emit's Db shim already loaded
+    # the driver when Main booted above.
+    ds = org.sqlite.SQLiteDataSource.new
+    ds.set_url("jdbc:sqlite:#{MEM_URI}")
+    conn = ds.get_connection
+    conn.get_database.restore("main", DB_FILE, nil)
+    st = conn.create_statement
+    st.execute("ANALYZE")
+    st.close
+    conn.close
+  else
+    require "sqlite3"
+    mem  = SQLite3::Database.new(MEM_URI)
+    file = SQLite3::Database.new(DB_FILE, readonly: true)
+    bk = SQLite3::Backup.new(mem, "main", file, "main")
+    bk.step(-1)
+    bk.finish
+    file.close
+    mem.execute("ANALYZE")
+    mem.close
+  end
+end
+
+# The SQLite build this lane actually queries — the sqlite3 gem's bundled
+# library (or the system one, if the gem was built against it), asked at
+# runtime via its own linked code. The AOT lane links a DIFFERENT build
+# and records its own the same way; the report compares the two, because
+# a version gap between them lands entirely on the query-heavy routes
+# (/top profiled at ~94% inside libsqlite3). nil under JRuby (JDBC path).
+SQLITE_RUNTIME = begin
+  require "sqlite3"
+  d = SQLite3::Database.new(DB_FILE, readonly: true)
+  v = d.execute("select sqlite_version()")[0][0].to_s
+  d.close
+  v
+rescue StandardError, LoadError
+  nil
+end
+
+# Baseline footprint, sampled AFTER the in-memory seed, so the fixture
+# DB is inside it. NOT a common floor across lanes: the first live run
+# put the emit lanes at ~87 MB here and Rails at ~184 MB, because each
+# baseline is dominated by the framework it loaded, not by the shared
+# fixture. Report it per lane; subtracting one lane's baseline from
+# another's peak says nothing.
+BOOT_RSS_KB = rss_kb
+
+# ── YJIT introspection ───────────────────────────────────────────────
+# Snapshotted AROUND the timed window, never inside it. `--yjit-stats`
+# would give more detail but changes what it measures; every key below is
+# available without it, so the timed lane stays the lane we publish.
+#
+# The question these answer: is YJIT still WORKING during the measured
+# window? A lane whose ms/iter drifts upward while compiled_iseq_count
+# climbs, invalidation_count climbs, or code_gc_count goes non-zero is not
+# noisy — it is recompiling, and the median then depends on run length.
+YJIT_KEYS = %w[
+  code_region_size inline_code_size outlined_code_size
+  code_gc_count freed_code_size live_page_count freed_page_count
+  invalidation_count compiled_iseq_count compiled_block_count
+  compile_time_ns
+].freeze
+
+def yjit_snapshot
+  return nil unless defined?(RubyVM::YJIT) && RubyVM::YJIT.respond_to?(:enabled?) && RubyVM::YJIT.enabled?
+  st = RubyVM::YJIT.runtime_stats
+  YJIT_KEYS.to_h { |k| [k, st[k.to_sym]] }.compact
+rescue StandardError
+  nil
+end
+
+# ── benchmark identity + route ids ───────────────────────────────────
+# The login identity is fixed by the benchmark (route_generator.rb logs
+# in as this user before every run). Story/comment ids are sampled from
+# the DB so the replay survives a benchmark-DB refresh; lowest-id
+# non-deleted rows keep the choice deterministic. The LOBSTERS_BENCH_*
+# overrides serve a DB that is not ruby-bench's: current upstream's
+# fake_data gives every user the password "fake".
+BENCH_EMAIL    = ENV["LOBSTERS_BENCH_EMAIL"]    || "wiegand.michell@mertz-vonrueden.test"
+BENCH_PASSWORD = ENV["LOBSTERS_BENCH_PASSWORD"] || "ji3W36xR"
+BENCH_USERNAME = ENV["LOBSTERS_BENCH_USERNAME"] || "michell_wiegand"
+
+# Sample through the tree's own adapter (already configured above) so
+# the replay runs wherever the tree runs — the sqlite3 C gem doesn't
+# exist under JRuby, whose tree reaches SQLite over JDBC.
+short_id = ->(sql) { ActiveRecord.adapter.select_rows(sql).first&.fetch("short_id", nil) }
+STORY   = short_id.call("SELECT short_id FROM stories  WHERE is_deleted = 0 ORDER BY id LIMIT 1") || "enr7ye"
+COMMENT = short_id.call("SELECT short_id FROM comments WHERE is_deleted = 0 ORDER BY id LIMIT 1") || "6srqij"
+
+ROUTES = [
+  "/u",
+  "/active", "/newest", "/recent", "/hottest",
+  "/rss", "/privacy", "/about", "/settings",
+  "/top?length=1d", "/top?length=1w", "/top?length=1y",
+  "/hidden", "/saved", "/upvoted/stories",
+  "/comments", "/upvoted/comments", "/threads", "/comments/#{COMMENT}/reply",
+  "/threads/#{BENCH_USERNAME}", "/u/#{BENCH_USERNAME}",
+  "/replies", "/replies/comments", "/replies/stories", "/replies/unread",
+  "/s/#{STORY}",
+].freeze
+
+# A 200 whose body is this small is almost certainly a hollow render —
+# flag it so it can't masquerade as parity.
+THIN_BYTES = 200
+
+# ── request plumbing ─────────────────────────────────────────────────
+$jar = {}
+
+def cookie_header = $jar.map { |k, v| "#{k}=#{v}" }.join("; ")
+
+def absorb_cookies(headers)
+  sc = headers["set-cookie"] || headers["Set-Cookie"]
+  return unless sc
+  Array(sc).each do |line|
+    pair = line.split(";", 2).first.to_s
+    k, v = pair.split("=", 2)
+    $jar[k.strip] = v.to_s if k
+  end
+end
+
+def req(method, path, body: nil)
+  p, q = path.include?("?") ? path.split("?", 2) : [path, ""]
+  env = {
+    "REQUEST_METHOD" => method,
+    "PATH_INFO"      => p,
+    "QUERY_STRING"   => q,
+    "HTTP_COOKIE"    => cookie_header,
+    "REMOTE_ADDR"    => "127.0.0.1",
+  }
+  if body
+    env["CONTENT_TYPE"]   = "application/x-www-form-urlencoded"
+    env["CONTENT_LENGTH"] = body.bytesize.to_s
+    env["rack.input"]     = StringIO.new(body)
+  end
+  status, headers, chunks = Main.run_rack(env)
+  absorb_cookies(headers)
+  [status, headers, chunks.join]
+rescue => e
+  [:EXC, e, "#{e.class}: #{e.message}\n#{e.backtrace.first(8).join("\n")}"]
+end
+
+def enc(s) = s.to_s.gsub(/[^a-zA-Z0-9_.\-]/) { |c| "%%%02X" % c.ord }
+
+def now_ms = Process.clock_gettime(Process::CLOCK_MONOTONIC) * 1000.0
+
+# Bucket a concrete visit path under its route template so per-route
+# samples aggregate across the sequence's parameterized visits — every
+# /s/<short_id> lands under /s/:story_id. Ordered most-specific first;
+# static routes (including the distinct /top?length=… variants) key by
+# their full path. Mirrors ruby-bench route_generator.rb ROUTE_GROUPS.
+# Keep in sync with scripts/lobsters-rails-replay (the Rails side).
+ROUTE_TEMPLATES = [
+  [%r{\A/comments/[^/]+/reply\z}, "/comments/:comment_id/reply"],
+  [%r{\A/threads/[^/]+\z},        "/threads/:username"],
+  [%r{\A/u/[^/]+\z},              "/u/:username"],
+  [%r{\A/s/[^/]+\z},              "/s/:story_id"],
+].freeze
+
+def route_template(path)
+  base = path.split("?", 2).first
+  ROUTE_TEMPLATES.each { |re, tmpl| return tmpl if base.match?(re) }
+  path
+end
+
+
+# Routes DEFERRED out of the timed sequence, declared in
+# bench/lobsters/declared-gaps.json. A deferred route is one the emit is
+# known not to render; timing it measures an exception or the wrong
+# document, and leaving it in makes ms/iter faster than real work for a
+# reason that has nothing to do with speed.
+#
+# The filter keys off route_template, so it drops every concrete visit of a
+# deferred route (the sequence visits /u/:username six times, with six
+# different usernames). EVERY lane must apply the same list or the lanes
+# time different work and the ratio between them stops meaning anything --
+# which is why the orchestrator passes the same file to all of them.
+#
+# A declared route matching no visit is fatal: a deferral that silently
+# defers nothing leaves the failing visits in the timing while the page
+# claims they were excluded.
+def load_deferred(path)
+  # Announce either way. A lane that silently times the full sequence while
+  # its siblings time a deferred one produces ratios that divide different
+  # work, and the only trace is a visit count nobody reads. Three runs were
+  # spent on exactly that, unable to tell "the flag never arrived" from "the
+  # flag arrived and matched nothing" -- one line of log distinguishes them.
+  if path.nil? || path.empty?
+    $stderr.puts "deferral: no --defer given; timing the FULL sequence"
+    return []
+  end
+  abort "deferred ledger not found at #{path.inspect}" unless File.exist?(path)
+  routes = (JSON.parse(File.read(path))["declared_gaps"] || []).map { |g| g["route"] }
+  $stderr.puts "deferral: #{path} -> #{routes.size} route(s): #{routes.join(", ")}"
+  routes
+end
+
+def drop_deferred(visits, deferred, label = "sequence")
+  return [visits, 0] if deferred.empty?
+  kept = visits.reject { |v| deferred.include?(route_template(v["path"])) }
+  dropped = visits.size - kept.size
+  unmatched = deferred.reject { |t| visits.any? { |v| route_template(v["path"]) == t } }
+  unless unmatched.empty?
+    abort "deferred route(s) #{unmatched.join(", ")} match no visit in the #{label}"
+  end
+  [kept, dropped]
+end
+
+# samples: { template => [ms, …] } -> { template => {ms_median, n, …} }.
+# The dumped body's file name for a route — kept identical to the write
+# below (and to the AOT driver's `safe_name`), because content parity is
+# keyed by it.
+def body_name(route)
+  route.delete_prefix("/").gsub(/[^\w.-]/, "_")
+end
+
+def summarize_samples(by_route)
+  by_route.sort.to_h.transform_values do |arr|
+    s = arr.sort
+    m = s.size / 2
+    med = s.size.odd? ? s[m] : (s[m - 1] + s[m]) / 2.0
+    # ms_p25 is the OWN-WORK estimate: a low percentile of this route's own
+    # visits, i.e. the ones where no collection happened to land inside the
+    # timing window. The median includes whatever cleanup fired during the
+    # visit regardless of whose garbage it reclaimed, and because collection
+    # arrival is roughly uniform while its cost is heap-proportional and
+    # route-independent, that bias scales as 1/own-cost: measured on lobsters
+    # it inflates the cheapest routes by >100% and the most expensive by 1%.
+    # Named for the percentile rather than called "own" so the estimator's
+    # one free choice stays visible in the data.
+    { "ms_median" => med.round(3), "ms_min" => s.first.round(3),
+      "ms_p25" => s[(0.25 * s.size).floor.clamp(0, s.size - 1)].round(3),
+      "ms_max" => s.last.round(3), "n" => s.size }
+  end
+end
+
+# ── login handshake ──────────────────────────────────────────────────
+# GET /login, scrape the CSRF token exactly the way the benchmark does
+# (value="…" — an EMPTY token crashes the benchmark's scrape), POST the
+# credentials, require a 302 + session cookie.
+def do_login!
+  st, _h, body = req("GET", "/login")
+  return "GET /login -> #{st} (expected 200)" unless st == 200
+  line  = body.lines.find { |l| l.include?("authenticity_token") && l.include?("value") }
+  token = line && line[/value="([^"]+)"/, 1]
+  return "no non-empty authenticity_token in /login" unless token && !token.empty?
+  form = "email=#{enc(BENCH_EMAIL)}&password=#{enc(BENCH_PASSWORD)}&authenticity_token=#{enc(token)}"
+  st, _h, _body = req("POST", "/login", body: form)
+  return "POST /login -> #{st} (expected 302)" unless st == 302
+  nil
+end
+
+summary = {
+  "generated_at" => Time.now.utc.iso8601,
+  "db"           => ENV["BLOG_DB"],
+  "sqlite"       => SQLITE_RUNTIME,
+  "memory"       => !!opts[:memory],
+  "story_id"     => STORY,
+  "comment_id"   => COMMENT,
+}
+
+if (err = do_login!)
+  summary.merge!("login_failed" => err, "pass" => 0, "total" => ROUTES.size)
+  File.write(opts[:json], JSON.pretty_generate(summary)) if opts[:json]
+  File.write(opts[:md], "# Lobsters route parity\n\n**LOGIN FAILED:** #{err}\n") if opts[:md]
+  abort "lobsters-replay: login failed: #{err}"
+end
+
+# ── route replay ─────────────────────────────────────────────────────
+require "fileutils"
+FileUtils.mkdir_p(opts[:dump]) if opts[:dump]
+
+results = ROUTES.map do |route|
+  t0 = now_ms
+  st, _h, body = req("GET", route)
+  ms = now_ms - t0
+  if opts[:dump] && st != :EXC
+    File.write(File.join(opts[:dump], body_name(route)), body.to_s)
+  end
+  exc = st == :EXC
+  bytes = exc ? 0 : body.to_s.bytesize
+  ok  = st == 200
+  r = {
+    "route"  => route,
+    "status" => exc ? "EXC" : st,
+    "bytes"  => bytes,
+    "ms"     => ms.round(2),
+    "ok"     => ok,
+    "thin"   => ok && bytes < THIN_BYTES,
+    # The JOIN KEYS. Content parity is keyed by the dumped body's FILE
+    # name and the timing tables by the ROUTE TEMPLATE, and neither can be
+    # derived from the other (`threads_michell_wiegand` vs
+    # `/threads/:username`). This loop is the one place that holds the raw
+    # path both are made from, so it records both rather than leaving the
+    # report to guess a mapping it cannot reconstruct.
+    "body"     => body_name(route),
+    "template" => route_template(route),
+  }
+  r["error"] = body.lines.first(4).join.strip if exc
+  r["error"] = body.to_s[0, 300] if !ok && !exc
+  unless opts[:quiet]
+    flag = r["thin"] ? "  <-- THIN" : ""
+    printf "%-28s -> %-4s %8s  %6.1fms%s\n", route, r["status"], exc ? "-" : bytes, ms, flag
+  end
+  r
+end
+
+fails = results.reject { |r| r["ok"] }
+summary.merge!(
+  "total"  => ROUTES.size,
+  "pass"   => ROUTES.size - fails.size,
+  "thin"   => results.count { |r| r["thin"] },
+  "routes" => results,
+)
+
+# ── P6: frozen-sequence replay (ruby-bench timing rule) ──────────────
+if opts[:sequence]
+  visits = JSON.parse(File.read(opts[:sequence]))["visits"]
+  visits, deferred_visits = drop_deferred(visits, load_deferred(opts[:defer]))
+  unless opts[:quiet]
+    puts "\nreplaying frozen sequence (#{visits.size} visits" \
+         "#{deferred_visits.zero? ? '' : ", #{deferred_visits} deferred"})"
+  end
+
+  # Verification pass: every visit must be 200 (the benchmark raises on
+  # anything else). Collect failures instead of raising so the report
+  # shows ALL of them; any failure marks the timing partial.
+  seq_fails = []
+  visits.each_with_index do |v, idx|
+    st, _h, body = req(v["method"], v["path"])
+    next if st == 200
+    seq_fails << { "idx" => idx, "method" => v["method"], "path" => v["path"],
+                   "status" => st == :EXC ? "EXC" : st,
+                   "error"  => body.to_s.lines.first(3).join.strip[0, 300] }
+  end
+  if seq_fails.any? && !opts[:quiet]
+    puts "SEQUENCE FAILURES (#{seq_fails.size}/#{visits.size} visits):"
+    seq_fails.first(10).each { |f| puts "  #{f['path']} -> #{f['status']}" }
+  end
+
+  warmup      = opts[:warmup]   || 15
+  min_iters   = (opts[:time] && opts[:time] > 0) ? opts[:time] : 10
+  min_time_ms = (opts[:min_time] || 10) * 1000.0
+
+  # When `timings` is passed (timed iterations only) each visit is clocked
+  # and bucketed by template; the outer per-iter clock is untouched, so
+  # ms_per_iter keeps its exact old meaning. Mirrors lobsters-rails-replay.
+  run_seq = ->(timings = nil) do
+    visits.each do |v|
+      t0 = timings ? now_ms : nil
+      req(v["method"], v["path"])
+      (timings[route_template(v["path"])] ||= []) << (now_ms - t0) if timings
+    end
+  end
+
+  # Verification counted as work, not warmup — start the warmups fresh.
+  # Warmup iterations are discarded from the stats but their wall time
+  # counts toward the stop clock — ruby-bench's rule exactly
+  # (harness/harness.rb: `until num_itrs >= WARMUP_ITRS + MIN_BENCH_ITRS
+  # and total_time >= MIN_BENCH_TIME`, total_time cumulative from itr 1).
+  warmup_ms = 0.0
+  warmup.times do
+    t0 = now_ms
+    run_seq.call
+    warmup_ms += (now_ms - t0)
+  end
+  yjit_before = yjit_snapshot
+  iters = []
+  total = 0.0
+  per_route = {}
+  until iters.size >= min_iters && (warmup_ms + total) >= min_time_ms
+    t0 = now_ms
+    run_seq.call(per_route)
+    ms = now_ms - t0
+    iters << ms
+    total += ms
+  end
+  yjit_after = yjit_snapshot
+  sorted = iters.sort
+  mid = sorted.size / 2
+  median = sorted.size.odd? ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2.0
+  # The mean is ruby-bench's reported statistic ("Average of last N,
+  # non-warmup iters"); the median stays as a robustness cross-check.
+  mean = iters.sum / iters.size
+  summary["sequence_timing"] = {
+    "sequence"           => opts[:sequence],
+    "visits_per_iter"    => visits.size,
+    "warmup"             => warmup,
+    "iterations"         => iters.size,
+    "ms_per_iter_mean"   => mean.round(2),
+    "ms_per_iter_median" => median.round(2),
+    "ms_per_iter_min"    => sorted.first.round(2),
+    "ms_per_iter_max"    => sorted.last.round(2),
+    "iter_ms"            => iters.map { |x| x.round(2) },
+    # Per-template median across every timed visit — a diagnostic
+    # breakdown; per-route medians do NOT sum to ms_per_iter_median.
+    "per_route"          => summarize_samples(per_route),
+    "failed_visits"      => seq_fails.size,
+    "partial"            => !seq_fails.empty?,
+  }
+  if yjit_after
+    summary["yjit"] = {
+      "before" => yjit_before, "after" => yjit_after,
+      # What CHANGED while the clock was running. Non-zero here means the
+      # timed window was not measuring steady state.
+      "delta"  => yjit_after.to_h { |k, v|
+        [k, (yjit_before && yjit_before[k]) ? v - yjit_before[k] : v]
+      },
+    }
+  end
+  summary["sequence_failures"] = seq_fails unless seq_fails.empty?
+  puts "sequence: #{mean.round(2)} ms/iter (avg) over #{iters.size} iterations" \
+       "#{seq_fails.any? ? " (PARTIAL: #{seq_fails.size} failing visits)" : ''}"
+
+# ── optional timed iterations ────────────────────────────────────────
+elsif opts[:time] && opts[:time] > 0
+  # Discarded warmup before timing: JRuby's JIT needs a warm run before
+  # its ms/iter stabilizes, and warming both runtimes keeps a CRuby-vs-
+  # JRuby comparison fair. Mirrors the --sequence path's warmup rule.
+  warmup = opts[:warmup] || 0
+  warmup.times { ROUTES.each { |r| req("GET", r) } }
+  iters = Array.new(opts[:time]) do
+    t0 = now_ms
+    ROUTES.each { |r| req("GET", r) }
+    now_ms - t0
+  end
+  sorted = iters.sort
+  mid = sorted.size / 2
+  median = sorted.size.odd? ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2.0
+  summary["timing"] = {
+    "iterations"        => opts[:time],
+    "warmup"            => warmup,
+    "routes_per_iter"   => ROUTES.size,
+    "ms_per_iter_median"=> median.round(2),
+    "ms_per_iter_min"   => sorted.first.round(2),
+    "ms_per_iter_max"   => sorted.last.round(2),
+    # Partial = failing routes short-circuit cheaply; not comparable
+    # to a full-parity run, let alone to Rails.
+    "partial"           => !fails.empty?,
+  }
+end
+
+# ── memory footprint ─────────────────────────────────────────────────
+# Recorded unconditionally — a parity-only run's footprint is still a
+# useful trend line. `peak_kb` is the whole process's high-water mark
+# since exec, which for a one-lane-per-process run is this measurement's
+# peak. GC counters are CRuby-only: JRuby's GC.stat is a different shape
+# and its heap is externally pinned, so the numbers wouldn't compare.
+summary["rss"] = {
+  "boot_kb"  => BOOT_RSS_KB,
+  "final_kb" => rss_kb,
+  "peak_kb"  => rss_peak_kb,
+  "engine"   => RUBY_ENGINE,
+}
+if RUBY_ENGINE == "ruby"
+  gc = GC.stat
+  summary["rss"]["gc"] = {
+    "count"                   => gc[:count],
+    "major_count"             => gc[:major_gc_count],
+    "heap_live_slots"         => gc[:heap_live_slots],
+    "total_allocated_objects" => gc[:total_allocated_objects],
+  }
+end
+
+# ── outputs ──────────────────────────────────────────────────────────
+File.write(opts[:json], JSON.pretty_generate(summary)) if opts[:json]
+
+if opts[:md]
+  md = +"# Lobsters route parity\n\n"
+  md << "_#{summary['pass']}/#{summary['total']} routes return 200"
+  md << " (#{summary['thin']} thin)" if summary["thin"] > 0
+  md << " — #{summary['generated_at']}_\n\n"
+  md << "| route | status | bytes | ms |\n|-------|-------:|------:|---:|\n"
+  results.each do |r|
+    status = r["ok"] ? r["status"].to_s : "**#{r['status']}**"
+    thin = r["thin"] ? " THIN" : ""
+    md << "| `#{r['route']}` | #{status}#{thin} | #{r['bytes']} | #{r['ms']} |\n"
+  end
+  if fails.any?
+    md << "\n## Failures\n\n"
+    fails.each do |r|
+      md << "### `#{r['route']}` → #{r['status']}\n\n```\n#{r['error']}\n```\n\n"
+    end
+  end
+  if (t = summary["timing"])
+    md << "\n## Timing#{t['partial'] ? ' (PARTIAL — failing routes short-circuit)' : ''}\n\n"
+    md << "#{t['ms_per_iter_median']} ms/iter median over #{t['iterations']} iterations "
+    md << "(min #{t['ms_per_iter_min']}, max #{t['ms_per_iter_max']}"
+    md << ", warmup #{t['warmup']}" if t['warmup'].to_i.positive?
+    md << ")\n"
+  end
+  if (t = summary["sequence_timing"])
+    md << "\n## Frozen-sequence timing#{t['partial'] ? " (PARTIAL — #{t['failed_visits']} failing visits)" : ''}\n\n"
+    md << "#{t['ms_per_iter_median']} ms/iter median over #{t['iterations']} iterations "
+    md << "of #{t['visits_per_iter']} visits (min #{t['ms_per_iter_min']}, max #{t['ms_per_iter_max']}, "
+    md << "warmup #{t['warmup']})\n"
+    (summary["sequence_failures"] || []).each do |f|
+      md << "- FAIL `#{f['path']}` -> #{f['status']}: `#{f['error']}`\n"
+    end
+  end
+  if (m = summary["rss"]) && m["final_kb"]
+    md << "\n## Memory (RSS)\n\n"
+    md << "#{(m['final_kb'] / 1024.0).round(1)} MB at end of run"
+    md << " (peak #{(m['peak_kb'] / 1024.0).round(1)} MB)" if m["peak_kb"]
+    md << ", #{(m['boot_kb'] / 1024.0).round(1)} MB after boot + seed" if m["boot_kb"]
+    md << "\n"
+  end
+  File.write(opts[:md], md)
+end
+
+puts "\n#{summary['pass']}/#{summary['total']} routes returned 200" \
+     "#{summary['thin'] > 0 ? " (#{summary['thin']} thin)" : ''}"
+exit [fails.size, 100].min

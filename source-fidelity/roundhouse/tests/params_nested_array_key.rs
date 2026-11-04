@@ -1,0 +1,241 @@
+//! A permit list with a NON-SCALAR key — `permit(:title, tags_a: [])`
+//! and its sibling spelling `permit(:name, settings: {})`.
+//!
+//! lobsters' `StoriesController#story_params` is the case. Before, one
+//! such key made the whole list unrecognizable: no `StoryParams` was
+//! synthesized, the helper kept its source shape, and the emitted tree
+//! called `@params.require(:story).permit(…)` — methods no target
+//! defines. That is a `NoMethodError` under CRuby the moment the helper
+//! runs, and it broke the Spinel AOT build of the lobsters benchmark
+//! outright (the `.except(…)` chained off it dispatched to the only
+//! `except` in the program, `HatRequestParams#except`).
+//!
+//! campfire's `AccountsController#account_params` is the hash-valued
+//! twin — `permit(:name, :logo, settings: {})`, Rails' "any nested hash
+//! under this key". It failed the same way for the same reason, and the
+//! symptom was better disguised: the surviving `@params.require(:account)`
+//! reached Kernel's PRIVATE `require`, so the error read "private method
+//! 'require' called for an instance of Hash".
+//!
+//! So the non-scalar key no longer sinks the list. On the ruby family it
+//! is carried (#1338): `tags_a: []` as an `Array[String]` field read by
+//! `Params.scalar_list`, `settings: {}` as a `Roundhouse::ParamValue`
+//! one read by `Params.nested`. Strict targets drop it with a
+//! `lower_residue` warning (`tests/params_nested_carry.rs`).
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+use roundhouse::emit::ruby;
+use roundhouse::ingest::ingest_app_from_tree;
+
+fn tree(files: &[(&str, &str)]) -> HashMap<PathBuf, Vec<u8>> {
+    files
+        .iter()
+        .map(|(p, c)| (PathBuf::from(p), c.as_bytes().to_vec()))
+        .collect()
+}
+
+const SCHEMA: &str = r#"ActiveRecord::Schema.define do
+  create_table "stories", force: :cascade do |t|
+    t.string "title", null: false
+    t.string "url"
+    t.string "description"
+    t.string "moderation_reason"
+  end
+end
+"#;
+
+const CONTROLLER: &str = r#"class StoriesController < ApplicationController
+  def update
+    @story = Story.find(params[:id])
+    update_story_attributes
+    @story.save
+  end
+
+  private
+
+  def story_params
+    p = params.require(:story).permit(
+      :title, :url, :description, :moderation_reason,
+      :tags_a => [],
+    )
+
+    if @user
+      p
+    else
+      p.except(:moderation_reason)
+    end
+  end
+
+  def update_story_attributes
+    @story.attributes = story_params.except(:url)
+  end
+end
+"#;
+
+fn app() -> roundhouse::App {
+    ingest_app_from_tree(tree(&[
+        ("db/schema.rb", SCHEMA),
+        ("app/models/story.rb", "class Story < ApplicationRecord\nend\n"),
+        ("app/controllers/stories_controller.rb", CONTROLLER),
+    ]))
+    .expect("ingest")
+}
+
+/// The pass under test is a POST-ANALYZE lowering, so the fixture goes
+/// through the session rather than bare ingest.
+fn lowered() -> roundhouse::App {
+    let mut app = app();
+    roundhouse::session::analyze_and_lower(&mut app);
+    app
+}
+
+fn emitted(suffix: &str) -> String {
+    let app = lowered();
+    ruby::emit_lowered_controllers(&app)
+        .iter()
+        .find(|f| f.path.to_string_lossy().ends_with(suffix))
+        .map(|f| f.content.clone())
+        .expect("emitted file")
+}
+
+#[test]
+fn the_scalar_half_of_the_list_still_lowers() {
+    let c = emitted("app/controllers/stories_controller.rb");
+    assert!(
+        // Behind `require`'s refusal on the ruby family (400 when missing).
+        c.contains(r#"StoryParams.from_raw(Params.require_present(@params, "story"))"#),
+        "the helper lowers to the synthesized record:\n{c}"
+    );
+    assert!(
+        !c.contains("permit("),
+        "no `require`/`permit` survives into the emit — nothing defines them:\n{c}"
+    );
+}
+
+#[test]
+fn the_array_valued_key_is_carried() {
+    let params = emitted("app/models/story_params.rb");
+    for field in ["title", "url", "description", "moderation_reason"] {
+        assert!(
+            params.contains(&format!("def {field}")),
+            "`{field}` is carried:\n{params}"
+        );
+    }
+    assert!(
+        params.contains(r#"Params.scalar_list(sub, "tags_a")"#),
+        "the array-valued key is an Array of Strings:\n{params}"
+    );
+}
+
+#[test]
+fn the_carried_key_is_not_ledgered() {
+    let (_files, diags) = roundhouse::emit::diagnostics::scope(|| {
+        let app = lowered();
+        ruby::emit_lowered_controllers(&app)
+    });
+    assert!(
+        !diags.iter().any(|d| d.message.contains("permitted key `tags_a`")),
+        "a carried key is not ledgered as dropped: {:?}",
+        diags.iter().map(|d| d.message.clone()).collect::<Vec<_>>(),
+    );
+}
+
+// ── the hash-valued spelling — campfire's `settings: {}` ─────────────
+
+const HASH_SCHEMA: &str = r#"ActiveRecord::Schema.define do
+  create_table "accounts", force: :cascade do |t|
+    t.string "name", null: false
+    t.string "settings"
+  end
+end
+"#;
+
+const HASH_CONTROLLER: &str = r#"class AccountsController < ApplicationController
+  def update
+    @account = Account.first
+    @account.update!(account_params)
+  end
+
+  private
+
+  def account_params
+    params.require(:account).permit(:name, settings: {})
+  end
+end
+"#;
+
+fn hash_lowered() -> roundhouse::App {
+    let mut app = ingest_app_from_tree(tree(&[
+        ("db/schema.rb", HASH_SCHEMA),
+        ("app/models/account.rb", "class Account < ApplicationRecord\nend\n"),
+        ("app/controllers/accounts_controller.rb", HASH_CONTROLLER),
+    ]))
+    .expect("ingest");
+    roundhouse::session::analyze_and_lower(&mut app);
+    app
+}
+
+/// The whole point: a `key: {}` entry must not take the list down with
+/// it. Before, it did — `nested_keys` accepted only Array values, the
+/// permit went unrecognized, and `require`/`permit` survived into the
+/// emit where nothing defines either.
+#[test]
+fn a_hash_valued_key_does_not_sink_the_permit() {
+    let app = hash_lowered();
+    let c = ruby::emit_lowered_controllers(&app)
+        .iter()
+        .find(|f| f.path.to_string_lossy().ends_with("app/controllers/accounts_controller.rb"))
+        .map(|f| f.content.clone())
+        .expect("emitted controller");
+    assert!(
+        c.contains(r#"AccountParams.from_raw(Params.require_present(@params, "account"))"#),
+        "the helper lowers to the synthesized record:\n{c}"
+    );
+    assert!(
+        !c.contains("permit(") && !c.contains(".require("),
+        "no `require`/`permit` survives into the emit — Hash#require is \
+         Kernel's private one:\n{c}"
+    );
+}
+
+/// The ruby family carries `settings: {}` (#1338): a
+/// `Roundhouse::ParamValue` member read by `Params.nested`, as Rails'
+/// `permit` keeps any hash there, and no "non-scalar" ledger entry.
+/// Strict targets keep the drop and its warning
+/// (`tests/params_nested_carry.rs`).
+#[test]
+fn the_hash_valued_key_is_carried() {
+    let (files, diags) = roundhouse::emit::diagnostics::scope(|| {
+        let app = hash_lowered();
+        ruby::emit_lowered_controllers(&app)
+    });
+    let params = files
+        .iter()
+        .find(|f| f.path.to_string_lossy().ends_with("app/models/account_params.rb"))
+        .map(|f| f.content.clone())
+        .expect("emitted params record");
+    assert!(params.contains("def name"), "the scalar half is carried:\n{params}");
+    assert!(
+        params.contains(r#"Params.nested(sub, "settings", [], "deep")"#),
+        "the nested hash is read as submitted:\n{params}"
+    );
+    assert!(
+        !diags.iter().any(|d| d.message.contains("permitted key `settings`")),
+        "a carried key is not ledgered as dropped: {:?}",
+        diags.iter().map(|d| d.message.clone()).collect::<Vec<_>>(),
+    );
+}
+
+/// `attributes=` with a params object reaches the model's typed
+/// `assign_from_<class>` (no runtime defines `attributes=`), the
+/// `.except(…)` filter still applied to the record it is handed.
+#[test]
+fn attributes_assignment_reaches_the_typed_assign() {
+    let c = emitted("app/controllers/stories_controller.rb");
+    assert!(
+        c.contains("@story.assign_from_story_params(self.story_params.except(:url))"),
+        "the record, filtered, goes to the typed assign:\n{c}"
+    );
+}

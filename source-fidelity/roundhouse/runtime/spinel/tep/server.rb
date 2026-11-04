@@ -1,0 +1,299 @@
+# frozen_string_literal: true
+# Tep::Server -- accept loop. Single-threaded inside one process;
+# the perf model is "fork N workers, each runs its own Server"
+# (-w workers) sharing the parent's listeners.
+module Tep
+  def self.reason(status)
+    if status == 200; return "OK"; end
+    if status == 201; return "Created"; end
+    if status == 204; return "No Content"; end
+    if status == 301; return "Moved Permanently"; end
+    if status == 302; return "Found"; end
+    if status == 304; return "Not Modified"; end
+    if status == 400; return "Bad Request"; end
+    if status == 401; return "Unauthorized"; end
+    if status == 403; return "Forbidden"; end
+    if status == 404; return "Not Found"; end
+    if status == 405; return "Method Not Allowed"; end
+    if status == 409; return "Conflict"; end
+    if status == 413; return "Content Too Large"; end
+    if status == 422; return "Unprocessable Content"; end
+    if status == 500; return "Internal Server Error"; end
+    "OK"
+  end
+
+  # An exception out of the app is ONE request's failure, not the
+  # server's. Both server variants call `dispatch` bare, so anything the
+  # handler raised unwound through the connection loop and killed the
+  # process: every later request on every later connection got a refused
+  # socket, and a sweep read one defect as a hundred. Rack servers have
+  # always contained this (Puma logs the exception and answers 500 —
+  # verified against the CRuby tree, where the next request still
+  # served); tep is the peer of Puma here and owed the same contract.
+  #
+  # Logged in Puma's shape — one line, verb and path, class and message
+  # — because the operator's next question is always "which request?".
+  # stderr, not stdout: the access banner owns stdout, and a crash
+  # report interleaved into it is the thing you grep past.
+  #
+  # THE FRAMES ARE THE POINT WHEN THE APP IS AOT-COMPILED. A 500 from
+  # the emitted binary used to be one line with no site, so locating it
+  # meant re-deriving the call path by reading the emit — the summary
+  # line names the request, and nothing names the statement. Spinel
+  # captures a native backtrace under `spin build --debug`
+  # (`SPIN_DEBUG=1`), and without this it captured one nobody printed.
+  #
+  # `backtrace` answers nil for an exception that was never raised and
+  # an EMPTY array on a release build (spinel's `backtrace_symbols` is
+  # a no-op stub unless `--debug`), so both are normal and neither is
+  # worth a line. The summary keeps Puma's shape whatever happens.
+  def self.log_dispatch_error(verb, path, e)
+    tag = "[" + Tep.display_name + "]"
+    $stderr.puts(tag + " 500 " + verb + " " + path + " -- " +
+                 e.class.to_s + ": " + e.message)
+    frames = e.backtrace
+    if !frames.nil?
+      frames.each do |frame|
+        $stderr.puts(tag + "        " + frame)
+      end
+    end
+  end
+
+  class Server
+    attr_accessor :app
+
+    def initialize(app)
+      @app = app
+    end
+
+    def run(port, workers, quiet, unix = UnixListener.new(""))
+      sfd = Sock.sphttp_listen_on(Tep::APP.bind_host, port, 0)
+      if sfd < 0
+        unix.close
+        raise IOError, "cannot bind to port " + port.to_s
+      end
+      Sock.sphttp_install_term_handlers
+      if !quiet
+        puts Tep.display_name + " (" + RUBY_ENGINE +
+             ") listening on http://" + (Tep::APP.bind_host.empty? ? "0.0.0.0" : Tep::APP.bind_host) + ":" + port.to_s +
+             ", pid " + Sock.sphttp_getpid.to_s
+        puts "  blocking accept loop, one request at a time per process; " +
+             "processes: " + Tep.processes_desc(workers)
+      end
+
+      if workers <= 1
+        worker_loop(sfd, unix.unix_fd)
+        unix.close
+        Sock.sphttp_close(sfd)
+        Sock.sphttp_exit(0)
+      end
+
+      # Both descriptors are inherited; only the parent owns the pathname.
+      pids = [0]
+      pids.pop
+      i = 0
+      while i < workers
+        pid = Sock.sphttp_fork
+        if pid == 0
+          worker_loop(sfd, unix.unix_fd)
+          unix.close
+          Sock.sphttp_exit(0)
+        end
+        pids.push(pid) if pid > 0
+        i += 1
+      end
+      Tep.reap_workers(pids)
+      unix.close
+      Sock.sphttp_close(sfd)
+      Sock.sphttp_exit(0)
+    ensure
+      unix.close
+      Sock.sphttp_close(sfd) if sfd >= 0
+    end
+
+    def worker_loop(sfd, ufd = -1)
+      Sock.sphttp_set_nonblock(sfd)
+      Sock.sphttp_set_nonblock(ufd) if ufd >= 0
+      while Sock.sphttp_shutdown_requested == 0
+        Sock.sphttp_poll_reset
+        tcp_slot = Sock.sphttp_poll_add(sfd, 1)
+        unix_slot = ufd >= 0 ? Sock.sphttp_poll_add(ufd, 1) : -1
+        Sock.sphttp_poll_run(1000)
+        if Sock.sphttp_poll_ready(tcp_slot) != 0
+          client = Sock.sphttp_accept_nb(sfd)
+          handle_connection(client, "tcp") if client >= 0
+        end
+        if unix_slot >= 0 && Sock.sphttp_poll_ready(unix_slot) != 0
+          client = Sock.sphttp_accept_nb(ufd)
+          handle_connection(client, "unix") if client >= 0
+        end
+      end
+    end
+
+    # Keep-alive loop on a single accepted connection.
+    # Per-request work is in handle_one so each iteration gets its own
+    # SP_GC_SAVE/RESTORE scope — without that, transient roots from
+    # earlier iterations pile up in the global root set inside the
+    # surrounding while loop and prevent the young-gen GC from
+    # reclaiming the previous request's allocations.
+    def handle_connection(client, transport = "tcp")
+      input = InputBuffer.new
+      keep_going = true
+      while keep_going
+        keep_going = handle_one(client, input, transport)
+      end
+      Sock.sphttp_close(client)
+    end
+
+    # Process exactly one request on `client`. Returns true if the
+    # connection should remain open for the next request (keep-alive)
+    # or false if it should close.
+    # Blocking request reader: accumulate recv_some until the header
+    # terminator "\r\n\r\n" (or EOF / 64 KiB cap). The prefork server's
+    # client fd is blocking, so each recv parks the worker until bytes
+    # arrive — no scheduler. Replaces the C sphttp_read_request +
+    # request_buf (sphttp.c retired — matz/spinel#1466). `+` is binary-safe.
+    def read_request_blocking(client, input = InputBuffer.new)
+      buf = input.take_pending_input
+      return buf if buf.include?("\r\n\r\n")
+      while buf.bytesize < 65535
+        chunk = Sock.sp_net_recv_some(client, [4096, 65535 - buf.bytesize].min).b
+        if chunk.length == 0
+          return ""
+        end
+        buf = buf + chunk
+        if buf.bytesize >= 4 && buf.include?("\r\n\r\n")
+          return buf
+        end
+      end
+      ""
+    end
+
+    def handle_one(client, input = InputBuffer.new, transport = "tcp")
+      blob = read_request_blocking(client, input)
+      return false if blob.length == 0
+      req = Parser.parse(blob, input)
+      if req == nil
+        send_simple(client, 400, "bad request")
+        return false
+      end
+      req.listener_transport = transport
+      # Before the drain, which is what held the bytes (Request#body_refusal).
+      refusal = req.body_refusal(Tep.max_body_bytes)
+      if refusal != 0
+        send_simple(client, refusal, refusal == 413 ? "request body too large" : "bad request")
+        return false
+      end
+      return false unless req.consume_body(client)
+      res = Response.new
+      begin
+        @app.dispatch(req, res)
+      # `StandardError` alone is not the whole of what an app raises. A
+      # stubbed gem facade raises NotImplementedError, which is a
+      # ScriptError, so a bare `rescue` let it unwind past here and kill
+      # the process — one unimplemented gem on one route took down every
+      # later request, which is the exact failure this rescue exists to
+      # prevent. Both names, so the contract holds for the raise a
+      # facade makes as well as the raise a bug makes.
+      rescue StandardError, ScriptError => e
+        # Nothing has been written to the socket yet — `write_response`
+        # runs after this, streaming included — so a clean 500 is still
+        # available. Close rather than keep-alive: `res` may be half
+        # configured (status set, streamer attached, body not), and the
+        # cheap way to not reason about that is to not reuse it.
+        Tep.log_dispatch_error(req.verb, req.path, e)
+        send_simple(client, 500, "internal server error")
+        return false
+      end
+      keep_alive = req.keep_alive? && !res.halted_close?
+      write_response(client, req, res, keep_alive)
+    end
+
+    # Return the keep-alive decision actually sent by the writer.
+    def write_response(client, req, res, keep_alive)
+      if res.streaming
+        # Chunked-encoding stream. Send headers immediately, hand a
+        # Stream writer to the user's Streamer.pump, emit terminator.
+        # Connection is closed afterwards (keep-alive + chunked is
+        # technically legal but we keep things simple).
+        res.headers["Transfer-Encoding"] = "chunked"
+        res.headers["Connection"] = "close"
+        if !res.headers.key?("Content-Type")
+          res.headers["Content-Type"] = "text/event-stream"
+        end
+        head = build_head(req, res)
+        Sock.sphttp_write_str(client, head)
+        out = Stream.new(client)
+        res.streamer.pump(out)
+        Sock.sphttp_write_chunk_end(client)
+        return false
+      end
+
+      if res.file_path.length > 0
+        # send_file path -- compute size, emit headers, then stream.
+        sz = Sock.sphttp_filesize(res.file_path)
+        if sz < 0
+          send_simple(client, 404, "file not found")
+          return false
+        end
+        res.headers["Content-Length"] = sz.to_s
+        if !res.headers.key?("Content-Type")
+          res.headers["Content-Type"] = "application/octet-stream"
+        end
+        if keep_alive
+          res.headers["Connection"] = "keep-alive"
+        else
+          res.headers["Connection"] = "close"
+        end
+        head = build_head(req, res)
+        Sock.sphttp_write_str(client, head)
+        Sock.sphttp_sendfile(client, res.file_path) unless req.verb == "HEAD"
+        return keep_alive
+      end
+
+      if res.body.length > 0 && !res.headers.key?("Content-Type")
+        res.headers["Content-Type"] = "text/html; charset=utf-8"
+      end
+      Tep.maybe_gzip!(req, res)
+      # BYTES, both times — `length` counts characters and `write_str`
+      # stops at the first NUL. See the twin comment in
+      # server_scheduled.rb#write_response for the failure this caused.
+      res.headers["Content-Length"] = res.body.bytesize.to_s
+      if keep_alive
+        res.headers["Connection"] = "keep-alive"
+      else
+        res.headers["Connection"] = "close"
+      end
+
+      head = build_head(req, res)
+      Sock.sphttp_write_str(client, head)
+      # HEAD: the headers GET would send, Content-Length included, and
+      # no body (RFC 9110 9.3.2). A body here would be read by the
+      # client as the start of the NEXT response on a keep-alive socket.
+      if res.body.bytesize > 0 && req.verb != "HEAD"
+        Sock.sphttp_write_bytes(client, res.body, res.body.bytesize)
+      end
+      keep_alive
+    end
+
+    def build_head(req, res)
+      reason = Tep.reason(res.status)
+      head = req.http_version + " " + res.status.to_s + " " + reason + "\r\n"
+      # Set-Cookie can repeat; header_lines emits each on its own line.
+      head << Tep.header_lines(res)
+      head + "\r\n"
+    end
+
+    # bytesize, as write_response: a multibyte `msg` would otherwise
+    # announce fewer bytes than the page carries.
+    def send_simple(client, status, msg)
+      reason = Tep.reason(status)
+      body = "<h1>" + status.to_s + " " + reason + "</h1><p>" + msg + "</p>\n"
+      head = "HTTP/1.0 " + status.to_s + " " + reason + "\r\n" +
+             "Content-Type: text/html; charset=utf-8\r\n" +
+             "Content-Length: " + body.bytesize.to_s + "\r\n" +
+             "Connection: close\r\n\r\n"
+      Sock.sphttp_write_str(client, head + body)
+    end
+  end
+end

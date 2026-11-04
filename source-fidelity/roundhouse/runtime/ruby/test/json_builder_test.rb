@@ -1,0 +1,102 @@
+# frozen_string_literal: true
+require_relative "test_helper"
+require "json_builder"
+
+# Direct unit tests for `runtime/ruby/json_builder.rb`. The four
+# primitives the Jbuilder lowerer relies on, exercised under stock
+# CRuby. Per-target transpile correctness is verified separately by
+# the comparison harness against Rails reference rendering.
+class JsonBuilderTest < Minitest::Test
+  # ── encode_string ──────────────────────────────────────────────
+
+  def test_encode_string_passthrough
+    assert_equal "hello", JsonBuilder.encode_string("hello")
+  end
+
+  def test_encode_string_escapes_quote_and_backslash
+    assert_equal "she said \\\"hi\\\"", JsonBuilder.encode_string("she said \"hi\"")
+    assert_equal "a\\\\b", JsonBuilder.encode_string("a\\b")
+  end
+
+  def test_encode_string_escapes_whitespace_controls
+    assert_equal "a\\nb\\tc\\rd", JsonBuilder.encode_string("a\nb\tc\rd")
+  end
+
+  # ActiveSupport's HTML-entity escaping, byte for byte:
+  # `ActiveSupport::JSON.encode(%q{<b>&</b>})` is `"\u003cb\u003e\u0026\u003c/b\u003e"`.
+  def test_encode_string_escapes_html_entities
+    assert_equal "\\u003cb\\u003e\\u0026\\u003c/b\\u003e", JsonBuilder.encode_string("<b>&</b>")
+  end
+
+  # Escaping an encoded document must preserve its syntax and existing escapes.
+  def test_escape_html_entities_preserves_json_structure_and_existing_escapes
+    json = %q({"<tag>":"<b>&</b>","escaped":"\\n\\u003c"})
+    expected = %q({"\\u003ctag\\u003e":"\\u003cb\\u003e\\u0026\\u003c/b\\u003e","escaped":"\\n\\u003c"})
+    assert_equal expected, JsonBuilder.escape_html_entities(json)
+  end
+
+  # Rails 8.1 defaults leave Unicode line and paragraph separators unescaped.
+  def test_escape_html_entities_preserves_rails_8_1_line_separators
+    json = "{\"separators\":\"\u2028\u2029\"}"
+    assert_equal json, JsonBuilder.escape_html_entities(json)
+  end
+
+  # ── encode_value ───────────────────────────────────────────────
+
+  def test_encode_value_nil
+    assert_equal "null", JsonBuilder.encode_value(nil)
+  end
+
+  def test_encode_value_bool
+    assert_equal "true", JsonBuilder.encode_value(true)
+    assert_equal "false", JsonBuilder.encode_value(false)
+  end
+
+  def test_encode_value_integer
+    assert_equal "0", JsonBuilder.encode_value(0)
+    assert_equal "-7", JsonBuilder.encode_value(-7)
+    assert_equal "42", JsonBuilder.encode_value(42)
+  end
+
+  def test_encode_value_float
+    assert_equal "3.14", JsonBuilder.encode_value(3.14)
+  end
+
+  def test_encode_value_string_is_quoted
+    assert_equal "\"hello\"", JsonBuilder.encode_value("hello")
+  end
+
+  def test_encode_value_string_escapes_inside_quotes
+    assert_equal "\"a\\\"b\"", JsonBuilder.encode_value("a\"b")
+  end
+
+  # ── encode_datetime ────────────────────────────────────────────
+
+  def test_encode_datetime_nil
+    assert_equal "null", JsonBuilder.encode_datetime(nil)
+  end
+
+  def test_encode_datetime_full_microseconds
+    # Sqlite TEXT timestamp with microsecond fraction.
+    assert_equal "\"2026-05-10T02:22:28.114Z\"",
+      JsonBuilder.encode_datetime("2026-05-10 02:22:28.114670")
+  end
+
+  def test_encode_datetime_no_fraction
+    # No fractional seconds → milliseconds default to "000".
+    assert_equal "\"2026-05-10T02:22:28.000Z\"",
+      JsonBuilder.encode_datetime("2026-05-10 02:22:28")
+  end
+
+  def test_encode_datetime_short_fraction
+    # One-digit fraction pads to milliseconds.
+    assert_equal "\"2026-05-10T02:22:28.100Z\"",
+      JsonBuilder.encode_datetime("2026-05-10 02:22:28.1")
+  end
+
+  def test_encode_datetime_unrecognized_passes_through_as_string
+    # Bogus input → fallback quoted-string encoding so call sites
+    # don't crash on malformed column data.
+    assert_equal "\"oops\"", JsonBuilder.encode_datetime("oops")
+  end
+end

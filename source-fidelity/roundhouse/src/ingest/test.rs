@@ -1,0 +1,1228 @@
+//! Rails test-file ingestion — `test/models/*_test.rb` and
+//! `test/controllers/*_test.rb`. Expects one or more test classes
+//! (typically inheriting from `ActiveSupport::TestCase` or
+//! `ActionDispatch::IntegrationTest`), at the top level or inside a
+//! `module`, whose bodies are sequences of `test "name" do ... end`
+//! declarations.
+
+use ruby_prism::Node;
+
+use crate::dialect::{AccessorKind, MethodDef, MethodReceiver, MethodVisibility, Test, TestModule};
+use crate::effect::EffectSet;
+use crate::expr::{Expr, ExprNode, LValue, Literal};
+use crate::ident::VarId;
+use crate::span::Span;
+use crate::ty::Ty;
+use crate::{ClassId, Symbol};
+
+use super::expr::ingest_expr;
+use super::library_class::{
+    ingest_library_method, library_class_from_node, library_class_from_node_with_scope,
+};
+use super::util::{
+    class_name_path, constant_id_str, constant_path_of, flatten_statements, module_name_path,
+};
+use super::{IngestError, IngestResult};
+
+/// Returns `Ok(None)` if the file doesn't contain a class (e.g. a pure
+/// helper or empty file). Unrecognized top-level constructs inside the
+/// class are silently skipped — same posture as `ingest_controller`'s
+/// `Unknown` fallback but without the surrounding body-item model.
+///
+/// When the file declares multiple top-level classes — typically a
+/// helper model paired with a `*Test` class (see
+/// `runtime/ruby/test/action_view/view_helpers_test.rb`'s `Article` +
+/// `ViewHelpersTest` pair) — pick the `*Test` class as the test
+/// module and ingest the rest as helpers on the returned module's
+/// `inner_classes`. This keeps the emit path generic: every per-target
+/// emitter already hoists `inner_classes` above the test body, so a
+/// top-level helper class lands alongside the test file without
+/// per-target plumbing changes.
+pub fn ingest_test_file(source: &[u8], file: &str) -> IngestResult<Option<TestModule>> {
+    Ok(ingest_test_files(source, file)?.into_iter().next())
+}
+
+/// Every test class the file declares, each as its own `TestModule`.
+///
+/// A Rails test file is usually one class, but not always:
+/// campfire's `test/channels/room_messages_channel_test.rb` declares
+/// `RoomMessagesChannelTest` and, beside it, `RoomMessagesViaStock-
+/// TurboChannelTest` — the second exists to prove the STOCK
+/// `Turbo::StreamsChannel` turns the same stream names away, which is
+/// a different subject and so a different class. `ingest_test_file`
+/// kept only the first and routed the second through
+/// `inner_classes`, where a `*Test` class was then skipped on
+/// purpose (see the note at the end of `ingest_test_class`): two
+/// tests silently absent from every tally. Each class here becomes
+/// a module of its own, and the emit names files by class, so they
+/// land as two test files the way Minitest would have run them as
+/// two suites. Non-test top-level classes are shared by every module
+/// as helpers, the way they were for the one.
+pub fn ingest_test_files(source: &[u8], file: &str) -> IngestResult<Vec<TestModule>> {
+    ingest_test_classes(source, file, true)
+}
+
+/// The test classes a support file (`test/test_helper.rb`) defines: only
+/// classes that read as test classes, with no single-class fallback, so a
+/// helper's plain `class RecordingLogger < Logger` is never mistaken for one.
+pub fn ingest_test_bases(source: &[u8], file: &str) -> IngestResult<Vec<TestModule>> {
+    ingest_test_classes(source, file, false)
+}
+
+fn ingest_test_classes(
+    source: &[u8],
+    file: &str,
+    single_class_fallback: bool,
+) -> IngestResult<Vec<TestModule>> {
+    super::sources::register(file, &String::from_utf8_lossy(source));
+    let result = super::prism::parse(source, file);
+    let root = result.node();
+    let mut top_classes: Vec<ScopedClass<'_>> = Vec::new();
+    collect_top_level_classes(&root, &[], &mut top_classes);
+    if top_classes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (mut test_nodes, helper_nodes): (Vec<_>, Vec<_>) =
+        top_classes.into_iter().partition(|(_, c)| is_test_class_node(c));
+    // No candidate matches: the historical single-class shape, where
+    // the first top-level class is the test whatever it is called. A
+    // class inside a module is not a candidate here: a support file
+    // in a test directory often declares one, and it has no tests.
+    if test_nodes.is_empty() {
+        if !single_class_fallback {
+            return Ok(Vec::new());
+        }
+        let mut helper_nodes = helper_nodes;
+        let Some(first) = helper_nodes.iter().position(|(scope, _)| scope.is_empty()) else {
+            return Ok(Vec::new());
+        };
+        test_nodes.push(helper_nodes.remove(first));
+        return ingest_test_class(&test_nodes[0], &helper_nodes, file).map(|tm| vec![tm]);
+    }
+    test_nodes
+        .iter()
+        .map(|class| ingest_test_class(class, &helper_nodes, file))
+        .collect()
+}
+
+fn ingest_test_class(
+    (scope, class): &ScopedClass<'_>,
+    top_level_helper_nodes: &[ScopedClass<'_>],
+    file: &str,
+) -> IngestResult<TestModule> {
+    let mut name_path = scope.clone();
+    name_path.extend(class_name_path(class).ok_or_else(|| IngestError::Unsupported {
+        file: file.into(),
+        message: "test class name must be a simple constant or path".into(),
+    })?);
+    let name = ClassId(Symbol::from(name_path.join("::")));
+
+    let parent = class.superclass().and_then(|n| {
+        constant_path_of(&n).map(|p| ClassId(Symbol::from(p.join("::"))))
+    });
+
+    // Rails convention: `ArticleTest` tests `Article`. Strip the `Test`
+    // suffix off the last name-path segment. Unusual naming → None.
+    let target = name_path
+        .last()
+        .and_then(|last| last.strip_suffix("Test"))
+        .map(|stem| ClassId(Symbol::from(stem)));
+
+    let mut acc = ClassBody { target, ..ClassBody::default() };
+    // Concerns `test_helper.rb` mixes into `ActiveSupport::TestCase`: a
+    // class that derives from a framework base inherits their `included`
+    // registrations ahead of its own, as a parent's callbacks run first.
+    if parent.as_ref().is_some_and(|p| is_framework_test_base(p.0.as_str())) {
+        for concern in test_case_wide_concerns() {
+            apply_test_concern(&concern, &mut acc, &name, 0)?;
+        }
+    }
+    if let Some(class_body) = class.body() {
+        for stmt in flatten_statements(class_body) {
+            class_body_statement(&stmt, file, &mut acc, &name, 0)?;
+        }
+    }
+    let ClassBody { tests, setup, mut inner_classes, mut helpers, constants, includes, teardowns, target, .. } = acc;
+
+    // ActiveSupport runs `teardown do … end` blocks after every test,
+    // passed or failed, after the class's own `def teardown` and in
+    // reverse of the order they were declared. The harness calls the
+    // test's `teardown` after each test the same way, so the blocks
+    // become that method. An early `return` in `def teardown` must not
+    // skip the blocks — wrap the method body in `ensure` so they run.
+    //
+    // Always `super` in a trailing ensure: TestBase's teardown runs
+    // `mocha_verify` / stub-slot verifies (see `patch_stub_lifecycle`).
+    // A subclass `def teardown` that omits `super` leaves Mocha expects
+    // installed, and the next test fails with "unexpected invocation"
+    // (campfire's CachedResponsesTest after this ingest landed).
+    // Method-level `ensure` (`implicit: true`) is the outer shape; the
+    // nested `begin/ensure` around the blocks is explicit so `super`
+    // still runs when a block raises.
+    //
+    // When `def teardown` already calls `super` (including conditionally),
+    // mark it at the call site and skip the ensure fallback so mocha
+    // verify runs exactly once on every path.
+    if !teardowns.is_empty() {
+        let blocks = Expr::new(
+            Span::synthetic(),
+            ExprNode::Seq {
+                exprs: teardowns.into_iter().rev().collect(),
+            },
+        );
+        let syn = Span::synthetic();
+        let super_call = || {
+            Expr::new(
+                syn,
+                ExprNode::Super { args: Some(Vec::new()) },
+            )
+        };
+        let own = helpers.iter().position(|m| m.name.as_str() == "teardown");
+        let (name_span, body) = match own.map(|i| helpers.remove(i)) {
+            Some(m) => {
+                // def teardown
+                //   __teardown_super_ran = false
+                //   begin
+                //     own  # Super sites set the flag then call super
+                //   ensure
+                //     begin
+                //       blocks
+                //     ensure
+                //       super() unless __teardown_super_ran
+                //     end
+                //   end
+                // end
+                let flag = Symbol::from("__teardown_super_ran");
+                let flag_lit = |value: bool| {
+                    Expr::new(syn, ExprNode::Lit { value: Literal::Bool { value } })
+                };
+                let flag_var = || {
+                    Expr::new(
+                        syn,
+                        ExprNode::Var {
+                            id: VarId(0),
+                            name: flag.clone(),
+                        },
+                    )
+                };
+                let assign_flag = |value: bool| {
+                    Expr::new(
+                        syn,
+                        ExprNode::Assign {
+                            target: LValue::Var {
+                                id: VarId(0),
+                                name: flag.clone(),
+                            },
+                            value: flag_lit(value),
+                        },
+                    )
+                };
+                let mut own_body = m.body;
+                mark_teardown_super_ran(&mut own_body, &flag);
+                let fallback_super = Expr::new(
+                    syn,
+                    ExprNode::If {
+                        cond: flag_var(),
+                        then_branch: Expr::new(syn, ExprNode::Lit { value: Literal::Nil }),
+                        else_branch: super_call(),
+                    },
+                );
+                let blocks_then_super = Expr::new(
+                    syn,
+                    ExprNode::BeginRescue {
+                        body: blocks,
+                        rescues: Vec::new(),
+                        else_branch: None,
+                        ensure: Some(fallback_super),
+                        implicit: false,
+                    },
+                );
+                (
+                    m.name_span,
+                    Expr::new(
+                        syn,
+                        ExprNode::BeginRescue {
+                            body: Expr::new(
+                                syn,
+                                ExprNode::Seq {
+                                    exprs: vec![assign_flag(false), own_body],
+                                },
+                            ),
+                            rescues: Vec::new(),
+                            else_branch: None,
+                            ensure: Some(blocks_then_super),
+                            implicit: true,
+                        },
+                    ),
+                )
+            }
+            None => (
+                Span::synthetic(),
+                // def teardown
+                //   blocks
+                // ensure
+                //   super()
+                // end
+                Expr::new(
+                    Span::synthetic(),
+                    ExprNode::BeginRescue {
+                        body: blocks,
+                        rescues: Vec::new(),
+                        else_branch: None,
+                        ensure: Some(super_call()),
+                        implicit: true,
+                    },
+                ),
+            ),
+        };
+        helpers.push(MethodDef {
+            name_span,
+            name: Symbol::from("teardown"),
+            receiver: crate::dialect::MethodReceiver::Instance,
+            visibility: crate::dialect::MethodVisibility::Public,
+            params: Vec::new(),
+            unsupported_formals: None,
+            has_anonymous_block: false,
+            body,
+            signature: None,
+            effects: crate::effect::EffectSet::default(),
+            enclosing_class: Some(name.0.clone()),
+            kind: crate::dialect::AccessorKind::Method,
+            is_async: false,
+            mutates_self: false,
+            block_param: None,
+        });
+    }
+
+    // Top-level helper classes (e.g. `class Article < ActiveRecord::
+    // Base` declared next to `ViewHelpersTest` in the same file) ingest
+    // as LibraryClass and flow through the same `inner_classes` channel
+    // as body-internal helpers. The per-target emit paths already hoist
+    // `inner_classes` to file scope above the test body — same routing,
+    // no further per-target changes needed.
+    //
+    // Additional `*Test`-shaped classes are each a module of their
+    // own — `ingest_test_files` splits them before this runs — so
+    // every node here is a genuine helper. (They used to be dropped:
+    // an inner class does not get the `< Minitest::Test → < TestBase`
+    // parent rewrite the test class does, so emitting one inline
+    // would have Minitest find it under CRuby and run it against the
+    // wrong assertion surface.)
+    for (helper_scope, helper_node) in top_level_helper_nodes {
+        let lc = library_class_from_node_with_scope(helper_node, helper_scope, file)?;
+        inner_classes.push(lc);
+    }
+
+    Ok(TestModule {
+        name,
+        parent,
+        target,
+        tests,
+        setup,
+        inner_classes,
+        helpers,
+        constants,
+        includes,
+    })
+}
+
+/// `self.use_transactional_tests = false` (or `true`) as
+/// `def self.use_transactional_tests; <bool>; end`. The shim calls that
+/// class method; `TestBase` answers true when the class does not override it.
+fn transactional_tests_method(stmt: &Node) -> Option<MethodDef> {
+    let call = stmt.as_call_node()?;
+    if constant_id_str(&call.name()) != "use_transactional_tests=" {
+        return None;
+    }
+    let recv = call.receiver()?;
+    if recv.as_self_node().is_none() {
+        return None;
+    }
+    let args = call.arguments()?;
+    let arg = args.arguments().iter().next()?;
+    let value = if arg.as_true_node().is_some() {
+        true
+    } else if arg.as_false_node().is_some() {
+        false
+    } else {
+        return None;
+    };
+    let body = Expr::new(
+        Span::synthetic(),
+        ExprNode::Lit {
+            value: Literal::Bool { value },
+        },
+    );
+    Some(MethodDef {
+        name: Symbol::from("use_transactional_tests"),
+        receiver: MethodReceiver::Class,
+        visibility: MethodVisibility::Public,
+        params: Vec::new(),
+        unsupported_formals: None,
+        has_anonymous_block: false,
+        block_param: None,
+        name_span: Span::synthetic(),
+        body,
+        signature: Some(Ty::Fn {
+            params: Vec::new().into(),
+            block: None,
+            ret: std::sync::Arc::new(Ty::Bool),
+            effects: EffectSet::pure(),
+        }),
+        effects: EffectSet::pure(),
+        enclosing_class: None,
+        kind: AccessorKind::Method,
+        is_async: false,
+        mutates_self: false,
+    })
+}
+
+/// The app-wide `setup do … end` an app's `test/test_helper.rb` puts on
+/// `ActiveSupport::TestCase` (reopened there, or nested as `module
+/// ActiveSupport; class TestCase`). Rails runs it before every test
+/// case's own setup, so the caller splices it ahead of each test
+/// module's `setup` — the same move `splice_test_helpers` makes for the
+/// helper modules that file includes.
+///
+/// campfire's is three statements — clear the cable test adapter,
+/// replace the web-push pool, forbid network — and the middle one is
+/// why this exists: `Room::PushTest` waits on the pool's task counter,
+/// which is cumulative, so every test needs the fresh pool the app's
+/// own setup gives it. Without the splice the suite's first push test
+/// leaves a count the next one's wait is satisfied by before its tasks
+/// have run.
+///
+/// Only the `setup` hook is read. `fixtures :all`, `parallelize`, and
+/// the `include` list are the harness's concern (the includes are read
+/// by `ingest_test_helper_modules`), and a `teardown` there has no
+/// home yet — the emitted `TestBase#teardown` is ours.
+pub fn ingest_test_case_setup(source: &[u8], file: &str) -> IngestResult<Option<Expr>> {
+    let result = super::prism::parse(source, file);
+    let root = result.node();
+    let mut classes: Vec<ScopedClass<'_>> = Vec::new();
+    collect_top_level_classes(&root, &[], &mut classes);
+    for (_, class) in classes {
+        let Some(path) = class_name_path(&class) else { continue };
+        if path.last().map(String::as_str) != Some("TestCase") {
+            continue;
+        }
+        let Some(body) = class.body() else { continue };
+        let mut setup: Option<Expr> = None;
+        let mut after_fixtures: Vec<Expr> = Vec::new();
+        for stmt in flatten_statements(body) {
+            if setup.is_none() {
+                if let Some(found) = ingest_setup_declaration(&stmt, file)? {
+                    setup = Some(found);
+                    continue;
+                }
+            }
+            if let Some(stmts) = ingest_load_fixtures_override(&stmt, file)? {
+                after_fixtures = stmts;
+            }
+        }
+        if after_fixtures.is_empty() {
+            return Ok(setup);
+        }
+        // The fixture hook's statements run first: Rails loads fixtures
+        // in `before_setup`, ahead of every `setup` block, and the
+        // harness reloads them per test before this runs.
+        let mut exprs = after_fixtures;
+        match setup {
+            Some(s) => match *s.node {
+                ExprNode::Seq { exprs: own } => exprs.extend(own),
+                node => exprs.push(Expr::new(s.span, node)),
+            },
+            None => {}
+        }
+        return Ok(Some(Expr::new(Span::synthetic(), ExprNode::Seq { exprs })));
+    }
+    Ok(None)
+}
+
+/// Rewrite every `super` in a teardown body to set `__teardown_super_ran`
+/// before the call, so the ensure fallback can skip a second inherited
+/// teardown. Works for bare `super`, `super(...)`, and conditional forms
+/// (`super if x`) — only executed Super sites flip the flag.
+fn mark_teardown_super_ran(expr: &mut Expr, flag: &Symbol) {
+    if matches!(&*expr.node, ExprNode::Super { .. }) {
+        let super_expr = std::mem::replace(
+            expr,
+            Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil }),
+        );
+        *expr = Expr::new(
+            super_expr.span,
+            ExprNode::Seq {
+                exprs: vec![
+                    Expr::new(
+                        Span::synthetic(),
+                        ExprNode::Assign {
+                            target: LValue::Var {
+                                id: VarId(0),
+                                name: flag.clone(),
+                            },
+                            value: Expr::new(
+                                Span::synthetic(),
+                                ExprNode::Lit {
+                                    value: Literal::Bool { value: true },
+                                },
+                            ),
+                        },
+                    ),
+                    super_expr,
+                ],
+            },
+        );
+        return;
+    }
+    expr.node
+        .for_each_child_mut(&mut |child| mark_teardown_super_ran(child, flag));
+}
+
+/// `def load_fixtures(config) = (fixtures = super; …; fixtures)` on the
+/// app's `ActiveSupport::TestCase` — work to do once fixtures are in
+/// the database. campfire repairs `rooms.messages_count` there, because
+/// `fixtures :all` inserts messages before the rooms they count:
+///
+/// ```ruby
+/// def load_fixtures(config)
+///   fixtures = super
+///   Room::MessagesCount.ensure!
+///   Room::MessagesCount.backfill!
+///   fixtures
+/// end
+/// ```
+///
+/// Only that shape — `super` first (bare or assigned), its value last
+/// when assigned — is read, as the statements between. The harness
+/// loads fixtures itself, so those statements are what the override
+/// adds. Any other shape is an error rather than a hook silently left
+/// out.
+fn ingest_load_fixtures_override(stmt: &Node<'_>, file: &str) -> IngestResult<Option<Vec<Expr>>> {
+    let Some(def) = stmt.as_def_node() else { return Ok(None) };
+    if std::str::from_utf8(def.name().as_slice()).ok() != Some("load_fixtures") {
+        return Ok(None);
+    }
+    let unsupported = || IngestError::Unsupported {
+        file: file.into(),
+        message: "a `load_fixtures` override other than `x = super; …; x` is not supported".into(),
+    };
+    let Some(body) = def.body() else { return Ok(Some(Vec::new())) };
+    let body = ingest_expr(&body, file)?;
+    let mut stmts = match *body.node {
+        ExprNode::Seq { exprs } => exprs,
+        node => vec![Expr::new(body.span, node)],
+    };
+    if stmts.is_empty() {
+        return Err(unsupported());
+    }
+    let first = stmts.remove(0);
+    let is_super = |e: &Expr| matches!(&*e.node, ExprNode::Super { .. });
+    match &*first.node {
+        _ if is_super(&first) => {}
+        ExprNode::Assign { target: crate::expr::LValue::Var { name, .. }, value } if is_super(value) => {
+            let returns_it = stmts
+                .last()
+                .is_some_and(|e| matches!(&*e.node, ExprNode::Var { name: n, .. } if n == name));
+            if !returns_it {
+                return Err(unsupported());
+            }
+            stmts.pop();
+        }
+        _ => return Err(unsupported()),
+    }
+    Ok(Some(stmts))
+}
+
+/// Collect every class the file declares outside another class, each
+/// with the path of the modules that enclose it. `module Models; class
+/// PostTest` gives `(["Models"], PostTest)`, the same class as `class
+/// Models::PostTest`. The walk does not go into class bodies: a class
+/// inside a test class is a helper of that test class.
+fn collect_top_level_classes<'pr>(
+    node: &Node<'pr>,
+    scope: &[String],
+    out: &mut Vec<ScopedClass<'pr>>,
+) {
+    if let Some(c) = node.as_class_node() {
+        out.push((scope.to_vec(), c));
+        return;
+    }
+    if let Some(p) = node.as_program_node() {
+        collect_top_level_classes(&p.statements().as_node(), scope, out);
+        return;
+    }
+    if let Some(s) = node.as_statements_node() {
+        for stmt in s.body().iter() {
+            collect_top_level_classes(&stmt, scope, out);
+        }
+        return;
+    }
+    if let Some(m) = node.as_module_node() {
+        let mut inner = scope.to_vec();
+        inner.extend(module_name_path(&m).unwrap_or_default());
+        if let Some(body) = m.body() {
+            collect_top_level_classes(&body, &inner, out);
+        }
+    }
+}
+
+type ScopedClass<'pr> = (Vec<String>, ruby_prism::ClassNode<'pr>);
+
+/// Heuristic: a class is "the test class" when its name ends with
+/// `Test` (e.g. `ViewHelpersTest`, `InflectorTest`) OR when its parent
+/// path's leaf segment is a known test base (`Test`, `TestCase`,
+/// `IntegrationTest`). The two conditions together cover both the
+/// framework's own `< Minitest::Test` shape and Rails app tests'
+/// `< ActiveSupport::TestCase` / `< ActionDispatch::IntegrationTest`.
+fn is_test_class_node(c: &ruby_prism::ClassNode<'_>) -> bool {
+    if let Some(name_path) = class_name_path(c) {
+        if let Some(last) = name_path.last() {
+            if last.ends_with("Test") {
+                return true;
+            }
+        }
+    }
+    if let Some(parent_node) = c.superclass() {
+        if let Some(parent_path) = constant_path_of(&parent_node) {
+            if let Some(last) = parent_path.last() {
+                if matches!(last.as_str(), "Test" | "TestCase" | "IntegrationTest") {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Recognize `setup do ... end` (Call with method=setup, block body)
+/// and `def setup; ...; end` (DefNode named setup). Returns the body
+/// expression in either case. Other shapes return Ok(None).
+/// What a test class body declares, gathered statement by statement:
+/// the class's own and, through `apply_test_concern`, the statements of
+/// a test helper Concern's `included` block where it is included.
+#[derive(Default)]
+struct ClassBody {
+    tests: Vec<Test>,
+    setup: Option<Expr>,
+    inner_classes: Vec<crate::dialect::LibraryClass>,
+    helpers: Vec<MethodDef>,
+    constants: Vec<(Symbol, Expr)>,
+    includes: Vec<ClassId>,
+    teardowns: Vec<Expr>,
+    target: Option<ClassId>,
+    /// Concerns whose `included` block already ran on this class: Ruby
+    /// includes a module once, so a second `include` runs nothing.
+    applied: Vec<String>,
+}
+
+/// One statement of a test class body. Returns whether it is one the
+/// class body models; the class's own unrecognized statements are
+/// skipped, as they always were, and a Concern block's are refused.
+fn class_body_statement(
+    stmt: &Node<'_>,
+    file: &str,
+    acc: &mut ClassBody,
+    name: &ClassId,
+    depth: usize,
+) -> IngestResult<bool> {
+    if let Some(test) = ingest_test_declaration(&stmt, file)? {
+        acc.tests.push(test);
+        return Ok(true);
+    }
+    if let Some(body) = ingest_teardown_block(&stmt, file)? {
+        acc.teardowns.push(body);
+        return Ok(true);
+    }
+    if let Some(body) = ingest_setup_declaration(&stmt, file)? {
+        // Multiple setup hooks compose in source order — append
+        // by wrapping in a Seq. Rare in practice; first wins
+        // when stored as Option, so accumulate.
+        acc.setup = Some(match acc.setup.take() {
+            None => body,
+            Some(prev) => {
+                let prev_stmts = match &*prev.node {
+                    ExprNode::Seq { exprs } => exprs.clone(),
+                    _ => vec![prev],
+                };
+                let body_stmts = match &*body.node {
+                    ExprNode::Seq { exprs } => exprs.clone(),
+                    _ => vec![body],
+                };
+                let mut all = prev_stmts;
+                all.extend(body_stmts);
+                Expr::new(Span::synthetic(), ExprNode::Seq { exprs: all })
+            }
+        });
+        return Ok(true);
+    }
+    // Inline class declaration inside the test class —
+    // `class Validatable; include ActiveRecord::Validations;
+    // ...; end`. Captured per-test-module so the emit can
+    // hoist them to file scope above the lowered test class.
+    if let Some(inner) = stmt.as_class_node() {
+        let lc = library_class_from_node(&inner, file)?;
+        acc.inner_classes.push(lc);
+        return Ok(true);
+    }
+    // Non-test, non-setup `def` — instance helper method
+    // (e.g. `setup_adapter_with_stub_row(id)`). Capture as
+    // an ordinary method on the test class so test bodies
+    // can `self.<helper>(...)` it. Definitions of `def
+    // setup` and `def test_*` already short-circuited above.
+    if let Some(def) = stmt.as_def_node() {
+        let m = ingest_library_method(&def, name, file)?;
+        acc.helpers.push(m);
+        return Ok(true);
+    }
+    // `include ModName` at class-body scope. Captured for
+    // the spinel emit to replay verbatim so bare-name refs
+    // (`Router`, `FormBuilder`) resolve under CRuby. TS emit
+    // ignores these — its framework-namespace import-stripper
+    // handles the same refs by a different mechanism.
+    if let Some(call) = stmt.as_call_node() {
+        // `tests RoomMessagesChannel` — ActionCable's channel
+        // and connection test cases (and ActionController::
+        // TestCase) name their subject with this macro when
+        // the class name does not: `RoomMessagesViaStock-
+        // TurboChannelTest` tests `Turbo::StreamsChannel`. It
+        // overrides the `FooTest` → `Foo` convention above.
+        if call.receiver().is_none() && constant_id_str(&call.name()) == "tests" {
+            if let Some(args) = call.arguments() {
+                if let Some(arg) = args.arguments().iter().next() {
+                    if let Some(path) = constant_path_of(&arg) {
+                        acc.target = Some(ClassId(Symbol::from(path.join("::"))));
+                    }
+                }
+            }
+            return Ok(true);
+        }
+        if call.receiver().is_none()
+            && constant_id_str(&call.name()) == "include"
+        {
+            if let Some(args) = call.arguments() {
+                for arg in args.arguments().iter() {
+                    if let Some(path) = constant_path_of(&arg) {
+                        let included = path.join("::");
+                        acc.includes.push(ClassId(Symbol::from(included.as_str())));
+                        if let Some(concern) = test_concern(&included) {
+                            apply_test_concern(&concern, acc, name, depth)?;
+                        }
+                    }
+                }
+            }
+            return Ok(true);
+        }
+    }
+    // `self.use_transactional_tests = false` — Rails' per-class
+    // opt-out of the fixture transaction. Kept as a class method
+    // so the autorun shim can ask the class. Anything else in
+    // the class body is still skipped.
+    if let Some(method) = transactional_tests_method(&stmt) {
+        acc.helpers.push(method);
+        return Ok(true);
+    }
+    // Class-level constant assignment — `TABLE = [...]`,
+    // `Article = Struct.new(...)`. Captured here so the test
+    // emit can hoist them to file scope as `const NAME =
+    // <value>`, which matches Ruby's lexical constant
+    // resolution for bare references inside test methods.
+    if let Some(cw) = stmt.as_constant_write_node() {
+        let const_name = std::str::from_utf8(cw.name().as_slice())
+            .ok()
+            .map(Symbol::from);
+        if let Some(const_name) = const_name {
+            let value = ingest_expr(&cw.value(), file)?;
+            acc.constants.push((const_name, value));
+        }
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
+/// A test helper `ActiveSupport::Concern` (`test/test_helpers/`, or a
+/// module-only file in a test folder) whose `included do` block a test
+/// class runs when it includes the module.
+#[derive(Clone, Debug)]
+pub struct TestConcern {
+    pub name: String,
+    pub file: String,
+    pub source: Vec<u8>,
+}
+
+/// The app's test helper Concerns, and the names `test/test_helper.rb`
+/// includes into `ActiveSupport::TestCase` (every test case's).
+#[derive(Clone, Debug, Default)]
+pub struct TestConcerns {
+    pub concerns: Vec<TestConcern>,
+    pub case_wide: Vec<String>,
+}
+
+thread_local! {
+    static TEST_CONCERNS: std::cell::RefCell<TestConcerns> = std::cell::RefCell::new(TestConcerns::default());
+}
+
+/// Ingest test files with `concerns` known: an `include` of one runs its
+/// `included` block's statements on the including class.
+pub fn with_test_concerns<R>(concerns: TestConcerns, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<TestConcerns>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let prev = self.0.take().unwrap_or_default();
+            TEST_CONCERNS.with(|c| *c.borrow_mut() = prev);
+        }
+    }
+    let _restore = Restore(Some(TEST_CONCERNS.with(|c| c.replace(concerns))));
+    f()
+}
+
+fn test_concern(name: &str) -> Option<TestConcern> {
+    let name = name.trim_start_matches("::");
+    TEST_CONCERNS.with(|c| c.borrow().concerns.iter().find(|tc| tc.name == name).cloned())
+}
+
+fn test_case_wide_concerns() -> Vec<TestConcern> {
+    TEST_CONCERNS.with(|c| {
+        let c = c.borrow();
+        c.case_wide.iter().filter_map(|n| c.concerns.iter().find(|tc| &tc.name == n).cloned()).collect()
+    })
+}
+
+/// A framework test case: one `ActiveSupport::TestCase` is, or derives
+/// from, so a Concern included into it reaches the class.
+fn is_framework_test_base(parent: &str) -> bool {
+    matches!(
+        parent.trim_start_matches("::"),
+        "ActiveSupport::TestCase"
+            | "ActionDispatch::IntegrationTest"
+            | "ActionController::TestCase"
+            | "ActionMailer::TestCase"
+            | "ActionView::TestCase"
+            | "ActiveJob::TestCase"
+            | "ActionCable::Channel::TestCase"
+            | "ActionCable::Connection::TestCase"
+            | "ActionDispatch::SystemTestCase"
+    )
+}
+
+/// Every module in `source` that is a Concern with an `included do`
+/// block, by its full name (`Widgets::ReadHelper`).
+pub fn concern_modules(source: &[u8], file: &str) -> Vec<String> {
+    let result = super::prism::parse(source, file);
+    let mut out = Vec::new();
+    fn walk(node: &Node<'_>, scope: &[String], out: &mut Vec<String>) {
+        let Some(stmts) = node.as_statements_node() else { return };
+        for stmt in stmts.body().iter() {
+            let Some(m) = stmt.as_module_node() else { continue };
+            let Some(path) = module_name_path(&m) else { continue };
+            let mut full = scope.to_vec();
+            full.extend(path);
+            if included_block_body(&m).is_some() {
+                out.push(full.join("::"));
+            }
+            if let Some(body) = m.body() {
+                walk(&body, &full, out);
+            }
+        }
+    }
+    if let Some(program) = result.node().as_program_node() {
+        walk(&program.statements().as_node(), &[], &mut out);
+    }
+    out
+}
+
+/// The body of a Concern module's `included do … end`: the module must
+/// `extend ActiveSupport::Concern`, which is what gives `included` a
+/// block to run on the includer.
+fn included_block_body<'pr>(m: &ruby_prism::ModuleNode<'pr>) -> Option<Option<Node<'pr>>> {
+    let body = m.body()?;
+    let stmts = flatten_statements(body);
+    let concern = stmts.iter().any(|stmt| {
+        stmt.as_call_node().is_some_and(|call| {
+            call.receiver().is_none()
+                && constant_id_str(&call.name()) == "extend"
+                && call.arguments().is_some_and(|args| {
+                    args.arguments().iter().any(|a| {
+                        constant_path_of(&a).is_some_and(|p| p.join("::").trim_start_matches("::") == "ActiveSupport::Concern")
+                    })
+                })
+        })
+    });
+    if !concern {
+        return None;
+    }
+    stmts.iter().find_map(|stmt| {
+        let call = stmt.as_call_node()?;
+        if call.receiver().is_some() || constant_id_str(&call.name()) != "included" || call.arguments().is_some() {
+            return None;
+        }
+        let block = call.block()?.as_block_node()?;
+        Some(block.body())
+    })
+}
+
+/// `Concern#append_features`: the `included` block runs on the
+/// includer where the `include` stands. Its statements go through the
+/// same class-body reading as the class's own, and one the class body
+/// does not model is refused by name rather than dropped, since the
+/// registration it made would otherwise never run.
+fn apply_test_concern(concern: &TestConcern, acc: &mut ClassBody, name: &ClassId, depth: usize) -> IngestResult<()> {
+    if acc.applied.iter().any(|n| n == &concern.name) {
+        return Ok(());
+    }
+    acc.applied.push(concern.name.clone());
+    let refuse = |message: String| IngestError::Unsupported { file: concern.file.clone(), message };
+    if depth > 8 {
+        return Err(refuse(format!("test helper `{}`: included blocks nest too deeply", concern.name)));
+    }
+    let result = super::prism::parse(&concern.source, &concern.file);
+    let path: Vec<&str> = concern.name.split("::").collect();
+    fn find<'pr>(node: &Node<'pr>, path: &[&str]) -> Option<ruby_prism::ModuleNode<'pr>> {
+        let stmts = node.as_statements_node()?;
+        for stmt in stmts.body().iter() {
+            let Some(m) = stmt.as_module_node() else { continue };
+            let Some(own) = module_name_path(&m) else { continue };
+            if path.len() < own.len() || path[..own.len()].iter().zip(&own).any(|(a, b)| a != b) {
+                continue;
+            }
+            if path.len() == own.len() {
+                return Some(m);
+            }
+            if let Some(found) = m.body().and_then(|body| find(&body, &path[own.len()..])) {
+                return Some(found);
+            }
+        }
+        None
+    }
+    let program = result.node();
+    let Some(module) = program.as_program_node().and_then(|p| find(&p.statements().as_node(), &path)) else {
+        return Ok(());
+    };
+    let Some(body) = included_block_body(&module) else { return Ok(()) };
+    for stmt in body.map(flatten_statements).unwrap_or_default() {
+        if !class_body_statement(&stmt, &concern.file, acc, name, depth + 1)? {
+            let line = String::from_utf8_lossy(stmt.location().as_slice()).lines().next().unwrap_or("").to_string();
+            return Err(refuse(format!(
+                "test helper `{}`'s included block: `{line}` is not modeled on a test class",
+                concern.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// `setup :a, :b` / `teardown :a`: callbacks naming the test's own
+/// methods, run in the order named. Options (`prepend: true`, `if:`)
+/// are refused by name.
+fn named_callbacks(call: &ruby_prism::CallNode<'_>, kind: &str, file: &str) -> IngestResult<Expr> {
+    let mut exprs = Vec::new();
+    for arg in call.arguments().into_iter().flat_map(|a| a.arguments().iter()) {
+        let Some(sym) = arg.as_symbol_node() else {
+            return Err(IngestError::Unsupported {
+                file: file.into(),
+                message: format!("test {kind} not modeled: only method names (`{kind} :name`) are, not options"),
+            });
+        };
+        let method = Symbol::from(String::from_utf8_lossy(sym.unescaped()).as_ref());
+        exprs.push(Expr::new(
+            Span::synthetic(),
+            ExprNode::Send { recv: None, method, args: vec![], block: None, parenthesized: false },
+        ));
+    }
+    Ok(Expr::new(Span::synthetic(), ExprNode::Seq { exprs }))
+}
+
+fn ingest_setup_declaration(
+    stmt: &Node<'_>,
+    file: &str,
+) -> IngestResult<Option<Expr>> {
+    // `setup do ... end` form.
+    if let Some(call) = stmt.as_call_node() {
+        if call.receiver().is_some() {
+            return Ok(None);
+        }
+        if constant_id_str(&call.name()) != "setup" {
+            return Ok(None);
+        }
+        if let Some(block_ref) = call.block() {
+            if let Some(block) = block_ref.as_block_node() {
+                let body = match block.body() {
+                    Some(body_node) => ingest_expr(&body_node, file)?,
+                    None => Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![] }),
+                };
+                return Ok(Some(body));
+            }
+        }
+        if call.block().is_none() && call.arguments().is_some() {
+            return named_callbacks(&call, "setup", file).map(Some);
+        }
+        return Ok(None);
+    }
+    // `def setup; ...; end` form.
+    if let Some(def) = stmt.as_def_node() {
+        let name_bytes = def.name().as_slice();
+        if std::str::from_utf8(name_bytes).ok() != Some("setup") {
+            return Ok(None);
+        }
+        super::forwarding::reject_entrypoint(&def, file, "test setup hook")?;
+        let body = match def.body() {
+            Some(body_node) => ingest_expr(&body_node, file)?,
+            None => Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![] }),
+        };
+        return Ok(Some(body));
+    }
+    Ok(None)
+}
+
+/// `teardown do … end`: the block's body. Any other `teardown` call
+/// (`teardown :close_files`, a block argument, `self.teardown do`) is
+/// refused by name: it would otherwise fall to the unrecognized-statement
+/// drop below and its cleanup would silently never run.
+fn ingest_teardown_block(stmt: &Node<'_>, file: &str) -> IngestResult<Option<Expr>> {
+    let Some(call) = stmt.as_call_node() else { return Ok(None) };
+    if constant_id_str(&call.name()) != "teardown" {
+        return Ok(None);
+    }
+    // Receiverless `teardown do` is the ActiveSupport form. `self.teardown
+    // do` is the same callback in some suites; refuse it rather than drop.
+    if let Some(recv) = call.receiver() {
+        let is_self = recv.as_self_node().is_some();
+        if is_self {
+            return Err(IngestError::Unsupported {
+                file: file.into(),
+                message: "test teardown not modeled: only receiverless `teardown do … end` runs after each test".into(),
+            });
+        }
+        return Ok(None);
+    }
+    if call.block().is_none() && call.arguments().is_some() {
+        return named_callbacks(&call, "teardown", file).map(Some);
+    }
+    let block = call.block().and_then(|b| b.as_block_node());
+    match block {
+        Some(block) if call.arguments().is_none() => Ok(Some(match block.body() {
+            Some(body_node) => ingest_expr(&body_node, file)?,
+            None => Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![] }),
+        })),
+        _ => Err(IngestError::Unsupported {
+            file: file.into(),
+            message: "test teardown not modeled: only `teardown do … end` runs after each test".into(),
+        }),
+    }
+}
+
+/// Recognize a single test declaration. Two shapes are supported:
+///
+///   `test "name" do ... end`  — Rails AS::TestCase DSL. Test name is the
+///                                string argument verbatim.
+///   `def test_*; ...; end`    — vanilla Minitest. Test name is the
+///                                method name with the `test_` prefix
+///                                stripped and underscores replaced with
+///                                spaces (mirrors how Minitest reports
+///                                them; keeps the two shapes
+///                                indistinguishable downstream).
+///
+/// Returns `None` for any other statement shape (intentional — we
+/// silently drop unrecognized body items rather than error; they'll
+/// surface when the test tries to reference something that isn't
+/// emitted).
+fn ingest_test_declaration(
+    stmt: &Node<'_>,
+    file: &str,
+) -> IngestResult<Option<Test>> {
+    // `def test_*; ...; end` form (vanilla Minitest).
+    if let Some(def) = stmt.as_def_node() {
+        let name_bytes = def.name().as_slice();
+        let Some(method_name) = std::str::from_utf8(name_bytes).ok() else {
+            return Ok(None);
+        };
+        let Some(stem) = method_name.strip_prefix("test_") else {
+            return Ok(None);
+        };
+        super::forwarding::reject_entrypoint(&def, file, "test entrypoint")?;
+        let name = stem.replace('_', " ");
+        let body = match def.body() {
+            Some(body_node) => ingest_expr(&body_node, file)?,
+            None => Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![] }),
+        };
+        return Ok(Some(Test { name, body }));
+    }
+
+    let Some(call) = stmt.as_call_node() else {
+        return Ok(None);
+    };
+    // Must be a bare-name `test(...)` call.
+    if call.receiver().is_some() {
+        return Ok(None);
+    }
+    let method = constant_id_str(&call.name()).to_string();
+    if method != "test" {
+        return Ok(None);
+    }
+
+    // First positional argument: the test's name as a string literal.
+    let Some(args) = call.arguments() else {
+        return Ok(None);
+    };
+    let args_iter = args.arguments();
+    let Some(first_arg) = args_iter.iter().next() else {
+        return Ok(None);
+    };
+    let Some(string_node) = first_arg.as_string_node() else {
+        return Ok(None);
+    };
+    let name = String::from_utf8_lossy(string_node.unescaped()).into_owned();
+
+    // The block body — Prism exposes it via `call.block()` when present.
+    let body = match call.block() {
+        Some(block_ref) => match block_ref.as_block_node() {
+            Some(block) => match block.body() {
+                Some(body_node) => ingest_expr(&body_node, file)?,
+                None => Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![] }),
+            },
+            None => Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![] }),
+        },
+        None => Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![] }),
+    };
+
+    Ok(Some(Test { name, body }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // campfire's `test/channels/room_messages_channel_test.rb`: two
+    // `< ActionCable::Channel::TestCase` classes in one file, the
+    // second naming its subject with `tests Turbo::StreamsChannel`.
+    // Before `ingest_test_files`, the second class was demoted to a
+    // helper and then skipped for being a test — two tests in no
+    // tally.
+    const TWO_CLASSES: &str = r#"
+require "test_helper"
+
+class RoomMessagesChannelTest < ActionCable::Channel::TestCase
+  tests RoomMessagesChannel
+
+  setup do
+    @room = rooms(:designers)
+  end
+
+  test "a member may subscribe" do
+    assert true
+  end
+
+  test "an outsider may not" do
+    assert true
+  end
+end
+
+class RoomMessagesViaStockTurboChannelTest < ActionCable::Channel::TestCase
+  tests Turbo::StreamsChannel
+
+  test "the stock channel refuses a room message stream" do
+    assert true
+  end
+end
+"#;
+
+    #[test]
+    fn every_test_class_in_a_file_is_its_own_module() {
+        let tms = ingest_test_files(TWO_CLASSES.as_bytes(), "room_messages_channel_test.rb")
+            .expect("ingest");
+        let names: Vec<&str> = tms.iter().map(|tm| tm.name.0.as_str()).collect();
+        assert_eq!(
+            names,
+            ["RoomMessagesChannelTest", "RoomMessagesViaStockTurboChannelTest"]
+        );
+        assert_eq!(tms[0].tests.len(), 2);
+        assert_eq!(tms[1].tests.len(), 1);
+        // Neither is the other's helper.
+        assert!(tms.iter().all(|tm| tm.inner_classes.is_empty()));
+        // The first module still carries its own setup.
+        assert!(tms[0].setup.is_some());
+        assert!(tms[1].setup.is_none());
+    }
+
+    #[test]
+    fn tests_macro_names_the_subject() {
+        let tms = ingest_test_files(TWO_CLASSES.as_bytes(), "room_messages_channel_test.rb")
+            .expect("ingest");
+        let targets: Vec<&str> = tms
+            .iter()
+            .map(|tm| tm.target.as_ref().map(|t| t.0.as_str()).unwrap_or(""))
+            .collect();
+        assert_eq!(targets, ["RoomMessagesChannel", "Turbo::StreamsChannel"]);
+    }
+
+    #[test]
+    fn single_class_wrapper_still_answers_the_first() {
+        let tm = ingest_test_file(TWO_CLASSES.as_bytes(), "room_messages_channel_test.rb")
+            .expect("ingest")
+            .expect("a test class");
+        assert_eq!(tm.name.0.as_str(), "RoomMessagesChannelTest");
+    }
+
+    // A test class that a `module` wraps is the same class as
+    // `class Models::PostTest`. Ingest used to read only the file's
+    // top-level classes, so it lost this one and reported nothing.
+    #[test]
+    fn a_test_class_inside_a_module_keeps_its_namespace() {
+        let src = r#"
+module Models
+  class Helper
+  end
+
+  class PostTest < ActiveSupport::TestCase
+    class Inner
+    end
+
+    test "truth" do
+      assert true
+    end
+  end
+end
+"#;
+        let tms = ingest_test_files(src.as_bytes(), "post_test.rb").expect("ingest");
+        let names: Vec<&str> = tms.iter().map(|tm| tm.name.0.as_str()).collect();
+        assert_eq!(names, ["Models::PostTest"]);
+        assert_eq!(tms[0].target.as_ref().map(|t| t.0.as_str()), Some("Post"));
+        assert_eq!(tms[0].tests.len(), 1);
+        let helpers: Vec<&str> =
+            tms[0].inner_classes.iter().map(|lc| lc.name.0.as_str()).collect();
+        assert_eq!(helpers, ["Inner", "Models::Helper"]);
+    }
+
+    // Ingest reads every `.rb` file in the test directories, so a
+    // support class in a module reaches it too. It is not a test.
+    #[test]
+    fn a_support_class_inside_a_module_is_not_a_test() {
+        let src = "module Support\n  class Thing\n    def x\n      1\n    end\n  end\nend\n";
+        let tms = ingest_test_files(src.as_bytes(), "thing.rb").expect("ingest");
+        assert!(tms.is_empty());
+    }
+
+    // When no class looks like a test, the first top-level class is
+    // the test. A class inside a module does not take its place.
+    #[test]
+    fn the_fallback_test_class_is_a_top_level_class() {
+        let src = r#"
+module Fakes
+  class Client
+  end
+end
+
+class ProbeChecks < Minitest::Unit
+  def test_x
+    assert true
+  end
+end
+"#;
+        let tms = ingest_test_files(src.as_bytes(), "probe_checks.rb").expect("ingest");
+        let names: Vec<&str> = tms.iter().map(|tm| tm.name.0.as_str()).collect();
+        assert_eq!(names, ["ProbeChecks"]);
+        let helpers: Vec<&str> =
+            tms[0].inner_classes.iter().map(|lc| lc.name.0.as_str()).collect();
+        assert_eq!(helpers, ["Fakes::Client"]);
+    }
+}

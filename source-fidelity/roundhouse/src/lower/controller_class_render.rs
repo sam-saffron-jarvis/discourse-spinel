@@ -1,0 +1,452 @@
+//! `ApplicationController.render partial: "users/mention", locals: {
+//! user: user }` → `Views::Users.mention(user)`.
+//!
+//! Rails' class-side renderer: a controller can render a template with
+//! no request, which is how a TEST builds a fragment to compare against
+//! (campfire's `mention_attachment_for` embeds the rendered mention
+//! inside an `<action-text-attachment>`). It is the same partial the
+//! views render, reached from outside a view.
+//!
+//! Bound through `view_to_library::partial_call_contracts` — the DEF
+//! SITE's own contract, the same one a `render partial:` call site in a
+//! view binds against — so the two cannot disagree about what the
+//! partial takes.
+//!
+//! **Declines whenever the partial needs more than its record.** A
+//! partial with closure ivars or extra locals is written to be rendered
+//! from a view that has them; a class-side call has no such context, so
+//! there is nothing to bind and guessing would pass the wrong
+//! arguments. Rails would raise there too, one step later.
+//!
+//! ## The attachment's own partial
+//!
+//! `ApplicationController.render partial: attachment.to_partial_path,
+//! locals: { opengraph_embed: attachment }` — the partial is not a
+//! literal but the ATTACHMENT'S, which is per node: whichever attachable
+//! the node resolves to names it. That is exactly the dispatch
+//! `Content.render_attachment` is generated to make
+//! (`project::apply_content_layout`: one arm per attachable class, the
+//! partial's local bound to the attachable), so the call becomes
+//! `ActionText::Content.render_attachment(attachment)` when the one
+//! local is that same attachment. The local's NAME is not checked: the
+//! generated arm binds the partial's declared local, and a working app
+//! (this one renders under Rails) can only have named it that.
+//!
+//! In a TEST class the local carries no type yet — test bodies are typed
+//! when they are lowered, after this pass — so the attachment is known
+//! syntactically instead: a local assigned from the class's own helper
+//! whose tail expression is `ActionText::Attachment.from_node(…)`
+//! (campfire's `attachment = attachment_for(…)`). A receiver typed
+//! `ActionText::Attachment` counts wherever the type is there.
+
+use crate::app::App;
+use crate::expr::{Expr, ExprNode, Literal};
+use crate::ident::Symbol;
+
+pub(crate) fn call_contracts(app: &App) -> Contracts {
+    crate::lower::view_to_library::partial_call_contracts(
+        &app.views,
+        &app.controllers,
+        &app.library_classes,
+    )
+}
+
+#[allow(dead_code)]
+pub fn apply_controller_class_render(app: &mut App) {
+    let contracts = call_contracts(app);
+    if contracts.is_empty() {
+        return;
+    }
+    let none = crate::det::HashSet::default();
+    super::for_each_hook_body(app, &mut |e| rewrite(e, &contracts, &none));
+    for tm in &mut app.test_modules {
+        let builders = attachment_builders(&tm.helpers);
+        if let Some(setup) = &mut tm.setup {
+            rewrite(setup, &contracts, &attachment_locals(setup, &builders));
+        }
+        for t in &mut tm.tests {
+            let locals = attachment_locals(&t.body, &builders);
+            rewrite(&mut t.body, &contracts, &locals);
+        }
+        for m in &mut tm.helpers {
+            let locals = attachment_locals(&m.body, &builders);
+            rewrite(&mut m.body, &contracts, &locals);
+        }
+    }
+}
+
+/// The test class's helpers that hand back attachments, split into the
+/// ones returning ONE and the ones returning an Array of them.
+///
+/// A helper returns one when its tail is `ActionText::Attachment.
+/// from_node(…)` — the constructor — or a receiverless call to another
+/// such helper; an Array when its tail is an Array literal of those
+/// calls. Iterated to a fixed point, because the helpers chain: campfire
+/// rewrote its opengraph test at the Lexxy merge so that
+/// `attachments_for` answers `[attribute_attachment_for(…),
+/// content_attachment_for(…)]`, each of which ends in
+/// `attachment_from(…)`, which ends in `from_node`.
+pub(crate) struct Builders {
+    one: crate::det::HashSet<Symbol>,
+    many: crate::det::HashSet<Symbol>,
+}
+
+impl Builders {
+    fn is_empty(&self) -> bool {
+        self.one.is_empty() && self.many.is_empty()
+    }
+}
+
+pub(crate) fn attachment_builders(helpers: &[crate::dialect::MethodDef]) -> Builders {
+    let mut b = Builders { one: Default::default(), many: Default::default() };
+    loop {
+        let before = (b.one.len(), b.many.len());
+        for h in helpers {
+            let tail = tail_of(&h.body);
+            if builds_attachment(tail) || calls_builder(tail, &b.one) {
+                b.one.insert(h.name.clone());
+            } else if let ExprNode::Array { elements, .. } = &*tail.node {
+                if !elements.is_empty() && elements.iter().all(|e| calls_builder(e, &b.one)) {
+                    b.many.insert(h.name.clone());
+                }
+            }
+        }
+        if (b.one.len(), b.many.len()) == before {
+            return b;
+        }
+    }
+}
+
+fn tail_of(body: &Expr) -> &Expr {
+    match &*body.node {
+        ExprNode::Seq { exprs } => exprs.last().unwrap_or(body),
+        _ => body,
+    }
+}
+
+fn calls_builder(e: &Expr, builders: &crate::det::HashSet<Symbol>) -> bool {
+    matches!(&*e.node, ExprNode::Send { recv: None, method, .. } if builders.contains(method))
+}
+
+/// Is this expression `ActionText::Attachment.from_node(…)` — the
+/// constructor, so whatever returns it holds an Attachment?
+fn builds_attachment(tail: &Expr) -> bool {
+    let ExprNode::Send { recv: Some(recv), method, .. } = &*tail.node else { return false };
+    if method.as_str() != "from_node" {
+        return false;
+    }
+    let ExprNode::Const { path } = &*recv.node else { return false };
+    let joined = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
+    joined == "ActionText::Attachment"
+}
+
+/// Locals in `body` holding an attachment: assigned from a call to a
+/// one-attachment builder, or the block parameter of `.map` / `.each`
+/// over a call to an Array one (`attachments_for(…).map do |attachment|`).
+pub(crate) fn attachment_locals(body: &Expr, builders: &Builders) -> crate::det::HashSet<Symbol> {
+    let mut out = crate::det::HashSet::default();
+    if builders.is_empty() {
+        return out;
+    }
+    fn walk(e: &Expr, builders: &Builders, out: &mut crate::det::HashSet<Symbol>) {
+        if let ExprNode::Assign { target: crate::expr::LValue::Var { name, .. }, value } = &*e.node {
+            if calls_builder(value, &builders.one) {
+                out.insert(name.clone());
+            }
+        }
+        if let ExprNode::Send { recv: Some(r), method, block: Some(b), .. } = &*e.node {
+            if matches!(method.as_str(), "map" | "each") && calls_builder(r, &builders.many) {
+                if let ExprNode::Lambda { params, .. } = &*b.node {
+                    if let [param] = params.as_slice() {
+                        out.insert(param.clone());
+                    }
+                }
+            }
+        }
+        e.node.for_each_child(&mut |c| walk(c, builders, out));
+    }
+    walk(body, builders, &mut out);
+    out
+}
+
+fn rewrite(expr: &mut Expr, contracts: &Contracts, attachment_locals: &crate::det::HashSet<Symbol>) {
+    expr.node.for_each_child_mut(&mut |c| rewrite(c, contracts, attachment_locals));
+    rewrite_node(expr, contracts, attachment_locals);
+}
+
+pub(crate) type Contracts = crate::det::HashMap<
+    (String, String),
+    crate::lower::view_to_library::PartialCallContract,
+>;
+
+pub(crate) fn rewrite_node(
+    expr: &mut Expr,
+    contracts: &Contracts,
+    attachment_locals: &crate::det::HashSet<Symbol>,
+) {
+    // `render_action_text_attachment(attachment)` — Action Text's own
+    // helper for the same render: `ActionText::ContentHelper`'s, which
+    // renders the attachment's partial with the attachment as its local.
+    // That is what the generated `Content.render_attachment` dispatch
+    // is, so the helper names it directly. campfire's `editable_body`
+    // (the Lexxy merge) calls it from a helper module, where it was an
+    // unbound method. A `locals:` second argument is not modeled and
+    // declines.
+    if let ExprNode::Send { recv: None, method, args, block: None, .. } = &*expr.node {
+        if method.as_str() == "render_action_text_attachment" && args.len() == 1 {
+            let span = expr.span;
+            let attachment = args[0].clone();
+            *expr = Expr::new(
+                span,
+                ExprNode::Send {
+                    recv: Some(Expr::new(
+                        span,
+                        ExprNode::Const {
+                            path: vec![Symbol::from("ActionText"), Symbol::from("Content")],
+                        },
+                    )),
+                    method: Symbol::from("render_attachment"),
+                    args: vec![attachment],
+                    block: None,
+                    parenthesized: true,
+                },
+            );
+            return;
+        }
+    }
+    let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &*expr.node else {
+        return;
+    };
+    if method.as_str() != "render" || args.len() != 1 {
+        return;
+    }
+    // A CONTROLLER constant — Rails' class-side renderer lives there.
+    let ExprNode::Const { path } = &*r.node else { return };
+    if !path.last().is_some_and(|s| s.as_str().ends_with("Controller")) {
+        return;
+    }
+    let ExprNode::Hash { entries, .. } = &*args[0].node else { return };
+    let opt = |name: &str| {
+        entries.iter().find_map(|(k, v)| match &*k.node {
+            ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == name => Some(v),
+            _ => None,
+        })
+    };
+    // Only `partial:` + `locals:`, or `partial:` + `collection:` (with
+    // an optional literal `cached:`). Any other option is one this does
+    // not read, and dropping it silently is how a render turns into the
+    // wrong markup.
+    if !entries.iter().all(|(k, _)| {
+        matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } }
+            if matches!(value.as_str(), "partial" | "locals" | "collection" | "cached"))
+    }) {
+        return;
+    }
+    let collection = opt("collection").cloned();
+    if collection.is_some() && opt("locals").is_some() {
+        return;
+    }
+    // `cached: true` asks the RENDERER's controller to cache, and the
+    // renderer here is the detached controller, which caches nothing
+    // (runtime/action_controller_fragment_caching.rb) -- the same answer
+    // the lowered collection gives under it. Anything but a literal
+    // boolean is a key this does not read.
+    if let Some(cached) = opt("cached") {
+        if collection.is_none()
+            || !matches!(&*cached.node, ExprNode::Lit { value: Literal::Bool { .. } })
+        {
+            return;
+        }
+    }
+    if let Some(attachment) = attachments_own_partial(opt("partial"), opt("locals"), attachment_locals) {
+        let span = expr.span;
+        *expr = Expr::new(
+            span,
+            ExprNode::Send {
+                recv: Some(Expr::new(
+                    span,
+                    ExprNode::Const {
+                        path: vec![Symbol::from("ActionText"), Symbol::from("Content")],
+                    },
+                )),
+                method: Symbol::from("render_attachment"),
+                args: vec![attachment],
+                block: None,
+                parenthesized: true,
+            },
+        );
+        return;
+    }
+    let Some(ExprNode::Lit { value: Literal::Str { value: partial } }) =
+        opt("partial").map(|p| &*p.node)
+    else {
+        return;
+    };
+    let Some((dir, stem)) = partial.rsplit_once('/') else { return };
+    let module = crate::naming::camelize_path(&crate::naming::snake_case(dir));
+    let Some(contract) = contracts.get(&(module.clone(), stem.to_string())) else { return };
+    // The record is all a class-side call can bind — except the FLASH
+    // PAIR, which every view method carries as a defaulted tail
+    // (`def self.mention(user, notice = nil, alert = nil)`) and which a
+    // caller outside a request has no business supplying anyway, nor
+    // the `local_assigns[:notice]` read a moved flash leaves beside it
+    // (`local_key_of`), nil for a render that passes no `notice:`.
+    // Anything else in the contract is a value the partial's body
+    // genuinely reads and a class-side call has nowhere to get, so
+    // declining is the honest answer — Rails raises there too, one step
+    // later.
+    if !contract.closure.is_empty()
+        || contract
+            .extras
+            .iter()
+            .any(|e| !matches!(crate::lower::view_to_library::local_key_of(&contract.extras, e), "notice" | "alert"))
+    {
+        return;
+    }
+    let span = expr.span;
+    let views_call = |args: Vec<Expr>| {
+        Expr::new(
+            span,
+            ExprNode::Send {
+                recv: Some(Expr::new(
+                    span,
+                    ExprNode::Const {
+                        path: std::iter::once(Symbol::from("Views"))
+                            .chain(module.split("::").map(Symbol::from))
+                            .collect(),
+                    },
+                )),
+                method: contract.method.clone(),
+                args,
+                block: None,
+                parenthesized: true,
+            },
+        )
+    };
+    let rendered = if let Some(collection) = collection {
+        // `collection: c` becomes `c.map { |<record>| Views::X.stem(<record>) }.join`:
+        // each element bound to the partial's record local, as Rails
+        // binds it, and the renders concatenated with no spacer.
+        let item = Symbol::from(contract.record.as_str());
+        let each = views_call(vec![Expr::new(
+            span,
+            ExprNode::Var { id: crate::ident::VarId(0), name: item.clone() },
+        )]);
+        let mapped = Expr::new(
+            span,
+            ExprNode::Send {
+                recv: Some(collection),
+                method: Symbol::from("map"),
+                args: Vec::new(),
+                block: Some(Expr::new(
+                    span,
+                    ExprNode::Lambda {
+                        extra_params: Vec::new(),
+                        rest_param: None,
+                        params: vec![item],
+                        block_param: None,
+                        body: each,
+                        block_style: crate::expr::BlockStyle::Brace,
+                    },
+                )),
+                parenthesized: false,
+            },
+        );
+        Expr::new(
+            span,
+            ExprNode::Send {
+                recv: Some(mapped),
+                method: Symbol::from("join"),
+                args: Vec::new(),
+                block: None,
+                parenthesized: false,
+            },
+        )
+    } else {
+        let locals = match opt("locals").map(|l| &*l.node) {
+            Some(ExprNode::Hash { entries, .. }) => entries.clone(),
+            Some(_) => return,
+            None => Vec::new(),
+        };
+        let record = locals.iter().find_map(|(k, v)| match &*k.node {
+            ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == contract.record => {
+                Some(v.clone())
+            }
+            _ => None,
+        });
+        // Exactly the record, nothing else — an unbound extra local is a
+        // value the partial would never see.
+        if locals.len() != record.iter().len() {
+            return;
+        }
+        views_call(record.into_iter().collect())
+    };
+    // Rendered as Rails' class-side renderer renders: through a
+    // controller of its own, with no request behind it. That is the
+    // bracket a broadcast render takes (`ViewHelpers.begin_broadcast_render`),
+    // and for the same reason, since a Turbo broadcast IS
+    // `ApplicationController.render`. Inside it `controller` is the
+    // detached controller, which reads and writes no fragment and
+    // writes no authenticity token.
+    let helpers = || {
+        Expr::new(
+            span,
+            ExprNode::Const { path: vec![Symbol::from("ActionView"), Symbol::from("ViewHelpers")] },
+        )
+    };
+    let begin = Expr::new(
+        span,
+        ExprNode::Send {
+            recv: Some(helpers()),
+            method: Symbol::from("begin_broadcast_render"),
+            args: Vec::new(),
+            block: None,
+            parenthesized: false,
+        },
+    );
+    *expr = Expr::new(
+        span,
+        ExprNode::Send {
+            recv: Some(helpers()),
+            method: Symbol::from("broadcast_render"),
+            args: vec![begin, rendered],
+            block: None,
+            parenthesized: true,
+        },
+    );
+}
+
+/// `partial: a.to_partial_path, locals: { k: a }` with `a` an
+/// `ActionText::Attachment`: the attachment, when the call is that
+/// shape and nothing else.
+fn attachments_own_partial(
+    partial: Option<&Expr>,
+    locals: Option<&Expr>,
+    attachment_locals: &crate::det::HashSet<Symbol>,
+) -> Option<Expr> {
+    let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &*partial?.node
+    else {
+        return None;
+    };
+    if method.as_str() != "to_partial_path" || !args.is_empty() {
+        return None;
+    }
+    let typed_attachment = matches!(
+        recv.ty.as_ref(),
+        Some(crate::ty::Ty::Class { id, .. }) if id.0.as_str() == "ActionText::Attachment"
+    );
+    let is_attachment = match &*recv.node {
+        ExprNode::Var { name, .. } => typed_attachment || attachment_locals.contains(name),
+        ExprNode::Ivar { .. } => typed_attachment,
+        _ => false,
+    };
+    if !is_attachment {
+        return None;
+    }
+    let ExprNode::Hash { entries, .. } = &*locals?.node else { return None };
+    let [(_, value)] = entries.as_slice() else { return None };
+    if value != recv {
+        return None;
+    }
+    Some(recv.clone())
+}

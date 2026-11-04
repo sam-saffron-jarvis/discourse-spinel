@@ -1,0 +1,631 @@
+//! ActiveSupport duration builders → `ActiveSupport::Duration` class
+//! calls: `70.days` / `NEW_USER_DAYS.days` / `1.week` would dispatch a
+//! nonexistent `Integer#days` on every tree — reopening `Integer` in
+//! the shared runtime is off-limits (no built-in reopening; `Time`
+//! arithmetic doesn't transpile uniformly) — so the builder grounds to
+//! `ActiveSupport::Duration.days(70)`, the value class the ruby-family
+//! trees ship (CRuby overlay `active_support_duration.rb`, spinel twin
+//! minus the `Time` reopen). `.ago` / `.from_now` then ride the
+//! returned instance and need no rewrite. Strict targets carry the
+//! grounded call as honest residue — ONE named runtime seam (provide a
+//! Duration value class) instead of scattered nonexistent-Int-method
+//! sends; widening them is a separate step (the Time-arith seam), same
+//! posture as `send_dispatch`'s plural arms before this pass existed.
+//!
+//! ORDER: must run AFTER `apply_send_static_dispatch` in the
+//! post-analyze hook — for an all-duration-unit name set, dispatch
+//! synthesizes its case arms as plural unit calls counting on this
+//! pass to ground them (`send_dispatch::duration_plural`; guard test
+//! `tests/send_dispatch_lowering.rs`). This constraint is declared
+//! canonically in `lower::POST_ANALYZE_PASS_ORDER` (the `duration`
+//! entry's `runs_after`).
+//!
+//! Collision gate: the singular `day`/`hour`/`month`/`year` also name
+//! `Time` component readers (`created_at.day`, lobsters
+//! traffic_helper's `time.month == 6`), so those rewrite only when the
+//! receiver is provably numeric — an Int/Float literal or a
+//! typer-stamped Int/Float. Every plural, plus `minute`/`second`/
+//! `week`/`fortnight`, never collides and rewrites unconditionally, so
+//! an Int constant receiver whose type stays unresolved
+//! (`NEW_USER_DAYS.days`) still lands. No residue policy: a skipped
+//! colliding singular is a `Time` component read in every corpus
+//! occurrence, and ledgering each legitimate `time.day` would be
+//! noise — the emit-time ancestor of this pass was silent for the
+//! same reason.
+//!
+//! TIME INTEROP. A Duration only ever meets a `Time` through operators
+//! Rails installs by reopening `Time`, which no transpiled runtime may
+//! do. The CRuby overlay reopens it anyway (it is CRuby-only forever);
+//! the spinel twin cannot, so every non-`.ago`/`.from_now` shape used
+//! to reach a Duration object in an operator slot and die at runtime —
+//! `Time - Duration` and `Time#after?` as `NoMethodError`, `Time <
+//! Duration` as `comparison of Time with ActiveSupport::Duration
+//! failed`. Three groundings below cover the shapes the corpus has,
+//! each emitting what the overlay computes so the CRuby tree keeps
+//! byte-parity while the AOT tree stops raising:
+//!
+//! - `after?` / `before?` → `>` / `<` (AS's readable comparators).
+//! - `<t> - <dur>` / `+` → the Duration's numeric `.value`.
+//! - `<time> <op> <bare dur>` → the ajd-vs-seconds arithmetic Rails
+//!   reaches through `Time#<=>` → `to_datetime <=> other` →
+//!   `Duration#coerce`. That comparison EVALUATES under Rails rather
+//!   than raising (`Time.now <= 1.hour` is false, `<= 1.year` is true,
+//!   verified against activesupport 8.1.3), and lobsters ships a
+//!   dormant one — `story.rb`'s `send_referrer?` reads `created_at <=
+//!   1.hour`, meaning `1.hour.ago`, on every story link. Grounding it
+//!   to plain seconds (an earlier attempt) answers a DIFFERENT question
+//!   and raises on CRuby, so the rewrite keeps the epoch offset:
+//!   `t.to_f + 210_866_760_000.0 <op> dur.to_f * 86_400.0` — the
+//!   overlay's `(to_r + 210_866_760_000r) / 86_400r <=> dur.seconds`
+//!   with the division multiplied out, which keeps both sides one
+//!   binop deep and needs no parenthesization from any emitter.
+//!   Receiver-side only: a Duration RECEIVER compared against a Time
+//!   raises under Rails too (`Duration#<=>` answers nil), so that
+//!   shape stays untouched residue.
+//!
+//! View bodies are deliberately not walked — the same carve-out as
+//! blank/time_current: the ruby view pipeline still applies the
+//! emit-time vestige (`emit::ruby::library::apply_duration_lowering`)
+//! to lowered view classes (lobsters' `_commentbox.html.erb` compares
+//! against `COMMENTABLE_DAYS.days.ago`); views rejoin when the view
+//! pipeline migrates to shared lowerings.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use crate::app::App;
+use crate::build_target::BuildTarget;
+use crate::expr::{Expr, ExprNode, LValue, Literal};
+use crate::ident::{ClassId, Symbol};
+use crate::ty::Ty;
+
+/// Ground duration-unit sends across every app body the post-analyze
+/// hook owns (models, library classes, controllers, seeds — not views).
+pub fn apply_duration_lowering(app: &mut App) {
+    apply_duration_lowering_for(app, BuildTarget::Ruby);
+}
+
+pub(crate) fn apply_duration_lowering_for(app: &mut App, target: BuildTarget) {
+    let time_operands = matches!(target, BuildTarget::Ruby | BuildTarget::Jruby | BuildTarget::Spinel);
+    let temporal_predicates = !app_defines_temporal_predicates(app);
+    let duration_constants = named_duration_constants(app);
+    super::for_each_owned_hook_body(app, &mut |owner, body| {
+        type_duration_constants(body, owner, &duration_constants);
+        apply_duration_rewrites(body, temporal_predicates, time_operands)
+    });
+    // TEST BODIES TOO. `1.day.ago` is not a method on any target's
+    // Integer — this pass IS what grounds it — so a test writing one
+    // got `undefined method 'day' for an instance of Integer` and no
+    // diagnostic, because the pass simply never looked. campfire's
+    // `rooms/refreshes_controller_test` opens with `travel_to
+    // 1.day.ago do`.
+    //
+    // Safe to widen where the blank pass is not: this rewrite produces
+    // `ActiveSupport::Duration.<unit>(n)`, a call every target's
+    // runtime answers, rather than leaning on a CRuby overlay the
+    // strict-target test lanes do not ship.
+    super::for_each_test_body(app, &mut |body| {
+        type_duration_constants(body, None, &duration_constants);
+        apply_duration_rewrites(body, temporal_predicates, time_operands)
+    });
+}
+
+fn named_duration_constants(app: &App) -> BTreeSet<Vec<Symbol>> {
+    let mut candidates = BTreeMap::new();
+    let mut record = |path: Vec<Symbol>, value: &Expr| {
+        let mut value = value.clone();
+        rewrite_durations(&mut value);
+        candidates.entry(path)
+            .and_modify(|duration| *duration = false)
+            .or_insert_with(|| is_duration_const_call(&value));
+    };
+    for class in app.library_classes.iter().chain(app.rails_application.iter()) {
+        for (name, value) in &class.constants {
+            let mut path: Vec<_> = class.name.0.as_str().split("::").map(Symbol::from).collect();
+            path.push(name.clone());
+            record(path, value);
+        }
+    }
+    for model in &app.models {
+        for item in &model.body {
+            let crate::dialect::ModelBodyItem::Unknown { expr, .. } = item else { continue };
+            let ExprNode::Assign { target: LValue::Const { path }, value } = &*expr.node else { continue };
+            let [name] = path.as_slice() else { continue };
+            let mut path: Vec<_> = model.name.0.as_str().split("::").map(Symbol::from).collect();
+            path.push(name.clone());
+            record(path, value);
+        }
+    }
+    candidates.into_iter().filter_map(|(path, duration)| duration.then_some(path)).collect()
+}
+
+fn type_duration_constants(expr: &mut Expr, owner: Option<&ClassId>, constants: &BTreeSet<Vec<Symbol>>) {
+    expr.node.for_each_child_mut(&mut |child| type_duration_constants(child, owner, constants));
+    let ExprNode::Const { path } = &*expr.node else { return };
+    let scoped = owner.map(|owner| {
+        let mut scoped: Vec<_> = owner.0.as_str().split("::").map(Symbol::from).collect();
+        scoped.extend(path.iter().cloned());
+        scoped
+    });
+    if constants.contains(path) || scoped.as_ref().is_some_and(|path| constants.contains(path)) {
+        expr.ty = Some(Ty::Class {
+            id: ClassId(Symbol::from("ActiveSupport::Duration")),
+            args: vec![].into(),
+        });
+    }
+}
+
+/// The pass order the view vestige must mirror
+/// (`emit::ruby::library::apply_duration_lowering`).
+///
+/// `rewrite_durations` first: everything downstream matches on the
+/// grounded `ActiveSupport::Duration.<unit>(n)` shape. Predicates next,
+/// so a rewritten `after?` reaches the comparison rules as the `>` it
+/// means. Comparisons BEFORE arithmetic: both read a bare Duration
+/// operand, and the arithmetic rewrite hides one behind `.value` — after
+/// it runs, `<t> - <dur>` is no longer distinguishable from the numeric
+/// `Time - Time` shape.
+pub(crate) fn apply_duration_rewrites(body: &mut Expr, temporal_predicates: bool, time_operands: bool) {
+    rewrite_durations(body);
+    if temporal_predicates {
+        rewrite_temporal_predicates(body);
+    }
+    rewrite_duration_comparisons(body);
+    rewrite_time_duration_arith(body, time_operands);
+    rewrite_expires_in(body);
+}
+
+/// `expires_in <dur>, stale_while_revalidate: <dur>, stale_if_error:
+/// <dur>` → seconds.
+///
+/// The same grounding `signed_id`'s `expires_in:` gets, for the
+/// CONTROLLER method of that name: the runtime's
+/// `ActionController::Base#expires_in` takes Integer seconds, so the
+/// corpus' spelling — an `ActiveSupport::Duration`, already grounded to
+/// `ActiveSupport::Duration.year(1)` by `rewrite_durations` above — is
+/// unwrapped here rather than at the callee, which would need an
+/// `untyped` parameter and a `to_i` every strict target pays for.
+///
+/// Unconditional `.to_i`, like the signed_id rewrite: on an Integer it
+/// is the identity, so `expires_in 3600` and `expires_in 1.hour` reach
+/// the runtime as the same thing.
+///
+/// Receiverless only. `expires_in` with a receiver is somebody else's
+/// method, and the `expires_in:` KEYWORD is a hash entry rather than a
+/// send, so neither is matched here.
+fn rewrite_expires_in(expr: &mut Expr) {
+    expr.node.for_each_child_mut(&mut rewrite_expires_in);
+    let matches_shape = matches!(
+        &*expr.node,
+        ExprNode::Send { recv, method, args, .. }
+            if method.as_str() == "expires_in"
+                && !args.is_empty()
+                && recv.as_ref().is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef))
+    );
+    if !matches_shape {
+        return;
+    }
+    let ExprNode::Send { args, .. } = &mut *expr.node else { unreachable!() };
+    args[0] = seconds_of(take(&mut args[0]));
+    // `stale_while_revalidate:` / `stale_if_error:` both ride the
+    // trailing kwargs hash and are a duration at every call site that
+    // passes one (rubys/roundhouse#679's `stale_if_error: 1.day`).
+    if let Some(last) = args.last_mut() {
+        if let ExprNode::Hash { entries, kwargs } = &mut *last.node {
+            let kwargs = *kwargs;
+            let mut rebuilt = entries.clone();
+            for (k, v) in rebuilt.iter_mut() {
+                let is_duration_kwarg = matches!(
+                    &*k.node,
+                    ExprNode::Lit { value: Literal::Sym { value } }
+                        if value.as_str() == "stale_while_revalidate"
+                            || value.as_str() == "stale_if_error"
+                );
+                if is_duration_kwarg {
+                    *v = seconds_of(v.clone());
+                }
+            }
+            *last = Expr::new(last.span, ExprNode::Hash { entries: rebuilt, kwargs });
+        }
+    }
+}
+
+/// Fold a compile-time duration expression to whole seconds when it is
+/// an Integer literal or `N.<fixed-unit>` /
+/// `ActiveSupport::Duration.<unit>(N)` for second/minute/hour/day/week.
+/// Month and year have no fixed length; anything computed is `None`.
+///
+/// Used where the integer must be known at compile time (for example
+/// `generates_token_for`'s purpose string embeds the seconds). Callers
+/// that only need a runtime Integer should keep using `.to_i` instead.
+pub(crate) fn literal_seconds(e: &Expr) -> Option<i64> {
+    let int = |e: &Expr| match &*e.node {
+        ExprNode::Lit { value: Literal::Int { value } } => Some(*value),
+        _ => None,
+    };
+    let unit_seconds = |unit: &str| match unit {
+        "second" | "seconds" => Some(1),
+        "minute" | "minutes" => Some(60),
+        "hour" | "hours" => Some(3_600),
+        "day" | "days" => Some(86_400),
+        "week" | "weeks" => Some(604_800),
+        _ => None,
+    };
+    match &*e.node {
+        ExprNode::Lit { .. } => int(e),
+        ExprNode::Send { recv: Some(recv), method, args, block: None, .. } => {
+            let (n, unit) = match (&*recv.node, args.as_slice()) {
+                (ExprNode::Const { path }, [n])
+                    if path.len() == 2
+                        && path[0].as_str() == "ActiveSupport"
+                        && path[1].as_str() == "Duration" =>
+                {
+                    (int(n)?, method.as_str())
+                }
+                (_, []) => (int(recv)?, method.as_str()),
+                _ => return None,
+            };
+            n.checked_mul(unit_seconds(unit)?)
+        }
+        _ => None,
+    }
+}
+
+/// `<e>` → `<e>.to_i`, stamped Int.
+fn seconds_of(inner: Expr) -> Expr {
+    let span = inner.span;
+    let mut out = Expr::new(
+        span,
+        ExprNode::Send {
+            recv: Some(inner),
+            method: Symbol::from("to_i"),
+            args: vec![],
+            block: None,
+            parenthesized: false,
+        },
+    );
+    out.ty = Some(Ty::Int);
+    out
+}
+
+/// Does any app class define its own `after?` / `before?`? Then the
+/// name doesn't mean ActiveSupport's temporal comparator and the
+/// predicate rewrite stands down wholesale — the same coarse opt-out
+/// `exclude_predicate` takes, and for the same reason: the receiver is
+/// rarely `self`, so a per-class check would not see the collision.
+pub(crate) fn app_defines_temporal_predicates(app: &App) -> bool {
+    let is_pred = |n: &Symbol| matches!(n.as_str(), "after?" | "before?");
+    app.models.iter().any(|m| {
+        m.body.iter().any(|item| {
+            matches!(item, crate::dialect::ModelBodyItem::Method { method, .. }
+                if is_pred(&method.name))
+        })
+    }) || app
+        .library_classes
+        .iter()
+        .any(|c| c.methods.iter().any(|m| is_pred(&m.name)))
+}
+
+/// `<t>.after?(x)` → `<t> > x`, `<t>.before?(x)` → `<t> < x`.
+///
+/// AS defines these on Date/Time/DateTime as literally `self > other` /
+/// `self < other`, so the rewrite is total and needs no receiver type —
+/// which is what lets it ground the untyped view receivers the
+/// commentbox partial hands it (`(story.created_at - 1.hour).before?`).
+fn rewrite_temporal_predicates(expr: &mut Expr) {
+    expr.node.for_each_child_mut(&mut rewrite_temporal_predicates);
+    let op = match &*expr.node {
+        ExprNode::Send { recv: Some(_), method, args, block: None, .. } if args.len() == 1 => {
+            match method.as_str() {
+                "after?" => ">",
+                "before?" => "<",
+                _ => return,
+            }
+        }
+        _ => return,
+    };
+    let ExprNode::Send { method, .. } = &mut *expr.node else { unreachable!() };
+    *method = Symbol::from(op);
+    expr.ty = Some(Ty::Bool);
+}
+
+/// `<t> - <dur>` / `<t> + <dur>` → the Duration's seconds, which is
+/// what the CRuby overlay's `Time#-` reopen unwraps to before calling
+/// through. `Time ± Numeric` is a `Time` on every ruby-family runtime
+/// (spinel included), so the outer node keeps its own type and span.
+///
+/// A Duration RECEIVER is left alone: `1.day - 1.hour` is Duration
+/// arithmetic, and the value class ships no operators, so grounding
+/// only one operand would quietly change what the expression means.
+fn rewrite_time_duration_arith(expr: &mut Expr, time_operands: bool) {
+    expr.node.for_each_child_mut(&mut |child| rewrite_time_duration_arith(child, time_operands));
+    let is_arith = matches!(
+        &*expr.node,
+        ExprNode::Send { recv: Some(recv), method, args, block: None, .. }
+            if args.len() == 1
+                && matches!(method.as_str(), "-" | "+")
+                && (is_duration_const_call(&args[0])
+                    || (is_typed_duration(&args[0])
+                        && recv.ty.as_ref().is_some_and(Ty::contains_time)))
+                && !is_duration_const_call(recv)
+                && !is_typed_duration(recv)
+    );
+    if !is_arith {
+        let ExprNode::Send {
+            recv: Some(recv),
+            method,
+            args,
+            block: None,
+            ..
+        } = &mut *expr.node
+        else {
+            return;
+        };
+        if !time_operands
+            || !matches!(recv.ty, Some(Ty::Time))
+            || !matches!(method.as_str(), "+" | "-")
+            || args.len() != 1
+            || matches!(args[0].ty, Some(Ty::Int | Ty::Float | Ty::Time))
+        {
+            return;
+        }
+        let operand = take(&mut args[0]);
+        let span = operand.span;
+        let mut duration = Expr::new(
+            span,
+            ExprNode::Const {
+                path: vec![Symbol::from("ActiveSupport"), Symbol::from("Duration")],
+            },
+        );
+        duration.ty = Some(Ty::Class {
+            id: ClassId(Symbol::from("ActiveSupport::Duration")),
+            args: vec![].into(),
+        });
+        args[0] = Expr::new(
+            span,
+            ExprNode::Send {
+                recv: Some(duration),
+                method: Symbol::from("time_operand"),
+                args: vec![operand],
+                block: None,
+                parenthesized: true,
+            },
+        );
+        args[0].ty = Some(Ty::Untyped);
+        return;
+    }
+    let ExprNode::Send { args, .. } = &mut *expr.node else { unreachable!() };
+    let dur = take(&mut args[0]);
+    let span = dur.span;
+    args[0] = Expr::new(
+        span,
+        ExprNode::Send {
+            recv: Some(dur),
+            method: Symbol::from("value"),
+            args: vec![],
+            block: None,
+            parenthesized: false,
+        },
+    );
+    args[0].ty = Some(Ty::Union { variants: vec![Ty::Int, Ty::Float].into() });
+}
+
+fn is_typed_duration(expr: &Expr) -> bool {
+    matches!(expr.ty.as_ref(), Some(Ty::Class { id, .. })
+        if id.0.as_str() == "ActiveSupport::Duration")
+}
+
+/// Move `side` out, leaving the empty-`Seq` placeholder this file uses
+/// for in-place operand surgery.
+fn take(side: &mut Expr) -> Expr {
+    let span = side.span;
+    std::mem::replace(side, Expr::new(span, ExprNode::Seq { exprs: vec![] }))
+}
+
+/// `<e>.to_f`, stamped `Float`.
+fn to_f(inner: Expr) -> Expr {
+    let span = inner.span;
+    let mut e = Expr::new(
+        span,
+        ExprNode::Send {
+            recv: Some(inner),
+            method: Symbol::from("to_f"),
+            args: vec![],
+            block: None,
+            parenthesized: false,
+        },
+    );
+    e.ty = Some(Ty::Float);
+    e
+}
+
+/// `<lhs> <op> <n>`, stamped `Float`. Both call sites bind tighter than
+/// the comparison they land inside, so neither needs parentheses.
+fn float_binop(lhs: Expr, op: &str, rhs: f64) -> Expr {
+    let span = lhs.span;
+    let mut lit = Expr::new(span, ExprNode::Lit { value: Literal::Float { value: rhs } });
+    lit.ty = Some(Ty::Float);
+    let mut e = Expr::new(
+        span,
+        ExprNode::Send {
+            recv: Some(lhs),
+            method: Symbol::from(op),
+            args: vec![lit],
+            block: None,
+            parenthesized: false,
+        },
+    );
+    e.ty = Some(Ty::Float);
+    e
+}
+
+/// Seconds from the astronomical Julian day epoch to the Unix epoch —
+/// `2_440_587.5 * 86_400`, the constant Rails' `Time#to_datetime`
+/// conversion puts in front of `Duration#coerce`.
+const AJD_EPOCH_SECONDS: f64 = 210_866_760_000.0;
+const SECONDS_PER_DAY: f64 = 86_400.0;
+
+/// A Duration compared against a NUMERIC scalar grounds to its
+/// seconds: `Time.now.utc - created_at <= 70.days` — the left side is
+/// Float seconds after the temporal lowering, and nothing coerces the
+/// Duration operand on strict targets (Rails resolves it through
+/// Duration#coerce, comparing seconds — `.to_f` is identical).
+///
+/// A TIME compared against a bare Duration takes the second rule
+/// below instead: Rails EVALUATES that shape rather than raising, so
+/// grounding it to plain seconds answers a different question — and
+/// raised on every /newest render when an earlier attempt did exactly
+/// that. See the module header's TIME INTEROP note.
+fn rewrite_duration_comparisons(expr: &mut Expr) {
+    expr.node.for_each_child_mut(&mut rewrite_duration_comparisons);
+    let is_cmp = matches!(
+        &*expr.node,
+        ExprNode::Send { recv: Some(_), method, args, block: None, .. }
+            if args.len() == 1
+                && matches!(method.as_str(), "<" | "<=" | ">" | ">=")
+    );
+    if !is_cmp {
+        return;
+    }
+    let ExprNode::Send { recv: Some(recv), args, .. } = &mut *expr.node else { unreachable!() };
+
+    // Rule 1 — numeric vs Duration grounds to seconds.
+    if is_numeric_side(recv) || is_numeric_side(&args[0]) {
+        for side in [recv as &mut Expr].into_iter().chain(args.iter_mut()) {
+            if is_duration_const_call(side) {
+                let grounded = to_f(take(side));
+                *side = grounded;
+            }
+        }
+        return;
+    }
+
+    // Rule 2 — a Time RECEIVER vs a bare Duration takes Rails'
+    // ajd-vs-seconds coercion, division multiplied out.
+    if recv.ty.as_ref().is_some_and(Ty::contains_time) && is_duration_const_call(&args[0]) {
+        let t = take(recv);
+        *recv = float_binop(to_f(t), "+", AJD_EPOCH_SECONDS);
+        let dur = take(&mut args[0]);
+        args[0] = float_binop(to_f(dur), "*", SECONDS_PER_DAY);
+    }
+}
+
+/// Is this comparison operand the NUMERIC side — a stamped Int/Float,
+/// or a subtraction yielding Float seconds (`Time.now.utc -
+/// created_at`)?
+///
+/// A subtraction whose operand is a Duration is excluded: `Time -
+/// Duration` is another Time, and treating it as numeric would ground
+/// the Duration on the far side to bare seconds and raise on CRuby.
+fn is_numeric_side(s: &Expr) -> bool {
+    if is_duration_const_call(s) {
+        return false;
+    }
+    if matches!(s.ty, Some(Ty::Float) | Some(Ty::Int)) {
+        return true;
+    }
+    matches!(&*s.node,
+        ExprNode::Send { method, args, block: None, .. }
+            if method.as_str() == "-" && args.len() == 1 && !is_duration_const_call(&args[0]))
+}
+
+/// `ActiveSupport::Duration.<unit>(n)` — the shape `rewrite_durations`
+/// itself produces.
+fn is_duration_const_call(e: &Expr) -> bool {
+    matches!(
+        &*e.node,
+        ExprNode::Send { recv: Some(r), method, block: None, .. }
+            if is_duration_unit(method.as_str())
+                && matches!(&*r.node,
+                    ExprNode::Const { path } if path.len() == 2
+                        && path[0].as_str() == "ActiveSupport"
+                        && path[1].as_str() == "Duration")
+    )
+}
+
+/// Duration units whose NAME also names a reader on something that is
+/// not a number, so the rewrite has to see a numeric receiver first.
+/// Enumerated against ActiveSupport itself, not guessed:
+///
+///   day / hour / month / year   `Time` component readers
+///                               (`created_at.day`)
+///   second                      `Array#second` — ActiveSupport's
+///                               ordinal accessor. Rails does NOT alias
+///                               `Time#second`, so this one collides
+///                               with the ARRAY, which is why it read
+///                               as "never collides" until campfire's
+///                               `@messages.second` lowered to
+///                               `ActiveSupport::Duration.second(array)`
+///                               and `dom_id` was handed a Duration.
+///
+/// Every other unit (`seconds`, `minute(s)`, `week(s)`, `fortnight(s)`,
+/// and the plurals of the four above) names nothing else and rewrites
+/// unconditionally.
+fn duration_unit_collides_with_a_reader(unit: &str) -> bool {
+    matches!(unit, "day" | "hour" | "month" | "year" | "second")
+}
+
+fn is_duration_unit(unit: &str) -> bool {
+    matches!(
+        unit,
+        "days" | "day" | "hours" | "hour" | "minutes" | "minute" | "seconds" | "second"
+            | "weeks" | "week" | "fortnights" | "fortnight" | "months" | "month" | "years" | "year"
+    )
+}
+
+/// Is `e` a numeric value — an Int/Float literal or an expression the
+/// typer resolved to `Int`/`Float`? (Keeps `created_at.day` — a
+/// datetime — out of the colliding-unit rewrite.)
+fn is_numeric_expr(e: &Expr) -> bool {
+    if matches!(&*e.node, ExprNode::Lit { value: Literal::Int { .. } })
+        || matches!(&*e.node, ExprNode::Lit { value: Literal::Float { .. } })
+    {
+        return true;
+    }
+    matches!(&e.ty, Some(Ty::Int) | Some(Ty::Float))
+}
+
+/// `<n>.days` → `ActiveSupport::Duration.days(<n>)`, in place,
+/// recursively. The receiver moves into argument position keeping its
+/// stamped type. The synthesized `ActiveSupport::Duration` const is
+/// stamped `Ty::Class` — what analyze stamps for any multi-segment
+/// const — because the residual-diagnostics audit walks hook output
+/// and an unstamped const reads as an unresolved name. The outer send
+/// keeps the site's own type (`Int#days` types as the gradual escape,
+/// so the stamp usually stays `Untyped`); a site the typer left open
+/// takes `Untyped` too — the honest type of a call whose runtime class
+/// the registry doesn't model (`send_dispatch`'s fallback convention).
+/// Also the implementation behind the ruby emitter's view-pipeline
+/// vestige.
+pub(crate) fn rewrite_durations(expr: &mut Expr) {
+    expr.node.for_each_child_mut(&mut rewrite_durations);
+    let rewrite = match &*expr.node {
+        ExprNode::Send { recv: Some(r), method, args, block: None, .. }
+            if args.is_empty() && is_duration_unit(method.as_str()) =>
+        {
+            !duration_unit_collides_with_a_reader(method.as_str()) || is_numeric_expr(r)
+        }
+        _ => false,
+    };
+    if rewrite {
+        let span = expr.span;
+        let node = std::mem::replace(&mut *expr.node, ExprNode::Seq { exprs: vec![] });
+        let ExprNode::Send { recv, method, .. } = node else { unreachable!() };
+        let arg = recv.expect("duration send has a receiver");
+        let path = vec![Symbol::from("ActiveSupport"), Symbol::from("Duration")];
+        let mut duration_const = Expr::new(span, ExprNode::Const { path });
+        duration_const.ty = Some(Ty::Class {
+            id: ClassId(Symbol::from("ActiveSupport::Duration")),
+            args: vec![].into(),
+        });
+        *expr.node = ExprNode::Send {
+            recv: Some(duration_const),
+            method,
+            args: vec![arg],
+            block: None,
+            parenthesized: true,
+        };
+        if matches!(expr.ty, None | Some(Ty::Var { .. })) {
+            expr.ty = Some(Ty::Untyped);
+        }
+    }
+}

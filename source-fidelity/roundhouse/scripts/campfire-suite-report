@@ -1,0 +1,512 @@
+#!/usr/bin/env ruby
+# scripts/campfire-suite-report — render a scripts/campfire-suite run to
+# self-contained HTML.
+#
+# The campfire twin of scripts/lobsters-spec-report, and it keeps that
+# page's contract: THE PAGE IS A WORKLIST, NOT A SCOREBOARD. The pass
+# count is the least interesting number on it — the ranked causes are
+# what anyone can act on — so the headline is one line and the cause
+# table is the body.
+#
+# TWO THINGS THIS PAGE SAYS THAT ITS LOBSTERS TWIN DOES NOT:
+#
+#   * THE INPUT IS PINNED. campfire is fetched at `CAMPFIRE_SHA`, so
+#     every movement in the number belongs to a roundhouse commit. That
+#     is why this lane lives in CI and lobsters' lives on a cron box, and
+#     the page should say which question it is answering.
+#
+#     ONLY ON THE INTERPRETED LANE. The compiled lane (`lane.target ==
+#     "spinel"`) has a FOURTH input the publisher rebuilds every morning,
+#     so its movements are two-sided and the box says so instead. Every
+#     claim here that begins "this lane" is branched — including "not
+#     whether roundhouse COMPILES campfire", which is false on a lane
+#     whose third status is a compile failure.
+#   * THE THIRD STATUS, on the compiled lane. CRuby gives a file two
+#     outcomes, pass or fail; compiling gives it three, and the new one
+#     is `build` — never linked. Its tests are charged to a compile error
+#     and nothing behind that error has been observed, so a never-linked
+#     row is not evidence the emit is wrong. Rendered as its own badge,
+#     its own paragraph and its own row label, ahead of `aborted` (which
+#     it implies: a file that did not compile did not run).
+#   * THE NUMBER IS PROPPED UP. `scripts/campfire-walk-stubs.rb` is
+#     spliced into the emit before the count is taken, and every entry in
+#     it is something the compiler cannot do for itself. Fourteen entries
+#     is not a footnote — it is a section, above the per-file table.
+#
+# NO HISTORY. Each run stands alone: current state and todos.
+#
+# Usage:
+#   scripts/campfire-suite-report [PATH] [OUT.html]
+#
+#   PATH defaults to build/campfire-suite/summary.json. It may be the run
+#   directory or the summary.json inside it. OUT defaults to index.html
+#   alongside it, so the page publishes next to the artifact it is
+#   rendered from.
+#
+# Pure stdlib; no JS, no CDN, no external assets.
+
+require "json"
+require "time"
+
+arg = ARGV[0] || File.join(__dir__, "..", "build", "campfire-suite")
+arg = File.expand_path(arg)
+run_path = File.directory?(arg) ? arg : File.dirname(arg)
+json_path = File.directory?(arg) ? File.join(arg, "summary.json") : arg
+out = ARGV[1] || File.join(run_path, "index.html")
+
+abort "campfire-suite-report: no summary.json at #{json_path}" unless File.exist?(json_path)
+d = begin
+  JSON.parse(File.read(json_path))
+rescue JSON::ParserError => e
+  abort "campfire-suite-report: unparseable #{json_path}: #{e.message}"
+end
+
+def esc(s) = s.to_s.gsub("&", "&amp;").gsub("<", "&lt;").gsub(">", "&gt;")
+def fmt_int(n) = n.to_i.to_s.reverse.scan(/\d{1,3}/).join(",").reverse
+def pct(n, of) = of.to_i.zero? ? 0.0 : (n.to_f / of * 100)
+
+# Owner is the participation axis: only some of these are addressable by
+# anyone outside this repo, and the page should not blur that.
+OWNER_LABEL = {
+  "compiler" => "roundhouse",
+  "app" => "campfire",
+  "gem" => "gem",
+  "spinel" => "spinel",
+  "harness" => "this harness",
+  "subset" => "outside the subset",
+  "unknown" => "untriaged",
+}.freeze
+
+# WHICH LANE. `ruby` runs each emitted test file under CRuby; `spinel`
+# compiles each one to its own native binary and runs that. Same emitted
+# source, so a difference between two summaries with the same campfire
+# SHA is the COMPILER's — which is why almost everything below that says
+# "this lane" has to ask which lane it is.
+lane    = d["lane"] || {}
+compiled = lane["target"].to_s == "spinel"
+spinel  = d["spinel"] || {}
+# The summary parses the sha out of the banner, but the banner's shape
+# has changed under it once already (the commit moved into parentheses
+# behind a dated version), and a run that recorded the full banner did
+# record its compiler. Re-derive from the banner here so an archived
+# summary whose parse missed still identifies the compiler that built it.
+if spinel["sha"].to_s.empty? && spinel["version"]
+  spinel = spinel.merge("sha" => spinel["version"][/\(([0-9a-f]{7,40})\)/, 1] ||
+                                 spinel["version"][/\bspinel\s+([0-9a-f]{7,40})\b/, 1])
+end
+
+cf      = d["campfire"] || {}
+rh      = d["roundhouse"] || {}
+tests   = d["tests"] || {}
+files   = d["files"] || {}
+emit    = d["emit"] || {}
+stubs   = d["stubs"] || {}
+attrib  = d["attribution"] || {}
+scope   = d["scope"] || {}
+causes  = d["causes"] || []
+by_file = d["by_file"] || []
+
+total  = tests["total"].to_i
+passed = tests["passed"].to_i
+failed = tests["failed"].to_i
+
+generated = (Time.parse(d["generated_at"]) rescue nil)
+age_days = generated ? ((Time.now.utc - generated) / 86_400.0) : nil
+
+# ── Trust banner ─────────────────────────────────────────────────────
+# Generated from the run's own data and gone once the run is clean — the
+# same contract the lobsters page's banner keeps. "Not checked" has to
+# raise as loudly as "checked and wrong", so a missing verdict is an
+# alarm, not a blank.
+trouble = []
+if by_file.empty?
+  trouble << ["tally", "this run recorded no test files at all, so nothing below describes a suite run"]
+end
+if cf["sha"].to_s.empty?
+  trouble << ["campfire", "this run recorded no campfire SHA, so the input it measured is unknown"]
+end
+if rh["dirty"]
+  trouble << ["roundhouse checkout", "had uncommitted changes, so these results cannot be reproduced " \
+              "from the recorded SHA"]
+end
+if emit["errors"].to_i > 0
+  trouble << ["emit", "#{fmt_int(emit["errors"])} error(s) — the tree under test is incomplete, so " \
+              "failures below may be missing code rather than wrong code"]
+end
+if attrib.key?("per_test") && !attrib["per_test"]
+  trouble << ["attribution", "no per-test failure log for this run, so every unpassed test is charged " \
+              "to its file's first error and the ranking below over-credits it"]
+end
+# THE COMPILED LANE HAS A FOURTH INPUT, and it is the one nobody here
+# controls: the publisher pulls and builds spinel every morning. A run
+# that did not record which compiler built it cannot answer "ours or
+# theirs?" about its own regression, which is the first question anyone
+# asks of a red night.
+if compiled && spinel["sha"].to_s.empty?
+  trouble << ["compiler", "this run recorded no spinel version, so a change in the numbers below " \
+              "cannot be told apart from a change in the compiler that produced them"]
+end
+if age_days && age_days > 14
+  trouble << ["freshness", "this report is #{age_days.round} days old — the job that produces it may " \
+              "have stopped"]
+end
+
+html = +"<!doctype html>\n<html lang=en>\n<head>\n<meta charset=utf-8>\n"
+html << %(<meta name="viewport" content="width=device-width, initial-scale=1">\n)
+html << "<title>Campfire conformance#{compiled ? " (compiled)" : ""} — their tests, our emit</title>\n"
+
+html << <<~CSS
+  <style>
+  body { font-family: -apple-system, system-ui, sans-serif; color: #222;
+         max-width: 880px; margin: 2em auto; padding: 0 1em; line-height: 1.5; }
+  h1 { font-size: 1.6em; margin-bottom: 0.2em; }
+  h2 { font-size: 1.2em; margin-top: 2em; border-bottom: 1px solid #ddd;
+       padding-bottom: 0.2em; }
+  .meta { color: #666; font-size: 0.9em; margin-bottom: 1em; }
+  .meta code { background: #f0f0f0; padding: 0.05em 0.3em; border-radius: 3px; }
+  .lead { font-size: 1.05em; }
+  .methodology { background: #f7f7f7; border-left: 3px solid #ccc;
+                 padding: 0.6em 1em; font-size: 0.92em; }
+  .methodology code { background: #ececec; padding: 0.05em 0.3em;
+                      border-radius: 3px; font-size: 0.9em; }
+  .caveat { color: #777; font-size: 0.9em; font-style: italic; }
+  .badges { margin: 0.8em 0; }
+  .badge { display: inline-block; padding: 0.25em 0.7em; border-radius: 999px;
+           font-size: 0.9em; font-weight: 600; margin-right: 0.5em; }
+  .badge.pass { background: #e7f4e8; color: #2e7d32; }
+  .badge.fail { background: #fdecea; color: #c0392b; }
+  .badge.info { background: #eef0f4; color: #445; }
+  .split { display: flex; height: 22px; border-radius: 4px; overflow: hidden;
+           margin: 0.6em 0 0.3em; background: #eee; }
+  .split span { display: block; }
+  .split .p { background: #2e7d32; }
+  .split .f { background: #c0392b; }
+  table { border-collapse: collapse; font-size: 0.88em; margin: 0.4em 0; width: 100%; }
+  th, td { padding: 5px 10px; border-bottom: 1px solid #eee; vertical-align: top; }
+  th { text-align: left; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .cause td { border-bottom: none; padding-bottom: 0; }
+  .cause-note td { color: #555; font-size: 0.95em; padding-top: 0.2em;
+                   border-bottom: 1px solid #eee; padding-bottom: 0.7em; }
+  .bar { height: 8px; background: #7d4cdb; border-radius: 2px; min-width: 2px; }
+  .barcell { width: 22%; }
+  .owner { display: inline-block; padding: 0.1em 0.5em; border-radius: 3px;
+           font-size: 0.8em; font-weight: 600; white-space: nowrap; }
+  .owner.compiler { background: #efe9fb; color: #5b32b0; }
+  .owner.harness  { background: #fdf3e0; color: #8a6d3b; }
+  .owner.app      { background: #e6f0fb; color: #1c5d99; }
+  .owner.gem      { background: #eee; color: #555; }
+  .owner.spinel   { background: #e8f4f4; color: #256; }
+  .owner.subset   { background: #f3f3f3; color: #666; border: 1px dashed #bbb; }
+  .owner.unknown  { background: #fdecea; color: #c0392b; }
+  .green  { color: #2e7d32; font-weight: 600; }
+  .abort  { color: #c0392b; font-weight: 600; }
+  details summary { cursor: pointer; color: #555; padding: 0.3em 0; font-size: 0.9em; }
+  details ul { margin: 0.2em 0 0.6em; font-size: 0.88em; color: #555; }
+  details li { margin-bottom: 0.35em; }
+  .alarm { border: 2px solid #b00; background: #fff4f4; border-radius: 6px;
+           padding: 0.9em 1.1em; margin: 1.2em 0; }
+  .alarm h2 { margin: 0 0 0.4em; font-size: 1.05em; color: #b00; border: none; padding: 0; }
+  .alarm ul { margin: 0.5em 0 0; padding-left: 1.3em; }
+  .alarm .why { margin: 0.6em 0 0; font-size: 0.9em; color: #444; }
+  </style>
+CSS
+html << "</head>\n<body>\n"
+
+html << "<h1>Campfire conformance#{compiled ? " — compiled" : ""}</h1>\n"
+# The lead used to claim "a few are this harness's own gaps", a category
+# no rule has ever been filed under. Owners come from the run instead, so
+# the sentence cannot drift from the table under it again.
+# "Who can act" — so a cause nobody can act on (`subset`: the test reaches
+# for dynamic Ruby no compiled target has) is named in its row, not here.
+owner_tally = Hash.new(0)
+causes.each do |c|
+  next if c["owner"].to_s == "subset"
+  owner_tally[c["owner"].to_s] += c["failures"].to_i if c["failures"].to_i > 0
+end
+owner_phrase = owner_tally.sort_by { |_, n| -n }
+                          .map { |o, n| "#{n} #{OWNER_LABEL[o] || o}" }.join(" · ")
+html << %(<p class="lead">ONCE Campfire's own Minitest suite, run against a Roundhouse emit of the same commit. A failure here mostly names a Rails construct not yet modeled; some are answers that came out wrong with nothing raised, and some have not been triaged at all. That makes their tests the worklist generator — so the ranked causes below, not the pass count, are what this page is for.</p>\n)
+# THE THIRD STATUS IS THE POINT OF THIS LANE. Its sibling runs the same
+# emitted Ruby under CRuby, where a file either passes or fails; only a
+# compiled lane can report a file that never LINKED, and a file that did
+# not compile has said nothing at all about whether the emit is correct.
+# Saying so up front, because the pass count is otherwise read as if the
+# denominator had been exercised.
+if compiled
+  unbuilt = files["unbuilt"].to_i
+  html << %(<p class="lead">This is the <strong>compiled</strong> lane: #{esc(lane["runner"] || "each test file compiled to its own native binary by spinel, then run")}. The same emitted source runs on the interpreted lane, so a difference between the two is the compiler's, not the app's — and this lane can report a status its sibling cannot.)
+  if unbuilt > 0
+    html << %( <strong>#{unbuilt} of #{files["total"]} files never linked</strong>, and their tests are counted against their first compile error rather than against anything the emit got wrong.)
+  end
+  html << "</p>\n"
+end
+html << %(<p class="meta">Unpassed tests by who can act: #{esc(owner_phrase)}.</p>\n) if owner_phrase != ""
+
+prov = []
+prov << %(campfire <code>#{esc(cf["sha"].to_s[0, 12])}</code>) if cf["sha"]
+prov << %(roundhouse <code>#{esc(rh["sha"].to_s[0, 12])}</code>) if rh["sha"]
+prov << %(spinel <code>#{esc(spinel["sha"].to_s[0, 12])}</code>) if spinel["sha"]
+prov << esc(d["generated_at"]) if d["generated_at"]
+prov << "#{age_days.round} days old" if age_days && age_days >= 1
+html << %(<div class="meta">#{prov.join(" · ")}</div>\n)
+
+if trouble.any?
+  html << %(<div class="alarm">\n<h2>These results do not describe what they claim to</h2>\n<ul>\n)
+  trouble.each { |what, why| html << "<li><strong>#{esc(what)}</strong> — #{why}</li>\n" }
+  html << "</ul>\n"
+  html << %(<p class="why">Generated from the run's own data; it disappears by itself once a run is clean. Absence of this box is the signal, which is why a missing check raises it just as loudly as a failed one.</p>\n)
+  html << "</div>\n"
+end
+
+# ── Headline ─────────────────────────────────────────────────────────
+html << %(<div class="badges">)
+html << %(<span class="badge #{passed == total && total > 0 ? "pass" : "fail"}">#{fmt_int(passed)}/#{fmt_int(total)} tests pass</span>)
+html << %(<span class="badge info">#{files["green"]} of #{files["total"]} files green</span>)
+if compiled && files["unbuilt"].to_i > 0
+  html << %(<span class="badge fail">#{files["unbuilt"]} never linked</span>)
+end
+if stubs["count"]
+  html << %(<span class="badge #{stubs["count"].to_i.zero? ? "pass" : "fail"}">#{stubs["count"]} spliced stubs</span>)
+end
+if emit["files"]
+  html << %(<span class="badge #{emit["errors"].to_i.zero? ? "pass" : "fail"}">emit #{fmt_int(emit["files"])} files, #{fmt_int(emit["errors"])} errors</span>)
+end
+html << "</div>\n"
+
+if total > 0
+  html << %(<div class="split">)
+  html << %(<span class="p" style="width:#{pct(passed, total).round(2)}%"></span>)
+  html << %(<span class="f" style="width:#{pct(failed, total).round(2)}%"></span>)
+  html << "</div>\n"
+  html << %(<div class="meta">#{fmt_int(passed)} passing · #{fmt_int(failed)} not passing)
+  # On the compiled lane the never-linked files are a SUBSET of the
+  # aborted ones (a file that did not compile did not run), so reporting
+  # both raw reads as double-counting. Name the compile failures and let
+  # the rest be the load failures they are.
+  if compiled && files["unbuilt"].to_i > 0
+    other = files["aborted"].to_i - files["unbuilt"].to_i
+    html << " · #{files["unbuilt"]} file(s) never linked"
+    html << " · #{other} more never ran a test" if other > 0
+  elsif files["aborted"].to_i > 0
+    html << " · #{files["aborted"]} file(s) never ran a test at all"
+  end
+  html << "</div>\n"
+end
+
+# ── Methodology ──────────────────────────────────────────────────────
+# The pin is the reason this lane can attribute a delta to a commit, so
+# it is the first thing the methodology box says.
+ruby = d["ruby"] || {}
+sha_short = esc(cf["sha"].to_s[0, 12])
+
+# WHAT RAN IT, and what that costs the attribution argument. The
+# interpreted lane has three inputs and pins one of them; the compiled
+# lane has FOUR, and the fourth is pulled and rebuilt by the publisher
+# every morning. Both facts belong in the box that explains why this
+# page's numbers can be trusted to move for a reason.
+runner_phrase =
+  if compiled
+    spinel["sha"] ? " and is compiled by spinel <code>#{esc(spinel["sha"].to_s[0, 12])}</code>"
+                  : " and is compiled by spinel"
+  elsif ruby["version"]
+    " and runs on Ruby <code>#{esc(ruby["version"])}</code>"
+  else
+    ""
+  end
+
+pin_para =
+  if compiled
+    <<~PIN.strip
+      <strong>The app is pinned#{cf["sha"] ? " at <code>#{sha_short}</code>" : ""}; the compiler is not.</strong>
+      This lane compiles 54 whole programs, which is too much to run per commit, so it runs on a schedule
+      and its spinel is whatever the publisher pulled and built that morning. That makes a movement here
+      two-sided: it belongs to a Roundhouse change <em>or</em> to a compiler change, and the two are told
+      apart by the spinel version recorded above — not by this page. Read a regression by checking that
+      version first.
+    PIN
+  else
+    <<~PIN.strip
+      <strong>The input is pinned#{cf["sha"] ? " at <code>#{sha_short}</code>" : ""}</strong>, which is the whole reason this lane
+      runs in CI on every commit: with campfire held still, every movement in the number belongs to a
+      Roundhouse change and nothing else. Bumping the pin moves the number deliberately, and the commit
+      that bumps it owns the delta. (The <a href="../lobsters-specs/">lobsters conformance lane</a> makes
+      the opposite call — it tracks upstream HEAD and pins nothing, so it cannot attribute per commit and
+      runs on a schedule instead.)
+    PIN
+  end
+# The interpreted lane can say "compiling is not the question" because
+# its target is gap-tolerant. THE COMPILED LANE CANNOT: it has just
+# reported 17 files that failed to compile, and a page that then denies
+# measuring compilation contradicts its own headline. On that lane the
+# honest framing is that it measures BOTH, in two separable columns.
+measures =
+  if compiled
+    <<~M.strip
+      <strong>What this measures.</strong> Two questions, kept apart. Whether the emit <em>compiles</em> is
+      the never-linked column — spinel is a strict target, so an unmodeled construct is a compile error
+      rather than a gap emitted through. Whether it <em>behaves</em> is everything else: their suite asserts
+      test by test, so a failure below names a construct that compiled and then answered wrongly. A file in
+      the first column has not yet been asked the second question.
+    M
+  else
+    <<~M.strip
+      <strong>What this measures.</strong> Not whether Roundhouse <em>compiles</em> campfire — the Ruby
+      target is gap-tolerant and answers that with a zero whether or not the output behaves. Their suite
+      asserts behavior test by test, so a failure here names a construct that was emitted but is wrong or
+      missing.
+    M
+  end
+
+html << <<~METHOD
+  <div class="methodology">
+    #{measures} The emit is produced fresh by <code>scripts/campfire-suite</code>#{runner_phrase}.
+    <p>#{pin_para}</p>
+    <p><strong>The file list is theirs.</strong> #{esc(scope["note"])}</p>
+    <p class="caveat">Each run stands alone. There is no history here and no comparison to previous
+    runs: a chart of a number that moves for a dozen reasons is not the point of a worklist.</p>
+  </div>
+METHOD
+
+# ── The worklist ─────────────────────────────────────────────────────
+html << "<h2>Todos, by tests blocked</h2>\n"
+html << %(<p>Occurrences churn; causes are the unit of work, so each carries a stable slug you can still refer to forty commits later. <strong>Owner</strong> says who can act: most of this is Roundhouse's own modeling debt.</p>\n)
+html << %(<p class="caveat">Counts are how many tests are <em>currently</em> stopped by each cause, not how many will pass when it lands: a test is attributed to the first thing that stopped it, so clearing one cause routinely reveals another behind it. #{esc(attrib["note"])}</p>\n)
+
+live = causes.reject { |c| c["failures"].to_i.zero? }
+      .sort_by { |c| [c["slug"] == "unclassified" ? 1 : 0, -c["failures"].to_i] }
+max_fail = live.map { |c| c["failures"].to_i }.max.to_i
+
+if live.any?
+  html << "<table>\n<tr><th class=num>Blocked</th><th class=barcell></th><th>Cause</th><th>Owner</th></tr>\n"
+  live.each do |c|
+    n = c["failures"].to_i
+    w = max_fail.zero? ? 0 : (n.to_f / max_fail * 100).round(1)
+    owner = c["owner"].to_s
+    html << %(<tr class="cause">)
+    html << %(<td class="num"><strong>#{fmt_int(n)}</strong></td>)
+    html << %(<td class="barcell"><div class="bar" style="width:#{w}%"></div></td>)
+    html << %(<td><strong>#{esc(c["title"])}</strong><br><code>#{esc(c["slug"])}</code></td>)
+    html << %(<td><span class="owner #{esc(owner)}">#{esc(OWNER_LABEL[owner] || owner)}</span></td>)
+    html << "</tr>\n"
+
+    html << %(<tr class="cause-note"><td></td><td colspan=3>#{esc(c["note"])}\n)
+    samples = Array(c["examples"])
+    if samples.any?
+      shown = samples.size >= n ? "#{n} test#{n == 1 ? "" : "s"}" \
+                                : "#{samples.size} of #{fmt_int(n)} tests"
+      html << %(<details><summary>#{shown}</summary><ul>)
+      samples.each do |s|
+        html << if s.is_a?(Hash)
+          "<li>#{esc(s["example"])}<br><code>#{esc(s["error"])}</code></li>"
+        else
+          "<li>#{esc(s)}</li>"
+        end
+      end
+      html << "</ul></details>"
+    end
+    html << "</td></tr>\n"
+  end
+  html << "</table>\n"
+end
+
+# A rule that matches nothing is information, but it is three different
+# pieces of it, and one footnote saying "cleared, or the message moved"
+# let the largest section on this page mean nothing. Cleared rules carry
+# their own explanation in the rules file; a rule the stub holds at zero
+# is a deliberate result; only the remainder is a question.
+cleared = causes.select { |c| c["at_zero"] }
+stubbed_zero = causes.select { |c| c["stubbed_zero"] }
+stale = causes.select { |c| c["stale_rule"] }
+if cleared.any? || stubbed_zero.any? || stale.any?
+  html << "<h2>Rules that matched nothing</h2>\n"
+  html << %(<p class="caveat">A rule at zero is kept, not deleted: it is the tripwire that catches the fix coming undone. What it means depends on why it is at zero.</p>\n)
+  if cleared.any?
+    # Not all of these are "cleared" — id-zero-sentinel was never a gap
+    # — so the column names the rule and lets each row say why.
+    html << "<table>\n<tr><th>Rule</th><th>Why it reads zero</th></tr>\n"
+    cleared.each do |c|
+      html << "<tr><td><code>#{esc(c["slug"])}</code></td><td>#{esc(c["at_zero"])}</td></tr>\n"
+    end
+    html << "</table>\n"
+  end
+  if stubbed_zero.any?
+    html << %(<p>Held at zero by the harness, not by the compiler — the stub ledger below covers what would otherwise fail here: #{stubbed_zero.map { |c| "<code>#{esc(c["slug"])}</code>" }.join(", ")}. Deleting the stub is what makes these counts real.</p>\n)
+  end
+  if stale.any?
+    html << %(<p>No explanation recorded, so these are the open question: either the cause is cleared and nobody wrote that down, or the failure's message changed and it is now being counted as untriaged above. #{stale.map { |c| "<code>#{esc(c["slug"])}</code>" }.join(", ")}.</p>\n)
+  end
+end
+
+# ── The stub ledger ──────────────────────────────────────────────────
+# Above the per-file table on purpose: a number propped up by the harness
+# is not a number about the emit, and this lane props it up fourteen
+# times over.
+entries = Array(stubs["entries"])
+if entries.any?
+  html << "<h2>What the harness compensates for</h2>\n"
+  html << %(<p><code>#{esc(stubs["file"])}</code> is spliced into the emitted app before the count above is taken. Each of its #{entries.size} entries stands for something the compiler cannot produce yet — a gem parked by design, or a gap ledgered elsewhere — and buys the suite a few more steps rather than fixing anything. <strong>A gap closed in the compiler is an entry deleted there</strong>, so the length of this list is itself a progress report, and the pass rate above should be read as "with these in place".</p>\n)
+  html << "<table>\n<tr><th>Stub</th><th>Why it is there</th></tr>\n"
+  entries.each do |e|
+    html << "<tr><td><strong>#{esc(e["what"])}</strong></td><td>#{esc(e["why"])}</td></tr>\n"
+  end
+  html << "</table>\n"
+elsif stubs.key?("spliced") && !stubs["spliced"]
+  html << "<h2>What the harness compensates for</h2>\n"
+  html << %(<p>Nothing: this run spliced no stubs (<code>--no-stubs</code>), so the numbers above are the emit's own.</p>\n)
+end
+
+# ── Per-file ─────────────────────────────────────────────────────────
+if by_file.any?
+  html << "<h2>By test file</h2>\n"
+  html << %(<p>A file that never ran is not the same as a file whose tests failed: it died at load, so its whole count is charged to one error and nothing behind that error has been seen yet.</p>\n)
+  if compiled
+    third = if files["unbuilt"].to_i > 0
+      "And on this lane there is a third row: a file that <strong>never linked</strong>."
+    else
+      "And on this lane there is a third row, empty this run: a file that <strong>never linked</strong>."
+    end
+    html << %(<p>#{third} Its tests are charged to its first compile error, and unlike a load failure it has not been observed to do anything at all — the emit may be perfectly correct behind it. Sort the work by asking which of the three a row is: didn't link, linked and diverged, linked and agreed.</p>\n)
+  end
+  html << "<table>\n<tr><th>File</th><th class=num>Tests</th><th class=num>Pass</th><th class=num>Fail</th><th>First error</th></tr>\n"
+  by_file.each do |f|
+    green = f["status"] == "pass"
+    html << "<tr><td><code>#{esc(f["file"])}</code></td>"
+    html << %(<td class="num">#{f["tests"]}</td>)
+    html << %(<td class="num">#{f["passed"]}</td>)
+    html << %(<td class="num">#{f["failed"]}</td>)
+    html << if green
+      %(<td class="green">all green</td>)
+    elsif f["status"] == "build"
+      # BEFORE the `aborted` arm: a file that never linked never ran
+      # either, so it satisfies both and only the first label is true
+      # about WHY.
+      %(<td><span class="abort">never linked</span> — <code>#{esc(f["first_error"])}</code></td>)
+    elsif f["aborted"]
+      %(<td><span class="abort">never ran</span> — <code>#{esc(f["first_error"])}</code></td>)
+    else
+      "<td><code>#{esc(f["first_error"])}</code></td>"
+    end
+    html << "</tr>\n"
+  end
+  html << "</table>\n"
+end
+
+# ── Emit diagnostics ─────────────────────────────────────────────────
+if (kinds = emit["by_kind"]) && kinds.any?
+  html << "<h2>Emit diagnostics</h2>\n"
+  html << %(<p>From the transpile that produced the tree under test: #{fmt_int(emit["files"])} files, <strong>#{fmt_int(emit["errors"])} errors</strong>, #{fmt_int(emit["warnings"])} warnings. Warnings are a modeling-debt ledger rather than a failure — the Ruby target emits through its gaps — so the COUNTS are not comparable to the test failures above.</p>\n)
+  html << %(<p class="caveat">They are not independent of them either. <code>send_dispatch_failed</code> in particular names a call the analyzer could not resolve, and three of the fixes on this lane came out of those lines before the suite reached them at all — the analyzer had already written the diagnosis. Read the emit log before the fail log.</p>\n)
+  html << "<table>\n<tr><th>Diagnostic</th><th class=num>Count</th></tr>\n"
+  kinds.sort_by { |_, n| -n.to_i }.each do |k, n|
+    html << "<tr><td><code>#{esc(k)}</code></td><td class=num>#{fmt_int(n)}</td></tr>\n"
+  end
+  html << "</table>\n"
+end
+
+rel = File.basename(json_path)
+html << %(<div class="meta" style="margin-top:2em">Artifact: <a href="#{esc(rel)}"><code>#{esc(rel)}</code></a> — every number on this page comes from it. Source: <a href="https://github.com/basecamp/once-campfire"><code>basecamp/once-campfire</code></a>#{cf["sha"] ? %( at <code>#{sha_short}</code>) : ""}.</div>\n)
+html << "</body>\n</html>\n"
+
+File.write(out, html)
+warn "campfire-suite-report: wrote #{out} (#{fmt_int(File.size(out))} bytes)"

@@ -1,0 +1,11 @@
+# Build products — re-generable via `make`.
+/build/
+/static/
+
+# Tailwind / npm working files (when `make assets` runs from this dir).
+/node_modules/
+/package.json
+/package-lock.json
+
+# Per-process working files (PID file, scratch DBs, etc.)
+/tmp/

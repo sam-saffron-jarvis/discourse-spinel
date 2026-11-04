@@ -1,0 +1,298 @@
+# frozen_string_literal: true
+
+module SiteSettings
+  class LabelFormatter
+    HUMANIZED_ACRONYMS =
+      Set.new(
+        %w[
+          2fa
+          acl
+          ai
+          api
+          arn
+          aws
+          bg
+          cdn
+          cors
+          csp
+          csrf
+          css
+          cta
+          csv
+          cx
+          db
+          dm
+          dns
+          eu
+          faq
+          fg
+          ga
+          gb
+          gif
+          gpu
+          gpt
+          gtm
+          hd
+          html
+          http
+          https
+          iam
+          id
+          imap
+          ip
+          jpg
+          json
+          kb
+          llm
+          mb
+          mfa
+          oauth
+          oidc
+          pdf
+          pm
+          png
+          pop3
+          rest
+          rss
+          s3
+          saml
+          smtp
+          sso
+          svg
+          tei
+          tl
+          tl0
+          tl1
+          tl2
+          tl3
+          tl4
+          tld
+          totp
+          txt
+          ui
+          url
+          ux
+          vpc
+          xml
+          yaml
+          yml
+        ],
+      ).freeze
+
+    HUMANIZED_MIXED_CASE = [
+      %w[apple Apple],
+      ["adobe analytics", "Adobe Analytics"],
+      ["amazon web services", "Amazon Web Services"],
+      %w[android Android],
+      %w[chinese Chinese],
+      %w[discord Discord],
+      %w[discourse Discourse],
+      ["discourse connect", "Discourse Connect"],
+      ["discourse discover", "Discourse Discover"],
+      ["discourse narrative bot", "Discourse Narrative Bot"],
+      %w[facebook Facebook],
+      %w[foundation Foundation],
+      %w[github GitHub],
+      %w[google Google],
+      ["google analytics", "Google Analytics"],
+      ["google tag manager", "Google Tag Manager"],
+      %w[gravatar Gravatar],
+      %w[gravatars Gravatars],
+      %w[gitter Gitter],
+      %w[horizon Horizon],
+      %w[ios iOS],
+      %w[japanese Japanese],
+      %w[linkedin LinkedIn],
+      %w[meta Meta],
+      %w[mediaconvert MediaConvert],
+      %w[microsoft Microsoft],
+      %w[matrix Matrix],
+      %w[mattermost Mattermost],
+      %w[oauth2 OAuth2],
+      ["openid connect", "OpenID Connect"],
+      %w[openai OpenAI],
+      %w[opengraph OpenGraph],
+      ["powered by discourse", "Powered by Discourse"],
+      %w[tiktok TikTok],
+      %w[tos ToS],
+      %w[twitter Twitter],
+      %w[telegram Telegram],
+      %w[teams Teams],
+      %w[rocketchat RocketChat],
+      %w[slack Slack],
+      %w[vimeo Vimeo],
+      %w[wordpress WordPress],
+      %w[webex WebEx],
+      %w[youtube YouTube],
+      %w[zulip Zulip],
+    ].freeze
+
+    HUMANIZED_MIXED_CASE_REGEX =
+      HUMANIZED_MIXED_CASE.map { |key, value| [/\b#{Regexp.escape(key)}\b/i, value] }.freeze
+
+    SETTING_LINK_PATTERN = /\{\{setting:([a-z][a-z0-9_]*)\}\}/
+    SETTINGS_LINK_PATTERN =
+      /\{\{settings:([a-z][a-z0-9_]*(?:,[a-z][a-z0-9_]*)*)(?:\|([^{}|]+))?\}\}/
+
+    LINK_ATTRIBUTES = %w[
+      class
+      data-setting-name
+      data-setting-area
+      data-setting-category
+      data-setting-plugin
+    ].freeze
+
+    class << self
+      def description(setting)
+        desc = I18n.t("site_settings.#{setting}", base_path: Discourse.base_path, default: "")
+        expand_setting_links(desc)
+      end
+
+      def setting_markers(settings)
+        Array(settings).map { "{{setting:#{it}}}" }.join(", ")
+      end
+
+      def settings_filter_href(filter)
+        "#{Discourse.base_path}/admin/site_settings/category/all_results?filter=#{CGI.escape(filter)}"
+      end
+
+      def linkify(setting)
+        setting = setting.to_sym
+
+        # The href points at the generic "all settings" page as a fallback that
+        # works without JavaScript. In the admin UI the linkify-setting-links
+        # modifier rewrites it to the setting's actual config page, using the
+        # data attributes below so it doesn't have to look the metadata up.
+        attributes = {
+          "class" => "site-setting-link",
+          "href" => settings_filter_href(setting.to_s),
+          "data-setting-name" => setting,
+        }
+
+        if (area = SiteSetting.areas[setting]&.first)
+          attributes["data-setting-area"] = area
+        end
+        if (category = SiteSetting.categories[setting])
+          attributes["data-setting-category"] = category
+        end
+        if (plugin = SiteSetting.plugins[setting])
+          attributes["data-setting-plugin"] = plugin
+        end
+
+        attribute_string =
+          attributes.map { |name, value| %(#{name}="#{CGI.escapeHTML(value.to_s)}") }.join(" ")
+
+        %(<a #{attribute_string}>#{CGI.escapeHTML(humanized_name(setting))}</a>).html_safe
+      end
+
+      # Links a group of settings as a single anchor pointing at the
+      # all-settings page filtered to every name at once, via the explicit
+      # `any:one|two` OR filter syntax (unprefixed pipes stay literal so
+      # admins can search pipe-delimited list values exactly). Unlike #linkify
+      # there is no per-setting config page to rewrite the href to, so no data
+      # attributes are emitted for the linkify-setting-links modifier.
+      def linkify_settings(settings, label: nil)
+        filter = "any:#{settings.map(&:to_s).join("|")}"
+        label ||= settings.map { |setting| humanized_name(setting) }.join(", ")
+
+        %(<a class="site-setting-link" href="#{CGI.escapeHTML(settings_filter_href(filter))}">#{CGI.escapeHTML(label)}</a>).html_safe
+      end
+
+      def contains_setting_links?(text)
+        return false if text.blank?
+        text.match?(SETTING_LINK_PATTERN) || text.match?(SETTINGS_LINK_PATTERN)
+      end
+
+      def expand_setting_links(text, escape_text: false)
+        return text if text.blank? || !text.include?("{{setting")
+
+        text = CGI.escapeHTML(text) if escape_text
+
+        text
+          .gsub(SETTINGS_LINK_PATTERN) do
+            label = Regexp.last_match(2)&.strip
+            label = CGI.unescapeHTML(label) if escape_text && label
+            linkify_settings(Regexp.last_match(1).split(","), label:)
+          end
+          .gsub(SETTING_LINK_PATTERN) { linkify(Regexp.last_match(1)) }
+          .html_safe
+      end
+
+      # Renders markers as plain text — the humanized setting names (quoted)
+      # for {{setting:...}}, and the label or name list for {{settings:...}} —
+      # for surfaces that display error messages outside the admin UI.
+      def plain_setting_links(text)
+        return text if text.blank? || !text.include?("{{setting")
+
+        text
+          .gsub(SETTINGS_LINK_PATTERN) do
+            Regexp.last_match(2)&.strip ||
+              Regexp.last_match(1).split(",").map { |s| humanized_name(s) }.join(", ")
+          end
+          .gsub(SETTING_LINK_PATTERN) { "'#{humanized_name(Regexp.last_match(1))}'" }
+      end
+
+      def humanized_name(setting)
+        name = setting.to_s.tr("_", " ")
+        words = name.split(" ")
+
+        words[0] = words[0].capitalize
+
+        words.map! do |word|
+          word_downcase = word.downcase
+
+          if HUMANIZED_ACRONYMS.include?(word_downcase)
+            word.upcase
+          elsif word.end_with?("s") && HUMANIZED_ACRONYMS.include?(word_downcase[0...-1])
+            word_downcase[0...-1].upcase + "s"
+          else
+            word
+          end
+        end
+
+        result = words.join(" ")
+
+        HUMANIZED_MIXED_CASE_REGEX.each do |regex, replacement|
+          result = result.gsub(regex, replacement)
+        end
+
+        result
+      end
+
+      def keywords(setting)
+        translated_keywords = I18n.t("site_settings.keywords.#{setting}", default: "")
+        english_translated_keywords = []
+
+        if I18n.locale != :en
+          english_translated_keywords =
+            I18n.t("site_settings.keywords.#{setting}", default: "", locale: :en).split("|")
+        end
+
+        # TODO (martin) We can remove this workaround of checking if
+        # we get an array back once keyword translations in languages other
+        # than English have been updated not to use YAML arrays.
+        if translated_keywords.is_a?(Array)
+          return(
+            (
+              translated_keywords + SiteSetting.deprecated_setting_aliases(setting) +
+                english_translated_keywords
+            ).compact
+          )
+        end
+
+        translated_keywords
+          .split("|")
+          .concat(SiteSetting.deprecated_setting_aliases(setting) + english_translated_keywords)
+          .compact
+      end
+
+      def placeholder(setting)
+        if !I18n.t("site_settings.placeholder.#{setting}", default: "").empty?
+          I18n.t("site_settings.placeholder.#{setting}")
+        elsif SiteIconManager.respond_to?("#{setting}_url")
+          SiteIconManager.public_send("#{setting}_url")
+        end
+      end
+    end
+  end
+end

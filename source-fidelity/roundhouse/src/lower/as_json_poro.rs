@@ -1,0 +1,1135 @@
+//! `render json: <PORO>` — a plain object has no `as_json`, so the
+//! encoder falls through to `to_s` and the response is
+//! `"#<Opengraph::Metadata:0x0000000121772a50>"`.
+//!
+//! Rails does not have this problem because ActiveSupport puts `as_json`
+//! on `Object` itself:
+//!
+//! ```text
+//! def as_json(options = nil)
+//!   if respond_to?(:to_hash) then to_hash.as_json(options)
+//!   else instance_values.as_json(options)
+//!   end
+//! end
+//! ```
+//!
+//! `instance_values` is reflection — a String-keyed Hash of every
+//! instance variable — which the shared runtime cannot have
+//! ([[feedback_runtime_must_be_statically_resolvable]]). The compiler
+//! already knows the answer, so it writes it down: a class the app
+//! renders as JSON gets an `as_json` built from its own attribute
+//! readers.
+//!
+//! DEMAND-GATED, the way `to_attrs` is. Only a class actually reached by
+//! `render json:` is given one — a method on every PORO in the app would
+//! be dead weight, and on a strict target it is dead weight that has to
+//! type-check.
+//!
+//! DIVERGENCE, ledgered: Rails' `instance_values` also carries the
+//! framework's own ivars. Measured against ActiveModel 8.1, `render
+//! json:` on campfire's `Opengraph::Metadata` yields
+//! `title/url/context_for_validation/errors` — the last two are
+//! validation bookkeeping no client reads, and inventing them here would
+//! mean naming internals of a shim rather than the app's own surface.
+//! What the app DECLARED is what ships.
+//!
+//! ## The encoder, monomorphized
+//!
+//! `as_json` answers the Hash; something still has to turn it into
+//! text. The runtime's `ActionController::JsonRender.encode` walks
+//! that Hash reflectively (`respond_to?(:as_json)`, `case value when
+//! Hash …`), which no strict target can bind.
+//!
+//! The key set is known here, so the text is written down too: the same
+//! readers become an `as_json_str` writer ([`super::as_json_writer`],
+//! the straight-line `io << "\"title\":" << JsonBuilder.encode_value(…)`
+//! shape jbuilder templates lower to), and the call site becomes the
+//! Rails idiom for an already-encoded body —
+//!
+//! ```text
+//! render json: opengraph
+//! render plain: opengraph.as_json_str, content_type: "application/json"
+//! ```
+//!
+//! — which the controller rewrite already lowers on every target, with
+//! the author's `content_type:` standing. `JsonBuilder` ships in the
+//! shared runtime, so the ruby lane runs the very writer the compiled
+//! lane does: one oracle, one text.
+//!
+//! ## A model with its own `as_json`
+//!
+//! Rails serializes it through that method, called bare. When
+//! `as_json_shape` reads the body (lobsters' `Story#as_json`) and
+//! analysis types every value, the pairs become the writer instead of
+//! the readers — see `declared_as_json_writer`. A COLLECTION of such
+//! records (`render json: @stories`, an `Array[Story]` or a
+//! `Relation[Story]`) is a JSON array of each record's text.
+//!
+//! Primitive-only Hash/Array values use JSON.generate in the controller
+//! rewrite. What keeps the runtime encoder (ruby family only): a
+//! collection containing objects or temporal values, an untyped value, and a model whose
+//! `as_json` is outside the two idioms or has a value with no encoding
+//! here (a nested record, a Hash).
+
+use crate::det::{HashMap, HashSet};
+
+use crate::analyze::ClassInfo;
+use crate::app::App;
+use crate::dialect::{AccessorKind, MethodDef, MethodReceiver, ModelBodyItem, Param};
+use crate::effect::EffectSet;
+use crate::expr::{Expr, ExprNode, Literal};
+use crate::ident::{ClassId, Symbol};
+use crate::span::Span;
+use crate::ty::Ty;
+
+use super::as_json_shape::{as_json_pairs_for_no_arg_call, JsonPair, PairValue, ShapeError};
+use super::as_json_writer::{typed_writer_method, writer_method, PairEncoding, WRITER_METHOD};
+use super::typing::with_ty;
+
+pub fn apply_as_json_synthesis(app: &mut App, registry: &HashMap<ClassId, ClassInfo>) {
+    let wanted = json_rendered_classes(app);
+    // BOTH homes. A tableless class under `app/models/` — which is what
+    // campfire's `Opengraph::Metadata` is — rides in `app.models`, not
+    // `app.library_classes`, so looking in one place found nothing and
+    // the pass was silently inert.
+    // The classes given a writer, so the call sites below rewrite for
+    // exactly those and no other.
+    let mut written: HashSet<ClassId> = HashSet::default();
+    let option_sites = serialize_option_sites(app);
+    let mut variants: HashSet<(ClassId, String)> = HashSet::default();
+    for model in &mut app.models {
+        if !wanted.contains(&model.name) {
+            continue;
+        }
+        let declares_as_json = model.body.iter().any(|item| {
+            matches!(item, ModelBodyItem::Method { method, .. } if method.name.as_str() == "as_json")
+        });
+        if declares_as_json {
+            // The model wrote its own `as_json`. Rails serializes a bare
+            // `render json:` through it with no options, so specialize
+            // it to that call and write the text it would build —
+            // provided every value's TYPE says how. One value that does
+            // not (a nested record, a Hash) leaves the whole model on
+            // the runtime encoder, whose dropped arm is already ledgered
+            // at the site.
+            let table = app.schema.tables.get(&model.table.0);
+            let Some(writer) = model.body.iter().find_map(|item| match item {
+                ModelBodyItem::Method { method, .. } if method.name.as_str() == "as_json" => {
+                    declared_as_json_writer(&model.name, method, table, registry).ok()
+                }
+                _ => None,
+            }) else {
+                continue;
+            };
+            model.body.push(ModelBodyItem::Method {
+                method: writer,
+                leading_comments: Vec::new(),
+                leading_blank_line: true,
+            });
+            written.insert(model.name.clone());
+            continue;
+        }
+        // Not the declared readers below: a table-backed record serializes its columns (`serializable_hash`), not its `attr_accessor`s.
+        if let Some(table) = app.schema.tables.get(&model.table.0) {
+            if let Ok(writer) = super::as_json_record::column_writer(model, table, registry) {
+                model.body.push(ModelBodyItem::Method {
+                    method: writer,
+                    leading_comments: Vec::new(),
+                    leading_blank_line: true,
+                });
+                written.insert(model.name.clone());
+            }
+            // Not only when the full writer was built: `only:` can leave out the column that writer declines.
+            for opts in option_sites.get(&model.name).into_iter().flatten() {
+                if let Ok(writer) = super::as_json_record::column_writer_with(model, table, registry, opts) {
+                    variants.insert((model.name.clone(), opts.method_name()));
+                    model.body.push(ModelBodyItem::Method {
+                        method: writer,
+                        leading_comments: Vec::new(),
+                        leading_blank_line: true,
+                    });
+                }
+            }
+            continue;
+        }
+        // The `attr_*` family, splat expanded — the SAME list the
+        // accessor synthesizer builds, borrowed rather than re-derived.
+        // A model's own readers do not exist yet at this point in the
+        // pipeline (`push_attr_accessor_methods` runs at emit time), so
+        // scanning for them here finds nothing.
+        let readers = super::model_to_library::markers::declared_attr_names(model);
+        if readers.is_empty() {
+            continue;
+        }
+        model.body.push(ModelBodyItem::Method {
+            method: as_json_method(&model.name, &readers),
+            leading_comments: Vec::new(),
+            leading_blank_line: true,
+        });
+        model.body.push(ModelBodyItem::Method {
+            method: as_json_str_method(&model.name, &readers),
+            leading_comments: Vec::new(),
+            leading_blank_line: true,
+        });
+        written.insert(model.name.clone());
+    }
+    for lc in &mut app.library_classes {
+        if !wanted.contains(&lc.name) {
+            continue;
+        }
+        if lc.methods.iter().any(|m| m.name.as_str() == "as_json") {
+            continue;
+        }
+        // A library class DOES already carry its readers: ingest lowers
+        // `attr_reader :x` to a `MethodDef` there.
+        let readers = attribute_readers(&lc.methods);
+        if readers.is_empty() {
+            continue;
+        }
+        lc.methods.push(as_json_method(&lc.name, &readers));
+        lc.methods.push(as_json_str_method(&lc.name, &readers));
+        written.insert(lc.name.clone());
+    }
+    let representers = settle_representable_writers(app, registry);
+    let serializers = settle_ams_writers(app, registry);
+    // Runs even when no class was given a PORO writer: a representer
+    // brings its own.
+    for controller in &mut app.controllers {
+        for action in controller.actions_mut() {
+            replace_in(&mut action.body, &mut |e| {
+                rewrite_render_json(e, &written, &variants)
+                    .or_else(|| rewrite_render_json_representer(e, &representers))
+                    .or_else(|| rewrite_render_json_serializer(e, &serializers))
+            });
+        }
+    }
+    super::for_each_hook_body(app, &mut |body| rewrite_to_json(body, &written, &variants));
+    for view in &mut app.views {
+        rewrite_to_json(&mut view.body, &written, &variants);
+    }
+}
+
+/// `<value>.to_json` → the same text a `render json:` of it writes; what has no writer falls back to `JSON.generate`, as before.
+fn rewrite_to_json(e: &mut Expr, written: &HashSet<ClassId>, variants: &HashSet<(ClassId, String)>) {
+    e.node.for_each_child_mut(&mut |c| rewrite_to_json(c, written, variants));
+    let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &*e.node else { return };
+    if method.as_str() != "to_json" {
+        return;
+    }
+    if let [arg] = args.as_slice() {
+        let ExprNode::Hash { entries, .. } = &*arg.node else { return };
+        let Ok(Some(opts)) = super::as_json_record::SerializeOpts::read(entries, &[]) else { return };
+        if let Some(t) = variant_text(r, &opts, variants) {
+            let span = e.span;
+            *e = t;
+            e.span = span;
+        }
+        return;
+    }
+    if !args.is_empty() {
+        return;
+    }
+    let text = match r.ty.as_ref().and_then(rendered_class).filter(|(id, _)| written.contains(*id)) {
+        Some((id, true)) => Some(collection_text(r, id)),
+        Some((_, false)) => Some(writer_call(r.clone())),
+        None if super::as_json_value::needs_text(r, written) => super::as_json_value::json_text(r, written),
+        None => None,
+    };
+    match text {
+        Some(t) => {
+            let span = e.span;
+            *e = t;
+            e.span = span;
+        }
+        None => super::to_json::rewrite_node_now(e),
+    }
+}
+
+/// Settle the `as_json_str` writers `ingest::representable` synthesized.
+///
+/// Ingest wrote every plain value through `JsonBuilder.encode_value`,
+/// because the value's type was not known yet. Now it is: a scalar (or a
+/// Symbol, which `encode_value` quotes by name, as Rails renders it)
+/// keeps that call, an `Array[String]` switches to `encode_string_array`,
+/// and anything else - a Time, a Hash, an untyped value - has no
+/// encoding here, so the class loses its writer and its `render json:`
+/// sites keep the runtime encoder. A nested representer's writer is
+/// only kept while the one it renders through is.
+///
+/// Returns the classes whose writer stands.
+fn settle_representable_writers(
+    app: &mut App,
+    registry: &HashMap<ClassId, ClassInfo>,
+) -> HashSet<ClassId> {
+    use crate::dialect::LibraryClassOrigin;
+    let mut valid: HashSet<ClassId> = HashSet::default();
+    let mut nested_on: Vec<(ClassId, ClassId)> = Vec::new();
+    let mut renames: HashMap<ClassId, Vec<Symbol>> = HashMap::default();
+    for lc in &app.library_classes {
+        let Some(LibraryClassOrigin::RepresentableDecorator { fields, .. }) = &lc.origin else { continue };
+        let mut ok = true;
+        for field in fields {
+            if let Some(target) = &field.nested {
+                nested_on.push((lc.name.clone(), target.clone()));
+                continue;
+            }
+            let reader = format!("representable_{}", field.name.as_str());
+            let ty = registry
+                .get(&lc.name)
+                .and_then(|info| match info.instance_methods.get(&Symbol::from(reader.as_str())) {
+                    Some(Ty::Fn { ret, .. }) => Some((**ret).clone()),
+                    _ => None,
+                })
+                .or_else(|| lc.methods.iter().find(|m| m.name.as_str() == reader).and_then(|m| m.body.ty.clone()));
+            let Some(ty) = ty else {
+                ok = false;
+                break;
+            };
+            match (&ty, encoding_for(&ty)) {
+                (Ty::Sym, _) | (_, Ok(PairEncoding::Scalar(_))) => {}
+                (_, Ok(PairEncoding::StringArray)) => {
+                    renames.entry(lc.name.clone()).or_default().push(field.name.clone())
+                }
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok {
+            valid.insert(lc.name.clone());
+        }
+    }
+    // A writer that renders through another class's writer stands only
+    // while that one does.
+    loop {
+        let before = valid.len();
+        for (owner, target) in &nested_on {
+            if !valid.contains(target) {
+                valid.remove(owner);
+            }
+        }
+        if valid.len() == before {
+            break;
+        }
+    }
+    for lc in &mut app.library_classes {
+        if !matches!(lc.origin, Some(LibraryClassOrigin::RepresentableDecorator { .. })) {
+            continue;
+        }
+        if !valid.contains(&lc.name) {
+            lc.methods.retain(|m| m.name.as_str() != WRITER_METHOD);
+            continue;
+        }
+        let Some(names) = renames.get(&lc.name) else { continue };
+        let locals: HashSet<String> = names.iter().map(|n| format!("j_{}", n.as_str())).collect();
+        for m in lc.methods.iter_mut().filter(|m| m.name.as_str() == WRITER_METHOD) {
+            replace_in(&mut m.body, &mut |e| {
+                let ExprNode::Send { recv: Some(r), method, args, block, parenthesized } = &*e.node else {
+                    return None;
+                };
+                let is_builder = matches!(&*r.node, ExprNode::Const { path } if path.len() == 1 && path[0].as_str() == "JsonBuilder");
+                let reads_local = matches!(args.as_slice(), [a] if matches!(&*a.node, ExprNode::Var { name, .. } if locals.contains(name.as_str())));
+                if !(is_builder && method.as_str() == "encode_value" && reads_local) {
+                    return None;
+                }
+                Some(Expr {
+                    node: Box::new(ExprNode::Send {
+                        recv: Some(r.clone()),
+                        method: Symbol::from("encode_string_array"),
+                        args: args.clone(),
+                        block: block.clone(),
+                        parenthesized: *parenthesized,
+                    }),
+                    ..e.clone()
+                })
+            });
+        }
+    }
+    valid
+}
+
+/// `render json: <record>` with no `serializer:` where the app defines
+/// `<Model>Serializer` < `ActiveModel::Serializer`: active_model_serializers
+/// renders the record through it (its lookup by the record's class name),
+/// which this build doesn't do. Reported, for the record (or a list or
+/// relation of them) each such render writes.
+pub fn implicit_serializer_renders(app: &App) -> Vec<crate::diagnostic::Diagnostic> {
+    use crate::dialect::LibraryClassOrigin;
+    let serializers: HashSet<String> = app
+        .library_classes
+        .iter()
+        .filter(|c| {
+            matches!(c.origin, Some(LibraryClassOrigin::ActiveModelSerializer { .. }))
+                || c.parent.as_ref().is_some_and(|p| p.0.as_str().trim_start_matches("::") == "ActiveModel::Serializer")
+        })
+        .map(|c| c.name.0.as_str().to_string())
+        .collect();
+    if serializers.is_empty() {
+        return Vec::new();
+    }
+    fn walk(e: &Expr, serializers: &HashSet<String>, out: &mut Vec<crate::diagnostic::Diagnostic>) {
+        e.node.for_each_child(&mut |c| walk(c, serializers, out));
+        let ExprNode::Send { recv: None, method, args, .. } = &*e.node else { return };
+        if method.as_str() != "render" || args.len() != 1 {
+            return;
+        }
+        let ExprNode::Hash { entries, .. } = &*args[0].node else { return };
+        if entries.iter().any(|(k, _)| ["serializer", "each_serializer", "adapter"].iter().any(|o| is_sym(k, o))) {
+            return;
+        }
+        let Some(value) = entries.iter().find_map(|(k, v)| is_sym(k, "json").then_some(v)) else { return };
+        let Some((id, _)) = value.ty.as_ref().and_then(rendered_class) else { return };
+        let serializer = format!("{}Serializer", id.0.as_str());
+        if !serializers.contains(&serializer) {
+            return;
+        }
+        let mut d = crate::diagnostic::Diagnostic::unsupported(
+            value.span,
+            None,
+            "render json: through an implicit serializer",
+            format!(
+                "active_model_serializers renders a `{}` through `{serializer}`, found by its name; this build renders the record's own JSON (pass `serializer: {serializer}`)",
+                id.0.as_str()
+            ),
+        );
+        d.severity = crate::diagnostic::Severity::Warning;
+        out.push(d);
+    }
+    let mut out = Vec::new();
+    for controller in &app.controllers {
+        for action in controller.actions() {
+            walk(&action.body, &serializers, &mut out);
+        }
+    }
+    out
+}
+
+/// Settle the `as_json_str` writers `ingest::active_model_serializer`
+/// synthesized, as `settle_representable_writers` settles a
+/// representer's: a scalar or Symbol keeps `JsonBuilder.encode_value`, an
+/// `Array[String]` switches to `encode_string_array`, and an attribute
+/// reading a temporal column of the serialized model (`object.created_at`)
+/// is written as Rails writes it (`ActiveSupport.json_time` of the stored
+/// text, the date form for a date column). Anything else drops the
+/// writer, and its renders keep the runtime encoder on the Hash.
+///
+/// Returns the classes whose writer stands.
+/// The local `as_json_str` holds an ActiveModel::Serializer attribute's
+/// value in (`ingest::active_model_serializer`): `j_<name>`, a `?` name's
+/// as `j_<name>_p`, since a local can't end in `?`.
+pub fn ams_writer_local(field: &str) -> String {
+    match field.strip_suffix('?') {
+        Some(bare) => format!("j_{bare}_p"),
+        None => format!("j_{field}"),
+    }
+}
+
+fn settle_ams_writers(app: &mut App, registry: &HashMap<ClassId, ClassInfo>) -> HashSet<ClassId> {
+    use crate::dialect::LibraryClassOrigin;
+    let column_type = |model: &ClassId, column: &str| -> Option<crate::schema::ColumnType> {
+        let m = app.models.iter().find(|m| &m.name == model)?;
+        let table = app.schema.tables.get(&m.table.0)?;
+        table.columns.iter().find(|c| c.name.as_str() == column).map(|c| c.col_type.clone())
+    };
+    // Per class: whether its writer stands, and the per-field rewrites.
+    let mut plans: Vec<(ClassId, bool, Vec<(String, &'static str, Option<String>)>)> = Vec::new();
+    for lc in &app.library_classes {
+        let Some(LibraryClassOrigin::ActiveModelSerializer { fields, .. }) = &lc.origin else { continue };
+        let mut ok = true;
+        let mut rewrites = Vec::new();
+        for field in fields {
+            let reader = format!("ams_{}", field.as_str());
+            let body = lc.methods.iter().find(|m| m.name.as_str() == reader).map(|m| &m.body);
+            // `object.<col>` of a temporal column.
+            let temporal = body.and_then(|b| match &*b.node {
+                ExprNode::Send { recv: Some(r), method, args, .. } if args.is_empty() => match (&*r.node, r.ty.as_ref()) {
+                    (ExprNode::Send { recv: None, method: o, .. }, Some(Ty::Class { id, .. })) if o.as_str() == "object" => {
+                        match column_type(id, method.as_str()) {
+                            Some(crate::schema::ColumnType::DateTime | crate::schema::ColumnType::Time) => {
+                                Some(("time", method.as_str().to_string()))
+                            }
+                            Some(crate::schema::ColumnType::Date) => Some(("date", method.as_str().to_string())),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                },
+                _ => None,
+            });
+            if let Some((kind, column)) = temporal {
+                rewrites.push((field.as_str().to_string(), kind, Some(column)));
+                continue;
+            }
+            let ty = registry
+                .get(&lc.name)
+                .and_then(|info| match info.instance_methods.get(&Symbol::from(reader.as_str())) {
+                    Some(Ty::Fn { ret, .. }) => Some((**ret).clone()),
+                    _ => None,
+                })
+                .or_else(|| body.and_then(|b| b.ty.clone()));
+            let Some(ty) = ty else {
+                ok = false;
+                break;
+            };
+            match (&ty, encoding_for(&ty)) {
+                (Ty::Sym, _) | (_, Ok(PairEncoding::Scalar(_))) => {}
+                (_, Ok(PairEncoding::StringArray)) => rewrites.push((field.as_str().to_string(), "strings", None)),
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        plans.push((lc.name.clone(), ok, rewrites));
+    }
+    let mut valid = HashSet::default();
+    for (name, ok, rewrites) in plans {
+        let Some(lc) = app.library_classes.iter_mut().find(|c| c.name == name) else { continue };
+        if !ok {
+            lc.methods.retain(|m| m.name.as_str() != WRITER_METHOD);
+            continue;
+        }
+        valid.insert(name);
+        for m in lc.methods.iter_mut().filter(|m| m.name.as_str() == WRITER_METHOD) {
+            replace_in(&mut m.body, &mut |e| {
+                let ExprNode::Send { recv: Some(r), method, args, block, parenthesized } = &*e.node else { return None };
+                let is_builder = matches!(&*r.node, ExprNode::Const { path } if path.len() == 1 && path[0].as_str() == "JsonBuilder");
+                let [arg] = args.as_slice() else { return None };
+                let ExprNode::Var { name: local, .. } = &*arg.node else { return None };
+                if !(is_builder && method.as_str() == "encode_value") {
+                    return None;
+                }
+                let (_, kind, column) = rewrites.iter().find(|(f, _, _)| ams_writer_local(f) == local.as_str())?;
+                let new_args = match (*kind, column) {
+                    ("strings", _) => return Some(Expr {
+                        node: Box::new(ExprNode::Send { recv: Some(r.clone()), method: Symbol::from("encode_string_array"), args: args.clone(), block: block.clone(), parenthesized: *parenthesized }),
+                        ..e.clone()
+                    }),
+                    (kind, Some(column)) => {
+                        let span = e.span;
+                        let object = with_ty(Expr::new(span, ExprNode::Send { recv: None, method: Symbol::from("object"), args: vec![], block: None, parenthesized: false }), Ty::Untyped);
+                        let raw = with_ty(
+                            Expr::new(span, ExprNode::Send { recv: Some(object), method: Symbol::from(format!("{column}_raw")), args: vec![], block: None, parenthesized: false }),
+                            Ty::Union { variants: vec![Ty::Str, Ty::Nil].into() },
+                        );
+                        let text = if kind == "date" {
+                            super::as_json_writer::date_column_text(raw)
+                        } else {
+                            let support = Expr::new(span, ExprNode::Const { path: vec![Symbol::from("ActiveSupport")] });
+                            with_ty(
+                                Expr::new(span, ExprNode::Send { recv: Some(support), method: Symbol::from("json_time"), args: vec![raw], block: None, parenthesized: true }),
+                                Ty::Union { variants: vec![Ty::Str, Ty::Nil].into() },
+                            )
+                        };
+                        vec![text]
+                    }
+                    _ => return None,
+                };
+                Some(Expr {
+                    node: Box::new(ExprNode::Send { recv: Some(r.clone()), method: method.clone(), args: new_args, block: block.clone(), parenthesized: *parenthesized }),
+                    ..e.clone()
+                })
+            });
+        }
+    }
+    valid
+}
+
+/// `render json: S.new(x).serializable_hash` → `render plain:
+/// S.new(x).as_json_str`, and `render json: xs.map { |i|
+/// S.new(i).serializable_hash }` → the list's text, for a serializer
+/// whose writer stands (`ingest::active_model_serializer` writes these
+/// renders).
+fn rewrite_render_json_serializer(e: &Expr, serializers: &HashSet<ClassId>) -> Option<Expr> {
+    let ExprNode::Send { recv: None, method, args, .. } = &*e.node else { return None };
+    if method.as_str() != "render" || args.len() != 1 || serializers.is_empty() {
+        return None;
+    }
+    let ExprNode::Hash { entries, kwargs: true } = &*args[0].node else { return None };
+    let value = entries.iter().find_map(|(k, v)| is_sym(k, "json").then_some(v))?;
+    // `S.new(x).serializable_hash` → `S.new(x)`, when S's writer stands.
+    let instance = |v: &Expr| -> Option<Expr> {
+        let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &*v.node else { return None };
+        if method.as_str() != "serializable_hash" || !args.is_empty() {
+            return None;
+        }
+        let ExprNode::Send { recv: Some(c), method: new, .. } = &*r.node else { return None };
+        let ExprNode::Const { path } = &*c.node else { return None };
+        let id = ClassId(Symbol::from(path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::")));
+        (new.as_str() == "new" && serializers.contains(&id)).then(|| r.clone())
+    };
+    if let Some(r) = instance(value) {
+        return Some(with_plain_json(e, writer_call(r)));
+    }
+    // `xs.map { |i| S.new(i).serializable_hash }`
+    let ExprNode::Send { recv: Some(list), method: map, args: margs, block: Some(block), parenthesized } = &*value.node else { return None };
+    if map.as_str() != "map" || !margs.is_empty() {
+        return None;
+    }
+    let ExprNode::Lambda { body, .. } = &*block.node else { return None };
+    let r = instance(body)?;
+    let mut text_block = block.clone();
+    if let ExprNode::Lambda { body, .. } = &mut *text_block.node {
+        *body = writer_call(r);
+    }
+    let span = value.span;
+    let mapped = with_ty(
+        Expr::new(span, ExprNode::Send { recv: Some(list.clone()), method: map.clone(), args: vec![], block: Some(text_block), parenthesized: *parenthesized }),
+        Ty::Array { elem: Ty::Str.into() },
+    );
+    let comma = with_ty(Expr::new(span, ExprNode::Lit { value: Literal::Str { value: ",".to_string() } }), Ty::Str);
+    let joined = with_ty(Expr::new(span, ExprNode::Send { recv: Some(mapped), method: Symbol::from("join"), args: vec![comma], block: None, parenthesized: true }), Ty::Str);
+    let lit = |t: &str| with_ty(Expr::new(span, ExprNode::Lit { value: Literal::Str { value: t.to_string() } }), Ty::Str);
+    let plus = |a: Expr, b: Expr| with_ty(Expr::new(span, ExprNode::Send { recv: Some(a), method: Symbol::from("+"), args: vec![b], block: None, parenthesized: false }), Ty::Str);
+    Some(with_plain_json(e, plus(plus(lit("["), joined), lit("]"))))
+}
+
+/// `render json: <representer>.to_hash` (or `.to_json`, or the
+/// decorator itself) → `render plain: <representer>.as_json_str`, for a
+/// representer whose writer stands.
+fn rewrite_render_json_representer(e: &Expr, representers: &HashSet<ClassId>) -> Option<Expr> {
+    let ExprNode::Send { recv: None, method, args, .. } = &*e.node else { return None };
+    if method.as_str() != "render" || args.len() != 1 || representers.is_empty() {
+        return None;
+    }
+    let ExprNode::Hash { entries, kwargs: true } = &*args[0].node else { return None };
+    let value = entries.iter().find_map(|(k, v)| is_sym(k, "json").then_some(v))?;
+    let decorator = match &*value.node {
+        ExprNode::Send { recv: Some(r), method, args, block: None, .. }
+            if args.is_empty() && matches!(method.as_str(), "to_hash" | "to_json" | "as_json") =>
+        {
+            r
+        }
+        _ => value,
+    };
+    let Some(Ty::Class { id, .. }) = decorator.ty.as_ref() else { return None };
+    if !representers.contains(id) {
+        return None;
+    }
+    Some(with_plain_json(e, writer_call(decorator.clone())))
+}
+
+/// The `render` call `e` (already checked to carry a `json:` entry)
+/// with that entry swapped for `plain: <encoded>`, plus `content_type:
+/// "application/json"` unless the author gave one. Other entries ride
+/// along untouched.
+fn with_plain_json(e: &Expr, encoded: Expr) -> Expr {
+    let ExprNode::Send { method, args, block, parenthesized, .. } = &*e.node else {
+        unreachable!("with_plain_json is handed a render Send")
+    };
+    let ExprNode::Hash { entries, .. } = &*args[0].node else {
+        unreachable!("with_plain_json is handed render's keyword Hash")
+    };
+    let span = encoded.span;
+    let sym = |name: &str| {
+        with_ty(
+            Expr::new(span, ExprNode::Lit { value: Literal::Sym { value: Symbol::from(name) } }),
+            Ty::Sym,
+        )
+    };
+    let mut new_entries: Vec<(Expr, Expr)> = Vec::new();
+    for (k, v) in entries {
+        if is_sym(k, "json") {
+            new_entries.push((sym("plain"), encoded.clone()));
+        } else {
+            new_entries.push((k.clone(), v.clone()));
+        }
+    }
+    if !entries.iter().any(|(k, _)| is_sym(k, "content_type")) {
+        new_entries.push((
+            sym("content_type"),
+            with_ty(
+                Expr::new(span, ExprNode::Lit { value: Literal::Str { value: "application/json".to_string() } }),
+                Ty::Str,
+            ),
+        ));
+    }
+    let mut hash = args[0].clone();
+    hash.node = Box::new(ExprNode::Hash { entries: new_entries, kwargs: true });
+    Expr {
+        node: Box::new(ExprNode::Send {
+            recv: None,
+            method: method.clone(),
+            args: vec![hash],
+            block: block.clone(),
+            parenthesized: *parenthesized,
+        }),
+        ..e.clone()
+    }
+}
+
+fn is_sym(k: &Expr, name: &str) -> bool {
+    matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == name)
+}
+
+/// `render json: <v>` → `render plain: <v>.as_json_str, content_type:
+/// "application/json"` when `<v>` is typed as a class this pass wrote a
+/// writer for. Other entries ride along untouched; an author's own
+/// `content_type:` stands (the controller rewrite keeps the first).
+fn rewrite_render_json(e: &Expr, written: &HashSet<ClassId>, variants: &HashSet<(ClassId, String)>) -> Option<Expr> {
+    let ExprNode::Send { recv: None, method, args, block, parenthesized } = &*e.node else {
+        return None;
+    };
+    if method.as_str() != "render" || args.len() != 1 {
+        return None;
+    }
+    let ExprNode::Hash { entries, kwargs: true } = &*args[0].node else { return None };
+    let is_key = |k: &Expr, name: &str| {
+        matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == name)
+    };
+    let value = entries.iter().find_map(|(k, v)| is_key(k, "json").then_some(v))?;
+    // Not the full-column writer: Rails hands a render's other options to `to_json`, so `only:` and its kind change the text.
+    let opts = super::as_json_record::SerializeOpts::read(entries, RENDER_OWN_OPTIONS).ok()?;
+    let variant = match &opts {
+        Some(opts) => Some(variant_text(value, opts, variants)?),
+        None => None,
+    };
+    let record = value.ty.as_ref().and_then(rendered_class).filter(|(id, _)| written.contains(*id));
+    let text = matches!(value.ty.as_ref(), Some(Ty::Str));
+    if variant.is_none() && record.is_none() && !text && !super::as_json_value::needs_text(value, written) {
+        return None;
+    }
+    let sym = |name: &str| {
+        with_ty(
+            Expr::new(value.span, ExprNode::Lit { value: Literal::Sym { value: Symbol::from(name) } }),
+            Ty::Sym,
+        )
+    };
+    let encoded = match (variant, record) {
+        (Some(text), _) => text,
+        (None, record) => match record {
+        Some((id, true)) => collection_text(value, id),
+        Some((_, false)) => writer_call(value.clone()),
+        // Not encoded again: Rails sends a String it is handed as the body.
+        None if text => value.clone(),
+        None => super::as_json_value::json_text(value, written)?,
+        },
+    };
+    let mut new_entries: Vec<(Expr, Expr)> = Vec::new();
+    for (k, v) in entries {
+        if is_key(k, "json") {
+            new_entries.push((sym("plain"), encoded.clone()));
+        } else if ["only", "except", "methods"].iter().any(|o| is_key(k, o)) {
+            continue;
+        } else {
+            new_entries.push((k.clone(), v.clone()));
+        }
+    }
+    if !entries.iter().any(|(k, _)| is_key(k, "content_type")) {
+        new_entries.push((
+            sym("content_type"),
+            with_ty(
+                Expr::new(
+                    value.span,
+                    ExprNode::Lit { value: Literal::Str { value: "application/json".to_string() } },
+                ),
+                Ty::Str,
+            ),
+        ));
+    }
+    let mut hash = args[0].clone();
+    hash.node = Box::new(ExprNode::Hash { entries: new_entries, kwargs: true });
+    Some(Expr {
+        node: Box::new(ExprNode::Send {
+            recv: None,
+            method: method.clone(),
+            args: vec![hash],
+            block: block.clone(),
+            parenthesized: *parenthesized,
+        }),
+        ..e.clone()
+    })
+}
+
+/// The class a `render json:` value serializes, and whether the value
+/// is a COLLECTION of it. Rails encodes an Array or a Relation as a JSON
+/// array of each record's `as_json` — lobsters' `render json: @stories`
+/// on every story listing.
+fn rendered_class(ty: &Ty) -> Option<(&ClassId, bool)> {
+    match ty {
+        Ty::Class { id, .. } => Some((id, false)),
+        Ty::Relation { of } => Some((of, true)),
+        Ty::Array { elem } => match &**elem {
+            Ty::Class { id, .. } => Some((id, true)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// `<v>.as_json_str`
+pub(super) fn writer_call(recv: Expr) -> Expr {
+    writer_call_named(recv, WRITER_METHOD)
+}
+
+fn writer_call_named(recv: Expr, name: &str) -> Expr {
+    let span = recv.span;
+    with_ty(
+        Expr::new(
+            span,
+            ExprNode::Send {
+                recv: Some(recv),
+                method: Symbol::from(name),
+                args: vec![],
+                block: None,
+                // Python reads an unparenthesized zero-arg send as an attribute, and the writer is a method.
+                parenthesized: true,
+            },
+        ),
+        Ty::Str,
+    )
+}
+
+/// `"[" + <v>.map { |item| item.as_json_str }.join(",") + "]"` —
+/// map+join, the shape the jbuilder lowerer's `array!` uses, for the
+/// same reason: it emits idiomatically on every target, where a
+/// mutable first-element flag does not.
+pub(super) fn collection_text(value: &Expr, id: &ClassId) -> Expr {
+    collection_text_named(value, id, WRITER_METHOD)
+}
+
+fn collection_text_named(value: &Expr, id: &ClassId, name: &str) -> Expr {
+    let span = value.span;
+    let str_lit = |s: &str| {
+        with_ty(
+            Expr::new(span, ExprNode::Lit { value: Literal::Str { value: s.to_string() } }),
+            Ty::Str,
+        )
+    };
+    // Not `record`: Elixir threads `self` through a local of that name, which the block param would shadow.
+    let item = Symbol::from("item");
+    let item_ref = with_ty(
+        Expr::new(span, ExprNode::Var { id: crate::ident::VarId(0), name: item.clone() }),
+        Ty::Class { id: id.clone(), args: vec![].into() },
+    );
+    let block = Expr::new(
+        span,
+        ExprNode::Lambda { extra_params: Vec::new(),
+            rest_param: None,
+            params: vec![item],
+            block_param: None,
+            body: writer_call_named(item_ref, name),
+            block_style: crate::expr::BlockStyle::Brace,
+        },
+    );
+    let send = |recv: Expr, method: &str, args: Vec<Expr>, block: Option<Expr>, ty: Ty| {
+        with_ty(
+            Expr::new(
+                span,
+                ExprNode::Send {
+                    recv: Some(recv),
+                    method: Symbol::from(method),
+                    args,
+                    block,
+                    parenthesized: true,
+                },
+            ),
+            ty,
+        )
+    };
+    let mapped = send(value.clone(), "map", vec![], Some(block), Ty::Array { elem: std::sync::Arc::new(Ty::Str) });
+    let joined = send(mapped, "join", vec![str_lit(",")], None, Ty::Str);
+    let open = send(str_lit("["), "+", vec![joined], None, Ty::Str);
+    send(open, "+", vec![str_lit("]")], None, Ty::Str)
+}
+
+/// A model's own `as_json`, specialized to the bare call `render json:`
+/// makes, as an `as_json_str` writer — or why not.
+///
+/// Every pair is typed before anything is written. A `Reader` answers
+/// from the schema (a temporal column renders zoned, as Rails'
+/// `TimeWithZone` does) or from the analyzer's signature for the method
+/// it names; a `Computed` value from the type analysis stamped on it.
+/// A type with no JSON encoding here — a record, a Hash, an Array of
+/// anything but Strings, or no type at all — declines the model rather
+/// than letting the scalar encoder quote its `to_s`.
+fn declared_as_json_writer(
+    owner: &ClassId,
+    method: &MethodDef,
+    table: Option<&crate::schema::Table>,
+    registry: &HashMap<ClassId, ClassInfo>,
+) -> Result<MethodDef, ShapeError> {
+    let pairs = as_json_pairs_for_no_arg_call(&method.params, &method.body)?;
+    let info = registry.get(owner).ok_or("the model has no analyzed class info")?;
+    let encodings = pairs
+        .iter()
+        .map(|pair| match &pair.value {
+            PairValue::Reader(name) => {
+                let column = table.and_then(|t| t.columns.iter().find(|c| &c.name == name));
+                if let Some(c) = column {
+                    if c.col_type == crate::schema::ColumnType::Date {
+                        return Ok(PairEncoding::DateColumn);
+                    }
+                    if matches!(
+                        c.col_type,
+                        crate::schema::ColumnType::DateTime
+                            | crate::schema::ColumnType::Time
+                    ) {
+                        return Ok(PairEncoding::ZonedTime);
+                    }
+                }
+                let ty = match info.instance_methods.get(name) {
+                    Some(Ty::Fn { ret, .. }) => (**ret).clone(),
+                    _ => info
+                        .attributes
+                        .fields
+                        .get(name)
+                        .cloned()
+                        .ok_or("a key reads a method with no known type")?,
+                };
+                encoding_for(&ty)
+            }
+            PairValue::Computed(e) => encoding_for(e.ty.as_ref().ok_or("a computed key has no type")?),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    typed_writer_method(owner, &pairs, &encodings)
+}
+
+/// The encoder a value of type `ty` takes, when there is one.
+pub(super) fn encoding_for(ty: &Ty) -> Result<PairEncoding, ShapeError> {
+    fn scalar(ty: &Ty) -> bool {
+        match ty {
+            Ty::Str | Ty::Int | Ty::Float | Ty::Bool | Ty::Nil => true,
+            Ty::Union { variants } => variants.iter().all(scalar),
+            _ => false,
+        }
+    }
+    if scalar(ty) {
+        return Ok(PairEncoding::Scalar(ty.clone()));
+    }
+    match ty {
+        Ty::Array { elem } if matches!(**elem, Ty::Str) => Ok(PairEncoding::StringArray),
+        _ => Err("a key's value type has no JSON encoding here"),
+    }
+}
+
+/// Post-order in-place replacement, the shape `params_merge` uses.
+fn replace_in(expr: &mut Expr, f: &mut impl FnMut(&Expr) -> Option<Expr>) {
+    expr.node.for_each_child_mut(&mut |c| replace_in(c, f));
+    if let Some(replacement) = f(expr) {
+        *expr = replacement;
+    }
+}
+
+/// The writer over the same readers `as_json` answers: one
+/// unconditional `Reader` pair per attribute, in declaration order. A
+/// PORO has no table and no associations, so the writer never declines.
+fn as_json_str_method(owner: &ClassId, readers: &[Symbol]) -> MethodDef {
+    let pairs: Vec<JsonPair> = readers
+        .iter()
+        .map(|name| JsonPair { key: name.clone(), value: PairValue::Reader(name.clone()), cond: None })
+        .collect();
+    writer_method(owner, &pairs, None, &[]).expect("unconditional reader pairs always encode")
+}
+
+/// The classes `render json: <expr>` names, by the type analyze stamped
+/// on the value.
+///
+/// TYPE ONLY. A name fallback would be guessing at which class to grow a
+/// method on, and an `as_json` on the wrong class is a method nobody
+/// calls plus a payload still rendered as `to_s` — two failures for one
+/// guess.
+fn json_rendered_classes(app: &App) -> HashSet<ClassId> {
+    let mut out = HashSet::default();
+    let mut to_json_ids = Vec::new();
+    let mut collect = |e: &Expr| {
+        walk(e, &mut |e| {
+            if let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &*e.node {
+                if method.as_str() == "to_json" && args.len() <= 1 {
+                    super::as_json_value::classes_in(r, &mut to_json_ids);
+                }
+            }
+        })
+    };
+    super::for_each_hook_body_ref(app, &mut collect);
+    for view in &app.views {
+        collect(&view.body);
+    }
+    let known: HashSet<&ClassId> = app
+        .library_classes
+        .iter()
+        .map(|lc| &lc.name)
+        .chain(app.models.iter().map(|m| &m.name))
+        .collect();
+    for controller in &app.controllers {
+        for action in controller.actions() {
+            walk(&action.body, &mut |e| {
+                let ExprNode::Send { recv: None, method, args, .. } = &*e.node else { return };
+                if method.as_str() != "render" {
+                    return;
+                }
+                for arg in args {
+                    let ExprNode::Hash { entries, .. } = &*arg.node else { continue };
+                    for (k, v) in entries {
+                        let ExprNode::Lit { value: Literal::Sym { value } } = &*k.node else {
+                            continue;
+                        };
+                        if value.as_str() != "json" {
+                            continue;
+                        }
+                        let mut ids = Vec::new();
+                        super::as_json_value::classes_in(v, &mut ids);
+                        out.extend(ids.into_iter().filter(|id| known.contains(id)));
+                    }
+                }
+            });
+        }
+    }
+    out.extend(to_json_ids.into_iter().filter(|id| known.contains(id)));
+    out
+}
+
+/// The class's own attribute readers, in declaration order: an instance
+/// method taking nothing whose body is exactly the ivar of the same
+/// name. That is the shape `attr_reader` / `attr_accessor` lowers to at
+/// ingest, so this reads the app's declared surface without ingest
+/// having to keep the macro around.
+///
+/// A computed method is deliberately NOT called — `as_json` must not
+/// run app code that queries or raises just because a response is being
+/// encoded.
+fn attribute_readers(methods: &[MethodDef]) -> Vec<Symbol> {
+    let mut out = Vec::new();
+    for m in methods {
+        if m.receiver != MethodReceiver::Instance || !m.params.is_empty() {
+            continue;
+        }
+        let Some(name) = sole_ivar_read(&m.body) else { continue };
+        if name == m.name && !out.contains(&name) {
+            out.push(name);
+        }
+    }
+    out
+}
+
+/// `def as_json(options = {}) = { "title" => @title, … }`
+///
+/// STRING keys, because `instance_values` is string-keyed and the
+/// encoder stringifies whatever it is handed — a Symbol-keyed hash would
+/// encode the same but says something the source does not.
+///
+/// `options` is declared and unused, which is Rails' signature: a caller
+/// passing `only:`/`except:` is not modeled, and a method that took no
+/// argument would raise instead of ignoring it.
+fn as_json_method(owner: &ClassId, readers: &[Symbol]) -> MethodDef {
+    let entries: Vec<(Expr, Expr)> = readers
+        .iter()
+        .map(|name| {
+            (
+                Expr::new(
+                    Span::synthetic(),
+                    ExprNode::Lit { value: Literal::Str { value: name.as_str().to_string() } },
+                ),
+                {
+                    // Stamped. This pass runs after the analyzer, so
+                    // nothing types these reads afterwards, and an
+                    // unstamped ivar is reported as `@title has no
+                    // known type` — with no file or line, because the
+                    // node is synthetic. `Untyped` is the honest
+                    // answer: the readers here are `attr_*`
+                    // declarations, which declare no type, and it is
+                    // what the emitted RBS says of them.
+                    let mut read =
+                        Expr::new(Span::synthetic(), ExprNode::Ivar { name: name.clone() });
+                    read.ty = Some(crate::ty::Ty::Untyped);
+                    read
+                },
+            )
+        })
+        .collect();
+    let body = Expr::new(Span::synthetic(), ExprNode::Hash { entries, kwargs: false });
+    MethodDef {
+        visibility: crate::dialect::MethodVisibility::Public,
+        unsupported_formals: None,
+        has_anonymous_block: false,
+        name_span: crate::span::Span::synthetic(),
+        name: Symbol::from("as_json"),
+        receiver: MethodReceiver::Instance,
+        params: vec![Param::with_default(
+            Symbol::from("options"),
+            Expr::new(Span::synthetic(), ExprNode::Hash { entries: vec![], kwargs: false }),
+        )],
+        body,
+        signature: None,
+        effects: EffectSet::default(),
+        enclosing_class: Some(owner.0.clone()),
+        kind: AccessorKind::Method,
+        is_async: false,
+        mutates_self: false,
+        block_param: None,
+    }
+}
+
+/// The ivar a one-statement body reads, if that is all it does. A method
+/// body arrives as a `Seq` even when the source wrote one line, so both
+/// spellings have to be recognized.
+fn sole_ivar_read(body: &Expr) -> Option<Symbol> {
+    match &*body.node {
+        ExprNode::Ivar { name } => Some(name.clone()),
+        ExprNode::Seq { exprs } if exprs.len() == 1 => sole_ivar_read(&exprs[0]),
+        _ => None,
+    }
+}
+
+fn walk(e: &Expr, f: &mut impl FnMut(&Expr)) {
+    f(e);
+    e.node.for_each_child(&mut |c| walk(c, f));
+}
+
+// Not serialization options: what `render` itself reads before handing the rest to `to_json`.
+const RENDER_OWN_OPTIONS: &[&str] = &["json", "status", "content_type", "location", "layout"];
+
+/// A record or collection written by the writer `opts` names, when one was built for its class.
+fn variant_text(value: &Expr, opts: &super::as_json_record::SerializeOpts, variants: &HashSet<(ClassId, String)>) -> Option<Expr> {
+    let (id, collection) = rendered_class(value.ty.as_ref()?)?;
+    let name = opts.method_name();
+    if !variants.contains(&(id.clone(), name.clone())) {
+        return None;
+    }
+    Some(if collection { collection_text_named(value, id, &name) } else { writer_call_named(value.clone(), &name) })
+}
+
+/// Each class's `only:`/`except:`/`methods:` sets, from `render json:` and `to_json` sites, for the demand gate.
+fn serialize_option_sites(app: &App) -> HashMap<ClassId, HashSet<super::as_json_record::SerializeOpts>> {
+    let mut out: HashMap<ClassId, HashSet<super::as_json_record::SerializeOpts>> = HashMap::default();
+    let mut note = |value: &Expr, entries: &[(Expr, Expr)], ignore: &[&str]| {
+        let Ok(Some(opts)) = super::as_json_record::SerializeOpts::read(entries, ignore) else { return };
+        if let Some((id, _)) = value.ty.as_ref().and_then(rendered_class) {
+            out.entry(id.clone()).or_default().insert(opts);
+        }
+    };
+    let mut visit = |e: &Expr| {
+        walk(e, &mut |e| match &*e.node {
+            ExprNode::Send { recv: None, method, args, .. } if method.as_str() == "render" => {
+                for arg in args {
+                    let ExprNode::Hash { entries, .. } = &*arg.node else { continue };
+                    let json = entries.iter().find_map(|(k, v)| {
+                        matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "json").then_some(v)
+                    });
+                    if let Some(v) = json {
+                        note(v, entries, RENDER_OWN_OPTIONS);
+                    }
+                }
+            }
+            ExprNode::Send { recv: Some(r), method, args, block: None, .. } if method.as_str() == "to_json" => {
+                if let [arg] = args.as_slice() {
+                    if let ExprNode::Hash { entries, .. } = &*arg.node {
+                        note(r, entries, &[]);
+                    }
+                }
+            }
+            _ => {}
+        })
+    };
+    for controller in &app.controllers {
+        for action in controller.actions() {
+            visit(&action.body);
+        }
+    }
+    super::for_each_hook_body_ref(app, &mut visit);
+    for view in &app.views {
+        visit(&view.body);
+    }
+    out
+}

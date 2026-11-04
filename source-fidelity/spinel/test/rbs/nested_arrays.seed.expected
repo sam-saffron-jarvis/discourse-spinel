@@ -1,0 +1,7 @@
+class Nested
+meth ii int_array_array int_array_array
+meth ff float_array_array float_array_array
+meth ss poly_array poly_array
+meth yy poly_array poly_array
+meth oo poly_array poly_array
+meth iii poly_array poly_array

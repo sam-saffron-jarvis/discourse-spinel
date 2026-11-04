@@ -1,0 +1,8 @@
+#<struct S x=5, y=6>
+#<struct S x=9, y=nil>
+#<struct T a=6>
+A(7)
+#<data D u=4>
+"struct size differs"
+#<struct S x=1, y=nil>
+"struct size differs"

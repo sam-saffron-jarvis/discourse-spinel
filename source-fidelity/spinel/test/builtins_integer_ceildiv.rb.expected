@@ -1,0 +1,31 @@
+4
+-3
+-3
+4
+0
+7
+1
+1
+4
+3
+-2
+-2
+[ZeroDivisionError, "divided by 0"]
+[TypeError, "not an integer"]
+[TypeError, "not an integer"]
+[TypeError, "not an integer"]
+[TypeError, "not an integer"]
+[TypeError, "not an integer"]
+[TypeError, "not an integer"]
+[TypeError, "not an integer"]
+393530540239137101142
+2
+-393530540239137101141
+-393530540239137101141
+1
+4
+393530540239137101142
+"widget"
+4
+"widget-diff-arity"
+4

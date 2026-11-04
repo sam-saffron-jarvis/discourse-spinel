@@ -1,0 +1,464 @@
+# frozen_string_literal: true
+
+class SiteSetting < ActiveRecord::Base
+  VALID_AREAS = %w[
+    about
+    analytics
+    login
+    authenticators
+    discourseconnect
+    oauth2
+    oidc
+    saml
+    badges
+    categories
+    categories_and_tags
+    email
+    embedding
+    emojis
+    experimental
+    flags
+    fonts
+    gifs
+    group_permissions
+    interface
+    legal
+    localization
+    mcp
+    navigation
+    notifications
+    permalinks
+    reports
+    posts_and_topics
+    user_defaults
+    sharing
+    site_admin
+    stats_and_thresholds
+    trust_levels
+    users
+  ]
+
+  DEFAULT_USER_PREFERENCES = %w[
+    default_email_digest_frequency
+    default_include_tl0_in_digests
+    default_email_level
+    default_email_messages_level
+    default_email_mailing_list_mode
+    default_email_mailing_list_mode_frequency
+    default_email_previous_replies
+    default_email_in_reply_to
+    default_hide_profile
+    default_hide_presence
+    default_other_new_topic_duration_minutes
+    default_other_auto_track_topics_after_msecs
+    default_other_notification_level_when_replying
+    default_other_external_links_in_new_tab
+    default_other_enable_quoting
+    default_other_enable_smart_lists
+    default_other_dynamic_favicon
+    default_other_like_notification_frequency
+    default_other_skip_new_user_tips
+    default_other_enable_markdown_monospace_font
+    default_topics_automatic_unpin
+    default_categories_watching
+    default_categories_tracking
+    default_categories_muted
+    default_categories_watching_first_post
+    default_categories_normal
+    default_tags_watching
+    default_tags_tracking
+    default_tags_muted
+    default_tags_watching_first_post
+    default_text_size
+    default_title_count_mode
+    default_navigation_menu_categories
+    default_navigation_menu_tags
+    default_sidebar_link_to_filtered_list
+    default_sidebar_show_count_of_new_items
+    default_composition_mode
+    default_watched_precedence_over_muted
+  ]
+
+  extend GlobalPath
+  extend SiteSettingExtension
+
+  has_many :upload_references, as: :target, dependent: :destroy
+
+  validates :name, presence: true
+  validates :data_type, presence: true
+
+  after_save do
+    if saved_change_to_value?
+      if data_type == SiteSettings::TypeSupervisor.types[:upload]
+        UploadReference.ensure_exist!(upload_ids: [value], target: self)
+      elsif data_type == SiteSettings::TypeSupervisor.types[:uploaded_image_list]
+        upload_ids = value.split("|").compact.uniq
+        UploadReference.ensure_exist!(upload_ids: upload_ids, target: self)
+      elsif data_type == SiteSettings::TypeSupervisor.types[:objects] && value.present?
+        upload_ids =
+          SchemaSettingsObjectValidator.upload_ids(
+            schema: SiteSetting.type_supervisor.type_hash(name.to_sym)[:schema],
+            objects: JSON.parse(value),
+          )
+
+        UploadReference.ensure_exist!(upload_ids: upload_ids, target: self)
+      end
+    end
+  end
+
+  load_settings(Rails.root.join("config/site_settings.yml").to_s)
+
+  if Rails.env.test?
+    SAMPLE_TEST_PLUGIN =
+      Plugin::Instance.new(
+        Plugin::Metadata.new.tap { |metadata| metadata.name = "discourse-sample-plugin" },
+      )
+
+    Discourse.plugins_by_name[SAMPLE_TEST_PLUGIN.name] = SAMPLE_TEST_PLUGIN
+
+    load_settings(
+      Rails.root.join("spec/support/sample_plugin_site_settings.yml").to_s,
+      plugin: SAMPLE_TEST_PLUGIN.name,
+    )
+  end
+
+  if GlobalSetting.load_plugins?
+    allowed_plugins = GlobalSetting.plugins_to_load
+    plugin_allowed = ->(name) { allowed_plugins.nil? || allowed_plugins.include?(name) }
+
+    Dir[Rails.root.join("plugins/*/config/settings.yml").to_s].each do |file|
+      plugin_name = file.split("/")[-3]
+      load_settings(file, plugin: plugin_name) if plugin_allowed.call(plugin_name)
+    end
+
+    # Sometimes plugins need to define their own fake site settings for testing
+    if Rails.env.test?
+      Dir[
+        Rails.root.join("plugins/*/spec/support/dummy_plugin_site_settings.yml").to_s
+      ].each do |file|
+        plugin_name = file.split("/")[-4]
+        load_settings(file, plugin: plugin_name) if plugin_allowed.call(plugin_name)
+      end
+    end
+  end
+
+  setup_deprecated_methods
+  client_settings << :available_locales
+
+  SEEDED_CATEGORY_SETTINGS = %i[
+    general_category_id
+    meta_category_id
+    staff_category_id
+    uncategorized_category_id
+  ]
+
+  def self.ensure_consistency!
+    current.each do |name, value|
+      next if !dangling_category?(name, value)
+
+      reason = I18n.t("staff_action_logs.site_setting.missing_category_reset", category_id: value)
+      set_and_log(name, defaults[name], Discourse.system_user, reason)
+      if name.to_sym == :uncategorized_category_id
+        set_and_log(:allow_uncategorized_topics, false, Discourse.system_user, reason)
+      end
+    end
+  end
+
+  def self.dangling_category?(name, value)
+    type = type_supervisor.get_type(name)
+    return false if type != :category && !SEEDED_CATEGORY_SETTINGS.include?(name.to_sym)
+
+    value.to_i > 0 && !Category.exists?(value.to_i)
+  end
+  private_class_method :dangling_category?
+
+  def self.available_locales
+    LocaleSiteSetting.values.to_json
+  end
+
+  def self.content_localization_locales
+    locales = SiteSetting.content_localization_supported_locales.split("|")
+    default_locale = SiteSetting.default_locale
+    locales << default_locale if default_locale.present? && !locales.include?(default_locale)
+    locales
+  end
+
+  client_settings << :available_content_localization_locales
+
+  def self.available_content_localization_locales
+    return [] if !SiteSetting.content_localization_enabled?
+
+    locales = content_localization_locales
+    LocaleSiteSetting.values.select { |locale| locales.include?(locale[:value]) }
+  end
+
+  def self.topic_title_length
+    min_topic_title_length..max_topic_title_length
+  end
+
+  def self.private_message_title_length
+    min_personal_message_title_length..max_topic_title_length
+  end
+
+  def self.post_length
+    min_post_length..max_post_length
+  end
+
+  def self.first_post_length
+    min_first_post_length..max_post_length
+  end
+
+  def self.private_message_post_length
+    min_personal_message_post_length..max_post_length
+  end
+
+  def self.top_menu_items
+    top_menu_map.map { |menu_item| TopMenuItem.new(menu_item) }
+  end
+
+  def self.homepage
+    configured = default_homepage.presence
+
+    if configured && HomepageSiteSetting.choices.include?(configured)
+      configured
+    else
+      top_menu_items[0].name
+    end
+  end
+
+  def self.anonymous_menu_items
+    @anonymous_menu_items ||= Set.new Discourse.anonymous_filters.map(&:to_s)
+  end
+
+  def self.anonymous_homepage
+    return homepage if anonymous_menu_items.include?(homepage)
+    if DiscoursePluginRegistry.homepage_options.any? { |option|
+         option[:id] == homepage && option[:anonymous]
+       }
+      return homepage
+    end
+
+    top_menu_items
+      .map { |item| item.name }
+      .select { |item| anonymous_menu_items.include?(item) }
+      .first
+  end
+
+  def self.should_download_images?(src)
+    setting = disabled_image_download_domains
+    return true if setting.blank?
+
+    host = URI.parse(src).host
+    !setting.split("|").include?(host)
+  rescue URI::Error
+    true
+  end
+
+  def self.scheme
+    force_https? ? "https" : "http"
+  end
+
+  def self.min_redirected_to_top_period(duration)
+    ListController.best_period_with_topics_for(duration)
+  end
+
+  def self.email_polling_enabled?
+    SiteSetting.manual_polling_enabled? || SiteSetting.pop3_polling_enabled? ||
+      DiscoursePluginRegistry.mail_pollers.any?(&:enabled?)
+  end
+
+  def self.blocked_attachment_content_types_regex
+    current_db = RailsMultisite::ConnectionManagement.current_db
+
+    @blocked_attachment_content_types_regex ||= {}
+    @blocked_attachment_content_types_regex[current_db] ||= Regexp.union(
+      SiteSetting.blocked_attachment_content_types.split("|"),
+    )
+  end
+
+  def self.blocked_attachment_filenames_regex
+    current_db = RailsMultisite::ConnectionManagement.current_db
+
+    @blocked_attachment_filenames_regex ||= {}
+    @blocked_attachment_filenames_regex[current_db] ||= Regexp.union(
+      SiteSetting.blocked_attachment_filenames.split("|"),
+    )
+  end
+
+  def self.allowed_unicode_username_characters_regex
+    current_db = RailsMultisite::ConnectionManagement.current_db
+
+    @allowed_unicode_username_regex ||= {}
+    @allowed_unicode_username_regex[
+      current_db
+    ] ||= if SiteSetting.allowed_unicode_username_characters.present?
+      Regexp.new(SiteSetting.allowed_unicode_username_characters)
+    end
+  end
+
+  def self.history_for(setting_name)
+    UserHistory.where(
+      action: UserHistory.actions[:change_site_setting],
+      subject: setting_name,
+    ).order(created_at: :desc)
+  end
+
+  class ImageQuality
+    def self.png_to_jpg_quality
+      SiteSetting.png_to_jpg_quality.nonzero? || SiteSetting.image_quality
+    end
+
+    def self.recompress_original_jpg_quality
+      SiteSetting.recompress_original_jpg_quality.nonzero? || SiteSetting.image_quality
+    end
+
+    def self.image_preview_jpg_quality
+      SiteSetting.image_preview_jpg_quality.nonzero? || SiteSetting.image_quality
+    end
+  end
+
+  def self.ImageQuality
+    SiteSetting::ImageQuality
+  end
+
+  # helpers for getting s3 settings that fallback to global
+  class Upload
+    def self.s3_cdn_url
+      SiteSetting.enable_s3_uploads ? SiteSetting.s3_cdn_url : GlobalSetting.s3_cdn_url
+    end
+
+    def self.s3_region
+      SiteSetting.enable_s3_uploads ? SiteSetting.s3_region : GlobalSetting.s3_region
+    end
+
+    def self.s3_upload_bucket
+      SiteSetting.enable_s3_uploads ? SiteSetting.s3_upload_bucket : GlobalSetting.s3_bucket
+    end
+
+    def self.s3_endpoint
+      SiteSetting.enable_s3_uploads ? SiteSetting.s3_endpoint : GlobalSetting.s3_endpoint
+    end
+
+    def self.enable_s3_transfer_acceleration
+      if SiteSetting.enable_s3_uploads
+        SiteSetting.enable_s3_transfer_acceleration
+      else
+        GlobalSetting.enable_s3_transfer_acceleration
+      end
+    end
+
+    def self.use_dualstack_endpoint
+      return false if !SiteSetting.Upload.enable_s3_uploads
+      return false if SiteSetting.Upload.s3_endpoint.present?
+      !SiteSetting.Upload.s3_region.start_with?("cn-")
+    end
+
+    def self.enable_s3_uploads
+      SiteSetting.enable_s3_uploads || GlobalSetting.use_s3?
+    end
+
+    def self.s3_base_url
+      path = s3_upload_bucket.split("/", 2)[1]
+      "#{absolute_base_url}#{path ? "/" + path : ""}"
+    end
+
+    def self.absolute_base_url
+      url_basename = SiteSetting.s3_endpoint.split("/")[-1]
+      bucket =
+        (
+          if SiteSetting.enable_s3_uploads
+            Discourse.store.s3_bucket_name
+          else
+            GlobalSetting.s3_bucket_name
+          end
+        )
+
+      # cf. http://docs.aws.amazon.com/general/latest/gr/rande.html#s3_region
+      if SiteSetting.s3_endpoint.blank? || SiteSetting.s3_endpoint.end_with?("amazonaws.com")
+        if SiteSetting.Upload.use_dualstack_endpoint
+          "//#{bucket}.s3.dualstack.#{SiteSetting.Upload.s3_region}.amazonaws.com"
+        else
+          "//#{bucket}.s3.#{SiteSetting.Upload.s3_region}.amazonaws.com.cn"
+        end
+      else
+        "//#{bucket}.#{url_basename}"
+      end
+    end
+  end
+
+  def self.Upload
+    SiteSetting::Upload
+  end
+
+  def self.require_invite_code
+    invite_code.present?
+  end
+  client_settings << :require_invite_code
+
+  %i[
+    site_logo_url
+    site_logo_small_url
+    site_mobile_logo_url
+    site_favicon_url
+    site_logo_dark_url
+    site_logo_small_dark_url
+    site_mobile_logo_dark_url
+  ].each { |client_setting| client_settings << client_setting }
+
+  %i[
+    logo
+    logo_small
+    digest_logo
+    mobile_logo
+    logo_dark
+    logo_small_dark
+    mobile_logo_dark
+    large_icon
+    manifest_icon
+    favicon
+    apple_touch_icon
+    x_summary_large_image
+    opengraph_image
+    push_notifications_icon
+  ].each do |setting_name|
+    define_singleton_method("site_#{setting_name}_url") do
+      if SiteIconManager.respond_to?("#{setting_name}_url")
+        return SiteIconManager.public_send("#{setting_name}_url")
+      end
+
+      upload = public_send(setting_name)
+      upload ? full_cdn_url(upload.url) : ""
+    end
+  end
+
+  def self.shared_drafts_enabled?
+    c = SiteSetting.shared_drafts_category
+    c.present? && c.to_i != SiteSetting.uncategorized_category_id.to_i
+  end
+
+  protected
+
+  def self.clear_cache!(expire_theme_site_setting_cache: false)
+    super(expire_theme_site_setting_cache:)
+
+    @blocked_attachment_content_types_regex = nil
+    @blocked_attachment_filenames_regex = nil
+    @allowed_unicode_username_regex = nil
+  end
+end
+
+# == Schema Information
+#
+# Table name: site_settings
+#
+#  id         :integer          not null, primary key
+#  data_type  :integer          not null
+#  name       :string           not null
+#  value      :text
+#  created_at :datetime         not null
+#  updated_at :datetime         not null
+#
+# Indexes
+#
+#  index_site_settings_on_name  (name) UNIQUE
+#

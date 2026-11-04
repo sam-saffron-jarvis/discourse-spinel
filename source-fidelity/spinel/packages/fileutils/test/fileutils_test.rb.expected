@@ -1,0 +1,50 @@
+["<root>/a/b/c"]
+true
+1
+2
+true
+true
+"hello"
+"hello"
+true
+false
+"hello"
+false
+true
+0
+false
+raised
+rm_f quiet
+"hello"
+true
+false
+rm_rf quiet
+false
+"still here"
+"600"
+true
+mkdir -p v/one
+mkdir v/two
+rmdir v/two
+cp v/src.txt v/copy.txt
+cp -r v/one v/one_copy
+mv v/copy.txt v/moved.txt
+rm v/moved.txt
+rm -f v/gone.txt
+touch v/t.txt
+chmod 644 v/t.txt
+chmod -R 644 v/one
+ln -s t.txt v/link
+ln v/t.txt v/hard
+rm -r v/one_copy
+rm -rf v/one v/nope
+false
+mkdir -p v/dry
+["v/dry"]
+false
+true
+cd v
+"v"
+cd -
+true
+false

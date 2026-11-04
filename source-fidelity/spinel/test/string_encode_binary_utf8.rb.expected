@@ -1,0 +1,13 @@
+"Hello World"
+"Hello ??????World"
+"plain"
+Encoding::UndefinedConversionError: "\xC3" from ASCII-8BIT to UTF-8
+17
+17
+"caf?"
+Encoding::UndefinedConversionError: U+00E9 from UTF-8 to ASCII-8BIT
+"bad*byte"
+"caf��"
+"ASCII-8BIT"
+"abc"
+"x__"

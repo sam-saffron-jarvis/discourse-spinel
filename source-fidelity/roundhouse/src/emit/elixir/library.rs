@@ -1,0 +1,741 @@
+//! Generic `LibraryClass` → Elixir emit.
+//!
+//! Mirrors `src/emit/go/library.rs` in shape, mapped to Elixir's
+//! functional/immutable model:
+//!
+//! - A Ruby `class`/`module` becomes a `defmodule`.
+//! - A module-singleton (a `module` whose methods are all
+//!   `self.`-receivers — e.g. `Inflector`, `JsonBuilder`) becomes a
+//!   module of functions; Ruby `def self.foo` → Elixir `def foo`.
+//! - A normal class becomes a module with a `defstruct` payload;
+//!   instance methods thread the record as the first param
+//!   (`def foo(record, …)`), class methods stay bare.
+//! - Inheritance (`parent`) is ignored — the lowerer linearizes method
+//!   overrides onto each class (same as rust).
+//!
+//! Each class emits its OWN `defmodule <DottedName> do … end`, named
+//! from its (fully-qualified) `ClassId` with the `` overlay prefix —
+//! so a multi-class file (`action_dispatch/router.rb` →
+//! `ActionDispatch.Router.Route` / `.MatchResult` / `.Router`) emits
+//! three sibling modules. Module-level constants don't appear in
+//! `emit_library_class` (they're parsed separately); they're injected
+//! INTO their owning module by `runtime_loader::elixir_wrap_namespace`,
+//! because Elixir module attributes don't cross module boundaries and
+//! Elixir has no file-level constants.
+
+use std::fmt::Write;
+
+use crate::dialect::{AccessorKind, LibraryClass, MethodDef, MethodReceiver};
+use crate::expr::{Expr, ExprNode, InterpPart, LValue, Literal, Pattern};
+
+use super::expr;
+
+/// Map a `ClassId` to its emitted Elixir module name. Ruby's `::` scope
+/// separator becomes Elixir's `.` (`ActiveRecord::Base` →
+/// `ActiveRecord.Base`); plain names pass through (`Article`).
+pub(super) fn v2_module_name(class: &str) -> String {
+    class.replace("::", ".")
+}
+
+/// Emit a `LibraryClass` as a full Elixir `defmodule <DottedName> do
+/// … end` (trailing newline included).
+pub fn emit_library_class(class: &LibraryClass) -> Result<String, String> {
+    let v2_name = v2_module_name(class.name.0.as_str());
+    // Register the Ruby class name for `Module#name` reflection
+    // (`#{name}` in a class method resolves to this string).
+    expr::set_current_class_name(class.name.0.as_str());
+    expr::set_process_wide_ivars(load_once_ivars(class));
+    // Not a plain module: a raise of it must carry its class, which only an exception module does
+    let parent = class.parent.as_ref().map(|p| p.0.as_str()).unwrap_or("");
+    let core_error = matches!(
+        parent.rsplit("::").next().unwrap_or(parent),
+        "StandardError" | "RuntimeError" | "ArgumentError" | "TypeError" | "NameError" | "KeyError" | "IndexError"
+    );
+    if (core_error || expr::is_error_module(parent)) && class.methods.is_empty() {
+        expr::register_error_module(class.name.0.as_str(), &v2_name);
+        return Ok(format!("defmodule {v2_name} do\n  defexception message: \"\"\nend\n"));
+    }
+    let body = emit_class_body(class, &v2_name)?;
+    Ok(format!("defmodule {v2_name} do\n{body}end\n"))
+}
+
+/// The body (def/defstruct lines, indented one level) that goes inside
+/// the `defmodule`.
+fn emit_class_body(class: &LibraryClass, v2_name: &str) -> Result<String, String> {
+    let is_module_singleton = class.is_module
+        && !class.methods.is_empty()
+        && class
+            .methods
+            .iter()
+            .all(|m| matches!(m.receiver, MethodReceiver::Class));
+
+    // Instance methods of this class, by emitted name. EVERY instance
+    // method threads a leading `record` param (a pure one gets `_record`),
+    // so a self-call, an implicit-self bareword call, and cross-instance
+    // `x.__struct__.m(x, …)` dispatch all agree on arity. Membership tells
+    // the call-site router which barewords are instance methods (thread
+    // record) vs class methods / module functions (don't). `initialize`
+    // is the constructor (`new`), not a threaded instance method.
+    let record_methods: crate::det::HashSet<String> = class
+        .methods
+        .iter()
+        .filter(|m| {
+            // Temporal readers ARE record-threaded functions (see the
+            // emission exception below); other accessors are struct
+            // slots, not functions.
+            let is_temporal_reader = m.kind == AccessorKind::AttributeReader
+                && matches!(
+                    m.signature.as_ref(),
+                    Some(crate::ty::Ty::Fn { ret, .. }) if ret.contains_time()
+                );
+            !is_module_singleton
+                && matches!(m.receiver, MethodReceiver::Instance)
+                && m.name.as_str() != "initialize"
+                && (is_temporal_reader
+                    || !matches!(
+                        m.kind,
+                        AccessorKind::AttributeReader | AccessorKind::AttributeWriter
+                    ))
+        })
+        .map(|m| elixir_fn_name(m.name.as_str()))
+        .collect();
+    expr::set_record_methods(record_methods);
+
+    // Per-method declared params (name + default), so a call site can
+    // unpack a trailing keyword-args hash (`render(:new, status: :x)`)
+    // into the matching positional params (`render(record, body, :x)`).
+    // Elixir has no Ruby keyword args — the runtime's render/redirect_to/
+    // head take `status:`/`content_type:`/… as defaulted positionals, and
+    // a Ruby call passes them as a single trailing options hash that must
+    // be spread by name into declaration order.
+    let method_params: crate::det::HashMap<String, Vec<crate::dialect::Param>> = class
+        .methods
+        .iter()
+        .map(|m| (elixir_fn_name(m.name.as_str()), m.params.clone()))
+        .collect();
+    expr::set_method_params(method_params);
+
+    let mut out = String::new();
+
+    if !is_module_singleton {
+        // Struct payload: attr-declared fields plus any field the
+        // mutation-threaded bodies touch (via the `__field__` /
+        // `__struct_put__` bridges — session's `@data` has no attr).
+        let fields = struct_fields(class);
+        if !fields.is_empty() {
+            // Framework-internal list fields (the AR `errors` collection,
+            // has_many `_cache`s) must default to `[]`, not `nil`: a fresh
+            // record (`%Struct{}` from `new`) does `record.errors.empty?` /
+            // `record.errors ++ [..]`, which raise on `nil`. Elixir's
+            // `defstruct` requires the bare-atom fields (nil default) FIRST,
+            // then the keyword-default ones — so partition rather than
+            // interleave.
+            let is_list_field = |f: &str| f == "errors" || f == "error_details" || f.ends_with("_cache");
+            let mut decls: Vec<String> = fields
+                .iter()
+                .filter(|f| !is_list_field(f))
+                .map(|f| format!(":{f}"))
+                .collect();
+            decls.extend(
+                fields.iter().filter(|f| is_list_field(f)).map(|f| format!("{f}: []")),
+            );
+            writeln!(out, "  defstruct [{}]", decls.join(", ")).unwrap();
+            out.push('\n');
+        }
+    }
+
+    for m in &class.methods {
+        // Accessors are represented by struct fields; no function.
+        // EXCEPTION: a temporal reader (`Ty::Time` return) has no slot —
+        // `collect_struct_fields` skipped it — and its body parses the
+        // `<col>_raw` storage slot, so it emits as a real function
+        // (`def created_at(record), do: RhDateTime.parse(record.created_at_raw)`);
+        // reads reach it through the normal method-dispatch routing.
+        let is_temporal_reader = m.kind == AccessorKind::AttributeReader
+            && matches!(
+                m.signature.as_ref(),
+                Some(crate::ty::Ty::Fn { ret, .. }) if ret.contains_time()
+            );
+        if !is_temporal_reader
+            && matches!(
+                m.kind,
+                AccessorKind::AttributeReader | AccessorKind::AttributeWriter
+            )
+        {
+            continue;
+        }
+        // `initialize` → a `new/n` constructor returning a struct literal
+        // built from the `@field = value` assignments in its body.
+        if m.name.as_str() == "initialize" {
+            emit_constructor(&mut out, m, v2_name);
+            continue;
+        }
+        let thread_record =
+            !is_module_singleton && matches!(m.receiver, MethodReceiver::Instance);
+        emit_fn(&mut out, m, thread_record);
+    }
+
+    Ok(out)
+}
+
+/// Emit `initialize` as a `new/n` constructor. A flat body (only
+/// `@field = value` assigns) emits a clean struct literal `%Name{f:
+/// v, …}`. A richer body (conditionals, early returns, locals — e.g.
+/// flash's cross-request population) seeds `record = %Name{}` and
+/// runs the body threaded through `record` (via
+/// `mutation_to_struct_return::thread_constructor_body`).
+fn emit_constructor(out: &mut String, m: &MethodDef, v2_name: &str) {
+    let params = m
+        .params
+        .iter()
+        .map(|p| param_decl(p, references_var(&m.body, p.as_str())))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    writeln!(out, "  def new({params}) do").unwrap();
+    match flat_field_assigns(&m.body) {
+        Some(pairs) if pairs.is_empty() => {
+            writeln!(out, "    %{v2_name}{{}}").unwrap();
+        }
+        Some(pairs) => {
+            writeln!(out, "    %{v2_name}{{{}}}", pairs.join(", ")).unwrap();
+        }
+        None => {
+            // Non-flat: seed the struct, then run the threaded body.
+            let threaded = crate::lower::functionalize::mutation_to_struct_return::thread_constructor_body(
+                &m.body,
+            );
+            // The seeded `record` is the threaded self here.
+            expr::set_threads_record(true);
+            writeln!(out, "    record = %{v2_name}{{}}").unwrap();
+            out.push_str(&expr::indent(&expr::emit_method_body(&threaded), 2));
+            out.push('\n');
+        }
+    }
+    out.push_str("  end\n");
+}
+
+/// `Some(pairs)` when every top-level statement is a `@field = value`
+/// assign (a flat constructor → struct literal); `None` otherwise.
+fn flat_field_assigns(body: &Expr) -> Option<Vec<String>> {
+    let stmts: &[Expr] = match &*body.node {
+        ExprNode::Seq { exprs } => exprs,
+        _ => std::slice::from_ref(body),
+    };
+    let mut pairs = Vec::new();
+    for s in stmts {
+        match &*s.node {
+            ExprNode::Assign { target: LValue::Ivar { name }, value } => {
+                pairs.push(format!("{name}: {}", expr::emit_expr(value)))
+            }
+            _ => return None,
+        }
+    }
+    Some(pairs)
+}
+
+/// Render one param, applying Elixir default-arg syntax (`name \\ default`).
+/// An unused param is `_`-prefixed (`_notice \\ nil`) to stay
+/// warning-clean — view partials carry uniform `notice`/`alert` flash
+/// params that most templates never reference.
+fn param_decl(p: &crate::dialect::Param, used: bool) -> String {
+    let name = if used {
+        p.as_str().to_string()
+    } else {
+        format!("_{}", p.as_str())
+    };
+    match &p.default {
+        Some(d) => format!("{} \\\\ {}", name, expr::emit_expr(d)),
+        None => name,
+    }
+}
+
+/// Emit a flat list of `MethodDef`s (Ruby `Mode::Module`) as Elixir
+/// functions. Required by the `TargetEmit` contract; not exercised by
+/// the current runtime slice.
+pub fn emit_module(methods: &[MethodDef]) -> Result<String, String> {
+    let mut out = String::new();
+    for m in methods {
+        emit_fn(&mut out, m, false);
+    }
+    Ok(out)
+}
+
+/// Render a module-level constant as an Elixir module attribute, e.g.
+/// `ESCAPES = {…}.freeze` → `  @escapes %{…}`. Indented one level to
+/// sit inside the `defmodule` the namespace wrapper supplies.
+pub fn format_constant(name: &str, value: &Expr) -> String {
+    format!("  @{} {}", name.to_lowercase(), expr::emit_const_value(value))
+}
+
+/// The struct's `defstruct` fields: attr-declared names plus every
+/// `@ivar` the method bodies reference (read or written). Covers structs
+/// whose state is a bare ivar with no accessor (session's `@data`).
+/// `pub(super)` so the overlay can register a global field registry for
+/// method-on-typed-local routing (a `x.id` field read vs `x.save()`
+/// method call on a typed record).
+pub(super) fn struct_fields(class: &LibraryClass) -> Vec<String> {
+    let mut out = collect_struct_fields(&class.methods);
+    for m in &class.methods {
+        collect_ivar_names(&m.body, &mut out);
+    }
+    out
+}
+
+/// Collect struct field names from the mutation-threading bridges in a
+/// (post-functionalize) body: `record.__field__(:x)` reads and
+/// `record.__struct_put__(:x, …)` writes carry the field as a Sym arg.
+fn collect_ivar_names(e: &Expr, out: &mut Vec<String>) {
+    match &*e.node {
+        ExprNode::Send { method, args, recv, block, .. } => {
+            let m = method.as_str();
+            if (m == "__field__" || m == "__struct_put__") && !args.is_empty() {
+                if let ExprNode::Lit { value: Literal::Sym { value } } = &*args[0].node {
+                    let n = value.to_string();
+                    if !out.contains(&n) {
+                        out.push(n);
+                    }
+                }
+            }
+            if let Some(r) = recv {
+                collect_ivar_names(r, out);
+            }
+            args.iter().for_each(|a| collect_ivar_names(a, out));
+            if let Some(b) = block {
+                collect_ivar_names(b, out);
+            }
+        }
+        ExprNode::Seq { exprs } | ExprNode::Array { elements: exprs, .. } => {
+            exprs.iter().for_each(|x| collect_ivar_names(x, out))
+        }
+        ExprNode::Assign { value, .. }
+        | ExprNode::OpAssign { value, .. }
+        | ExprNode::Return { value }
+        | ExprNode::Raise { value }
+        | ExprNode::Cast { value, .. } => collect_ivar_names(value, out),
+        ExprNode::If { cond, then_branch, else_branch } => {
+            collect_ivar_names(cond, out);
+            collect_ivar_names(then_branch, out);
+            collect_ivar_names(else_branch, out);
+        }
+        ExprNode::While { cond, body, .. } => {
+            collect_ivar_names(cond, out);
+            collect_ivar_names(body, out);
+        }
+        ExprNode::BoolOp { left, right, .. } => {
+            collect_ivar_names(left, out);
+            collect_ivar_names(right, out);
+        }
+        ExprNode::Lambda { body, .. } => collect_ivar_names(body, out),
+        ExprNode::Yield { args } => args.iter().for_each(|a| collect_ivar_names(a, out)),
+        ExprNode::Hash { entries, .. } => entries.iter().for_each(|(k, v)| {
+            collect_ivar_names(k, out);
+            collect_ivar_names(v, out);
+        }),
+        _ => {}
+    }
+}
+
+/// Collect unique `defstruct` field names from attr accessor methods.
+fn collect_struct_fields(methods: &[MethodDef]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for m in methods {
+        if !matches!(
+            m.kind,
+            AccessorKind::AttributeReader | AccessorKind::AttributeWriter
+        ) {
+            continue;
+        }
+        // A temporal reader (`Ty::Time` return) is a computed accessor,
+        // not storage — the `<col>_raw` String pair contributes the
+        // struct slot; a same-named slot here would be a dead member
+        // nothing writes. Reads route to the raw slot instead (see
+        // `expr::struct_field_read`) until a native DateTime seam lands.
+        if m.kind == AccessorKind::AttributeReader
+            && matches!(
+                m.signature.as_ref(),
+                Some(crate::ty::Ty::Fn { ret, .. }) if ret.contains_time()
+            )
+        {
+            continue;
+        }
+        let field = m.name.as_str().trim_end_matches('=').to_string();
+        if !out.contains(&field) {
+            out.push(field);
+        }
+    }
+    out
+}
+
+/// Emit one method as an Elixir `def` (indented one level for inside a
+/// `defmodule`; the body is indented a further level). EVERY instance
+/// method threads a leading `record` param so call sites (self-calls,
+/// bareword implicit-self, and cross-instance `x.__struct__.m(x, …)`)
+/// agree on arity; a method whose body doesn't reference `record` (a
+/// pure one, e.g. `resolve_status`) names it `_record` to stay
+/// warning-clean.
+fn emit_fn(out: &mut String, m: &MethodDef, instance_method: bool) {
+    // Make the method's params visible to emit so a recv-less bareword
+    // matching a param resolves to a local read, not a call (a view
+    // partial's `article` param vs the `article` view fn).
+    expr::set_current_params(m.params.iter().map(|p| p.as_str().to_string()).collect());
+    // Whether `record` in the body is the threaded self (instance method)
+    // vs. a genuine local/param — gates the self-call receiver-drop.
+    expr::set_threads_record(instance_method);
+    let body = expr::emit_method_body(&m.body);
+
+    let mut params: Vec<String> = Vec::new();
+    if instance_method {
+        let name = if references_token(&body, "record") { "record" } else { "_record" };
+        params.push(name.to_string());
+    }
+    params.extend(
+        m.params
+            .iter()
+            .map(|p| param_decl(p, references_var(&m.body, p.as_str()))),
+    );
+    // A body that `yield`s calls the block through a trailing `block_fn`.
+    if references_token(&body, "block_fn") {
+        params.push("block_fn".to_string());
+    }
+
+    writeln!(
+        out,
+        "  def {}({}) do",
+        elixir_fn_name(m.name.as_str()),
+        params.join(", ")
+    )
+    .unwrap();
+    out.push_str(&expr::indent(&body, 2));
+    out.push('\n');
+    out.push_str("  end\n");
+}
+
+/// Whether a rendered body references `tok` as an identifier token
+/// (used to detect emitter-introduced params: `record` from mutation-
+/// threading, `block_fn` from `yield`).
+pub(super) fn references_token(body: &str, tok: &str) -> bool {
+    body.split(|c: char| !c.is_alphanumeric() && c != '_')
+        .any(|t| t == tok)
+}
+
+/// Whether `name` is read as a variable anywhere in `e`'s IR. Used to
+/// decide if a method param is unused (→ `_`-prefixed, warning-clean).
+/// This walks the IR rather than scanning the rendered string because a
+/// param name can occur inside HTML string literals (a view partial's
+/// `notice`/`alert` flash params appear in class names/text) without
+/// being a real reference. A recv-less 0-arg bareword matching a param
+/// also counts — `set_current_params` renders it as the param local.
+/// The match is exhaustive (no wildcard) so a new `ExprNode` variant
+/// forces an update rather than silently under-detecting (which would
+/// `_`-prefix a live param and emit an undefined-variable reference).
+pub(super) fn references_var(e: &Expr, name: &str) -> bool {
+    fn lvalue(lv: &LValue, name: &str) -> bool {
+        match lv {
+            LValue::Var { .. } | LValue::Ivar { .. } | LValue::Const { .. } => false,
+            LValue::Attr { recv, .. } => references_var(recv, name),
+            LValue::Index { recv, index } => {
+                references_var(recv, name) || references_var(index, name)
+            }
+        }
+    }
+    fn opt(e: &Option<Expr>, name: &str) -> bool {
+        e.as_ref().is_some_and(|x| references_var(x, name))
+    }
+    match &*e.node {
+        ExprNode::Var { name: n, .. } => n.as_str() == name,
+        ExprNode::Lit { .. }
+        | ExprNode::Ivar { .. }
+        | ExprNode::Const { .. }
+        | ExprNode::Retry
+        | ExprNode::Redo
+        | ExprNode::ForwardArgs
+        | ExprNode::ForwardKeywords
+        | ExprNode::Defined { .. }
+        | ExprNode::SelfRef => false,
+        ExprNode::Send { recv, method, args, block, .. } => {
+            (recv.is_none() && args.is_empty() && method.as_str() == name)
+                || opt(recv, name)
+                || args.iter().any(|a| references_var(a, name))
+                || opt(block, name)
+        }
+        ExprNode::Apply { fun, args, block } => {
+            references_var(fun, name)
+                || args.iter().any(|a| references_var(a, name))
+                || opt(block, name)
+        }
+        ExprNode::Hash { entries, .. } => entries
+            .iter()
+            .any(|(k, v)| references_var(k, name) || references_var(v, name)),
+        ExprNode::ForwardKeywordsWithPairs { entries } => entries
+            .iter()
+            .any(|(k, v)| references_var(k, name) || references_var(v, name)),
+        ExprNode::Array { elements, .. } => elements.iter().any(|x| references_var(x, name)),
+        ExprNode::StringInterp { parts } => parts.iter().any(|p| {
+            matches!(p, InterpPart::Expr { expr } if references_var(expr, name))
+        }),
+        ExprNode::BoolOp { left, right, .. } => {
+            references_var(left, name) || references_var(right, name)
+        }
+        ExprNode::Let { value, body, .. } => {
+            references_var(value, name) || references_var(body, name)
+        }
+        ExprNode::Lambda { body, .. } => references_var(body, name),
+        ExprNode::MethodRef { recv, .. } => opt(recv, name),
+        ExprNode::If { cond, then_branch, else_branch } => {
+            references_var(cond, name)
+                || references_var(then_branch, name)
+                || references_var(else_branch, name)
+        }
+        ExprNode::Case { scrutinee, arms } => {
+            references_var(scrutinee, name)
+                || arms.iter().any(|a| {
+                    matches!(&a.pattern, Pattern::Expr { expr } if references_var(expr, name))
+                        || opt(&a.guard, name)
+                        || references_var(&a.body, name)
+                })
+        }
+        // A pattern's OWN bindings shadow `name` for its guard and
+        // body: `in name` rebinds `name` to the matched value, so a
+        // read of `name` past that point is the new local, not the
+        // outer one this search is for — checking `bound_names` first
+        // is what keeps `CaseMatch` from over-reporting a capture a
+        // real Elixir closure would never need.
+        ExprNode::CaseMatch { scrutinee, arms, else_body } => {
+            references_var(scrutinee, name)
+                || arms.iter().any(|a| {
+                    let mut pattern_hit = false;
+                    a.pattern.for_each_expr(&mut |e| pattern_hit |= references_var(e, name));
+                    let mut bound = Vec::new();
+                    a.pattern.bound_names(&mut bound);
+                    let shadowed = bound.iter().any(|n| n.as_str() == name);
+                    let guard_hit = a.guard.as_ref().is_some_and(|(_, g)| references_var(g, name));
+                    pattern_hit || (!shadowed && (guard_hit || references_var(&a.body, name)))
+                })
+                || opt(else_body, name)
+        }
+        ExprNode::MatchPredicate { value, pattern } | ExprNode::MatchRequired { value, pattern } => {
+            let mut pattern_hit = false;
+            pattern.for_each_expr(&mut |e| pattern_hit |= references_var(e, name));
+            references_var(value, name) || pattern_hit
+        }
+        ExprNode::Seq { exprs } => exprs.iter().any(|x| references_var(x, name)),
+        ExprNode::Assign { target, value } | ExprNode::OpAssign { target, value, .. } => {
+            lvalue(target, name) || references_var(value, name)
+        }
+        ExprNode::MultiAssign { targets, value } => {
+            targets.iter().any(|t| lvalue(t, name)) || references_var(value, name)
+        }
+        ExprNode::Yield { args } => args.iter().any(|a| references_var(a, name)),
+        ExprNode::Raise { value }
+        | ExprNode::Return { value }
+        | ExprNode::Splat { value }
+        | ExprNode::KeywordSplat { value }
+        | ExprNode::Cast { value, .. } => references_var(value, name),
+        ExprNode::RescueModifier { expr, fallback } => {
+            references_var(expr, name) || references_var(fallback, name)
+        }
+        ExprNode::Super { args } => {
+            args.as_ref().is_some_and(|a| a.iter().any(|x| references_var(x, name)))
+        }
+        ExprNode::Next { value } | ExprNode::Break { value } => opt(value, name),
+        ExprNode::While { cond, body, .. } => {
+            references_var(cond, name) || references_var(body, name)
+        }
+        ExprNode::Range { begin, end, .. } => opt(begin, name) || opt(end, name),
+        ExprNode::BeginRescue { body, rescues, else_branch, ensure, .. } => {
+            references_var(body, name)
+                || rescues.iter().any(|r| {
+                    r.classes.iter().any(|c| references_var(c, name))
+                        || references_var(&r.body, name)
+                })
+                || opt(else_branch, name)
+                || opt(ensure, name)
+        }
+    }
+}
+
+/// Map a Ruby method name to a legal Elixir function name. `?`/`!`
+/// suffixes are valid in Elixir and pass through when they *terminate*
+/// the name. The indexing operators `[]`/`[]=` (illegal as Elixir
+/// function names) become `get`/`put`; a writer `foo=` becomes
+/// `set_foo`.
+///
+/// While→recursion helpers append `__loop` to the Ruby name
+/// (`header_key_ok?` → `header_key_ok?__loop`). Elixir identifiers may
+/// *end* in `?`/`!` but cannot continue after them — `?_` is a
+/// character literal — so mid-name `?`/`!` become `_p`/`_b` before the
+/// suffix.
+pub(super) fn elixir_fn_name(name: &str) -> String {
+    // Indexing operators and their while→recursion helpers (`[]__loop`,
+    // `[]=__loop`) are illegal Elixir identifiers — map to get/put.
+    if let Some(rest) = name.strip_prefix("[]=__") {
+        return format!("put__{rest}");
+    }
+    if let Some(rest) = name.strip_prefix("[]__") {
+        return format!("get__{rest}");
+    }
+    match name {
+        "[]" => return "get".to_string(),
+        "[]=" => return "put".to_string(),
+        _ => {}
+    }
+    if let Some(base) = name.strip_suffix('=') {
+        // `foo=` writer — but not `foo?=` / mangled forms.
+        if !base.ends_with(['?', '!']) {
+            return format!("set_{base}");
+        }
+    }
+    // `pred?__loop` / `bang!__loop`: rewrite the mid-name punct so the
+    // identifier stays legal (`pred_p__loop` / `bang_b__loop`). A
+    // trailing `?`/`!` (end of name) falls through to the catch-all and
+    // is preserved.
+    let mut out = String::with_capacity(name.len() + 2);
+    let chars: Vec<char> = name.chars().collect();
+    for (i, &c) in chars.iter().enumerate() {
+        let next = chars.get(i + 1).copied();
+        match c {
+            '?' if next.is_some() => out.push_str("_p"),
+            '!' if next.is_some() => out.push_str("_b"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_load_once_method_s_ivars_are_process_wide_and_a_toggled_flag_s_are_not() {
+        let src = b"module Cache\n  def self.table\n    load unless @loaded == true\n    @table\n  end\n\n  def self.load\n    @table = { \"a\" => 1 }\n    @loaded = true\n  end\n\n  def self.render\n    @rendering = true\n    @frame = 1\n    @rendering = false\n  end\n\n  def self.rendering?\n    @rendering == true\n  end\n\n  def self.stamp\n    @memo = 1\n    @stamped = true\n  end\n\n  def self.rules\n    load_rules unless @rules_loaded\n    @rules\n  end\n\n  def self.load_rules\n    @rules = [1]\n    @rules_loaded = true\n  end\nend\n";
+        let classes = crate::ingest::ingest_library_classes(src, "cache.rb").expect("ingest");
+        let names = load_once_ivars(&classes[0]);
+        let mut names: Vec<&str> = names.iter().map(String::as_str).collect();
+        names.sort();
+        assert_eq!(names, ["loaded", "rules", "rules_loaded", "table"]);
+    }
+    use crate::ident::{Symbol, VarId};
+    use crate::span::Span;
+
+    fn var(name: &str) -> Expr {
+        Expr::new(Span::synthetic(), ExprNode::Var { id: VarId(0), name: Symbol::from(name) })
+    }
+
+    // A param name that appears only inside a string-literal interpolation
+    // text (a view partial's `notice`/`alert` flash params occur in HTML
+    // class names) must NOT count as referenced — that's the whole reason
+    // `references_var` walks the IR instead of scanning the rendered text.
+    #[test]
+    fn references_var_ignores_string_literal_tokens() {
+        // `"... notice ..." #{article.id}` — "notice" is literal text,
+        // `article` is a real read.
+        let body = Expr::new(Span::synthetic(), ExprNode::StringInterp {
+            parts: vec![
+                InterpPart::Text { value: "class notice alert".to_string() },
+                InterpPart::Expr {
+                    expr: Expr::new(Span::synthetic(), ExprNode::Send {
+                        recv: Some(var("article")),
+                        method: Symbol::from("id"),
+                        args: vec![],
+                        block: None,
+                        parenthesized: false,
+                    }),
+                },
+            ],
+        });
+        assert!(!references_var(&body, "notice"));
+        assert!(!references_var(&body, "alert"));
+        assert!(references_var(&body, "article"));
+    }
+
+    // A recv-less 0-arg bareword matching a param renders as the param
+    // local (via `set_current_params`), so it counts as a reference.
+    #[test]
+    fn references_var_counts_bareword_param_read() {
+        let bare = Expr::new(Span::synthetic(), ExprNode::Send {
+            recv: None,
+            method: Symbol::from("notice"),
+            args: vec![],
+            block: None,
+            parenthesized: false,
+        });
+        assert!(references_var(&bare, "notice"));
+    }
+
+    #[test]
+    fn elixir_fn_name_rewrites_mid_pred_before_loop_suffix() {
+        // Trailing `?`/`!` stay; mid-name (before `__loop`) cannot.
+        assert_eq!(elixir_fn_name("header_key_ok?"), "header_key_ok?");
+        assert_eq!(elixir_fn_name("header_key_ok?__loop"), "header_key_ok_p__loop");
+        assert_eq!(elixir_fn_name("bang!__loop"), "bang_b__loop");
+        assert_eq!(elixir_fn_name("[]__loop"), "get__loop");
+        assert_eq!(elixir_fn_name("[]=__loop"), "put__loop");
+        assert_eq!(elixir_fn_name("title="), "set_title");
+    }
+}
+
+/// The ivars a load-once method fills: one that sets `@flag = true`
+/// where nothing sets `@flag` to anything else and it is read only as
+/// `@flag == true`, so it runs once per process in Ruby, and its ivars
+/// are what every later request reads.
+fn load_once_ivars(class: &LibraryClass) -> crate::det::HashSet<String> {
+    use crate::expr::{ExprNode, LValue, Literal};
+    fn writes(e: &crate::expr::Expr, out: &mut Vec<(String, bool)>) {
+        if let ExprNode::Assign { target: LValue::Ivar { name }, value } = &*e.node {
+            out.push((name.as_str().to_string(), matches!(&*value.node, ExprNode::Lit { value: Literal::Bool { value: true } })));
+        }
+        e.node.for_each_child(&mut |c| writes(c, out));
+    }
+    // Reads of `@name` other than as the left of `== true`, and how many of those guards there are
+    fn other_reads(e: &crate::expr::Expr, name: &str, found: &mut bool, guards: &mut usize) {
+        if let ExprNode::Send { recv: Some(r), method, args, .. } = &*e.node
+            && method.as_str() == "=="
+            && matches!(&*r.node, ExprNode::Ivar { name: n } if n.as_str() == name)
+            && matches!(args.as_slice(), [a] if matches!(&*a.node, ExprNode::Lit { value: Literal::Bool { value: true } }))
+        {
+            *guards += 1;
+            return;
+        }
+        // `load unless @loaded`: the flag read bare, or negated, as the condition of a branch
+        if let ExprNode::If { cond, then_branch, else_branch } = &*e.node {
+            let is_flag = |x: &crate::expr::Expr| matches!(&*x.node, ExprNode::Ivar { name: n } if n.as_str() == name);
+            let bare = is_flag(cond)
+                || matches!(&*cond.node, ExprNode::Send { recv: Some(r), method, args, .. } if method.as_str() == "!" && args.is_empty() && is_flag(r));
+            if bare {
+                *guards += 1;
+                other_reads(then_branch, name, found, guards);
+                other_reads(else_branch, name, found, guards);
+                return;
+            }
+        }
+        if matches!(&*e.node, ExprNode::Ivar { name: n } if n.as_str() == name) {
+            *found = true;
+        }
+        e.node.for_each_child(&mut |c| other_reads(c, name, found, guards));
+    }
+    let mut all_writes = Vec::new();
+    for m in &class.methods {
+        writes(&m.body, &mut all_writes);
+    }
+    let mut out = crate::det::HashSet::default();
+    for m in &class.methods {
+        let mut w = Vec::new();
+        writes(&m.body, &mut w);
+        let flags: Vec<&String> = w.iter().filter(|(_, t)| *t).map(|(n, _)| n).collect();
+        let once = flags.iter().any(|flag| {
+            let mut found = all_writes.iter().any(|(n, t)| n == *flag && !t);
+            let mut guards = 0;
+            for other in &class.methods {
+                other_reads(&other.body, flag, &mut found, &mut guards);
+            }
+            // Not a flag nothing reads: without a guard, the method runs on every request
+            !found && guards > 0
+        });
+        if once {
+            out.extend(w.into_iter().map(|(n, _)| n));
+        }
+    }
+    out
+}

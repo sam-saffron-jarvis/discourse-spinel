@@ -1,0 +1,264 @@
+// Editor abstraction for the playground. Default: Monaco (loaded from a CDN
+// via its AMD loader — no bundler, no npm, matching the no-container thesis).
+// Fallback: a plain <textarea>, so the page still works offline, under a
+// strict CSP, or in headless CI where the CDN is unreachable. Both expose the
+// same tiny interface: { setValue(text, lang), getValue(), kind }.
+//
+// The fallback is deliberate, not a stopgap: the playground's data flow
+// (source tree -> editable buffer -> debounced transpile -> output) is proven
+// through this interface regardless of which widget backs it.
+
+const MONACO_VERSION = "0.52.2";
+const MONACO_BASE = `https://cdn.jsdelivr.net/npm/monaco-editor@${MONACO_VERSION}/min/vs`;
+const LOAD_TIMEOUT_MS = 8000;
+
+// Memoized: the editor and the output view both load Monaco; concurrent
+// callers must share a single AMD-loader injection (a second loader.js
+// re-declares `_amdLoaderGlobal` and throws).
+let monacoPromise = null;
+// Exported for surfaces (the /ide/ page) that build their own editor
+// wiring but must share the single AMD-loader injection.
+export function loadMonaco() {
+  if (monacoPromise) return monacoPromise;
+  monacoPromise = new Promise((resolve, reject) => {
+    if (window.monaco) return resolve(window.monaco);
+    const timer = setTimeout(() => reject(new Error("monaco load timeout")), LOAD_TIMEOUT_MS);
+    // Run Monaco's language services in the main thread; avoids cross-origin
+    // worker setup. (A worker is a later optimization, not needed to edit.)
+    window.MonacoEnvironment = { getWorker: () => ({ postMessage() {}, addEventListener() {}, terminate() {} }) };
+    const script = document.createElement("script");
+    script.src = `${MONACO_BASE}/loader.js`;
+    script.onload = () => {
+      window.require.config({ paths: { vs: MONACO_BASE } });
+      window.require(["vs/editor/editor.main"], () => {
+        clearTimeout(timer);
+        silenceWorkerLanguageServices(window.monaco);
+        resolve(window.monaco);
+      }, (e) => { clearTimeout(timer); reject(e); });
+    };
+    script.onerror = () => { clearTimeout(timer); reject(new Error("monaco loader.js failed")); };
+    document.head.appendChild(script);
+  });
+  return monacoPromise;
+}
+
+// Monaco's HTML/CSS/JSON/TS "language services" (hover, completion, validation,
+// formatting, …) run in a Web Worker, which we deliberately stub above to avoid
+// cross-origin worker setup. A stubbed worker never replies, so every
+// worker-backed provider hangs: hovering inside an .erb (an `html` model) spins
+// Monaco's own "Loading…" tooltip forever, because its HTML hover provider is
+// waiting on the dead worker. Turn those providers off — the Monarch syntax
+// highlighters are main-thread and keep working, and our inferred-type hover
+// (registered per-editor) is independent. `setModeConfiguration` replaces the
+// whole config, so any key we omit defaults to disabled, which is what we want;
+// optional chaining guards languages/methods absent in a given Monaco build.
+function silenceWorkerLanguageServices(monaco) {
+  const off = {
+    completionItems: false, hovers: false, documentSymbols: false, links: false,
+    documentHighlights: false, rename: false, colors: false, foldingRanges: false,
+    diagnostics: false, selectionRanges: false, documentFormattingEdits: false,
+    documentRangeFormattingEdits: false, tokens: false, definitions: false,
+    references: false, inlayHints: false, codeActions: false, onTypeFormattingEdits: false,
+  };
+  const langs = monaco.languages;
+  // HTML (+ its handlebars/razor variants) — what .erb opens as.
+  langs.html?.htmlDefaults?.setModeConfiguration(off);
+  langs.html?.handlebarDefaults?.setModeConfiguration(off);
+  langs.html?.razorDefaults?.setModeConfiguration(off);
+  // CSS/SCSS/LESS and JSON — reached via embedded <style>/<script> and the
+  // output pane; same dead-worker hang otherwise.
+  langs.css?.cssDefaults?.setModeConfiguration(off);
+  langs.css?.scssDefaults?.setModeConfiguration(off);
+  langs.css?.lessDefaults?.setModeConfiguration(off);
+  langs.json?.jsonDefaults?.setModeConfiguration(off);
+  // TS/JS — the output view renders emitted TypeScript; guard the method since
+  // older monaco-typescript lacks setModeConfiguration.
+  langs.typescript?.typescriptDefaults?.setModeConfiguration?.(off);
+  langs.typescript?.javascriptDefaults?.setModeConfiguration?.(off);
+}
+
+// Typed completion, shared by every surface (playground, studio, /ide/):
+// register a Monaco completion provider that calls `complete(text, line0,
+// ch0)` — the page closes over its own notion of "current file" — and maps
+// the analyzer's candidates (label/kind/detail/sort_text/insert_text, the
+// `ide::complete_at` contract) to Monaco items. Registered once per page;
+// kinds and ranking match the LSP so all surfaces rank identically.
+export function registerTypedCompletion(monaco, languages, complete) {
+  const kinds = {
+    column: monaco.languages.CompletionItemKind.Field,
+    kwarg: monaco.languages.CompletionItemKind.Field,
+    association: monaco.languages.CompletionItemKind.Property,
+    accessor: monaco.languages.CompletionItemKind.Property,
+    scope: monaco.languages.CompletionItemKind.Function,
+    method: monaco.languages.CompletionItemKind.Method,
+    ivar: monaco.languages.CompletionItemKind.Variable,
+  };
+  monaco.languages.registerCompletionItemProvider(languages, {
+    triggerCharacters: [".", "@", "(", ",", " "],
+    async provideCompletionItems(model, position) {
+      // `model` rides along for multi-model pages (the /ide/) that key
+      // file identity off it; single-editor pages close over their own
+      // current-file state and ignore it.
+      const cands = await complete(
+        model.getValue(), position.lineNumber - 1, position.column - 1, model,
+      );
+      if (!Array.isArray(cands)) return { suggestions: [] };
+      const word = model.getWordUntilPosition(position);
+      const range = new monaco.Range(
+        position.lineNumber, word.startColumn, position.lineNumber, word.endColumn,
+      );
+      return {
+        suggestions: cands.map((c) => ({
+          label: { label: c.label, description: c.detail },
+          kind: kinds[c.kind] ?? kinds.method,
+          detail: c.detail,
+          sortText: c.sort_text,
+          insertText: c.insert_text || c.label,
+          range,
+        })),
+      };
+    },
+  });
+}
+
+// container: the DOM element to mount into. onChange(text): fired on user edits
+// only (programmatic setValue does NOT fire it). complete(text, line0, ch0):
+// when provided, wires typed completion (see registerTypedCompletion) for the
+// ruby/html languages this editor hosts.
+export async function createEditor(container, { onChange, complete }) {
+  try {
+    const monaco = await loadMonaco();
+    const ed = monaco.editor.create(container, {
+      value: "", language: "ruby", automaticLayout: true,
+      minimap: { enabled: false }, fontSize: 13, scrollBeyondLastLine: false,
+      tabSize: 2,
+    });
+    let suppress = false;
+    ed.onDidChangeModelContent(() => { if (!suppress) onChange(ed.getValue()); });
+
+    // Inferred-type hovers. `hoverTypes` holds the open file's (span, ty)
+    // pairs; the provider returns the smallest span containing the cursor.
+    let hoverTypes = [];
+    const contains = (t, ln, col) =>
+      (ln > t.start_line || (ln === t.start_line && col >= t.start_col)) &&
+      (ln < t.end_line || (ln === t.end_line && col <= t.end_col));
+    const spanSize = (t) => (t.end_line - t.start_line) * 100000 + (t.end_col - t.start_col);
+    monaco.languages.registerHoverProvider(["ruby", "html"], {
+      provideHover(_model, position) {
+        let best = null;
+        for (const t of hoverTypes) {
+          if (contains(t, position.lineNumber, position.column) &&
+              (!best || spanSize(t) < spanSize(best))) best = t;
+        }
+        if (!best) return null;
+        return {
+          range: new monaco.Range(best.start_line, best.start_col, best.end_line, best.end_col),
+          contents: [{ value: "inferred type" }, { value: "`" + best.ty + "`" }],
+        };
+      },
+    });
+
+    if (complete) registerTypedCompletion(monaco, ["ruby", "html"], complete);
+
+    return {
+      kind: "monaco",
+      setTypes(types) { hoverTypes = types; },
+      getValue: () => ed.getValue(),
+      // Swap in a fresh model rather than mutating the current model's language:
+      // monaco's Monarch tokenizer can underflow ("pop an empty stack") when a
+      // model's language changes (ruby -> html for an .erb), and a per-file
+      // model is the idiomatic file-switcher pattern anyway.
+      setValue(text, lang) {
+        suppress = true;
+        const prev = ed.getModel();
+        ed.setModel(monaco.editor.createModel(text, lang || "plaintext"));
+        if (prev) prev.dispose();
+        suppress = false;
+      },
+      // Render diagnostics as squiggles on the current model. `diags` are the
+      // wasm contract's DiagnosticOut objects (1-based positions), already
+      // filtered to the open file.
+      setMarkers(diags) {
+        const markers = diags.map((d) => ({
+          startLineNumber: d.start_line, startColumn: d.start_col,
+          endLineNumber: d.end_line, endColumn: d.end_col,
+          message: `[${d.code}] ${d.message}`,
+          severity: d.severity === "error"
+            ? monaco.MarkerSeverity.Error : monaco.MarkerSeverity.Warning,
+        }));
+        monaco.editor.setModelMarkers(ed.getModel(), "roundhouse", markers);
+      },
+      // Scroll to a 1-based line, place the cursor, and flash the line (used by
+      // the studio test panel to jump a failing test to its Ruby source).
+      revealLine(line) {
+        ed.revealLineInCenter(line);
+        ed.setPosition({ lineNumber: line, column: 1 });
+        ed.focus();
+        const ids = ed.deltaDecorations([], [{
+          range: new monaco.Range(line, 1, line, 1),
+          options: { isWholeLine: true, className: "rh-flash-line" },
+        }]);
+        setTimeout(() => { try { ed.deltaDecorations(ids, []); } catch { /* model swapped */ } }, 1500);
+      },
+    };
+  } catch (err) {
+    console.warn("[playground] Monaco unavailable, using textarea fallback:", err.message);
+    const ta = document.createElement("textarea");
+    ta.spellcheck = false;
+    ta.autocapitalize = "off";
+    ta.setAttribute("autocomplete", "off");
+    container.appendChild(ta);
+    ta.addEventListener("input", () => onChange(ta.value));
+    return {
+      kind: "textarea",
+      getValue: () => ta.value,
+      setValue(text) { ta.value = text; },
+      setMarkers() {}, // textarea can't render squiggles; status bar shows counts
+      setTypes() {}, // no hovers in the textarea fallback
+      revealLine(line) { // best-effort: move the caret to the line's start
+        const off = ta.value.split("\n").slice(0, Math.max(0, line - 1)).reduce((n, l) => n + l.length + 1, 0);
+        ta.focus(); ta.setSelectionRange(off, off);
+      },
+    };
+  }
+}
+
+// Read-only output view for the emitted code: a second Monaco instance (giving
+// the output pane syntax highlighting), with a plain <pre> fallback that
+// mirrors the editor's textarea fallback. setValue(text, lang) swaps both the
+// content and the highlighting grammar (lang is a Monaco language id; targets
+// without a Monaco grammar pass "plaintext").
+export async function createOutputView(container) {
+  try {
+    const monaco = await loadMonaco();
+    const ed = monaco.editor.create(container, {
+      value: "", language: "plaintext", readOnly: true, domReadOnly: true,
+      automaticLayout: true, minimap: { enabled: false }, fontSize: 13,
+      scrollBeyondLastLine: false, tabSize: 2,
+    });
+    let curLang = "plaintext";
+    return {
+      kind: "monaco",
+      // Fresh model per file (same reason as the editor's setValue above); the
+      // editor's readOnly option applies to whatever model it shows.
+      // `preserveView` keeps the scroll/cursor across the model swap, so that
+      // editing a source file (which re-emits the SAME output file) doesn't
+      // bounce the output pane back to the top. We still swap the model (the
+      // Monarch tokenizer can underflow on an in-place language change), but
+      // restoreViewState reinstates the scroll offset on the new model.
+      setValue(text, lang, preserveView) {
+        lang = lang || "plaintext";
+        const state = preserveView && lang === curLang ? ed.saveViewState() : null;
+        const prev = ed.getModel();
+        ed.setModel(monaco.editor.createModel(text, lang));
+        if (prev) prev.dispose();
+        if (state) ed.restoreViewState(state);
+        curLang = lang;
+      },
+    };
+  } catch (err) {
+    const pre = document.createElement("pre");
+    container.appendChild(pre);
+    return { kind: "pre", setValue(text) { pre.textContent = text; } };
+  }
+}

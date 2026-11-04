@@ -1,0 +1,6 @@
+close woke the reader 30 times
+true
+"EOFError: end of file reached"
+gets: stream closed in another thread
+"write: stream closed in another thread"
+churn survived

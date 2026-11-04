@@ -1,0 +1,62 @@
+//! Python type rendering helpers.
+
+use crate::ty::Ty;
+
+// Types ----------------------------------------------------------------
+
+pub fn python_ty(ty: &Ty) -> String {
+    match ty {
+        Ty::Int => "int".to_string(),
+        Ty::Float => "float".to_string(),
+        Ty::Bool => "bool".to_string(),
+        Ty::Str | Ty::Sym => "str".to_string(),
+        // Python has `datetime.datetime`. Temporal columns store ISO-8601
+        // text (a `str` backing attribute) and read back as a real
+        // `datetime` via an explicit parsing `@property` — see the temporal
+        // branch in python/library.rs and `Roundhouse.RhDateTime.parse`.
+        Ty::Time => "datetime.datetime".to_string(),
+        Ty::Date => crate::emit::diagnostics::unsupported_date_ty("python"),
+        Ty::Nil => "None".to_string(),
+        // A self type the analyzer should have substituted with
+        // the receiving class (see `Ty::SelfInstance`). Reaching
+        // here is a defect: report, never guess a class.
+        Ty::SelfInstance => {
+            return crate::emit::diagnostics::unsupported_self_instance_ty("python");
+        }
+        // Analysis-time relation type — erased by query specialization
+        // before emit (see `Ty::Relation`). Reaching here is a
+        // coverage gap: report, never degrade to `list[T]`.
+        Ty::Relation { of } => {
+            return crate::emit::diagnostics::unsupported_relation_ty("python", of);
+        }
+        Ty::Array { elem } => format!("list[{}]", python_ty(elem)),
+        Ty::Hash { key, value } => format!("dict[{}, {}]", python_ty(key), python_ty(value)),
+        Ty::Tuple { elems } => {
+            let parts: Vec<String> = elems.iter().map(python_ty).collect();
+            format!("tuple[{}]", parts.join(", "))
+        }
+        Ty::Record { .. } => "dict[str, object]".to_string(),
+        Ty::Union { variants } => {
+            // PEP 604 union syntax: `A | B | C`. Python 3.10+.
+            let parts: Vec<String> = variants.iter().map(python_ty).collect();
+            parts.join(" | ")
+        }
+        Ty::Class { id, .. } => match id.0.as_str() {
+            "Time" => "str".to_string(),
+            // Flatten a qualified `Foo::Bar` nominal type to its last
+            // segment — `::` is never valid in a Python annotation, and
+            // flat-module emit imports each class by its bare name.
+            other => other.rsplit("::").next().unwrap_or(other).to_string(),
+        },
+        Ty::Fn { .. } => "object".to_string(),
+        Ty::Var { .. } => "object".to_string(),
+        // RBS-declared `untyped` — Python's gradual escape is
+        // `typing.Any`. Importing `Any` is the emitter caller's
+        // responsibility (typically already pulled in via `from typing
+        // import Any` at the top of generated modules).
+        Ty::Untyped => "Any".to_string(),
+        // Bottom type — Python's `typing.Never` (3.11+) or
+        // `NoReturn` (older). Used for divergent expressions.
+        Ty::Bottom => "Never".to_string(),
+    }
+}

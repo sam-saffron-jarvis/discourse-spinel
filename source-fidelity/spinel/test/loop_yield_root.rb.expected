@@ -1,0 +1,7 @@
+each_line seen=300 bad=0
+each_char seen=1392 bad=0
+Dir#each seen=42 bad=0
+ARGF.each_line seen=200 bad=0
+each_line rebound seen=300 bad=0
+each_char rebound seen=1392 bad=0
+Dir#each rebound seen=42 bad=0

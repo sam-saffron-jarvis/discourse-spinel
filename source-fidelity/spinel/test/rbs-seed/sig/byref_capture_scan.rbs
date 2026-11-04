@@ -1,0 +1,5 @@
+module V
+  def self.one_into: (String io, untyped x) -> nil
+  def self.all_into: (String io, untyped items) -> nil
+  def self.all: (untyped items) -> String
+end

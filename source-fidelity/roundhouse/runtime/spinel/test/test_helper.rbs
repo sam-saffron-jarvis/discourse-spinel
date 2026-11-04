@@ -1,0 +1,410 @@
+# RBS sidecar for runtime/spinel/test/test_helper.rb. Matches the
+# convention used across runtime/ruby/ (hand-maintained signatures
+# alongside each .rb), extended here into the spinel-target test
+# shim where it was previously absent.
+#
+# Where signatures are permissive (`untyped` for some param/return
+# types), it's because the underlying Ruby surface is genuinely
+# polymorphic — params hashes carry mixed Symbol/String keys and
+# arbitrary leaf values, assertion helpers receive `untyped` lhs/rhs.
+# Methods whose Ruby body has a single statically-determinable shape
+# (notably `stringify_keys` after its restructure to inline the
+# Hash-vs-leaf check at call sites) get concrete signatures — keeps
+# inference clean across every strict-typed target.
+
+module SchemaSetup
+  def self.reset!: () -> void
+end
+
+module FixtureLoader
+  def self.load_all!: () -> void
+end
+
+# Dom primitive surface — the cross-target contract `assert_select`
+# lowers to (mirrored by the per-target test runtimes: TS `Dom`,
+# Python `Dom`, Rust `dom_*`, Elixir `Dom`, …). `parse` yields an
+# opaque document; `select` yields opaque nodes scoped to a root
+# (document or node); `text` reads a node's concatenated descendant
+# text. The stub represents both doc and node as the html String and
+# substring-matches; a real CSS engine keeps this surface and returns
+# tree/node handles instead. `fragment_for` is the stub's selector →
+# substring rule and goes away under a real engine.
+module Dom
+  def self.parse: (String html) -> String
+  def self.select: (String root, String selector) -> Array[String]
+  def self.text: (String node) -> String
+  def self.unescape: (String s) -> String
+  def self.fragment_for: (String selector) -> String
+  def self.selector_attrs: (String chunk) -> Array[String]
+  def self.target_chunk: (String selector) -> String
+  def self.element_chunk?: (String chunk) -> bool
+  def self.tag_start: (String root, Integer i) -> Integer
+  def self.tag_named?: (String tag, String want) -> bool
+  def self.tag_classes: (String tag) -> Array[String]
+  def self.selector_tag: (String base) -> String
+  def self.selector_id: (String base) -> String
+  def self.selector_classes: (String base) -> Array[String]
+  def self.without_id: (String base) -> String
+end
+
+# Captured response from a dispatched in-process request. The four
+# attr_readers + `?` query methods are exercised by emitted controller
+# tests via `assert_response` / `assert_redirected_to` / `assert_select`.
+# ActiveJob::TestHelper — Rails' enqueue assertions over the `:test`
+# adapter. Undeclared until the campfire lane found `test_helper.rb:454`
+# ("variable has incomplete type 'void'"): `perform_enqueued_jobs`
+# returns its block's value out of a `begin`/`ensure`, and with no
+# declared return the temp holding it took the block's void type.
+# Declared `-> void` because that is how every call site uses it.
+module ActiveJob
+  module TestHelper
+    # `ActiveJob.performed` is `Array[String]` (runtime/active_job.rbs),
+    # so both the filter and its answer are job NAMES.
+    def capture_enqueued_jobs: (Array[String] only) { () -> void } -> Array[String]
+    def assert_enqueued_jobs: (Integer count, ?only: Array[String]) { () -> void } -> void
+    def assert_no_enqueued_jobs: (?only: Array[String]) { () -> void } -> void
+    def perform_enqueued_jobs: (?only: Array[String]) { () -> void } -> void
+    # `args:` is declared and DELIBERATELY unread by the body — the
+    # divergence is stated in the .rb beside it. A signature that
+    # dropped the parameter would stop the call sites compiling rather
+    # than make the divergence visible.
+    def assert_enqueued_with: (?job: String, ?args: untyped) { () -> void } -> void
+  end
+end
+
+# ActionCable::TestHelper — the DELTA-taking twin of the turbo helpers
+# on TestBase (Action Cable's own helper takes a delta in every
+# version; turbo-rails at campfire's pin does not).
+module ActionCable
+  module TestHelper
+    def capture_broadcasts_on: (String stream) { () -> void } -> Array[Hash[Symbol, untyped]]
+    def assert_broadcasts: (String stream, Integer count) { () -> void } -> void
+    def assert_no_broadcasts: (String stream) { () -> void } -> void
+    def assert_broadcast_on: (String stream, untyped data) ?{ () -> void } -> void
+  end
+end
+
+# `ActionDispatch::Http::UploadedFile` is the runtime's own
+# (sig/runtime/multipart.rbs); `fixture_file_upload` builds one.
+module ActionDispatch
+
+  # Where Rails keeps `fixture_file_upload` — a plain
+  # `ActiveSupport::TestCase` does not get it for free, so a test that
+  # needs it writes `include ActionDispatch::TestProcess` and the module
+  # has to exist under that name. `TestBase` includes it as well.
+  module TestProcess
+    def fixture_file_upload: (String name, ?String content_type) -> ActionDispatch::Http::UploadedFile
+  end
+end
+
+# rack-test's StringIO form; it is the file params carry.
+module Rack
+  module Test
+    class UploadedFile < ActionDispatch::Http::UploadedFile
+      def initialize: (StringIO io, ?String content_type, ?bool binary, original_filename: String) -> void
+    end
+  end
+end
+
+class ActionResponse
+  def status: () -> Integer
+  def body: () -> String
+  def location: () -> String?
+  def flash: () -> ActionDispatch::Flash
+  def cookies: () -> ActionController::CookieJar
+  def content_type: () -> String
+  def media_type: () -> String
+  # Rails' mixed `{max_age: Integer, ?public: true}` — the one bag in
+  # the harness, and deliberately not in the shared runtime (see
+  # ActionController::Base's two typed readers).
+  def cache_control: () -> Hash[Symbol, untyped]
+  # A decoded JSON tree is Array-or-Hash-or-scalar all the way down;
+  # `untyped` is what that is, and the second declared bag in this
+  # harness for the same kind of reason as the first.
+  def parsed_body: () -> untyped
+  # ASSEMBLED from the fields this response carries (see the .rb), and
+  # lowercase-keyed the way Rack 3 normalizes — the values are the
+  # response's own Strings, not the caller's Hash.
+  def headers: () -> Hash[String, String]
+
+  def initialize: (
+    status: Integer,
+    body: String,
+    location: String?,
+    flash: ActionDispatch::Flash,
+    # DECLARED, and load-bearing. This entry was missing while every
+    # parameter after it was required, which is a drift that costs
+    # nothing — until an OPTIONAL one is added behind it. spinel then
+    # binds the call's `cookies:` argument to the first declared
+    # optional it can reach and reports `no implicit conversion of
+    # ActionController::CookieJar into String`, naming the new parameter
+    # rather than the missing one.
+    cookies: ActionController::CookieJar,
+    ?content_type: String,
+    ?cache_control_max_age: Integer,
+    ?cache_control_public: bool,
+    # Declared in the same position as the Ruby `initialize` — see the
+    # `cookies:` comment above about why order here must track order
+    # there. nil for `relation_find_test.rb`'s bare responses, which
+    # never touch Cache-Control; `cache_control` falls back to the two
+    # legacy readers above when this is nil.
+    ?cache_control_store: ActionController::CacheControlStore?,
+    # The comment above about an OPTIONAL parameter behind a missing
+    # one applies to this entry too: `headers:` was in the Ruby
+    # `initialize` and not here.
+    ?headers: Hash[String, String]
+  ) -> void
+
+  def redirect?: () -> bool
+  def success?: () -> bool
+  def unprocessable?: () -> bool
+end
+
+# Base class for every emitted test. Roundhouse-owned, no Minitest
+# dependency. `setup` / `teardown` are no-op lifecycle hooks the per-
+# test shim invokes; subclasses override and may `super`.
+class TestSkipped < Exception
+end
+
+class TestBase
+  def initialize: () -> void
+  # Rails' default: each example runs inside a non-joinable transaction.
+  # A class sets this false when it has to see a real COMMIT.
+  def self.use_transactional_tests: () -> bool
+  def setup: () -> void
+  def teardown: () -> void
+  def file_fixture: (String name) -> Pathname
+
+  include ActionDispatch::TestProcess
+
+  # `assert_match` isn't lowered by inline_assertions (nil-handling
+  # divergence across targets). Method body stays; RBS pins the
+  # contract. (`assert_operator` retired — Class-subclass `<` rewritten
+  # to direct `assert <Class> < <Class>` form.)
+  def assert_match: (Regexp pattern, String? value, ?String? msg) -> void
+  def assert_no_match: (Regexp pattern, String? value, ?String? msg) -> void
+
+  # ---- Declared because an UNDECLARED body is not a free pass -----
+  #
+  # spinel infers an undeclared method's body on its own, and where the
+  # body opens a poly slot the inference cannot close it: campfire's
+  # `rooms_controller_test` failed its C compile on
+  # `test_helper.rb:844` — the `end` of `turbo_stream_name`, whose
+  # `streamables.is_a?(Array) ? streamables : [streamables]` assigns an
+  # `sp_PolyArray *` into an `sp_RbVal` slot. One declaration turned
+  # that whole test file. The sidecar had 52 declarations for 70
+  # definitions; these are the ones the campfire lane proved load-
+  # bearing, and the rest are named in the same sweep so the gap does
+  # not reopen one method at a time.
+  def dom_id: (untyped record, ?String? suffix) -> String
+  def turbo_stream_name: (untyped streamables) -> String
+
+  # ActiveSupport::Testing::TimeHelpers. `travel_to` takes an OPTIONAL
+  # block (`return unless block_given?`), which is the shape, not a
+  # convenience — declaring it required would misdescribe every
+  # blockless call the corpus makes.
+  def travel_to: (untyped target) ?{ () -> void } -> void
+  def travel: (untyped duration) ?{ () -> void } -> void
+  def freeze_time: () ?{ () -> void } -> void
+  def stub_const: (untyped mod, Symbol constant, untyped value) ?{ () -> void } -> void
+  def travel_back: () -> void
+
+  # `assert_difference -> { Model.count }, +1 do … end`. The expression
+  # is a Proc whose value is subtracted, so it answers Integer; the
+  # difference is compared against that.
+  def assert_difference: (untyped expression, ?Integer difference, ?String? message) { () -> void } -> void
+  def assert_no_difference: (untyped expression, ?String? message) { () -> void } -> void
+
+  # `assert_changes` compares the expression's value before and after,
+  # so unlike `assert_difference` it is not numeric — `from:`/`to:` are
+  # whatever the expression answers.
+  def assert_changes: (untyped expression, ?String? message, ?from: untyped, ?to: untyped) { () -> void } -> void
+  def assert_no_changes: (untyped expression, ?String? message) { () -> void } -> void
+  # The mail log counts; see the .rb for what is not checked. `args:` is
+  # declared and deliberately unread, like `assert_enqueued_with`'s.
+  def assert_enqueued_emails: (Integer count) ?{ () -> void } -> void
+  def assert_enqueued_email_with: (String mailer, Symbol method, ?args: untyped) ?{ () -> void } -> void
+  def skip: (?String message) -> void
+
+  # Turbo::Broadcastable::TestHelper. `capture_` answers the LOG
+  # entries themselves — Symbol-keyed rows carrying action/stream/
+  # target/html, which is the one bag `Broadcasts.log` really is.
+  def capture_turbo_stream_broadcasts: (untyped streamables) { () -> void } -> Array[Hash[Symbol, untyped]]
+  def assert_turbo_stream_broadcasts: (untyped streamables, ?count: Integer) { () -> void } -> void
+  def assert_no_turbo_stream_broadcasts: (untyped streamables) { () -> void } -> void
+end
+
+# ActionDispatch::IntegrationTest parent — emitted controller tests
+# inherit from this. Pure mixin of RequestDispatch; no methods of its
+# own here.
+module ActionDispatch
+  module Assertions
+    module RoutingAssertions
+      def assert_recognizes: (Hash[Symbol, untyped] expected_options, String | Hash[Symbol, untyped] path, ?Hash[untyped, untyped] extras, ?String? message) -> void
+      def recognized_path_parameters: (String verb, String path) -> Hash[String, untyped]
+      def assert_generates: (String expected_path, Hash[Symbol, untyped] options, ?Hash[Symbol, untyped] defaults, ?Hash[Symbol, untyped] extras, ?String? message) -> void
+      def assert_routing: (String | Hash[Symbol, untyped] path, Hash[Symbol, untyped] options, ?Hash[Symbol, untyped] defaults, ?Hash[Symbol, untyped] extras, ?String? message) -> void
+      def generation_parts: (Hash[Symbol, untyped] options) -> Hash[String, String]
+      def generated_route: (Hash[String, String] given) -> ActionDispatch::Router::Route
+      def generation_options_text: (Hash[String, String] given) -> String
+      def generation_segment_names: (String pattern) -> Array[String]
+      def generated_route_path: (ActionDispatch::Router::Route route, Hash[String, String] given) -> String
+      def generated_query_keys: (ActionDispatch::Router::Route route, Hash[String, String] options) -> Array[String]
+    end
+  end
+
+  class IntegrationTest < TestBase
+  end
+
+  # A standalone client — RequestDispatch on an object that is not a
+  # test case. See the .rb.
+  module Integration
+    class Session
+      def initialize: (untyped app) -> void
+    end
+  end
+end
+
+# The three other test-case parents — bare subclasses of TestBase so
+# a file declaring one loads; see the .rb for what each still lacks.
+module ActionView
+  class TestCase < TestBase
+  end
+end
+
+module ActionCable
+  module Channel
+    # The channel harness (see the .rb). `subscribe_to` is what
+    # `lower::cable_test_case` rewrites a test's `subscribe k: v` to;
+    # `subscription` is the channel it built, typed as the base class
+    # the generated factory answers.
+    class TestCase < TestBase
+      def stub_connection: (?current_user: untyped) -> void
+      def self.identifier: (String channel, Array[String] keys, Array[String] values) -> String
+      def subscribe_to: (String channel, Array[String] keys, Array[String] values) -> void
+      def subscription: () -> ActionCable::Channel::Base
+      def unsubscribe: () -> void
+      def assert_has_stream: (untyped stream) -> void
+    end
+  end
+
+  module Connection
+    class TestCase < TestBase
+      def cookies: () -> ActionController::CookieJar
+      def connect: () -> void
+      def assert_reject_connection: () { () -> void } -> void
+    end
+  end
+end
+
+# In-process request dispatch. The four HTTP-verb helpers route
+# through `dispatch_request`. `stringify_keys` is strictly typed
+# `(Hash) -> Hash`; the polymorphism (Hash vs leaf) lives in the
+# caller's ternary, not on this boundary. Keeps inference clean
+# across every strict-typed target.
+module RequestDispatch
+  # `headers:` is raw CGI env (`"REMOTE_ADDR" => "203.0.113.1"`),
+  # merged onto the env the dispatch builds. String=>String on the
+  # wire; declared wide because a test may pass Symbol keys or a
+  # non-String value (`content_length: 1.gigabyte`) and the body
+  # `to_s`es both.
+  #
+  # `env:` is Rails' other spelling of the same thing, and the body
+  # merges the two before handing them on, so it is declared with the
+  # identical element type. It was MISSING here while the `.rb` had it
+  # — a signature describing three parameters for a four-parameter
+  # method — which is drift worth closing on its own.
+  #
+  # It is NOT, however, why `headers.merge(env)` fails to compile under
+  # spinel: adding it left the error ledger byte-identical. That is
+  # spinel#4172 — a `Hash#merge` whose argument is keyed differently
+  # resolves to `ActionDispatch::Flash#merge` instead. Do not "fix" it
+  # from this file.
+  def get: (String path, ?params: Hash[untyped, untyped], ?headers: Hash[untyped, untyped], ?env: Hash[untyped, untyped], ?xhr: bool, ?as: Symbol?) -> ActionResponse
+  def post: (String path, ?params: Hash[untyped, untyped], ?headers: Hash[untyped, untyped], ?env: Hash[untyped, untyped], ?xhr: bool, ?as: Symbol?) -> ActionResponse
+  def patch: (String path, ?params: Hash[untyped, untyped], ?headers: Hash[untyped, untyped], ?env: Hash[untyped, untyped], ?xhr: bool, ?as: Symbol?) -> ActionResponse
+  def put: (String path, ?params: Hash[untyped, untyped], ?headers: Hash[untyped, untyped], ?env: Hash[untyped, untyped], ?xhr: bool, ?as: Symbol?) -> ActionResponse
+  def head: (String path, ?params: Hash[untyped, untyped], ?headers: Hash[untyped, untyped], ?env: Hash[untyped, untyped], ?xhr: bool, ?as: Symbol?) -> ActionResponse
+  def follow_redirect!: () -> ActionResponse
+  def delete: (String path, ?params: Hash[untyped, untyped], ?headers: Hash[untyped, untyped], ?env: Hash[untyped, untyped], ?xhr: bool, ?as: Symbol?) -> ActionResponse
+  def xhr_headers: (Hash[untyped, untyped] headers, bool xhr) -> Hash[untyped, untyped]
+
+  def open_session: () -> ActionDispatch::Integration::Session
+  def status: () -> Integer
+  def env_key: (String name) -> String
+
+  def dispatch_request: (
+    String method,
+    String path,
+    Hash[untyped, untyped] params,
+    ?Hash[untyped, untyped] headers,
+    ?Symbol? as
+  ) -> ActionResponse
+
+  def run_controller: (
+    ActionController::Base controller,
+    Symbol action,
+    Hash[String, String] path_params,
+    Symbol? req_format,
+    String method,
+    String wire_method,
+    String path,
+    String query,
+    untyped params,
+    Hash[untyped, untyped] headers,
+    Symbol? as
+  ) -> ActionResponse
+
+  # Recursive Hash-keys-to-strings. Strictly `(Hash) -> Hash`; non-
+  # Hash values are filtered out at the call site (caller wraps the
+  # call in `v.is_a?(Hash) ? stringify_keys(v) : v`). Return value
+  # type is `Hash[String, untyped]` — keys always String via `k.to_s`,
+  # values are recursive Hash | original-leaf, both unified as untyped.
+  def stringify_keys: (Hash[untyped, untyped] hash) -> Hash[String, untyped]
+  # `stringify_keys` for an Array value, at any depth of nesting.
+  def stringify_list: (Array[untyped] list) -> Array[untyped]
+
+  def assert_response: (Symbol | Integer expected, ?String? message) -> void
+  def assert_redirected_to: (String expected_path, ?ActionResponse response) -> void
+
+  # Two positional + optional content/opts forms + optional block.
+  # The FIRST parameter is Rails' overload: a String is the selector
+  # and the last response is the haystack; anything else is a ROOT
+  # NODE to search instead, and the selector shifts one right
+  # (campfire's turbo_test_helper hands it a Nokogiri fragment built
+  # from the pubsub queue). Hence `untyped` rather than `String` — the
+  # root is whatever HTML library the app's own test reached for, and
+  # this file cannot name it.
+  #
+  # Second arg is either the selector (root form), the content string
+  # to match against the rendered tag, or an options Hash, or nil.
+  # Returns void (raises on mismatch).
+  def assert_select: (
+    untyped selector_or_root,
+    ?(String | Hash[Symbol, untyped])? content_or_opts,
+    ?Hash[Symbol, untyped]? opts
+  ) { () -> void } -> void
+       | (
+    untyped selector_or_root,
+    ?(String | Hash[Symbol, untyped])? content_or_opts,
+    ?Hash[Symbol, untyped]? opts
+  ) -> void
+end
+
+# ActionController::TestCase: a functional test (see test_helper.rb).
+module ActionController
+  class TestCase < TestBase
+    include RequestDispatch
+    include ActionDispatch::Assertions::RoutingAssertions
+    def get: (Symbol | String action, ?params: Hash[untyped, untyped], ?session: Hash[untyped, untyped], ?flash: Hash[untyped, untyped], ?format: (Symbol | String)?, ?xhr: bool, ?as: Symbol?) -> ActionResponse
+    def post: (Symbol | String action, ?params: Hash[untyped, untyped], ?session: Hash[untyped, untyped], ?flash: Hash[untyped, untyped], ?format: (Symbol | String)?, ?xhr: bool, ?as: Symbol?) -> ActionResponse
+    def patch: (Symbol | String action, ?params: Hash[untyped, untyped], ?session: Hash[untyped, untyped], ?flash: Hash[untyped, untyped], ?format: (Symbol | String)?, ?xhr: bool, ?as: Symbol?) -> ActionResponse
+    def put: (Symbol | String action, ?params: Hash[untyped, untyped], ?session: Hash[untyped, untyped], ?flash: Hash[untyped, untyped], ?format: (Symbol | String)?, ?xhr: bool, ?as: Symbol?) -> ActionResponse
+    def delete: (Symbol | String action, ?params: Hash[untyped, untyped], ?session: Hash[untyped, untyped], ?flash: Hash[untyped, untyped], ?format: (Symbol | String)?, ?xhr: bool, ?as: Symbol?) -> ActionResponse
+    def head: (Symbol | String action, ?params: Hash[untyped, untyped], ?session: Hash[untyped, untyped], ?flash: Hash[untyped, untyped], ?format: (Symbol | String)?, ?xhr: bool, ?as: Symbol?) -> ActionResponse
+    def session: () -> ActionDispatch::Session
+    def flash: () -> ActionDispatch::Flash
+    def process: (Symbol | String action, String method, Hash[untyped, untyped] params, Hash[untyped, untyped] session_values, Hash[untyped, untyped] flash_values, (Symbol | String)? format, bool xhr, Symbol? as) -> ActionResponse
+    def test_request_param: (untyped value) -> untyped
+  end
+end

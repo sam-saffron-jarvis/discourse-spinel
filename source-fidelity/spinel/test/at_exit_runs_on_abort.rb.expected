@@ -1,0 +1,3 @@
+body
+hook 2 (registered last, runs first)
+hook 1 (registered first, runs last)

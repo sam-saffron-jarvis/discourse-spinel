@@ -1,0 +1,209 @@
+#!/usr/bin/env bash
+# scripts/campfire-docker-files — write the Docker archive's Dockerfile and README.
+#
+# Called by scripts/build-campfire-archive with the staged Docker context:
+#   campfire-docker-files DIR ROUNDHOUSE_SHA CAMPFIRE_SHA SPINEL_VERSION
+#
+# DIR already holds pack/ (the `spin pack` output: generated C, runtime
+# source, native package source, Makefile) and app/ (what the binary reads
+# at run time: static assets, public/, db/, config/). This writes the two
+# files a downloader reads first, and the image's entry point (boot).
+#
+# WHY clang. The build is one 12 MB translation unit and nothing else of
+# consequence, so it is pure single-core compiler speed: on the same
+# trixie image gcc 14 takes 73 s and clang 19 takes 33 s (2026-09-10,
+# Apple silicon, arm64 native). The compiler never reaches the runtime
+# image, so its apt weight costs the download nothing.
+#
+# The source archive's README is written by scripts/campfire-archive-files;
+# a prerequisite that changes there may need to change here too.
+
+set -euo pipefail
+
+DIR="$1"; ROUNDHOUSE_SHA="$2"; CAMPFIRE_SHA="$3"; SPINEL_VERSION="$4"
+
+# This recipe needs only Docker's bundled frontend. A syntax directive
+# would fetch another image from Docker Hub before even reading the build.
+cat > "$DIR/Dockerfile" <<'DOCKERFILE'
+# ONCE Campfire, transpiled by Roundhouse and compiled by Spinel.
+#
+# Two stages. The first compiles pack/ — the generated C plus the Spinel
+# runtime as source, with a Makefile that needs a C compiler and make and
+# nothing else. The second carries only the binary and what it reads at
+# run time. clang, not gcc: the build is one 12 MB translation unit, and
+# clang compiles it in under half the time.
+
+FROM debian:trixie-slim AS build
+RUN apt-get update -qq && \
+    apt-get install --no-install-recommends -y clang make libsqlite3-dev libjemalloc-dev libvips-dev && \
+    rm -rf /var/lib/apt/lists/*
+COPY pack /src
+RUN make -C /src -j"$(nproc)" CC=clang
+
+FROM debian:trixie-slim
+# ca-certificates: the CA store the binary's OpenSSL verifies against —
+# link unfurls, webhooks and Web Push all leave over https, and
+# debian:trixie-slim has no store at all.
+RUN apt-get update -qq && \
+    apt-get install --no-install-recommends -y ca-certificates libsqlite3-0 libjemalloc2 libvips42 ffmpeg && \
+    rm -rf /var/lib/apt/lists/*
+# The server runs as an unprivileged user, as campfire's own image does
+# (uid 1000, named for that image's `rails`).
+RUN groupadd --system --gid 1000 campfire && \
+    useradd campfire --uid 1000 --gid 1000 --no-create-home --shell /usr/sbin/nologin
+WORKDIR /app
+COPY app/ ./
+COPY --from=build /src/campfire ./campfire
+# The SQLite database lives here; mount a volume to keep it across runs.
+RUN mkdir -p storage && chown 1000:1000 storage
+VOLUME /app/storage
+# boot starts as root only to hand /app/storage to uid 1000 — a volume
+# created by an earlier image holds root-owned files — then the server
+# runs as that user. Started with `--user`, it skips straight to the
+# server.
+# The archive already carries boot's executable mode; COPY preserves it.
+COPY boot ./boot
+ENV PORT=3000
+# #865 taught the server to bind localhost in development (Rails'
+# ServerCommand#host). Published Docker ports only reach the container's
+# non-loopback interfaces, so the image must listen on 0.0.0.0 — same as
+# production / `rails server -b 0.0.0.0`. Override with `-e BINDING=…`.
+ENV BINDING=0.0.0.0
+EXPOSE 3000
+CMD ["./boot"]
+DOCKERFILE
+
+cat > "$DIR/boot" <<'BOOT'
+#!/bin/sh
+# The image's entry point: see the Dockerfile's note above COPY boot.
+set -e
+if [ "$(id -u)" = 0 ]; then
+  chown -R 1000:1000 /app/storage
+  exec setpriv --reuid=1000 --regid=1000 --init-groups ./campfire "$@"
+fi
+exec ./campfire "$@"
+BOOT
+chmod 755 "$DIR/boot"
+
+cat > "$DIR/README.md" <<README
+# ONCE Campfire → spinel, for Docker
+
+[ONCE Campfire](https://github.com/basecamp/once-campfire) — Basecamp's
+MIT-licensed chat app — transpiled from its Rails source by
+[Roundhouse](https://roundhouse-rb.dev/), compiled ahead-of-time
+to C by the [Spinel](https://github.com/matz/spinel) Ruby VM, and packaged
+so that building it needs Docker and nothing else.
+
+What is in the box: \`pack/\` is the generated C and the Spinel runtime as
+source with a Makefile (\`spin pack\` wrote it — a C compiler and \`make\`
+build it, no Spinel required); \`app/\` is what the binary reads at run
+time — prebuilt static assets, the error pages, the seed; the
+\`Dockerfile\` compiles the one and ships the other.
+
+## Provenance
+
+| | |
+|---|---|
+| roundhouse | \`$ROUNDHOUSE_SHA\` |
+| once-campfire | \`$CAMPFIRE_SHA\` |
+| spinel | \`$SPINEL_VERSION\` |
+
+Unlike the source archive, this one does not depend on a Spinel checkout:
+the runtime it was generated against travels with it.
+
+## Prerequisites
+
+- Docker (or anything that builds a Dockerfile — podman works)
+
+## Build
+
+Compiles the C — one whole-program translation unit, a minute or two on a
+fast machine, longer on a slow one — and produces a ~600 MB image:
+\`debian:trixie-slim\` plus the CA certificates and the SQLite, jemalloc
+and libvips runtime libraries and ffmpeg. libvips resizes the uploads —
+attachments, avatars, the account logo — into the variants Rails serves;
+ffmpeg makes the video previews. Those two are most of the size: the
+binary is about 11 MB.
+
+\`\`\`sh
+docker build -t campfire .
+\`\`\`
+
+## Run
+
+Serves campfire on http://localhost:3000. The first visit lands on
+campfire's own first-run page, which creates the account, the first user,
+and the first room. The database is created on demand in \`/app/storage\`;
+the named volume keeps it across container restarts. The image sets
+\`BINDING=0.0.0.0\` so \`-p 3000:3000\` reaches the process (development's
+default \`localhost\` bind would only listen inside the container).
+
+\`\`\`sh
+docker run --rm -p 3000:3000 -v campfire-data:/app/storage campfire
+\`\`\`
+
+\`-e PORT=n\` changes the port inside the container; \`-e BINDING=…\`
+overrides the listen address; \`-e SPINEL_WORKERS=n\` caps the OS worker
+threads (default: one per core).
+
+The server runs as uid 1000, not root. The container starts as root only
+to give \`/app/storage\` to that user, so a volume an earlier image
+created as root keeps working; \`--user 1000:1000\` skips that step.
+
+The key that signs cookies and links (sessions, sign-in transfer links,
+stream names) is generated on first run and kept in \`/app/storage\`
+beside the database, so it survives restarts with the volume. To supply
+your own instead — several containers sharing one key, or a key kept out
+of the data volume — generate it once (\`openssl rand -hex 64\`), keep it,
+and pass the same value on every run:
+
+\`\`\`sh
+docker run --rm -p 3000:3000 -v campfire-data:/app/storage \\
+  -e SECRET_KEY_BASE="\$CAMPFIRE_SECRET" campfire
+\`\`\`
+
+An image built from an archive published before 2026-09-28 signed with
+an empty key when \`SECRET_KEY_BASE\` was unset: rebuild from a current
+archive, or pass the variable.
+
+Push notifications need a VAPID key pair, as Rails' campfire does:
+pass \`-e VAPID_PUBLIC_KEY=… -e VAPID_PRIVATE_KEY=…\` (URL-safe Base64
+P-256; \`npx web-push generate-vapid-keys\` makes a pair, as does
+campfire's own \`script/admin/generate-secrets\`). Keep the pair stable —
+browsers subscribe against the public key. Without it the page carries no
+key and browsers never offer to subscribe.
+
+Behind a proxy that terminates TLS (Fly, a load balancer, Kamal's proxy),
+the app builds its absolute URLs with the scheme the proxy reports in
+\`X-Forwarded-Proto\`, as Rails does, so its links and fetches stay https.
+
+## Without Docker
+
+The Dockerfile is a recipe, not a requirement. On Linux with a C
+compiler, \`make\`, \`libsqlite3-dev\`, \`libjemalloc-dev\` and \`libvips-dev\`
+(and \`ffmpeg\` on the path for video previews):
+
+\`\`\`sh
+make -C pack -j CC=clang
+mkdir -p app/storage && cd app && ../pack/campfire
+\`\`\`
+
+On macOS with Homebrew's \`sqlite\`, \`jemalloc\` and \`vips\`, the compiler needs
+telling where they are: append \`-I\$(brew --prefix)/include
+-L\$(brew --prefix)/lib\` to the \`CFLAGS\` line in \`pack/Makefile\`
+(the rest of that line is the program's defines — keep them).
+
+## What is not verified yet
+
+Web push delivery is implemented — the service worker and manifest are
+served, subscriptions are stored, and each message's delivery is
+encrypted and VAPID-signed byte-for-byte as the web-push gem does it —
+but a delivery from this binary to a real browser push service (Google,
+Mozilla, Apple) has not yet been confirmed. Note that campfire, as
+written, deletes a subscription on any OpenSSL error: after a failed
+delivery, subscribe again before retrying. Image uploads — attachments,
+avatars, the account logo — work, persist under \`/app/storage/files\`,
+and are served as the thumbnails Rails would serve (libvips, through the
+spinel-ruby-vips package). See the
+[project page](https://roundhouse-rb.dev/apps/campfire.html).
+README

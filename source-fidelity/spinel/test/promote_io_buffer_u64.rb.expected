@@ -1,0 +1,15 @@
+u64 max-1: => 18446744073709551614
+u64 2**63: => 9223372036854775808
+u64 rt class: => [9223372036854775808, "Integer"]
+u64 arith: => 9223372036854775809
+U64 BE: => [128, 0, 0, 0, 0, 0, 0, 5]
+U64 read: => 9223372036854775813
+u64 -1: => 18446744073709551615
+u64 small: => [7, "Integer"]
+u64 2**64: RangeError: bignum too big to convert into 'unsigned long long'
+u64 -2**63-1: RangeError: bignum out of range of unsigned long long
+s64 big: RangeError: bignum too big to convert into 'long long'
+s64 -2**63: => -9223372036854775808
+values u64: => [9223372036854775817, 3]
+get_values u64: => [9223372036854775817, 3]
+each u64: => [[0, 9223372036854775817], [8, 3]]

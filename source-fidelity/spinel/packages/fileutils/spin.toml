@@ -1,0 +1,7 @@
+[package]
+name = "fileutils"
+
+# Pre-installed spin package: ships with the compiler, versioned with it.
+# Plain Ruby over Dir and File -- no carried C. Everything FileUtils does is
+# a loop and a path calculation on top of primitives spinel already has, so
+# the package is the loop and the path calculation, nothing else.

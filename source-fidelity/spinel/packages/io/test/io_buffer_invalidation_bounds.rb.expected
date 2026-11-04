@@ -1,0 +1,21 @@
+read after source free: IO::Buffer::InvalidatedError: Buffer has been invalidated!
+null?: => false
+valid?: => false
+read after source shrink: IO::Buffer::InvalidatedError: Buffer has been invalidated!
+read after source transfer: IO::Buffer::InvalidatedError: Buffer has been invalidated!
+get_string after free: IO::Buffer::InvalidatedError: Buffer has been invalidated!
+huge off get: ArgumentError: Type extends beyond end of buffer! (offset=4611686018427387904 > size=8)
+huge off+len get_string: ArgumentError: Specified offset+length is bigger than the buffer size!
+huge set_string off: ArgumentError: Specified offset+length is bigger than the buffer size!
+huge clear: ArgumentError: Specified offset+length is bigger than the buffer size!
+huge copy off: ArgumentError: Specified offset+length is bigger than the buffer size!
+huge slice: ArgumentError: Specified offset+length is bigger than the buffer size!
+huge each offset: ArgumentError: The given offset is bigger than the buffer size!
+valid slice still works: => "QQQQ"
+gs(9,0): ArgumentError: Specified offset+length is bigger than the buffer size!
+ss(ab,7,5): ArgumentError: Specified offset+length is bigger than the buffer size!
+copy both bad: ArgumentError: The given source offset is bigger than the source itself!
+each off>size: ArgumentError: The given offset is bigger than the buffer size!
+each off=size: => []
+values off>size: ArgumentError: The given offset is bigger than the buffer size!
+each neg: ArgumentError: Offset can't be negative!

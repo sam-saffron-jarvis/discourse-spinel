@@ -1,0 +1,417 @@
+#!/usr/bin/env ruby
+# scripts/lobsters-rails-replay — the Rails half of the P6 comparison.
+#
+# Boots the REAL ruby-bench lobsters app the way its benchmark.rb does
+# (RAILS_ENV=production, file DB copied into :memory: via SQLite3::Backup),
+# generates the benchmark's frozen route sequence (RouteGenerator, RNG seed
+# 0x1be52551fc152997 — 114 authenticated GET visits), then replays it with
+# the ruby-bench timing rule:
+#
+#   WARMUP_ITRS full-sequence iterations, discarded from the stats, then
+#   keep iterating until >= MIN_BENCH_ITRS timed iterations AND the TOTAL
+#   wall clock (warmup included, as upstream counts it) >= MIN_BENCH_TIME
+#   seconds. Metric = mean ms per full-sequence iteration over the
+#   non-warmup iterations — the statistic ruby-bench itself reports;
+#   the median rides along as a robustness cross-check.
+#
+# scripts/lobsters-replay --sequence replays the SAME frozen JSON with the
+# SAME rule against the roundhouse emit; keep the two loops in sync.
+#
+# Usage:
+#   scripts/lobsters-rails-replay [--src DIR] [--seq-out PATH] [--json PATH]
+#                                 [--warmup N] [--min-iters N] [--min-time S]
+#                                 [--dump DIR] [--dump-only]
+#
+#   --src DIR      lobsters checkout (default $LOBSTERS_SRC, else
+#                  ~/git/ruby-bench/benchmarks/lobsters)
+#   --seq-out PATH write the frozen sequence as JSON (visits: method/path)
+#   --json PATH    write timing summary JSON
+#   --dump DIR     write each parity-route response body to DIR — the
+#                  REFERENCE side of scripts/lobsters-content-diff, whose
+#                  candidate side is scripts/lobsters-replay --dump. Rails is
+#                  the oracle for what these routes should render, so this is
+#                  what turns "26/26 return 200" into "26/26 render what Rails
+#                  renders". Same route set and same filename derivation as
+#                  lobsters-replay, so the two dirs line up file for file.
+#   --dump-only    dump and exit; skip warmup and timing entirely
+#
+# A `--target futamura` tree passed as --src carries its own whole-route
+# bridge (vendor/futamura/bridge.rb): under Ruby 4.1 with RUBY_BOX=1 the
+# GET actions the analysis cleared are served by the lowered app inside
+# this process, and the summary's "stack" says so. FUTAMURA_WHOLE_ROUTE=off
+# runs the same tree as plain Rails; FUTAMURA_STATS=1 prints how many
+# requests each side served.
+#
+# Self-bootstraps into the lobsters bundle: re-execs itself under
+# `bundle exec` from the --src directory, so it can be run from anywhere.
+
+require "json"
+
+opts = { src: ENV["LOBSTERS_SRC"] || File.expand_path("~/git/ruby-bench/benchmarks/lobsters"),
+         warmup: 15, min_iters: 10, min_time: 10 }
+args = ARGV.dup
+until args.empty?
+  case (a = args.shift)
+  when "--src"       then opts[:src]       = File.expand_path(args.shift)
+  when "--seq-out"   then opts[:seq_out]   = File.expand_path(args.shift)
+  when "--defer"     then opts[:defer]     = File.expand_path(args.shift)
+  when "--json"      then opts[:json]      = File.expand_path(args.shift)
+  when "--warmup"    then opts[:warmup]    = Integer(args.shift)
+  when "--min-iters" then opts[:min_iters] = Integer(args.shift)
+  when "--min-time"  then opts[:min_time]  = Integer(args.shift)
+  when "--dump"      then opts[:dump]      = File.expand_path(args.shift)
+  when "--dump-only" then opts[:dump_only] = true
+  else abort "lobsters-rails-replay: unknown arg #{a}"
+  end
+end
+
+unless ENV["LOBSTERS_RAILS_REPLAY_BOOTSTRAPPED"]
+  ENV["LOBSTERS_RAILS_REPLAY_BOOTSTRAPPED"] = "1"
+  ENV["RAILS_ENV"] = "production"
+  ENV["DISABLE_DATABASE_ENVIRONMENT_CHECK"] = "1"
+  me = File.expand_path(__FILE__) # resolve BEFORE chdir
+  Dir.chdir(opts[:src])
+  # Re-exec under the lobsters bundle with normalized (absolute) args.
+  argv = ["--src", opts[:src], "--warmup", opts[:warmup].to_s,
+          "--min-iters", opts[:min_iters].to_s, "--min-time", opts[:min_time].to_s]
+  argv += ["--seq-out", opts[:seq_out]] if opts[:seq_out]
+  argv += ["--defer", opts[:defer]] if opts[:defer]
+  argv += ["--json", opts[:json]] if opts[:json]
+  argv += ["--dump", opts[:dump]] if opts[:dump]
+  argv << "--dump-only" if opts[:dump_only]
+  if RUBY_ENGINE == "jruby"
+    # The rails-jruby lane: bare `bundle`/`ruby` would resolve CRuby's via
+    # PATH — re-exec explicitly into JRuby's bundler and interpreter.
+    exec("jruby", "-S", "bundle", "exec", "jruby", me, *argv)
+  else
+    exec("bundle", "exec", "ruby", me, *argv)
+  end
+end
+
+# ── self-RSS ─────────────────────────────────────────────────────────
+# This process IS the measurement (in-process replay, no server to
+# sample from outside). VmHWM is the high-water mark since exec, which
+# for one-lane-per-process is this run's peak; macOS has no /proc, so
+# peak comes back nil rather than guessed. Keep in lockstep with
+# scripts/lobsters-replay — the numbers only compare if both sides
+# sample the same way, at the same points.
+def rss_kb
+  if File.exist?("/proc/self/status")
+    File.read("/proc/self/status")[/^VmRSS:\s+(\d+) kB/, 1]&.to_i
+  else
+    `ps -o rss= -p #{Process.pid}`.strip.to_i.nonzero?
+  end
+rescue StandardError
+  nil
+end
+
+def rss_peak_kb
+  return nil unless File.exist?("/proc/self/status")
+  File.read("/proc/self/status")[/^VmHWM:\s+(\d+) kB/, 1]&.to_i
+rescue StandardError
+  nil
+end
+
+# ── boot (mirrors benchmark.rb) ──────────────────────────────────────
+$stderr.puts "booting Rails lobsters (production, in-mem DB)..."
+require_relative File.join(opts[:src], "config/environment")
+require_relative File.join(opts[:src], "route_generator")
+
+# Post-seed ANALYZE: the fixture DB ships with no sqlite_stat1, and
+# without planner statistics SQLite misplans the hottest-stories SELECT
+# (the engine under /rss, /hottest, /recent) — 5.1ms vs 0.05ms per
+# query. Keep this in lockstep with scripts/lobsters-replay — BOTH
+# lanes must get identical stats or the comparison is dishonest.
+if RUBY_ENGINE == "jruby"
+  # AR-JDBC exposes SQLite's online-backup C API through the driver:
+  # restore() is Backup with source/destination swapped — the same move
+  # scripts/lobsters-replay makes for the emit lane's in-memory seed.
+  raw   = ActiveRecord::Base.connection.raw_connection
+  jconn = raw.respond_to?(:connection) ? raw.connection : raw.jdbc_connection
+  sq    = jconn.respond_to?(:getDatabase) ? jconn : jconn.unwrap(org.sqlite.SQLiteConnection.java_class)
+  sq.get_database.restore("main", File.join(opts[:src], "db/production.sqlite3"), nil)
+  st = sq.create_statement
+  st.execute("ANALYZE")
+  st.close
+else
+  mem_db  = ActiveRecord::Base.connection.raw_connection
+  file_db = SQLite3::Database.new(File.join(opts[:src], "db/production.sqlite3"))
+  b = SQLite3::Backup.new(mem_db, "main", file_db, "main")
+  b.step(-1)
+  b.finish
+  file_db.close
+  mem_db.execute("ANALYZE")
+end
+
+# A futamura tree with whole-route replacement on: its bridge booted the
+# lowered app into a Ruby::Box during initialization.
+WHOLE_ROUTE = defined?(Futamura::WholeRoute) && !Futamura::WholeRoute.box.nil?
+$stderr.puts "whole-route: #{Futamura::WholeRoute.actions.size} GET action(s) served by the lowered app" if WHOLE_ROUTE
+
+# Baseline footprint, sampled AFTER the in-memory seed — same point the
+# emit lanes sample, so the shared fixture is inside both baselines.
+BOOT_RSS_KB = rss_kb
+
+# The SQLite build behind ActiveRecord, asked at runtime — the sqlite3
+# gem's bundled library on CRuby, the JDBC driver's on JRuby. Recorded so
+# the report can compare it against the AOT lane's system-linked build.
+SQLITE_RUNTIME = begin
+  ActiveRecord::Base.connection.select_value("select sqlite_version()").to_s
+rescue StandardError
+  nil
+end
+
+app = Rails.application
+generator = RouteGenerator.new(app)
+routes = generator.routes # generates the frozen sequence; logs in as a side effect
+$stderr.puts "frozen sequence: #{routes.size} visits"
+
+if opts[:seq_out]
+  seq = routes.map do |env|
+    path = env["PATH_INFO"]
+    path += "?#{env['QUERY_STRING']}" unless env["QUERY_STRING"].to_s.empty?
+    { "method" => env["REQUEST_METHOD"], "path" => path }
+  end
+  File.write(opts[:seq_out], JSON.pretty_generate(
+    "seed" => "0x1be52551fc152997", "visits" => seq
+  ))
+  $stderr.puts "sequence written to #{opts[:seq_out]}"
+end
+
+
+# Bucket a concrete visit path under its route template so per-route
+# samples aggregate across the sequence's parameterized visits — every
+# /s/<short_id> lands under /s/:story_id. Ordered most-specific first;
+# static routes (including the distinct /top?length=… variants) key by
+# their full path. Mirrors ruby-bench route_generator.rb ROUTE_GROUPS.
+# Keep in sync with scripts/lobsters-replay (the roundhouse side).
+ROUTE_TEMPLATES = [
+  [%r{\A/comments/[^/]+/reply\z}, "/comments/:comment_id/reply"],
+  [%r{\A/threads/[^/]+\z},        "/threads/:username"],
+  [%r{\A/u/[^/]+\z},              "/u/:username"],
+  [%r{\A/s/[^/]+\z},              "/s/:story_id"],
+].freeze
+
+def route_template(path)
+  base = path.split("?", 2).first
+  ROUTE_TEMPLATES.each { |re, tmpl| return tmpl if base.match?(re) }
+  path
+end
+
+# Routes DEFERRED out of the timed sequence (bench/lobsters/declared-gaps.json).
+# The oracle has to drop exactly what the emit lanes drop: Rails renders these
+# routes perfectly, so leaving them in HERE while the emit lanes skip them
+# would credit the emit with not doing work Rails still pays for -- the ratio
+# would move for a reason that is not speed.
+#
+# The sequence is still GENERATED whole and still written by --seq-out, so the
+# committed frozen-sequence.json and its drift check are untouched; only what
+# gets timed is narrowed.
+def load_deferred(path)
+  # Announce either way. A lane that silently times the full sequence while
+  # its siblings time a deferred one produces ratios that divide different
+  # work, and the only trace is a visit count nobody reads. Three runs were
+  # spent on exactly that, unable to tell "the flag never arrived" from "the
+  # flag arrived and matched nothing" -- one line of log distinguishes them.
+  if path.nil? || path.empty?
+    $stderr.puts "deferral: no --defer given; timing the FULL sequence"
+    return []
+  end
+  abort "deferred ledger not found at #{path.inspect}" unless File.exist?(path)
+  routes = (JSON.parse(File.read(path))["declared_gaps"] || []).map { |g| g["route"] }
+  $stderr.puts "deferral: #{path} -> #{routes.size} route(s): #{routes.join(", ")}"
+  routes
+end
+
+# samples: { template => [ms, …] } -> { template => {ms_median, n, …} }.
+# Narrow what gets TIMED. Placed AFTER route_template and load_deferred:
+# both are plain top-level defs, so this call has to sit below them or it
+# raises NoMethodError at run time — which `ruby -c` does not catch.
+# The full sequence has already been written by --seq-out above, so the
+# committed frozen-sequence.json and its drift check are unaffected.
+DEFERRED = load_deferred(opts[:defer])
+unless DEFERRED.empty?
+  before = routes.size
+  unmatched = DEFERRED.reject do |t|
+    routes.any? { |env| route_template(env["PATH_INFO"]) == t }
+  end
+  abort "deferred route(s) #{unmatched.join(", ")} match no visit in the sequence" unless unmatched.empty?
+  routes = routes.reject { |env| DEFERRED.include?(route_template(env["PATH_INFO"])) }
+  $stderr.puts "deferred #{before - routes.size} visit(s) of #{DEFERRED.size} route(s): #{DEFERRED.join(", ")}"
+end
+
+def summarize_samples(by_route)
+  by_route.sort.to_h.transform_values do |arr|
+    s = arr.sort
+    m = s.size / 2
+    med = s.size.odd? ? s[m] : (s[m - 1] + s[m]) / 2.0
+    # ms_p25 is the OWN-WORK estimate: a low percentile of this route's own
+    # visits, i.e. the ones where no collection happened to land inside the
+    # timing window. The median includes whatever cleanup fired during the
+    # visit regardless of whose garbage it reclaimed, and because collection
+    # arrival is roughly uniform while its cost is heap-proportional and
+    # route-independent, that bias scales as 1/own-cost: measured on lobsters
+    # it inflates the cheapest routes by >100% and the most expensive by 1%.
+    # Named for the percentile rather than called "own" so the estimator's
+    # one free choice stays visible in the data.
+    { "ms_median" => med.round(3), "ms_min" => s.first.round(3),
+      "ms_p25" => s[(0.25 * s.size).floor.clamp(0, s.size - 1)].round(3),
+      "ms_max" => s.last.round(3), "n" => s.size }
+  end
+end
+
+# ── replay loop (benchmark.rb's inner block, verbatim semantics) ─────
+# When `timings` is passed (only during the timed iterations) each visit
+# is individually clocked and bucketed by template — the outer per-iter
+# clock in the caller is unchanged, so ms_per_iter keeps its exact old
+# semantics and the two extra monotonic reads per visit stay in the noise.
+def run_sequence!(generator, routes, timings: nil)
+  routes.each_with_index do |env, idx|
+    path = env["PATH_INFO"]
+    t0 = timings ? now_ms : nil
+    resp = generator.visit(env)
+    if timings
+      full = path.dup
+      full << "?#{env['QUERY_STRING']}" unless env["QUERY_STRING"].to_s.empty?
+      (timings[route_template(full)] ||= []) << (now_ms - t0)
+    end
+    unless resp.first == 200
+      raise "HTTP #{resp.first} != 200 for visit #{idx}/#{routes.size} #{path.inspect}"
+    end
+    resp.last.close if resp.last.respond_to?(:close)
+  end
+end
+
+def now_ms = Process.clock_gettime(Process::CLOCK_MONOTONIC) * 1000.0
+
+# ── reference bodies for the content diff ────────────────────────────
+# The parity ROUTE SET, not the frozen sequence: one representative visit
+# per distinct route shape is what scripts/lobsters-replay dumps, and a
+# content diff needs the two dirs to line up file for file. Story and
+# comment are the lowest-id non-deleted rows — the same deterministic
+# choice lobsters-replay makes, so both sides land on the same records
+# without either side being told which.
+#
+# KEEP IN SYNC with scripts/lobsters-replay's ROUTES / dump filename rule.
+if opts[:dump]
+  require "fileutils"
+  bench_username = "michell_wiegand"
+  story   = Story.where(is_deleted: false).order(:id).first.short_id
+  comment = Comment.where(is_deleted: false).order(:id).first.short_id
+  parity_routes = [
+    "/u",
+    "/active", "/newest", "/recent", "/hottest",
+    "/rss", "/privacy", "/about", "/settings",
+    "/top?length=1d", "/top?length=1w", "/top?length=1y",
+    "/hidden", "/saved", "/upvoted/stories",
+    "/comments", "/upvoted/comments", "/threads", "/comments/#{comment}/reply",
+    "/threads/#{bench_username}", "/u/#{bench_username}",
+    "/replies", "/replies/comments", "/replies/stories", "/replies/unread",
+    "/s/#{story}",
+  ]
+  FileUtils.mkdir_p(opts[:dump])
+  statuses = {}
+  parity_routes.each do |route|
+    env = Rack::MockRequest.env_for("https://localhost#{route}", method: :GET)
+    st, _h, body = generator.visit(env)
+    body = body.respond_to?(:each) ? body.to_a.join : body.to_s
+    file = route.delete_prefix("/").gsub(/[^\w.-]/, "_")
+    statuses[file] = st
+    File.write(File.join(opts[:dump], file), body)
+  end
+  # A non-200 reference is a BROKEN ORACLE: comparing against it would
+  # dress up an error page as the expected output. Record the statuses
+  # rather than aborting — the timing run this lane exists for is still
+  # perfectly valid, and lobsters-content-diff refuses those routes on its
+  # own (verdict "oracle-failed") instead of scoring them. Underscore-
+  # prefixed files are metadata, not bodies.
+  File.write(File.join(opts[:dump], "_status.json"), JSON.pretty_generate(statuses))
+  bad = statuses.reject { |_, st| st == 200 }
+  $stderr.puts "reference bodies -> #{opts[:dump]} (#{parity_routes.size} routes)"
+  $stderr.puts "WARNING: reference is not all-200: #{bad.map { |f, st| "#{f}=#{st}" }.join(', ')}" if bad.any?
+  if opts[:dump_only]
+    File.unlink(File.join(opts[:src], "log/production.log")) rescue nil
+    exit 0
+  end
+end
+
+$stderr.puts "warmup x#{opts[:warmup]}..."
+# Warmup iterations are discarded from the stats but their wall time counts
+# toward the stop clock — ruby-bench's rule exactly (harness/harness.rb:
+# `until num_itrs >= WARMUP_ITRS + MIN_BENCH_ITRS and total_time >=
+# MIN_BENCH_TIME`, with total_time cumulative from iteration 1).
+warmup_ms = 0.0
+opts[:warmup].times do
+  t0 = now_ms
+  run_sequence!(generator, routes)
+  warmup_ms += (now_ms - t0)
+end
+
+$stderr.puts "timing (>= #{opts[:min_iters]} iters and >= #{opts[:min_time]}s incl. warmup)..."
+iters = []
+total = 0.0
+per_route = {}
+until iters.size >= opts[:min_iters] && (warmup_ms + total) >= opts[:min_time] * 1000.0
+  t0 = now_ms
+  run_sequence!(generator, routes, timings: per_route)
+  ms = now_ms - t0
+  iters << ms
+  total += ms
+end
+
+sorted = iters.sort
+mid = sorted.size / 2
+median = sorted.size.odd? ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2.0
+# The mean is ruby-bench's reported statistic ("Average of last N,
+# non-warmup iters"); the median stays as a robustness cross-check.
+mean = iters.sum / iters.size
+
+summary = {
+  "stack"              => WHOLE_ROUTE ? "rails+whole-route" : "rails",
+  # The GET actions a futamura tree's whole-route bridge serves from the
+  # lowered app, and how many requests each side served this run.
+  "whole_route"        => WHOLE_ROUTE && { "actions" => Futamura::WholeRoute.actions.size,
+                                           "served" => Futamura::WholeRoute.stats.to_h },
+  "generated_at"       => Time.now.utc.iso8601,
+  "ruby"               => RUBY_DESCRIPTION,
+  "rails"              => Rails::VERSION::STRING,
+  "sqlite"             => SQLITE_RUNTIME,
+  "visits_per_iter"    => routes.size,
+  "warmup"             => opts[:warmup],
+  "iterations"         => iters.size,
+  "ms_per_iter_mean"   => mean.round(2),
+  "ms_per_iter_median" => median.round(2),
+  "ms_per_iter_min"    => sorted.first.round(2),
+  "ms_per_iter_max"    => sorted.last.round(2),
+  "iter_ms"            => iters.map { |x| x.round(2) },
+  # Per-template median across every timed visit (weighted routes get many
+  # samples). A diagnostic breakdown — per-route medians do NOT sum to
+  # ms_per_iter_median (GC/ordering don't decompose linearly).
+  "per_route"          => summarize_samples(per_route),
+  # Footprint of the whole replay process. Same sample points and same
+  # shape as scripts/lobsters-replay's "rss" block, so the matrix can
+  # put the baseline and the emit lanes in one column. GC counters are
+  # CRuby-only (JRuby's GC.stat is a different shape, externally pinned).
+  "rss"                => {
+    "boot_kb"  => BOOT_RSS_KB,
+    "final_kb" => rss_kb,
+    "peak_kb"  => rss_peak_kb,
+    "engine"   => RUBY_ENGINE,
+  }.merge(
+    if RUBY_ENGINE == "ruby"
+      gc = GC.stat
+      { "gc" => { "count"                   => gc[:count],
+                  "major_count"             => gc[:major_gc_count],
+                  "heap_live_slots"         => gc[:heap_live_slots],
+                  "total_allocated_objects" => gc[:total_allocated_objects] } }
+    else
+      {}
+    end
+  ),
+}
+File.write(opts[:json], JSON.pretty_generate(summary)) if opts[:json]
+puts "rails: #{mean.round(2)} ms/iter (avg) over #{iters.size} iterations " \
+     "(min #{sorted.first.round(2)}, max #{sorted.last.round(2)})"
+
+# benchmark.rb's disk-hygiene: production.log grows on every request.
+File.unlink(File.join(opts[:src], "log/production.log")) rescue nil

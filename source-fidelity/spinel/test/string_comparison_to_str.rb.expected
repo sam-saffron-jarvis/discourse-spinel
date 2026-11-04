@@ -1,0 +1,98 @@
+ArgumentError
+ArgumentError
+ArgumentError
+TypeError: can't convert Loose to String (Loose#to_str gives Integer)
+TypeError: can't convert Loose to String (Loose#to_str gives Integer)
+TypeError: can't convert Loose to String (Loose#to_str gives Integer)
+0
+-1
+1
+0
+-1
+true
+false
+true
+true
+true
+true
+false
+true
+true
+true
+false
+0
+-1
+true
+-1
+true
+-1
+-1
+-1
+true
+-1
+-1
+false
+true
+true
+false
+false
+true
+-1
+-1
+nil
+nil
+ArgumentError: comparison of String with Plain failed
+ArgumentError: comparison of String with Plain failed
+ArgumentError: comparison of String with Plain failed
+false
+false
+nil
+nil
+ArgumentError: comparison of String with :abc failed
+true
+nil
+ArgumentError: comparison of String with nil failed
+nil
+nil
+ArgumentError
+["abd"]
+["abd"]
+["aaa", "abd"]
+["zzz"]
+false
+["abd"]
+ArgumentError: comparison of String with Plain failed
+["aaa"]
+ArgumentError: comparison of String with Plain failed
+[]
+true
+true
+true
+true
+ArgumentError: comparison of String with 5 failed
+ArgumentError: comparison of String with nil failed
+false
+[]
+-1
+nil
+nil
+nil
+ArgumentError: comparison of String with Maybe failed
+ArgumentError: comparison of String with Maybe failed
+ArgumentError: comparison of String with Maybe failed
+ArgumentError: comparison of String with Maybe failed
+ArgumentError: comparison of String with Maybe failed
+nil
+nil
+nil
+ArgumentError: comparison of String with Vague failed
+ArgumentError: comparison of String with Vague failed
+ArgumentError: comparison of String with Vague failed
+ArgumentError: comparison of String with Vague failed
+ArgumentError: comparison of String with Vague failed
+-1
+true
+0
+true
+300
+0

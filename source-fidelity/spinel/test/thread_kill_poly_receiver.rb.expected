@@ -1,0 +1,4 @@
+after each(&:kill): 0 alive
+after each { t.kill }: 0 alive
+after ivar kill: false
+after local kill: false

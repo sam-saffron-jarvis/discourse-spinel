@@ -1,0 +1,522 @@
+#!/usr/bin/env ruby
+# Named-channel subscribe dispatch on the CRuby overlay, exercised.
+#
+# Loads the overlay files directly — no emit, no server, no socket:
+# `ruby tests/overlay_cable_dispatch.rb .` reproduces it by hand.
+#
+# WHAT IS UNDER TEST is the authorization decision, not the plumbing.
+# `Cable::Dispatch.subscribe` resolves the channel a client NAMED,
+# instantiates it, and runs the app's own `subscribed`; the reactor and
+# the worker pool exist only to decide which thread that happens on.
+# Keeping the decision in a plain module is what lets this file drive it
+# with neither nio4r nor websocket-driver installed — the same
+# constraint `overlay_cable_identity.rb` documents, and the same
+# stubbing.
+#
+# The channels below are campfire's EMITTED forms, copied from
+# `app/models/room_messages_channel.rb` in the transpiled tree rather
+# than from campfire's source. That is deliberate and it is the point of
+# the test: the emit is what runs, and its `ActiveSupport.present?` /
+# `self.class.subscribable_room` spellings are what the runtime has to
+# satisfy.
+root = ARGV[0] or abort "usage: overlay_cable_dispatch.rb <repo-root>"
+root = File.expand_path(root)
+
+require "json"
+require "stringio"
+
+# --- what boot.rb has standing before cable.rb loads -----------------
+load "#{root}/runtime/spinel/base64.rb"
+load "#{root}/runtime/ruby/active_support_ext.rb"
+load "#{root}/runtime/spinel/scaffold/ruby_overlay/runtime/active_support_core_ext.rb"
+
+# The REAL `GlobalID.param` rides in here, and it has to: this file
+# round-trips the mint through `GlobalID::Locator`, and a local copy of
+# the encoder would agree with the decoder while both disagreed with the
+# page. That is the failure the `turbo_stream_from` commit ran into from
+# the other direction — three spellings, two of them in step.
+load "#{root}/runtime/ruby/rails.rb"
+
+# `Rails.application` in the shipped runtime is an app-specific reopen
+# (`apply_application_reopen` synthesizes `global_id_app` from the module
+# wrapping `class Application < Rails::Application`). campfire's is
+# "campfire", which is half of every gid below.
+# `secret_key_base` beside it: stream names are SIGNED now, and the
+# verifier keys off it. The verifier and its digests ride in as the
+# real files, so the names this driver signs are the names a page
+# would carry.
+module Rails
+  def self.application = @application ||= Struct.new(:global_id_app, :secret_key_base).new("campfire", "a" * 64)
+end
+load "#{root}/runtime/spinel/message_digest_cruby.rb"
+load "#{root}/runtime/ruby/action_controller/message_verifier.rb"
+
+# action_cable.rb's one require; the transport half is not under test.
+# Not expand_path: require_relative resolves symlinks, so under a symlinked tree (Bazel's runfiles) the paths differ.
+$LOADED_FEATURES << File.join(
+  File.dirname(File.realpath("#{root}/runtime/spinel/scaffold/ruby_overlay/runtime/action_cable.rb")),
+  "broadcasts.rb"
+)
+module Broadcasts
+  LOG = []
+  TRANSPORTS = []
+end
+
+load "#{root}/runtime/spinel/scaffold/ruby_overlay/runtime/action_cable.rb"
+
+# turbo_streams.rb requires `action_cable`, `base64` and `broadcasts` as
+# SIBLINGS, which
+# in the emitted tree are the overlay's (ruby_overlay supersedes the
+# spinel file at the same path). In this repo they are the spinel ones,
+# so both are marked loaded and the overlay pair above stands instead.
+# Loading the spinel action_cable here would replace `Channel::Base` with
+# the sibling whose methods raise — a green run against the wrong file.
+%w[action_cable base64 broadcasts].each do |sibling|
+  $LOADED_FEATURES << File.join(File.dirname(File.realpath("#{root}/runtime/spinel/turbo_streams.rb")), "#{sibling}.rb")
+end
+load "#{root}/runtime/spinel/turbo_streams.rb"
+load "#{root}/runtime/spinel/global_id_locator.rb"
+
+# The reactor's two gems, marked loaded and left EMPTY — see
+# overlay_cable_identity.rb for why they are not stubbed. Dispatch never
+# reaches a driver or a selector; anything that does dies with a
+# NameError naming the constant it wanted.
+%w[nio websocket/driver].each { |feature| $LOADED_FEATURES << "#{feature}.rb" }
+module NIO; end
+module WebSocket; end
+
+# boot.rb loads runtime/redis_cable.rb first; on a tree that keeps
+# broadcasts in process that is this no-op facade.
+load "#{root}/runtime/spinel/redis_cable.rb"
+load "#{root}/runtime/spinel/scaffold/ruby_overlay/cable.rb"
+
+puts "vendor ruby #{RUBY_VERSION}"
+
+# --- the app half ----------------------------------------------------
+# A Room the locator can find, and a User whose `rooms` is a membership
+# list rather than every room — the distinction the guard turns on.
+class Room
+  ALL = {}
+  attr_reader :id
+  def initialize(id) = @id = id
+  def self.find(id)
+    ALL[id] or raise ActiveRecord::RecordNotFound, "Couldn't find Room with id=#{id}"
+  end
+  def to_gid_param = GlobalID.param("Room", id)
+end
+
+module ActiveRecord
+  class RecordNotFound < StandardError; end
+end
+
+class RoomScope
+  def initialize(ids) = @ids = ids
+  def find_by(id:) = @ids.include?(id) ? Room::ALL[id] : nil
+end
+
+class User
+  attr_reader :id, :rooms
+  def initialize(id, room_ids)
+    @id = id
+    @rooms = RoomScope.new(room_ids)
+  end
+end
+
+module ApplicationCable
+  class Channel < ActionCable::Channel::Base
+  end
+end
+
+# campfire's `app/models/room_messages_channel.rb`, as emitted.
+class RoomMessagesChannel < ApplicationCable::Channel
+  include Turbo::Streams::StreamName::ClassMethods
+
+  STREAM_SUFFIX = "messages"
+
+  def self.guarded_stream?(stream_name)
+    stream_name.to_s.split(":", 2).second == STREAM_SUFFIX
+  end
+
+  def self.subscribable_room(user, stream_name)
+    gid_param, suffix = stream_name.to_s.split(":", 2)
+
+    if suffix == STREAM_SUFFIX && (room = room_from(gid_param))
+      user.rooms.find_by(id: room.id)
+    end
+  end
+
+  def self.room_from(gid_param)
+    begin
+      GlobalID::Locator.locate gid_param, only: Room
+    rescue ActiveRecord::RecordNotFound
+      nil
+    end
+  end
+
+  def subscribed
+    if stream_name = authorized_stream_name
+      stream_from stream_name
+    else
+      reject
+    end
+  end
+
+  def authorized_stream_name
+    stream_name = verified_stream_name_from_params
+    stream_name if ActiveSupport.present?(stream_name) && self.class.subscribable_room(current_user, stream_name)
+  end
+end
+
+# campfire's `app/models/room_streams_are_authorized.rb`, verbatim.
+module RoomStreamsAreAuthorized
+  def subscribed
+    if RoomMessagesChannel.guarded_stream?(verified_stream_name_from_params)
+      reject
+    else
+      super
+    end
+  end
+end
+
+class UnreadRoomsChannel < ApplicationCable::Channel
+  def self.stream_name_for(user_id) = "user_#{user_id}_unreads"
+  def subscribed = stream_from(self.class.stream_name_for(current_user.id))
+end
+
+class ExplodingChannel < ApplicationCable::Channel
+  def subscribed = raise("the app raised")
+end
+
+# What the emitted boot.rb's generated mixin block does.
+Turbo::StreamsChannel.prepend RoomStreamsAreAuthorized
+
+# --- probes ----------------------------------------------------------
+FAILURES = []
+
+def check(label, got, want)
+  if got == want
+    puts "  ok   #{label}"
+  else
+    FAILURES << label
+    puts "  FAIL #{label}: got #{got.inspect}, want #{want.inspect}"
+  end
+end
+
+Room::ALL[1] = Room.new(1)
+Room::ALL[2] = Room.new(2)
+MEMBER = User.new(7, [1])          # a member of room 1 only
+OUTSIDER = User.new(8, [])
+
+# The connection a channel is built against. A channel asks it ONE
+# thing — `current_user` — and both real connections answer it: the
+# reactor's `Cable::Connection` off the identity the handshake
+# resolved, and the app's own `ApplicationCable::Connection` directly
+# (which is what `Channel::TestCase` hands a channel).
+Conn = Struct.new(:current_user)
+
+# `turbo_stream_from @room, :messages` mints exactly this, and
+# `ActionView::ViewHelpers.turbo_stream_from` base64s the JSON of it
+# into the page's `signed-stream-name`.
+def stream_name(room, suffix) = "#{room.to_gid_param}:#{suffix}"
+
+# Signed the way the page signs it — `turbo_stream_from` writes
+# `Turbo::Streams::StreamName.signed`, and a name the channel refuses
+# to verify never reaches the membership check.
+def signed(name) = Turbo::Streams::StreamName.signed(name)
+
+def subscribe(channel_name, params, user)
+  identifier = { "channel" => channel_name }.merge(params)
+  json = JSON.generate(identifier)
+  klass = ActionCable::Channel::Base.lookup(channel_name)
+  return :no_such_channel if klass.nil?
+  Cable::Dispatch.subscribe(klass, Conn.new(user), json, identifier)
+end
+
+def streams_of(outcome)
+  Cable::Dispatch.rejected?(outcome) ? :rejected : outcome.streams
+end
+
+# --- the locator, both directions ------------------------------------
+# Round-tripped rather than compared to a literal: the mint lives in
+# runtime/ruby/rails.rb and the parse in runtime/spinel/global_id_locator.rb,
+# and this is the assertion that keeps the two files in step.
+check("a minted gid locates its record",
+      GlobalID::Locator.locate(Room::ALL[1].to_gid_param, only: Room)&.id, 1)
+check("a gid for another model does not locate",
+      GlobalID::Locator.locate(GlobalID.param("User", 1), only: Room), nil)
+check("a gid from another app does not locate",
+      GlobalID::Locator.locate(Base64.urlsafe_encode64_nopad("gid://other/Room/1"), only: Room),
+      nil)
+check("a param that is not base64 does not locate",
+      GlobalID::Locator.locate("!!!!", only: Room), nil)
+check("a gid for a missing record raises RecordNotFound",
+      (begin
+        GlobalID::Locator.locate(GlobalID.param("Room", 99), only: Room)
+      rescue ActiveRecord::RecordNotFound
+        :raised
+      end), :raised)
+
+# --- the guard, which is what item 4 exists for ----------------------
+messages = stream_name(Room::ALL[1], "messages")
+
+# THE BYPASS, CLOSED. Same signed stream name, stock channel: campfire's
+# prepend refuses it before `super` ever reaches `stream_from`.
+check("the stock channel refuses a :messages stream",
+      streams_of(subscribe("Turbo::StreamsChannel",
+                           { "signed_stream_name" => signed(messages) }, MEMBER)),
+      :rejected)
+
+# ... and refuses it for a member too. The point of the guard is that
+# the CHANNEL is wrong, not that the user is.
+check("the stock channel refuses it even for a member",
+      streams_of(subscribe("Turbo::StreamsChannel",
+                           { "signed_stream_name" => signed(messages) }, MEMBER)),
+      :rejected)
+
+# A name the app did not guard still goes through the stock channel, and
+# `super` is what carries it — proof the prepend calls up rather than
+# replacing the body.
+other = stream_name(Room::ALL[1], "presence")
+check("the stock channel still serves an unguarded stream",
+      streams_of(subscribe("Turbo::StreamsChannel",
+                           { "signed_stream_name" => signed(other) }, MEMBER)),
+      [other])
+
+# --- the door that is left ------------------------------------------
+check("a member subscribes through RoomMessagesChannel",
+      streams_of(subscribe("RoomMessagesChannel",
+                           { "signed_stream_name" => signed(messages) }, MEMBER)),
+      [messages])
+
+check("a non-member is refused by RoomMessagesChannel",
+      streams_of(subscribe("RoomMessagesChannel",
+                           { "signed_stream_name" => signed(messages) }, OUTSIDER)),
+      :rejected)
+
+# A member of room 1 naming room 2's stream. The room is derived from
+# the stream name, so there is nothing to point elsewhere — but the
+# membership still has to be checked against the room it names.
+check("a member of another room is refused",
+      streams_of(subscribe("RoomMessagesChannel",
+                           { "signed_stream_name" => signed(stream_name(Room::ALL[2], "messages")) },
+                           MEMBER)),
+      :rejected)
+
+# THE SIGNATURE IS CHECKED, not just the membership: a member who can
+# SPELL the stream they are entitled to still has to present the page's
+# signed name. Under the old `--unsigned` wire either of these was a
+# confirmed subscription.
+check("a bare stream name a member could spell is refused",
+      streams_of(subscribe("RoomMessagesChannel",
+                           { "signed_stream_name" => stream_name(Room::ALL[1], "messages") },
+                           MEMBER)),
+      :rejected)
+check("the old unsigned encoding is refused",
+      streams_of(subscribe("RoomMessagesChannel",
+                           { "signed_stream_name" =>
+                             "#{Base64.strict_encode64(JSON.generate(stream_name(Room::ALL[1], "messages")))}--unsigned" },
+                           MEMBER)),
+      :rejected)
+
+check("a garbage stream name is refused",
+      streams_of(subscribe("RoomMessagesChannel",
+                           { "signed_stream_name" => "not-base64--unsigned" }, MEMBER)),
+      :rejected)
+
+check("a missing stream name is refused",
+      streams_of(subscribe("RoomMessagesChannel", {}, MEMBER)), :rejected)
+
+# --- the rest of the dispatch surface --------------------------------
+check("a channel with no signed name streams what it computes",
+      streams_of(subscribe("UnreadRoomsChannel", {}, MEMBER)), ["user_7_unreads"])
+
+check("an unregistered channel name resolves to nothing",
+      subscribe("Kernel", {}, MEMBER), :no_such_channel)
+
+check("a channel that raises rejects rather than escaping",
+      streams_of(subscribe("ExplodingChannel", {}, MEMBER)), :rejected)
+
+# `stream_for`/`broadcast_to` spell the stream name once, through
+# `broadcasting_for`. actioncable: name minus "Channel", "::" to ":",
+# underscored, then the record's gid param.
+check("channel_name follows actioncable's spelling",
+      [RoomMessagesChannel.channel_name, Turbo::StreamsChannel.channel_name],
+      ["room_messages", "turbo:streams"])
+check("broadcasting_for joins the channel name to the record's gid",
+      ActionCable::Channel::Base::REGISTRY["UnreadRoomsChannel"]
+        .broadcasting_for(Room::ALL[1]),
+      "unread_rooms:#{Room::ALL[1].to_gid_param}")
+
+# Channel bodies read `params[:room_id]`; the wire has string keys only.
+params = ActionCable::Channel::Parameters.new({ "room_id" => 1 })
+check("params read indifferently", [params[:room_id], params["room_id"]], [1, 1])
+
+# --- a `message` frame: the client's `perform` (#71 item 6) ----------
+#
+# Through the connection's own frame handler, as the reactor calls it.
+# The connection is allocated rather than built (no socket, no driver);
+# the worker pool and the database lease run in line, so each frame has
+# finished when `handle_message` returns. Which methods are actions and
+# how they are called is the emitted contract's job
+# (`emit_and_run::a_cable_action_runs_with_rails_rules`); this is the
+# routing: the right subscription, JSON types kept, and every way a
+# frame can be wrong dropped without escaping.
+class ActionProbeChannel < ApplicationCable::Channel
+  SEEN = []
+  def input(data) = SEEN << [:input, data["d"]]
+  def speech(data) = SEEN << [:speech, data["on"]]
+  def boom(_data) = raise("boom")
+end
+
+Cable::Workers.define_singleton_method(:post) { |&block| block.call }
+unless defined?(Db)
+  module Db
+    def self.with_connection = yield
+  end
+end
+
+PROBE_ID = '{"channel":"ActionProbeChannel"}'
+socket_conn = Cable::Connection.allocate
+socket_conn.instance_variable_set(:@channels, {
+  PROBE_ID => ActionProbeChannel.new(nil, PROBE_ID, ActionCable::Channel::Parameters.new({})),
+  '{"channel":"Pending"}' => :pending
+})
+frame = ->(identifier, data) { JSON.generate("command" => "message", "identifier" => identifier, "data" => data) }
+
+socket_conn.send(:handle_message, frame.(PROBE_ID, '{"action":"input","d":"ls\r"}'))
+socket_conn.send(:handle_message, frame.(PROBE_ID, '{"action":"speech","on":false}'))
+check("a message frame runs the action on that subscription, JSON types kept",
+      ActionProbeChannel::SEEN, [[:input, "ls\r"], [:speech, false]])
+
+ActionProbeChannel::SEEN.clear
+socket_conn.send(:handle_message, frame.('{"channel":"Nobody"}', '{"action":"input","d":"x"}'))
+socket_conn.send(:handle_message, frame.('{"channel":"Pending"}', '{"action":"input","d":"x"}'))
+socket_conn.send(:handle_message, frame.(PROBE_ID, '["input"]'))
+socket_conn.send(:handle_message, frame.(PROBE_ID, "not json"))
+check("no subscription, a pending one, or data that is not an object runs nothing",
+      ActionProbeChannel::SEEN, [])
+
+survived = begin
+  socket_conn.send(:handle_message, frame.(PROBE_ID, '{"action":"boom"}'))
+  true
+rescue StandardError
+  false
+end
+check("an action that raises is contained", survived, true)
+
+# --- remote_connections.where(current_user:).disconnect --------------
+#
+# Rails' two halves: the broadcast on `action_cable/<identifier>`, and
+# the identified connection that subscribed to that internal channel
+# closing itself on it. The transport delivers in line, as the reactor
+# would on its own thread.
+module Broadcasts
+  def self.log_append(entry) = LOG << entry
+end
+Broadcasts::TRANSPORTS[0] = Object.new.tap do |t|
+  t.define_singleton_method(:broadcast) { |stream, payload| Cable::Registry.deliver(stream, payload) }
+end
+class User
+  def to_gid_param = GlobalID.param("User", id)
+end
+
+kicked = User.new(7, [])
+identity = ActionCable::Connection::Base.new(nil)
+identity.current_user = kicked
+bystander_identity = ActionCable::Connection::Base.new(nil)
+bystander_identity.current_user = User.new(8, [])
+
+sent = Hash.new { |h, k| h[k] = [] }
+closed = []
+live = [identity, bystander_identity].map do |ident|
+  conn = Cable::Connection.allocate
+  conn.instance_variable_set(:@identity, ident)
+  conn.define_singleton_method(:send_text) { |text| sent[ident.current_user.id] << JSON.parse(text) }
+  conn.define_singleton_method(:on_writable) { nil }
+  conn.define_singleton_method(:close) { closed << ident.current_user.id; Cable::Registry.unsubscribe_all(self) }
+  conn.subscribe_internal_channel
+  conn
+end
+
+check("an identified connection names its internal channel by gid",
+      live[0].internal_channel?("action_cable/#{kicked.to_gid_param}"), true)
+
+ActionCable.server.remote_connections.where(current_user: kicked).disconnect(reconnect: true)
+check("disconnect broadcasts Rails' internal message",
+      Broadcasts::LOG.last,
+      { action: :message, stream: "action_cable/#{kicked.to_gid_param}",
+        payload: { type: "disconnect", reconnect: true } })
+check("only the selected user's socket is told, then closed",
+      [sent[7], sent[8], closed],
+      [[{ "type" => "disconnect", "reason" => "remote", "reconnect" => true }], [], [7]])
+
+# --- the heartbeat's `beat`, and `close(reason:)` ---------------------
+#
+# Rails' heartbeat calls every connection's `beat`; campfire's override
+# looks its session up again now and then (through `perform_work`) and
+# closes the socket once the session is gone, telling the client why.
+# The reactor's posts run in line here, as the worker pool's already do.
+Cable::Reactor.define_singleton_method(:post) { |&block| block.call }
+class SessionCheckingConnection < ActionCable::Connection::Base
+  attr_reader :beats
+  attr_accessor :gone, :explode
+  def beat
+    super
+    @beats = (@beats || 0) + 1
+    raise "beat failed" if @explode
+    perform_work -> { close(reason: ActionCable::INTERNAL[:disconnect_reasons][:unauthorized]) if @gone }, :call
+  end
+end
+
+def beating_socket(identity, frames, shut)
+  socket = Cable::Connection.allocate
+  socket.instance_variable_set(:@identity, identity)
+  socket.instance_variable_set(:@closed, false)
+  identity.transport = socket    # what Connection#initialize does
+  socket.define_singleton_method(:send_json) { |value| frames << value }
+  socket.define_singleton_method(:on_writable) { nil }
+  socket.define_singleton_method(:close) { shut << :closed; @closed = true }
+  socket
+end
+
+kept_frames, kept_shut = [], []
+kept = SessionCheckingConnection.new(nil)
+kept_socket = beating_socket(kept, kept_frames, kept_shut)
+ended_frames, ended_shut = [], []
+ended = SessionCheckingConnection.new(nil)
+ended.gone = true
+ended_socket = beating_socket(ended, ended_frames, ended_shut)
+
+kept_socket.app_beat
+ended_socket.app_beat
+check("the heartbeat calls the app connection's beat", [kept.beats, ended.beats], [1, 1])
+check("a connection whose session remains is left open", [kept_frames, kept_shut], [[], []])
+check("one whose session is gone is told why, then closed",
+      [ended_frames, ended_shut],
+      [[{ "type" => "disconnect", "reason" => "unauthorized", "reconnect" => true }], [:closed]])
+ended_socket.app_beat
+check("a closed socket's connection is not beaten again", ended.beats, 1)
+
+broken = SessionCheckingConnection.new(nil)
+broken.explode = true
+broken_socket = beating_socket(broken, [], [])
+$stderr = StringIO.new
+contained = begin
+  broken_socket.app_beat
+  true
+rescue StandardError
+  false
+end
+$stderr = STDERR
+check("a beat that raises is contained", contained, true)
+check("perform_work runs only a callable's call",
+      (begin; kept.perform_work(-> { 1 }, :run); :ran; rescue ArgumentError; :refused; end), :refused)
+check("ActionCable::INTERNAL carries Rails' disconnect reasons",
+      ActionCable::INTERNAL[:disconnect_reasons][:unauthorized], "unauthorized")
+
+if FAILURES.empty?
+  puts "ALL OK"
+else
+  puts "#{FAILURES.length} FAILED"
+  exit 1
+end

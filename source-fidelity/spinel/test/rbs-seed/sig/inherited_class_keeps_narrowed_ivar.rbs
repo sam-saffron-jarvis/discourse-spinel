@@ -1,0 +1,15 @@
+class HatRequest
+  attr_reader id: Integer
+  def self.from_row: (Integer row) -> HatRequest
+end
+
+module Views
+  module Hats
+    def self.requests_index_into: (String io, Array[HatRequest] hat_requests, untyped notice, untyped alert) -> nil
+    def self.requests_index: (Array[HatRequest] hat_requests, ?String? notice, ?String? alert) -> String
+  end
+end
+
+class HatsController
+  def requests_index: () -> nil
+end

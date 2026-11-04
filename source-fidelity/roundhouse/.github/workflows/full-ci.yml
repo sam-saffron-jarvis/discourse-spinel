@@ -1,0 +1,118 @@
+name: Full validation
+
+on:
+  schedule:
+    - cron: '17 */3 * * *'
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Publish after the compact gate passes (canonical main only)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# Keep a started snapshot; replace obsolete pending requests. This literal
+# namespace is different from the reusable validation workflow's lock.
+concurrency:
+  group: full-background-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    if: github.event_name != 'schedule' || github.repository == 'rubys/roundhouse'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      spinel: ${{ steps.inputs.outputs.spinel }}
+      publish: ${{ steps.inputs.outputs.publish }}
+    steps:
+      - name: Resolve the immutable inputs and publication boundary
+        id: inputs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          REQUEST_PUBLISH: ${{ inputs.publish || false }}
+        run: |
+          publish=false
+          if [ "$EVENT" = schedule ] || [ "$REQUEST_PUBLISH" = true ]; then
+            test "$GITHUB_REPOSITORY" = rubys/roundhouse
+            test "$GITHUB_REF" = refs/heads/main
+            publish=true
+          fi
+          spinel=$(gh api repos/matz/spinel/commits/master --jq .sha) || spinel=master
+          if ! [[ "$spinel" =~ ^[0-9a-f]{40}$ ]]; then spinel=master; fi
+          echo "spinel=$spinel" >> "$GITHUB_OUTPUT"
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+      - name: Report fresh validation inputs
+        env:
+          SPINEL: ${{ steps.inputs.outputs.spinel }}
+        run: |
+          printf 'Source snapshot: `%s`\n\nRequested Spinel: `%s`\n\nEvery cycle executes validation freshly, including floating Rails/package/system inputs. Actual Spinel revisions are recorded in the toolchain and archive evidence.\n' "$GITHUB_SHA" "$SPINEL" >> "$GITHUB_STEP_SUMMARY"
+
+  validation:
+    needs: preflight
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/ci.yml
+    with:
+      full: true
+      publish: ${{ needs.preflight.outputs.publish == 'true' }}
+      spinel_revision: ${{ needs.preflight.outputs.spinel }}
+
+  # No Pages/OIDC permissions are available to the reusable validator or any
+  # PR. Extra-target failures must not hide useful broken-emit repro archives.
+  deploy:
+    needs: [preflight, validation]
+    if: ${{ !cancelled() && needs.preflight.outputs.publish == 'true' && needs.validation.outputs.publication-ready == 'true' && github.repository == 'rubys/roundhouse' && github.ref == 'refs/heads/main' }}
+    permissions:
+      contents: read
+      actions: read
+      pages: write
+      id-token: write
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      # Publish this run's assembled Pages artifact even if main advanced
+      # mid-cycle. High merge velocity used to starve github-pages whenever
+      # the tip-equality check raced a later commit; the site describes the
+      # validated snapshot that assembled it, not whatever HEAD is now.
+      #
+      # assemble-site uploads `github-pages-${{ github.run_attempt }}` so a
+      # `gh run rerun --failed` that re-assembles cannot leave two default
+      # `github-pages` artifacts for deploy-pages to reject. When only
+      # deploy is re-run, assemble still owns attempt N-1's artifact —
+      # walk attempt → 1 and take the newest present name.
+      # actions:read lets the resolver list this run's artifacts.
+      - name: Resolve Pages artifact
+        id: pages-artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for n in $(seq "${{ github.run_attempt }}" -1 1); do
+            name="github-pages-$n"
+            # --paginate: Full val runs already exceed the default page (30).
+            if gh api --paginate "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts" \
+                --jq ".artifacts[] | select(.name == \"$name\" and .expired == false) | .name" \
+                | grep -qx "$name"; then
+              echo "name=$name" >> "$GITHUB_OUTPUT"
+              echo "Using Pages artifact $name"
+              exit 0
+            fi
+          done
+          echo "::error::no github-pages-* artifact for run ${{ github.run_id }}"
+          exit 1
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5
+        with:
+          artifact_name: ${{ steps.pages-artifact.outputs.name }}

@@ -1,0 +1,12 @@
+1
+-1
+"1"
+"5"
+"$3"
+true
+false
+true
+false
+true
+comparison of Money with String failed
+["$1", "$2", "$3"]

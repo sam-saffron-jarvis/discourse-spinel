@@ -1,0 +1,39 @@
+undefined method 'first' for nil
+x[0]             NoMethodError
+x["k"]           NoMethodError
+x.dig("k")       NoMethodError
+x.at(0)          NoMethodError
+x.values_at      NoMethodError
+x.first          NoMethodError
+x.last           NoMethodError
+x.key?           NoMethodError
+x.include?       NoMethodError
+x.member?        NoMethodError
+x.empty?         NoMethodError
+x.any?           NoMethodError
+x.all?           NoMethodError
+x.none?          NoMethodError
+x.one?           NoMethodError
+x.count          NoMethodError
+x.join           NoMethodError
+x.map            NoMethodError
+x.sum            NoMethodError
+x["k"] = 1       NoMethodError
+x.push(1)        NoMethodError
+x.clear          NoMethodError
+x.each_pair      NoMethodError
+x.each_key       NoMethodError
+x.each_value     NoMethodError
+y[0]             NoMethodError
+y.first          NoMethodError
+y.empty?         NoMethodError
+y.map            NoMethodError
+y.push(1)        NoMethodError
+y["k"] = 1       NoMethodError
+y[k]             NoMethodError
+z.first          1
+z.push(3)        [1, 2, 3]
+z.any?           true
+h.each_pair      {"k" => 1}
+h.key?           true
+queue size       1

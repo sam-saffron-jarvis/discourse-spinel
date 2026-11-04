@@ -1,0 +1,29 @@
+#<Enumerator: 1..4:each_slice(2)>
+#<Enumerator: [1, 2, 3, 4, 5]:each_slice(3)>
+#<Enumerator: 1..4:each_cons(2)>
+#<Enumerator: [1, 2, 3, 4, 5]:each_cons(3)>
+#<Enumerator: 1..4:each_slice(2)>
+[1, 2]
+#<Enumerator: 1..4:each_slice(2)>
+[3, 4]
+#<Enumerator: 1..4:each_slice(2)>
+[[1, 2], [3, 4]]
+#<Enumerator: [1, 2, 3]:each>
+#<Enumerator: [1, 2, 3]:reverse_each>
+#<Enumerator: [1, 2, 3]:each_with_index>
+#<Enumerator: [1, 2, 3]:each_index>
+#<Enumerator: [1, 2, 3]:map>
+#<Enumerator: [1, 2, 3]:cycle>
+#<Enumerator: "ab":each_char>
+#<Enumerator: "ab":each_byte>
+#<Enumerator: "ab":each_codepoint>
+#<Enumerator: "a\nb\n":each_line>
+#<Enumerator: "a\nb\n":each_line(chomp: true)>
+#<Enumerator: "a\nb\n":each_line(chomp: false)>
+#<Enumerator: 5:then>
+#<Enumerator: 5:then>
+true
+true
+true
+7
+nil

@@ -1,0 +1,27 @@
+[1, "z"]
+[1, 2.5]
+[1.5, "z"]
+[1.5, 2]
+["a", 7]
+[1, "z"]
+["a", nil]
+["z", 0]
+[nil, 0]
+push: TypeError: cannot store String into an Array[Integer]: a typed array holds one kind of element
+[]
+[2, 2]
+unshift: TypeError: cannot store String into an Array[Integer]: a typed array holds one kind of element
+[]
+insert: TypeError: cannot store String into an Array[Integer]: a typed array holds one kind of element
+[]
+concat: TypeError: cannot store String into an Array[Integer]: a typed array holds one kind of element
+[1]
+fill: TypeError: cannot store String into an Array[Integer]: a typed array holds one kind of element
+[0, 0]
+[1, 2.5]
+push value: TypeError: cannot store Integer into an Array[String]: a typed array holds one kind of element
+["a"]
+[0.5, "z"]
+method push: TypeError: cannot store String into an Array[Integer]: a typed array holds one kind of element
+[1, 2]
+[1, 2, 3]

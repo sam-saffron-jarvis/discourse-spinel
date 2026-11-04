@@ -1,0 +1,3 @@
+hook 2 err (registered last, runs first)
+hook 1 err (registered first, runs last)
+boom (ArgumentError)

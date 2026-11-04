@@ -1,0 +1,1895 @@
+//! Step 3 — first session: model lowerers from Rails-shape `Model` to
+//! the universal post-lowering `LibraryClass` whose body is a flat
+//! sequence of `MethodDef`s. The forcing function is the spinel-blog
+//! fixture pair: real-blog/app/models/article.rb (Rails DSL) lowers to
+//! a LibraryClass structurally matching spinel-blog/app/models/article.rb
+//! (explicit method bodies).
+//!
+//! Comparison is structural at the IR level — method names, parameter
+//! lists, receiver kinds. Body shapes are spot-checked rather than
+//! deep-compared because the spinel-blog fixture is hand-written and
+//! carries stylistic choices (variable naming, formatting) that the
+//! lowerer's output won't match byte-for-byte. See the handoff for the
+//! "structural compare passes ≠ textual match required" calibration.
+
+use std::path::Path;
+
+use roundhouse::dialect::{LibraryClass, MethodReceiver};
+use roundhouse::ident::{ClassId, Symbol};
+use roundhouse::ingest::ingest_app;
+use roundhouse::lower::{
+    class_info_from_library_class, lower_fixtures_to_library_classes,
+    lower_model_to_library_class, lower_models_with_registry,
+    lower_test_modules_to_library_classes, lower_view_to_library_class,
+    lower_views_to_library_classes,
+};
+
+fn fixture_path() -> &'static Path {
+    roundhouse::fixtures::real_blog()
+}
+
+fn lower(name: &str) -> LibraryClass {
+    let app = ingest_app(fixture_path()).expect("ingest real-blog");
+    let model = app
+        .models
+        .iter()
+        .find(|m| m.name.0.as_str() == name)
+        .unwrap_or_else(|| panic!("model {name} not in real-blog"));
+    lower_model_to_library_class(model, &app.schema)
+}
+
+fn method_names(lc: &LibraryClass) -> Vec<&str> {
+    lc.methods.iter().map(|m| m.name.as_str()).collect()
+}
+
+#[test]
+fn application_record_lowers_with_abstract_marker() {
+    // application_record.rb is abstract — no schema table, no
+    // associations, no validations. The `primary_abstract_class`
+    // marker lowers to `def self.abstract?; true; end`; nothing else
+    // synthesizes.
+    let lc = lower("ApplicationRecord");
+    assert_eq!(lc.name.0.as_str(), "ApplicationRecord");
+    let parent = lc.parent.as_ref().map(|p| p.0.as_str()).unwrap_or("(none)");
+    assert_eq!(parent, "ActiveRecord::Base", "parent: {parent}");
+    assert!(!lc.is_module);
+    assert_eq!(method_names(&lc), vec!["abstract?"]);
+    let m = &lc.methods[0];
+    assert!(matches!(m.receiver, MethodReceiver::Class));
+    assert!(m.params.is_empty());
+}
+
+#[test]
+fn article_lowers_with_schema_methods() {
+    let lc = lower("Article");
+    assert_eq!(lc.name.0.as_str(), "Article");
+    let parent = lc.parent.as_ref().map(|p| p.0.as_str()).unwrap_or("(none)");
+    assert_eq!(parent, "ApplicationRecord");
+
+    let names = method_names(&lc);
+
+    // Per-column accessors (excluding id — inherits from base).
+    for col in ["title", "body", "created_at", "updated_at"] {
+        assert!(names.contains(&col), "missing reader `{col}`: {names:?}");
+    }
+    // Plain columns keep the `<col>=` writer; temporal columns store
+    // under a `<col>_raw` String accessor pair (the public reader is a
+    // computed Time getter) plus a Rails-parity public `<col>=` writer
+    // normalizing through the `format_db_time` intrinsic — see
+    // `schema::synth_temporal_writer`.
+    for col in ["title", "body"] {
+        let writer = format!("{col}=");
+        assert!(
+            names.iter().any(|n| *n == writer.as_str()),
+            "missing writer `{writer}`: {names:?}",
+        );
+    }
+    for col in ["created_at", "updated_at"] {
+        let raw_reader = format!("{col}_raw");
+        let raw_writer = format!("{col}_raw=");
+        let writer = format!("{col}=");
+        assert!(
+            names.iter().any(|n| *n == raw_reader.as_str()),
+            "missing storage reader `{raw_reader}`: {names:?}",
+        );
+        assert!(
+            names.iter().any(|n| *n == raw_writer.as_str()),
+            "missing storage writer `{raw_writer}`: {names:?}",
+        );
+        let w = lc
+            .methods
+            .iter()
+            .find(|m| m.name.as_str() == writer && m.receiver == MethodReceiver::Instance)
+            .unwrap_or_else(|| panic!("missing public temporal writer `{writer}`: {names:?}"));
+        // Kind `Method`, not `AttributeWriter` — a writer kind would
+        // read as a plain field pair to per-target collapse walkers
+        // (and to the ruby emit datetime pass's hand-written-writer
+        // arm), re-pointing storage at a nonexistent `@<col>`.
+        assert!(
+            matches!(w.kind, roundhouse::dialect::AccessorKind::Method),
+            "temporal writer `{writer}` must be kind Method",
+        );
+        // Body normalizes through the intrinsic and stores via the raw
+        // field (`self.<col>_raw = ActiveSupport.format_db_time(value)`).
+        let body_str = format!("{:?}", w.body);
+        assert!(
+            body_str.contains("format_db_time"),
+            "temporal writer `{writer}` must normalize through format_db_time: {body_str}",
+        );
+    }
+    // id reader/writer ARE synthesized (per-class so target emitters
+    // can declare `id: number` as a typed field on the subclass; the
+    // ApplicationRecord baseline registration doesn't surface a
+    // declaration on Article in the lowered IR). Earlier shape skipped
+    // id with the rationale "ApplicationRecord owns it"; that worked
+    // for typer dispatch but left TS without a field declaration.
+    assert!(
+        names.contains(&"id"),
+        "id reader should be synthesized: {names:?}",
+    );
+    assert!(
+        names.contains(&"id="),
+        "id writer should be synthesized: {names:?}",
+    );
+
+    // The non-attr scaffold: table_name, schema_columns,
+    // schema_time_columns, schema_date_columns, schema_boolean_columns,
+    // schema_decimal_columns,
+    // instantiate, initialize, attributes, [], []=, update.
+    for expected in [
+        "table_name",
+        "_table_sql",
+        "schema_columns",
+        "schema_time_columns",
+        "schema_date_columns",
+        "schema_boolean_columns",
+        "schema_decimal_columns",
+        "instantiate",
+        "initialize",
+        "attributes",
+        "[]",
+        "[]=",
+        "update",
+    ] {
+        assert!(
+            names.contains(&expected),
+            "missing scaffold method `{expected}`: {names:?}",
+        );
+    }
+
+    // Receiver checks: table_name, schema_columns, instantiate, from_row,
+    // from_stmt, and the per-model `_adapter_*` Level-3 primitives are
+    // class methods; everything else is instance.
+    let class_methods = [
+        "table_name",
+        "_table_sql",
+        "schema_columns",
+        "schema_time_columns",
+        "schema_date_columns",
+        "schema_boolean_columns",
+        "schema_decimal_columns",
+        "instantiate",
+        "from_row",
+        "from_stmt",
+        "_adapter_find_by_id",
+        "_adapter_all",
+        "_adapter_last",
+        "_adapter_count",
+        "_adapter_any?",
+        "_adapter_exists_by_id?",
+        "_adapter_truncate",
+        "delete_all",
+        "_columns_sql",
+        "_hydrate_all",
+        // #818: class-side name table for `reflect_on_association`.
+        "_association_names",
+        "schema_column_types",
+    ];
+    for m in &lc.methods {
+        let n = m.name.as_str();
+        if class_methods.contains(&n) {
+            assert!(
+                matches!(m.receiver, MethodReceiver::Class),
+                "`{n}` should be a class method, got {:?}",
+                m.receiver,
+            );
+        } else {
+            assert!(
+                matches!(m.receiver, MethodReceiver::Instance),
+                "`{n}` should be an instance method, got {:?}",
+                m.receiver,
+            );
+        }
+    }
+
+    let any = lc
+        .methods
+        .iter()
+        .find(|m| m.name.as_str() == "_adapter_any?")
+        .expect("_adapter_any? synthesized");
+    let any_body = format!("{:?}", any.body);
+    assert!(
+        any_body.contains("SELECT 1 FROM") && any_body.contains("LIMIT 1"),
+        "_adapter_any? must probe existence, not COUNT(*): {any_body}"
+    );
+    assert!(
+        !any_body.contains("COUNT(*)"),
+        "_adapter_any? must not COUNT: {any_body}"
+    );
+}
+
+#[test]
+fn article_lowers_has_many_to_collection_reader() {
+    let lc = lower("Article");
+    let comments = lc
+        .methods
+        .iter()
+        .find(|m| m.name.as_str() == "comments")
+        .expect("comments method present (has_many :comments)");
+
+    assert!(matches!(comments.receiver, MethodReceiver::Instance));
+    assert!(comments.params.is_empty());
+
+    // Cache-aware body (issue #27):
+    //   return @comments_cache if @comments_loaded   # eager-loaded
+    //   Comment.where(article_id: @id)                # lazy fallback
+    // A Seq whose guard short-circuits to the preloaded cache and whose
+    // tail keeps the lazy query (so `render @article.comments` with no
+    // upstream `includes` still works). The guard's ivar reads are typed
+    // (Bool / Array<Comment>) so the strict-0 untyped residual holds —
+    // see lowered_real_blog_typing_residual.
+    let stmts = match &*comments.body.node {
+        roundhouse::ExprNode::Seq { exprs } => exprs,
+        other => panic!("comments body should be a Seq (guard + lazy query); got {other:?}"),
+    };
+    assert_eq!(stmts.len(), 2, "expected [loaded-guard, lazy query]");
+
+    // Guard: `return @comments_cache if @comments_loaded`.
+    match &*stmts[0].node {
+        roundhouse::ExprNode::If { cond, then_branch, .. } => {
+            assert!(
+                matches!(&*cond.node, roundhouse::ExprNode::Ivar { name } if name.as_str() == "comments_loaded"),
+                "guard cond should read @comments_loaded; got {:?}",
+                cond.node,
+            );
+            match &*then_branch.node {
+                roundhouse::ExprNode::Return { value } => assert!(
+                    matches!(&*value.node, roundhouse::ExprNode::Ivar { name } if name.as_str() == "comments_cache"),
+                    "guard should return @comments_cache; got {:?}",
+                    value.node,
+                ),
+                other => panic!("guard then-branch should return the cache; got {other:?}"),
+            }
+        }
+        other => panic!("first stmt should be the loaded-guard If; got {other:?}"),
+    }
+
+    // Lazy fallback tail: `Comment.where(article_id: @id)`.
+    let (recv_path, method) = match &*stmts[1].node {
+        roundhouse::ExprNode::Send { recv, method, .. } => {
+            let recv = recv.as_ref().expect("lazy tail should be Comment.where(...)");
+            let path = match &*recv.node {
+                roundhouse::ExprNode::Const { path } => {
+                    path.iter().map(|s| s.as_str().to_string()).collect::<Vec<_>>()
+                }
+                other => panic!("lazy tail receiver should be Const; got {other:?}"),
+            };
+            (path, method.as_str().to_string())
+        }
+        other => panic!("lazy tail is not Send: {other:?}"),
+    };
+    assert_eq!(recv_path, vec!["Comment".to_string()]);
+    assert_eq!(method, "where");
+}
+
+#[test]
+fn bulk_lowering_rewrites_has_many_proxy_via_arel() {
+    // The single-model lowerer (above) emits the cache-aware reader
+    // `[guard-If, Comment.where(article_id: @id)]`. The bulk lowerer
+    // additionally runs the Arel pass, which recognizes the lazy-tail
+    // Send (Comment is in the registry) and replaces it with the inline
+    // SELECT/hydrate Expr emitted by SqliteVisitor. So the body stays a
+    // 2-stmt Seq, but the tail is now the SELECT/hydrate Seq rather than
+    // a bare `Comment.where` Send. The guard is untouched (no AR call to
+    // rewrite). See project_arel_compile_time_first.md + issue #27.
+    let app = ingest_app(fixture_path()).expect("ingest real-blog");
+    let (lcs, _) = lower_models_with_registry(&app.models, &app.schema, vec![]);
+    let article = lcs
+        .iter()
+        .find(|lc| lc.name.0.as_str() == "Article")
+        .expect("Article in bulk-lowered output");
+    let comments = article
+        .methods
+        .iter()
+        .find(|m| m.name.as_str() == "comments")
+        .expect("comments method present");
+
+    let stmts = match &*comments.body.node {
+        roundhouse::ExprNode::Seq { exprs } => exprs,
+        roundhouse::ExprNode::Send { method, .. } => panic!(
+            "comments body is a bare Send {{ method: {} }} — the cache-aware \
+             reader shape was lost",
+            method.as_str()
+        ),
+        other => panic!("comments body has unexpected shape: {other:?}"),
+    };
+    assert_eq!(stmts.len(), 2, "expected [loaded-guard, arel hydrate Seq]");
+
+    // Guard is left alone (no AR call to rewrite).
+    assert!(
+        matches!(&*stmts[0].node, roundhouse::ExprNode::If { .. }),
+        "first stmt should remain the loaded-guard If; got {:?}",
+        stmts[0].node,
+    );
+
+    // Lazy tail is rewritten into the SELECT/hydrate Seq.
+    match &*stmts[1].node {
+        roundhouse::ExprNode::Seq { exprs } => {
+            assert!(
+                exprs.len() >= 5,
+                "expected SELECT/hydrate Seq (stmt = prepare; results = []; while step? …; \
+                 finalize; results); got {} exprs",
+                exprs.len()
+            );
+        }
+        roundhouse::ExprNode::Send { method, .. } => panic!(
+            "Arel pass did not fire — lazy tail is still `Send {{ method: {} }}`",
+            method.as_str()
+        ),
+        other => panic!("lazy tail has unexpected shape: {other:?}"),
+    }
+}
+
+#[test]
+fn article_lowers_validate_method() {
+    let lc = lower("Article");
+    let validate = lc
+        .methods
+        .iter()
+        .find(|m| m.name.as_str() == "validate")
+        .expect("validate method present (article has presence/length validations)");
+
+    assert!(matches!(validate.receiver, MethodReceiver::Instance));
+    assert!(validate.params.is_empty());
+
+    // Body is a Seq of stmts. Article has:
+    //   validates :title, presence: true       → 1 inline If (Phase 2.5(a))
+    //   validates :body,  presence: true       → 1 inline If (Phase 2.5(a))
+    //   validates :body,  length: { min: 10 }  → 1 helper Send (not yet inlined)
+    let body = &*validate.body.node;
+    let exprs = match body {
+        roundhouse::ExprNode::Seq { exprs } => exprs,
+        other => panic!("validate body is not Seq: {other:?}"),
+    };
+    assert!(
+        exprs.len() >= 3,
+        "expected >=3 stmts (presence-if on title, presence-if on body, length helper on body); got {}: {exprs:?}",
+        exprs.len(),
+    );
+
+    // First stmt: presence-if for title. Shape: `If { cond: BoolOp(Or, …),
+    // then: Send(errors << "Title can't be blank"), else: Nil }`.
+    let first = exprs.first().unwrap();
+    match &*first.node {
+        roundhouse::ExprNode::If { cond, .. } => {
+            assert!(
+                matches!(&*cond.node, roundhouse::ExprNode::BoolOp { .. }),
+                "presence cond should be a BoolOp tree; got {:?}",
+                &*cond.node,
+            );
+        }
+        other => panic!("first validate stmt should be presence-If (Phase 2.5(a) inline); got {other:?}"),
+    }
+}
+
+#[test]
+fn comment_lowers_validate_with_two_inline_presence_and_belongs_to() {
+    let lc = lower("Comment");
+    let validate = lc
+        .methods
+        .iter()
+        .find(|m| m.name.as_str() == "validate")
+        .expect("validate method present");
+
+    let exprs = match &*validate.body.node {
+        roundhouse::ExprNode::Seq { exprs } => exprs.clone(),
+        other => panic!("validate body should be Seq; got {other:?}"),
+    };
+    // Three stmts, all inline-If under Phase 2.5(a): presence-If for
+    // commenter + presence-If for body + belongs_to-If for the
+    // `belongs_to :article` synthesized check.
+    assert_eq!(exprs.len(), 3, "got {}: {exprs:?}", exprs.len());
+    for (i, e) in exprs.iter().enumerate() {
+        assert!(
+            matches!(&*e.node, roundhouse::ExprNode::If { .. }),
+            "stmt {i} should be inline-If; got {:?}",
+            &*e.node,
+        );
+    }
+}
+
+#[test]
+fn comment_lowers_belongs_to_reader() {
+    let lc = lower("Comment");
+    assert_eq!(lc.name.0.as_str(), "Comment");
+
+    let article = lc
+        .methods
+        .iter()
+        .find(|m| m.name.as_str() == "article")
+        .expect("article method present (belongs_to :article)");
+
+    assert!(matches!(article.receiver, MethodReceiver::Instance));
+    assert!(article.params.is_empty());
+
+    // Shape: `if @article_id == 0 then nil else Article.find_by(id: @article_id) end`.
+    match &*article.body.node {
+        roundhouse::ExprNode::If { cond, .. } => match &*cond.node {
+            roundhouse::ExprNode::Send { method, .. } => {
+                assert_eq!(method.as_str(), "==", "guard should be ==");
+            }
+            other => panic!("if-cond should be Send `==`; got {other:?}"),
+        },
+        other => panic!("article body should be If; got {other:?}"),
+    }
+}
+
+#[test]
+fn article_lowers_dependent_destroy_to_before_destroy() {
+    let lc = lower("Article");
+    let cb = lc
+        .methods
+        .iter()
+        .find(|m| m.name.as_str() == "before_destroy")
+        .expect("before_destroy method present (has_many dependent: :destroy)");
+
+    assert!(matches!(cb.receiver, MethodReceiver::Instance));
+    let body = &*cb.body.node;
+    let exprs = match body {
+        roundhouse::ExprNode::Seq { exprs } => exprs.clone(),
+        // Single statement collapses to non-Seq; treat as one-element list.
+        _ => vec![cb.body.clone()],
+    };
+    assert!(!exprs.is_empty(), "before_destroy should not be empty");
+    // First (and only) statement: `comments.each { |c| c.destroy }`.
+    let first = &exprs[0];
+    let (method, block_present) = match &*first.node {
+        roundhouse::ExprNode::Send { method, block, .. } => (method.as_str(), block.is_some()),
+        other => panic!("expected each-Send in before_destroy; got {other:?}"),
+    };
+    assert_eq!(method, "each");
+    assert!(block_present, "each call should carry a block");
+}
+
+/// `has_one …, autosave: true` folds `_autosave_<name>` into `after_save`.
+#[test]
+fn has_one_autosave_folds_into_after_save() {
+    use roundhouse::ingest::{ingest_model, ingest_schema};
+
+    let schema = ingest_schema(
+        br#"
+ActiveRecord::Schema[7.1].define(version: 1) do
+  create_table "users", force: :cascade do |t|
+    t.string "name"
+  end
+  create_table "profiles", force: :cascade do |t|
+    t.integer "user_id"
+    t.string "bio"
+  end
+end
+"#,
+        "db/schema.rb",
+    )
+    .expect("ingest schema");
+    let model = ingest_model(
+        b"class User < ApplicationRecord\n  has_one :profile, autosave: true\nend\n",
+        "app/models/user.rb",
+        &schema,
+        &Default::default(),
+    )
+    .expect("ingest")
+    .expect("model");
+    let lc = lower_model_to_library_class(&model, &schema);
+    assert!(
+        lc.methods.iter().any(|m| m.name.as_str() == "_autosave_profile"),
+        "expected _autosave_profile"
+    );
+    assert!(
+        lc.methods.iter().any(|m| m.name.as_str() == "profile="),
+        "expected has_one writer"
+    );
+    let after = lc
+        .methods
+        .iter()
+        .find(|m| m.name.as_str() == "after_save")
+        .expect("after_save present for autosave");
+    let dump = format!("{:?}", after.body);
+    assert!(
+        dump.contains("_autosave_profile"),
+        "after_save should call _autosave_profile: {dump}"
+    );
+}
+
+/// Polymorphic `as:` autosave writes the type column in the lowered body.
+#[test]
+fn polymorphic_has_one_autosave_sets_type_column() {
+    use roundhouse::ingest::{ingest_model, ingest_schema};
+
+    let schema = ingest_schema(
+        br#"
+ActiveRecord::Schema[7.1].define(version: 1) do
+  create_table "users", force: :cascade do |t|
+    t.string "name"
+  end
+  create_table "avatars", force: :cascade do |t|
+    t.integer "imageable_id"
+    t.string "imageable_type"
+    t.string "url"
+  end
+end
+"#,
+        "db/schema.rb",
+    )
+    .expect("ingest schema");
+    let model = ingest_model(
+        b"class User < ApplicationRecord\n  has_one :avatar, as: :imageable, autosave: true\nend\n",
+        "app/models/user.rb",
+        &schema,
+        &Default::default(),
+    )
+    .expect("ingest")
+    .expect("model");
+    let lc = lower_model_to_library_class(&model, &schema);
+    let autosave = lc
+        .methods
+        .iter()
+        .find(|m| m.name.as_str() == "_autosave_avatar")
+        .expect("_autosave_avatar");
+    let dump = format!("{:?}", autosave.body);
+    assert!(
+        dump.contains("imageable_type=") || dump.contains("\"User\""),
+        "autosave should assign polymorphic type: {dump}"
+    );
+}
+
+/// `has_one …, dependent: :destroy` cascades the single child, not
+/// a collection `each`. Nil child is the else branch so destroy of an
+/// owner with no row does not raise.
+#[test]
+fn has_one_dependent_destroy_lowers_to_before_destroy() {
+    use roundhouse::ingest::{ingest_model, ingest_schema};
+
+    let schema = ingest_schema(
+        br#"
+ActiveRecord::Schema[7.1].define(version: 1) do
+  create_table "users", force: :cascade do |t|
+    t.string "name"
+  end
+  create_table "profiles", force: :cascade do |t|
+    t.integer "user_id"
+    t.string "bio"
+  end
+end
+"#,
+        "db/schema.rb",
+    )
+    .expect("ingest schema");
+    let model = ingest_model(
+        b"class User < ApplicationRecord\n  has_one :profile, dependent: :destroy\nend\n",
+        "app/models/user.rb",
+        &schema,
+        &Default::default(),
+    )
+    .expect("ingest")
+    .expect("model");
+    let lc = lower_model_to_library_class(&model, &schema);
+    let cb = lc
+        .methods
+        .iter()
+        .find(|m| m.name.as_str() == "before_destroy")
+        .expect("before_destroy method present (has_one dependent: :destroy)");
+    assert!(matches!(cb.receiver, MethodReceiver::Instance));
+    let first = &body_stmts(cb)[0];
+    match &*first.node {
+        roundhouse::ExprNode::If { cond, then_branch, .. } => {
+            match &*cond.node {
+                roundhouse::ExprNode::Send { method, .. } => {
+                    assert_eq!(method.as_str(), "profile");
+                }
+                other => panic!("expected profile reader cond; got {other:?}"),
+            }
+            match &*then_branch.node {
+                roundhouse::ExprNode::Send { method, .. } => {
+                    assert_eq!(method.as_str(), "destroy");
+                }
+                other => panic!("expected destroy in then; got {other:?}"),
+            }
+        }
+        other => panic!("expected If cascade for has_one destroy; got {other:?}"),
+    }
+}
+
+/// Statements of a method body as a list (single stmt = one element).
+fn body_stmts(m: &roundhouse::dialect::MethodDef) -> Vec<roundhouse::Expr> {
+    match &*m.body.node {
+        roundhouse::ExprNode::Seq { exprs } => exprs.clone(),
+        _ => vec![m.body.clone()],
+    }
+}
+
+/// `!self.persisted?`: the `on: :create` guard a validation callback gets.
+/// `self.persisted?` rather than a bare `new_record?`, which the rust and
+/// go structs don't inherit.
+fn assert_not_self_persisted(cond: &roundhouse::Expr) {
+    match &*cond.node {
+        roundhouse::ExprNode::Send { recv: Some(inner), method, .. } if method.as_str() == "!" => match &*inner.node {
+            roundhouse::ExprNode::Send { recv: Some(r), method, .. }
+                if method.as_str() == "persisted?" && matches!(&*r.node, roundhouse::ExprNode::SelfRef) => {}
+            other => panic!("expected self.persisted?; got {other:?}"),
+        },
+        other => panic!("expected !self.persisted?; got {other:?}"),
+    }
+}
+
+/// The method name of a receiverless self-call statement.
+fn self_call_name(e: &roundhouse::Expr) -> &str {
+    match &*e.node {
+        roundhouse::ExprNode::Send { recv: None, method, .. } => method.as_str(),
+        other => panic!("expected self-call; got {other:?}"),
+    }
+}
+
+#[test]
+fn symbol_form_callbacks_lower_to_hook_overrides() {
+    use roundhouse::ingest::ingest_model;
+    use roundhouse::schema::Schema;
+
+    let source = br#"class User < ApplicationRecord
+  before_save :check_session_token
+  after_create :mark_submitter, :record_initial_upvote
+  after_commit :recreate_links, on: :create
+  before_validation :assign_initial_attributes, on: :create
+  after_save :log_hat_use, if: :hat_selected?
+end
+"#;
+    let model = ingest_model(source, "app/models/user.rb", &Schema::default(), &Default::default())
+        .expect("ingest")
+        .expect("model");
+    let lc = lower_model_to_library_class(&model, &Schema::default());
+    let names = method_names(&lc);
+
+    // before_save :check_session_token → override with one self-call.
+    let bs = lc.methods.iter().find(|m| m.name.as_str() == "before_save").expect("before_save");
+    assert!(matches!(bs.receiver, MethodReceiver::Instance));
+    assert_eq!(
+        body_stmts(bs).iter().map(self_call_name).collect::<Vec<_>>(),
+        vec!["check_session_token"]
+    );
+
+    // Multi-target form keeps declaration order in one override.
+    let ac = lc.methods.iter().find(|m| m.name.as_str() == "after_create").expect("after_create");
+    assert_eq!(
+        body_stmts(ac).iter().map(self_call_name).collect::<Vec<_>>(),
+        vec!["mark_submitter", "record_initial_upvote"]
+    );
+
+    // `after_commit ..., on: :create` remaps onto the runtime's
+    // after_create_commit hook; no plain after_commit override appears.
+    let acc = lc
+        .methods
+        .iter()
+        .find(|m| m.name.as_str() == "after_create_commit")
+        .expect("after_create_commit");
+    assert_eq!(
+        body_stmts(acc).iter().map(self_call_name).collect::<Vec<_>>(),
+        vec!["recreate_links"]
+    );
+    assert!(!names.contains(&"after_commit"), "{names:?}");
+
+    // `before_validation ..., on: :create` guards on `!self.persisted?`:
+    // accurate at validation time (the insert hasn't happened yet).
+    let bv = lc
+        .methods
+        .iter()
+        .find(|m| m.name.as_str() == "before_validation")
+        .expect("before_validation");
+    match &*body_stmts(bv)[0].node {
+        roundhouse::ExprNode::If { cond, then_branch, .. } => {
+            assert_not_self_persisted(cond);
+            let then_stmts = match &*then_branch.node {
+                roundhouse::ExprNode::Seq { exprs } => exprs.clone(),
+                _ => vec![then_branch.clone()],
+            };
+            assert_eq!(
+                then_stmts.iter().map(self_call_name).collect::<Vec<_>>(),
+                vec!["assign_initial_attributes"]
+            );
+        }
+        other => panic!("expected !self.persisted? guard; got {other:?}"),
+    }
+
+    // `after_save :log_hat_use, if: :hat_selected?` lowers with the
+    // predicate as a guard (it used to be dropped entirely — running it
+    // unconditionally would have been worse, but dropping it is wrong
+    // too).
+    let asv = lc
+        .methods
+        .iter()
+        .find(|m| m.name.as_str() == "after_save")
+        .expect("after_save");
+    match &*body_stmts(asv)[0].node {
+        roundhouse::ExprNode::If { cond, then_branch, .. } => {
+            assert_eq!(self_call_name(cond), "hat_selected?");
+            let then_stmts = match &*then_branch.node {
+                roundhouse::ExprNode::Seq { exprs } => exprs.clone(),
+                _ => vec![then_branch.clone()],
+            };
+            assert_eq!(
+                then_stmts.iter().map(self_call_name).collect::<Vec<_>>(),
+                vec!["log_hat_use"]
+            );
+        }
+        other => panic!("expected hat_selected? guard; got {other:?}"),
+    }
+}
+
+#[test]
+fn block_form_callbacks_honor_the_on_restriction() {
+    use roundhouse::ingest::ingest_model;
+    use roundhouse::schema::Schema;
+
+    // lobsters' User: the token generators run only on create, and the
+    // block form carries `on:` as an option hash where the symbol form
+    // carries it as a keyword.
+    let source = br#"class User < ApplicationRecord
+  before_validation on: :create do
+    create_rss_token
+  end
+  after_commit on: :create do
+    recreate_links
+  end
+  after_create do
+    mark_submitter
+  end
+  before_save on: :create do
+    never_lowers
+  end
+  after_validation if: :active? do
+    also_never_lowers
+  end
+end
+"#;
+    let model = ingest_model(source, "app/models/user.rb", &Schema::default(), &Default::default())
+        .expect("ingest")
+        .expect("model");
+    let lc = lower_model_to_library_class(&model, &Schema::default());
+    let names = method_names(&lc);
+
+    // Validation hook keeps its name and gains the `!self.persisted?` guard.
+    let bv = lc
+        .methods
+        .iter()
+        .find(|m| m.name.as_str() == "before_validation")
+        .expect("before_validation");
+    match &*body_stmts(bv)[0].node {
+        roundhouse::ExprNode::If { cond, then_branch, .. } => {
+            assert_not_self_persisted(cond);
+            let then_stmts = match &*then_branch.node {
+                roundhouse::ExprNode::Seq { exprs } => exprs.clone(),
+                _ => vec![then_branch.clone()],
+            };
+            assert_eq!(
+                then_stmts.iter().map(self_call_name).collect::<Vec<_>>(),
+                vec!["create_rss_token"]
+            );
+        }
+        other => panic!("expected !self.persisted? guard; got {other:?}"),
+    }
+
+    // after_commit retargets the per-lifecycle runtime hook.
+    let acc = lc
+        .methods
+        .iter()
+        .find(|m| m.name.as_str() == "after_create_commit")
+        .expect("after_create_commit");
+    assert_eq!(
+        body_stmts(acc).iter().map(self_call_name).collect::<Vec<_>>(),
+        vec!["recreate_links"]
+    );
+    assert!(!names.contains(&"after_commit"), "{names:?}");
+
+    // Optionless block form is unchanged by this path.
+    let ac = lc.methods.iter().find(|m| m.name.as_str() == "after_create").expect("after_create");
+    assert_eq!(
+        body_stmts(ac).iter().map(self_call_name).collect::<Vec<_>>(),
+        vec!["mark_submitter"]
+    );
+
+    // Rails doesn't accept `on:` on before_save, and an `if:`
+    // condition drops the callback rather than run it unguarded.
+    assert!(!names.contains(&"before_save"), "{names:?}");
+    assert!(!names.contains(&"after_validation"), "{names:?}");
+}
+
+/// A column's SCHEMA default is the value Rails gives an unset
+/// attribute: `Membership.new.involvement` is `"mentions"` because
+/// `t.string "involvement", default: "mentions"` says so. The column
+/// is NULLABLE — nothing declares `null: false` — so before this the
+/// slot took a bare `attrs[:involvement]` and answered nil, and
+/// campfire's `INVOLVEMENT_ORDER.index(involvement) + 1` met a nil.
+///
+/// The literal is typed by the COLUMN, not by how the default was
+/// spelled: lobsters declares `t.decimal "hotness", default: "0.0"`
+/// and the slot wants a float.
+#[test]
+fn schema_column_default_backs_the_unset_attribute() {
+    use roundhouse::ingest::{ingest_model, ingest_schema};
+
+    let schema = ingest_schema(
+        br#"
+ActiveRecord::Schema[7.1].define(version: 1) do
+  create_table "memberships", force: :cascade do |t|
+    t.string "involvement", default: "mentions"
+    t.decimal "hotness", precision: 20, scale: 10, default: "0.0", null: false
+    t.string "note"
+  end
+end
+"#,
+        "db/schema.rb",
+    )
+    .expect("ingest schema");
+    let model = ingest_model(
+        b"class Membership < ApplicationRecord\nend\n",
+        "app/models/membership.rb",
+        &schema,
+        &Default::default(),
+    )
+    .expect("ingest")
+    .expect("model");
+    let lc = lower_model_to_library_class(&model, &schema);
+    let init = lc.methods.iter().find(|m| m.name.as_str() == "initialize").expect("initialize");
+    let rendered = format!("{:?}", body_stmts(init));
+
+    // The defaulted nullable column takes the `||` form with the
+    // SCHEMA's literal, not the type-zero `""`.
+    assert!(rendered.contains("mentions"), "schema default missing: {rendered}");
+    // A nullable column with NO default keeps the BARE lookup — its
+    // unset value really is NULL, and `""` in a nullable UNIQUE column
+    // collides on the second row.
+    // A string column's value sits inside Rails' String cast (a
+    // `Cast` to the column slot); the `||` is what this test pins.
+    let is_boolop = |e: &roundhouse::Expr| match &*e.node {
+        roundhouse::ExprNode::BoolOp { .. } => true,
+        roundhouse::ExprNode::Cast { value, .. } => {
+            matches!(&*value.node, roundhouse::ExprNode::BoolOp { .. })
+        }
+        _ => false,
+    };
+    let arg_is_boolop = |setter: &str| {
+        body_stmts(init).iter().any(|e| matches!(&*e.node,
+            roundhouse::ExprNode::Send { method, args, .. }
+                if method.as_str() == setter
+                && args.first().is_some_and(is_boolop)))
+    };
+    assert!(arg_is_boolop("involvement="), "defaulted column has no `||`: {rendered}");
+    assert!(!arg_is_boolop("note="), "undefaulted nullable column gained a `||`: {rendered}");
+    // Float slot, float literal — the decimal's `"0.0"` is not a String.
+    assert!(rendered.contains("Float { value: 0.0 }"), "decimal default not a float: {rendered}");
+}
+
+#[test]
+fn raw_slot_columns_route_through_writers_in_initialize_and_presence() {
+    use roundhouse::ingest::{ingest_model, ingest_schema};
+
+    let schema = ingest_schema(
+        br#"
+ActiveRecord::Schema[7.1].define(version: 1) do
+  create_table "usernames", force: :cascade do |t|
+    t.string "username"
+    t.integer "user_id", null: false
+    t.datetime "created_at", null: false
+  end
+end
+"#,
+        "db/schema.rb",
+    )
+    .expect("ingest schema");
+    let model = ingest_model(
+        br#"
+class Username < ApplicationRecord
+  belongs_to :user
+  validates :created_at, presence: true
+end
+"#,
+        "app/models/username.rb",
+        &schema,
+        &Default::default(),
+    )
+    .expect("ingest")
+    .expect("model");
+    let lc = lower_model_to_library_class(&model, &schema);
+
+    // initialize: the temporal column default-inits its raw slot
+    // (strict targets assign every field), then routes a provided
+    // value through the PUBLIC `created_at=` writer under a nil guard
+    // (format_db_time normalizes the Time); the belongs_to
+    // association-object key routes through `user=` the same way
+    // (`Username.new(user: some_user)` — lobsters' User#after_create).
+    let init = lc.methods.iter().find(|m| m.name.as_str() == "initialize").expect("initialize");
+    let stmts = body_stmts(init);
+    assert!(
+        stmts.iter().any(|e| matches!(&*e.node,
+            roundhouse::ExprNode::Send { method, args, .. }
+                if method.as_str() == "created_at_raw="
+                && matches!(args.first().map(|a| &*a.node), Some(roundhouse::ExprNode::BoolOp { .. })))),
+        "raw slot standard `attrs[:col] || default` init missing"
+    );
+    let guarded_writers: Vec<&str> = stmts
+        .iter()
+        .filter_map(|e| match &*e.node {
+            roundhouse::ExprNode::If { then_branch, .. } => match &*then_branch.node {
+                roundhouse::ExprNode::Send { method, .. } => Some(method.as_str()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    // temporal: guarded raw-slot assign through the format_db_time
+    // intrinsic (NOT the public `created_at=` writer — several
+    // emitters render that MethodDef without a property-setter
+    // counterpart for the computed getter; tsc flags TS2540).
+    assert!(guarded_writers.contains(&"created_at_raw="), "{guarded_writers:?}");
+    assert!(!guarded_writers.contains(&"created_at="), "{guarded_writers:?}");
+    let init_dbg = format!("{:?}", init.body);
+    assert!(init_dbg.contains("format_db_time"), "temporal attrs normalize via the intrinsic");
+    // belongs_to object key assigns the fk directly (`self.user_id =
+    // Cast(attrs[:user], User).id`) — writer-named Sends on
+    // non-column names break go's field-assign peephole.
+    assert!(guarded_writers.contains(&"user_id="), "{guarded_writers:?}");
+    assert!(!guarded_writers.contains(&"user="), "{guarded_writers:?}");
+
+    // The presence check reads the raw storage slot — `@created_at` is
+    // never the storage for a temporal column, so a check against it
+    // fired unconditionally.
+    let validate = lc.methods.iter().find(|m| m.name.as_str() == "validate").expect("validate");
+    let body_dbg = format!("{:?}", validate.body);
+    assert!(body_dbg.contains("Symbol(\"created_at_raw\")"), "presence must read the raw slot");
+    assert!(
+        !body_dbg.contains("Ivar { name: Symbol(\"created_at\") }"),
+        "presence must not read the bare temporal ivar"
+    );
+}
+
+#[test]
+fn has_many_through_collection_writer_and_save_sync() {
+    use roundhouse::ingest::{ingest_model, ingest_schema};
+
+    let schema = ingest_schema(
+        br#"
+ActiveRecord::Schema[7.1].define(version: 1) do
+  create_table "stories", force: :cascade do |t|
+    t.string "title"
+  end
+end
+"#,
+        "db/schema.rb",
+    )
+    .expect("ingest schema");
+    let model = ingest_model(
+        br#"
+class Story < ApplicationRecord
+  has_many :taggings, dependent: :destroy
+  has_many :tags, through: :taggings
+end
+"#,
+        "app/models/story.rb",
+        &schema,
+        &Default::default(),
+    )
+    .expect("ingest")
+    .expect("model");
+    let lc = lower_model_to_library_class(&model, &schema);
+    let names = method_names(&lc);
+
+    // `story.tags = [tag]` stages cache/loaded/stale; `_sync_tags`
+    // replaces the join rows; the sync call folds into after_save.
+    assert!(names.contains(&"tags="), "{names:?}");
+    assert!(names.contains(&"_sync_tags"), "{names:?}");
+    let writer = lc.methods.iter().find(|m| m.name.as_str() == "tags=").unwrap();
+    let writer_dbg = format!("{:?}", writer.body);
+    for ivar in ["tags_cache", "tags_loaded", "tags_stale"] {
+        assert!(writer_dbg.contains(ivar), "writer must assign {ivar}");
+    }
+    // The staged value is MATERIALIZED: a Relation assigned as-is
+    // (`self.tags = Tag.where(…)`, lobsters' story factory) became the
+    // cache, so `tags.to_a` handed the Relation back and `.sum { }`
+    // reached `Relation#sum(expr)`.
+    assert!(
+        writer_dbg.contains("method: Symbol(\"to_a\")"),
+        "writer must cache `values.to_a`: {writer_dbg}"
+    );
+    let sync = lc.methods.iter().find(|m| m.name.as_str() == "_sync_tags").unwrap();
+    let sync_dbg = format!("{:?}", sync.body);
+    // join resolution: sibling through assoc gives Tagging + story_id;
+    // target-side fk is the `<target>_id` convention.
+    for needle in ["Tagging", "story_id=", "tag_id=", "destroy", "save"] {
+        assert!(sync_dbg.contains(needle), "sync must contain {needle}: {sync_dbg}");
+    }
+    let after_save = lc.methods.iter().find(|m| m.name.as_str() == "after_save").expect("after_save");
+    assert!(format!("{:?}", after_save.body).contains("_sync_tags"));
+
+    // the direct has_many (no through) gets no collection writer.
+    assert!(!names.contains(&"taggings="), "{names:?}");
+}
+
+#[test]
+fn secure_password_attrs_route_through_writers_in_initialize() {
+    use roundhouse::ingest::{ingest_model, ingest_schema};
+
+    let schema = ingest_schema(
+        br#"
+ActiveRecord::Schema[7.1].define(version: 1) do
+  create_table "users", force: :cascade do |t|
+    t.string "username"
+    t.string "password_digest"
+  end
+end
+"#,
+        "db/schema.rb",
+    )
+    .expect("ingest schema");
+    let model = ingest_model(
+        br#"
+class User < ApplicationRecord
+  has_secure_password
+end
+"#,
+        "app/models/user.rb",
+        &schema,
+        &Default::default(),
+    )
+    .expect("ingest")
+    .expect("model");
+    let lc = lower_model_to_library_class(&model, &schema);
+
+    // `User.new(password: "...", password_confirmation: "...")` — the
+    // factory/signup shape — must reach the macro's plaintext writers.
+    let init = lc.methods.iter().find(|m| m.name.as_str() == "initialize").expect("initialize");
+    let stmts = body_stmts(init);
+    let guarded_writers: Vec<&str> = stmts
+        .iter()
+        .filter_map(|e| match &*e.node {
+            roundhouse::ExprNode::If { then_branch, .. } => match &*then_branch.node {
+                roundhouse::ExprNode::Send { method, .. } => Some(method.as_str()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    assert!(guarded_writers.contains(&"password="), "{guarded_writers:?}");
+    assert!(guarded_writers.contains(&"password_confirmation="), "{guarded_writers:?}");
+}
+
+#[test]
+fn concern_included_do_dsl_splices_into_including_models() {
+    use roundhouse::ingest::ingest_app_from_tree;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    let tree: HashMap<PathBuf, Vec<u8>> = [
+        (
+            "db/schema.rb",
+            r#"ActiveRecord::Schema.define do
+  create_table "moderations", force: :cascade do |t|
+    t.string "action", null: false
+    t.string "token", null: false
+  end
+end
+"#,
+        ),
+        (
+            "app/models/concerns/token.rb",
+            r#"module Token
+  extend ActiveSupport::Concern
+
+  included do
+    after_initialize do
+      self.token ||= "generated"
+    end
+
+    validates :token, presence: true
+  end
+end
+"#,
+        ),
+        (
+            "app/models/moderation.rb",
+            r#"class Moderation < ApplicationRecord
+  include Token
+end
+"#,
+        ),
+    ]
+    .into_iter()
+    .map(|(p, c)| (PathBuf::from(p), c.as_bytes().to_vec()))
+    .collect();
+    let app = ingest_app_from_tree(tree).expect("ingest");
+    let model = app.models.iter().find(|m| m.name.0.as_str() == "Moderation").expect("model");
+
+    // The include line survives (the ruby emit re-emits it verbatim so
+    // Ruby's own include provides module constants/methods); the
+    // `included do` DSL items follow it.
+    let has_include = model.body.iter().any(|item| {
+        matches!(item, roundhouse::dialect::ModelBodyItem::Unknown { expr, .. }
+            if matches!(&*expr.node, roundhouse::ExprNode::Send { method, .. }
+                if method.as_str() == "include"))
+    });
+    assert!(has_include, "include line must be kept");
+    let validations: Vec<&roundhouse::Validation> = model.validations().collect();
+    assert!(
+        validations.iter().any(|v| v.attribute.as_str() == "token"),
+        "concern validates spliced"
+    );
+
+    // The spliced block-form after_initialize lowers to a hook
+    // override with the `||=` rewritten blank-aware (Rails' nil-attr
+    // idiom vs this runtime's ""-defaulted string slots), and the
+    // synthesized initialize gains the hook-call tail.
+    let lc = lower_model_to_library_class(model, &app.schema);
+    let hook = lc
+        .methods
+        .iter()
+        .find(|m| m.name.as_str() == "after_initialize")
+        .expect("after_initialize lowered");
+    let hook_dbg = format!("{:?}", hook.body);
+    // GROUNDED, not a `blank?` send. This assertion used to read
+    // `contains("blank?")`, which passed on a bare dynamic dispatch —
+    // the shape that compiled and then raised `NoMethodError` on
+    // spinel. `lower::blank` has already run by the time this rewrite
+    // builds the guard, so it grounds the String itself; see
+    // `blank::synthesized_string_blank` and
+    // tests/synthesized_blank_is_grounded.rs.
+    // GROUNDED to the runtime predicate, not a `blank?` send on the
+    // receiver. This assertion used to read `contains("blank?")`, which
+    // passed on a bare dynamic dispatch — the shape that compiled and
+    // then raised `NoMethodError` on spinel. `lower::blank` has already
+    // run by the time this rewrite builds the guard, so it grounds the
+    // call itself; see `blank::synthesized_string_blank` and
+    // tests/synthesized_blank_is_grounded.rs.
+    assert!(
+        hook_dbg.contains("ActiveSupport"),
+        "||= rewritten blank-aware, and grounded: {hook_dbg}"
+    );
+    let init = lc.methods.iter().find(|m| m.name.as_str() == "initialize").expect("initialize");
+    let init_dbg = format!("{:?}", init.body);
+    assert!(init_dbg.contains("after_initialize"), "hook tail in initialize");
+
+    // Loaded records fire the hook ONCE, after their columns are set.
+    // The hydration factories construct with the HYDRATE_ATTRS sentinel
+    // and the initialize tail skips the hook for it — without that the
+    // hook also ran on the empty shell (new_record? true, token blank),
+    // which minted a TypeID per loaded lobsters row and raised
+    // NameError on spinel, where TypeID was undefined.
+    assert!(
+        init_dbg.contains("equal?") && init_dbg.contains("HYDRATE_ATTRS"),
+        "initialize's hook tail is skipped for the hydration sentinel: {init_dbg}"
+    );
+    let body_of = |name: &str| {
+        let m = lc
+            .methods
+            .iter()
+            .find(|m| m.name.as_str() == name)
+            .unwrap_or_else(|| panic!("{name} synthesized"));
+        format!("{:?}", m.body)
+    };
+    // Both constructions use the sentinel.
+    for factory in ["from_row", "from_stmt"] {
+        let dbg = body_of(factory);
+        assert!(dbg.contains("HYDRATE_ATTRS"), "{factory} constructs with the sentinel: {dbg}");
+    }
+    // The hook fires once per hydration path, on a persisted record:
+    // `from_stmt` (a full-column read) itself, and a row-hydrated record
+    // in `instantiate`, AFTER it notes the row's unselected columns —
+    // Rails answers `has_attribute?` false for those, which is the test
+    // Token's guard makes. `from_row` fires nothing.
+    assert_eq!(body_of("from_row").matches("\"after_initialize\"").count(), 0, "from_row leaves the hook to instantiate");
+    for (factory, before) in [("from_stmt", vec!["\"mark_persisted!\""]), ("instantiate", vec!["\"mark_persisted!\"", "\"_note_unloaded\""])] {
+        let dbg = body_of(factory);
+        assert_eq!(dbg.matches("\"after_initialize\"").count(), 1, "{factory} fires the hook once: {dbg}");
+        let hook = dbg.find("\"after_initialize\"").unwrap();
+        for step in before {
+            let at = dbg.find(step).unwrap_or_else(|| panic!("{factory} does {step}: {dbg}"));
+            assert!(at < hook, "{factory}: {step} before the hook: {dbg}");
+        }
+    }
+}
+
+#[test]
+fn allow_blank_drops_dead_presence_check() {
+    use roundhouse::dialect::ValidationRule;
+    use roundhouse::ingest::ingest_model;
+    use roundhouse::schema::Schema;
+
+    let source = br#"class User < ApplicationRecord
+  validates :session_token, allow_blank: true, presence: true, length: { maximum: 75 }
+  validates :email, presence: true
+end
+"#;
+    let model = ingest_model(source, "app/models/user.rb", &Schema::default(), &Default::default())
+        .expect("ingest")
+        .expect("model");
+    let validations: Vec<&roundhouse::Validation> = model.validations().collect();
+
+    // presence + allow_blank can never fire (presence fails only on
+    // blank; allow_blank skips blank) — dropped. Length survives.
+    let st = validations.iter().find(|v| v.attribute.as_str() == "session_token").unwrap();
+    assert!(!st.rules.iter().any(|r| matches!(r, ValidationRule::Presence)), "{st:?}");
+    assert!(st.rules.iter().any(|r| matches!(r, ValidationRule::Length { .. })), "{st:?}");
+
+    // presence without allow_blank is untouched.
+    let email = validations.iter().find(|v| v.attribute.as_str() == "email").unwrap();
+    assert!(email.rules.iter().any(|r| matches!(r, ValidationRule::Presence)), "{email:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Typing-coverage probe — sibling of
+// `inference_on_spinel_blog_runtime::untyped_subexpressions_baseline`,
+// pointed at the post-lowering output of every lowerer applied to
+// real-blog: models, views, and controllers.
+//
+// What's measured: count of Expr sub-expressions whose `ty` is None
+// (or Ty::Var{...}) after lowering, summed across every method body
+// in every lowered class. Single test, single invariant — the
+// universal post-lowering IR is fully typed for emission. Failure
+// path lists the first 20 sites with `Class#method` paths so the
+// kind is implicit in the name.
+// ---------------------------------------------------------------------------
+
+fn collect_untyped_lowered(
+    e: &roundhouse::expr::Expr,
+    path: &str,
+    out: &mut Vec<String>,
+) {
+    use roundhouse::expr::{ExprNode, InterpPart};
+    use roundhouse::ty::Ty;
+
+    let ty_ok = matches!(&e.ty, Some(t) if !matches!(t, Ty::Var { .. }));
+    if !ty_ok {
+        out.push(format!("{path}: {:?} has ty={:?}", &e.node, e.ty));
+    }
+    match &*e.node {
+        ExprNode::Lit { .. }
+        | ExprNode::Var { .. }
+        | ExprNode::Ivar { .. }
+        | ExprNode::Const { .. }
+        | ExprNode::Retry
+        | ExprNode::Redo
+        | ExprNode::ForwardArgs
+        | ExprNode::ForwardKeywords
+        | ExprNode::Defined { .. }
+        | ExprNode::SelfRef => {}
+        ExprNode::ForwardKeywordsWithPairs { entries } => {
+            for (key, value) in entries {
+                collect_untyped_lowered(key, path, out);
+                collect_untyped_lowered(value, path, out);
+            }
+        }
+        ExprNode::If { cond, then_branch, else_branch } => {
+            collect_untyped_lowered(cond, &format!("{path}/if.cond"), out);
+            collect_untyped_lowered(then_branch, &format!("{path}/if.then"), out);
+            collect_untyped_lowered(else_branch, &format!("{path}/if.else"), out);
+        }
+        ExprNode::Send { recv, args, block, .. } => {
+            if let Some(r) = recv {
+                collect_untyped_lowered(r, &format!("{path}/send.recv"), out);
+            }
+            for (i, a) in args.iter().enumerate() {
+                collect_untyped_lowered(a, &format!("{path}/send.arg[{i}]"), out);
+            }
+            if let Some(b) = block {
+                collect_untyped_lowered(b, &format!("{path}/send.block"), out);
+            }
+        }
+        ExprNode::StringInterp { parts } => {
+            for (i, p) in parts.iter().enumerate() {
+                if let InterpPart::Expr { expr } = p {
+                    collect_untyped_lowered(expr, &format!("{path}/interp[{i}]"), out);
+                }
+            }
+        }
+        ExprNode::Seq { exprs } => {
+            for (i, e) in exprs.iter().enumerate() {
+                collect_untyped_lowered(e, &format!("{path}/seq[{i}]"), out);
+            }
+        }
+        ExprNode::BoolOp { left, right, .. } => {
+            collect_untyped_lowered(left, &format!("{path}/boolop.left"), out);
+            collect_untyped_lowered(right, &format!("{path}/boolop.right"), out);
+        }
+        ExprNode::RescueModifier { expr, fallback } => {
+            collect_untyped_lowered(expr, &format!("{path}/rescue.expr"), out);
+            collect_untyped_lowered(fallback, &format!("{path}/rescue.fallback"), out);
+        }
+        ExprNode::Let { value, body, .. } => {
+            collect_untyped_lowered(value, &format!("{path}/let.value"), out);
+            collect_untyped_lowered(body, &format!("{path}/let.body"), out);
+        }
+        ExprNode::Lambda { body, .. } => {
+            collect_untyped_lowered(body, &format!("{path}/lambda.body"), out)
+        }
+        ExprNode::MethodRef { recv, .. } => {
+            if let Some(r) = recv {
+                collect_untyped_lowered(r, &format!("{path}/method_ref.recv"), out);
+            }
+        }
+        ExprNode::Apply { fun, args, block } => {
+            collect_untyped_lowered(fun, &format!("{path}/apply.fun"), out);
+            for (i, a) in args.iter().enumerate() {
+                collect_untyped_lowered(a, &format!("{path}/apply.arg[{i}]"), out);
+            }
+            if let Some(b) = block {
+                collect_untyped_lowered(b, &format!("{path}/apply.block"), out);
+            }
+        }
+        ExprNode::Hash { entries, .. } => {
+            for (i, (k, v)) in entries.iter().enumerate() {
+                collect_untyped_lowered(k, &format!("{path}/hash[{i}].key"), out);
+                collect_untyped_lowered(v, &format!("{path}/hash[{i}].value"), out);
+            }
+        }
+        ExprNode::Array { elements, .. } => {
+            for (i, el) in elements.iter().enumerate() {
+                collect_untyped_lowered(el, &format!("{path}/array[{i}]"), out);
+            }
+        }
+        ExprNode::Case { scrutinee, arms } => {
+            collect_untyped_lowered(scrutinee, &format!("{path}/case.scrut"), out);
+            for (i, arm) in arms.iter().enumerate() {
+                if let Some(g) = &arm.guard {
+                    collect_untyped_lowered(g, &format!("{path}/case.arm[{i}].guard"), out);
+                }
+                collect_untyped_lowered(&arm.body, &format!("{path}/case.arm[{i}].body"), out);
+            }
+        }
+        ExprNode::CaseMatch { scrutinee, arms, else_body } => {
+            collect_untyped_lowered(scrutinee, &format!("{path}/case_match.scrut"), out);
+            for (i, arm) in arms.iter().enumerate() {
+                arm.pattern.for_each_expr(&mut |e| {
+                    collect_untyped_lowered(e, &format!("{path}/case_match.arm[{i}].pattern"), out);
+                });
+                if let Some((_, g)) = &arm.guard {
+                    collect_untyped_lowered(g, &format!("{path}/case_match.arm[{i}].guard"), out);
+                }
+                collect_untyped_lowered(&arm.body, &format!("{path}/case_match.arm[{i}].body"), out);
+            }
+            if let Some(e) = else_body {
+                collect_untyped_lowered(e, &format!("{path}/case_match.else"), out);
+            }
+        }
+        ExprNode::MatchPredicate { value, pattern } | ExprNode::MatchRequired { value, pattern } => {
+            collect_untyped_lowered(value, &format!("{path}/match.value"), out);
+            pattern.for_each_expr(&mut |e| {
+                collect_untyped_lowered(e, &format!("{path}/match.pattern"), out);
+            });
+        }
+        ExprNode::Assign { value, .. } | ExprNode::OpAssign { value, .. } => {
+            collect_untyped_lowered(value, &format!("{path}/assign.value"), out)
+        }
+        ExprNode::Yield { args } => {
+            for (i, a) in args.iter().enumerate() {
+                collect_untyped_lowered(a, &format!("{path}/yield.arg[{i}]"), out);
+            }
+        }
+        ExprNode::Raise { value } => {
+            collect_untyped_lowered(value, &format!("{path}/raise.value"), out)
+        }
+        ExprNode::Return { value } => {
+            collect_untyped_lowered(value, &format!("{path}/return.value"), out)
+        }
+        ExprNode::Super { args } => {
+            if let Some(args) = args {
+                for (i, a) in args.iter().enumerate() {
+                    collect_untyped_lowered(a, &format!("{path}/super.arg[{i}]"), out);
+                }
+            }
+        }
+        ExprNode::BeginRescue { body, rescues, else_branch, ensure, .. } => {
+            collect_untyped_lowered(body, &format!("{path}/begin.body"), out);
+            for (i, r) in rescues.iter().enumerate() {
+                for (j, c) in r.classes.iter().enumerate() {
+                    collect_untyped_lowered(c, &format!("{path}/begin.rescue[{i}].class[{j}]"), out);
+                }
+                collect_untyped_lowered(&r.body, &format!("{path}/begin.rescue[{i}].body"), out);
+            }
+            if let Some(e) = else_branch {
+                collect_untyped_lowered(e, &format!("{path}/begin.else"), out);
+            }
+            if let Some(e) = ensure {
+                collect_untyped_lowered(e, &format!("{path}/begin.ensure"), out);
+            }
+        }
+        ExprNode::Next { value } | ExprNode::Break { value } => {
+            if let Some(v) = value {
+                collect_untyped_lowered(v, &format!("{path}/next.value"), out);
+            }
+        }
+        ExprNode::Splat { value } | ExprNode::KeywordSplat { value } => {
+            collect_untyped_lowered(value, &format!("{path}/splat.value"), out);
+        }
+        ExprNode::MultiAssign { value, .. } => {
+            collect_untyped_lowered(value, &format!("{path}/multi_assign.value"), out);
+        }
+        ExprNode::While { cond, body, .. } => {
+            collect_untyped_lowered(cond, &format!("{path}/while.cond"), out);
+            collect_untyped_lowered(body, &format!("{path}/while.body"), out);
+        }
+        ExprNode::Range { begin, end, .. } => {
+            if let Some(b) = begin {
+                collect_untyped_lowered(b, &format!("{path}/range.begin"), out);
+            }
+            if let Some(e) = end {
+                collect_untyped_lowered(e, &format!("{path}/range.end"), out);
+            }
+        }
+        ExprNode::Cast { value, .. } => {
+            collect_untyped_lowered(value, &format!("{path}/cast.value"), out);
+        }
+    }
+}
+
+/// Convert a slice of LibraryClasses into `(ClassId, ClassInfo)`
+/// pairs suitable for passing as `extras` to a bulk lowerer. Folds
+/// methods across same-named classes (e.g. `articles/index`,
+/// `articles/show`, `articles/_article` all share `Views::Articles`)
+/// before emitting. Each grouped entry is registered under both the
+/// full ClassId and a last-segment alias so the body-typer's
+/// Const-path resolver finds it.
+fn build_class_info_extras(lcs: &[LibraryClass]) -> Vec<(ClassId, roundhouse::analyze::ClassInfo)> {
+    use std::collections::HashMap;
+    let mut grouped: HashMap<ClassId, roundhouse::analyze::ClassInfo> = HashMap::new();
+    for lc in lcs {
+        let info = grouped.entry(lc.name.clone()).or_default();
+        let from = class_info_from_library_class(lc);
+        for (k, v) in from.class_methods {
+            info.class_methods.insert(k, v);
+        }
+        for (k, v) in from.instance_methods {
+            info.instance_methods.insert(k, v);
+        }
+    }
+    let mut out: Vec<(ClassId, roundhouse::analyze::ClassInfo)> = Vec::new();
+    for (full_id, info) in grouped {
+        let raw = full_id.0.as_str();
+        let last = raw.rsplit("::").next().unwrap_or(raw).to_string();
+        if last != raw {
+            let mut alias = roundhouse::analyze::ClassInfo::default();
+            alias.class_methods = info.class_methods.clone();
+            alias.instance_methods = info.instance_methods.clone();
+            out.push((ClassId(Symbol::from(last)), alias));
+        }
+        out.push((full_id, info));
+    }
+    out
+}
+
+#[test]
+fn lowered_real_blog_typing_residual() {
+    let mut app = ingest_app(fixture_path()).expect("ingest real-blog");
+    // The form partial's `errors[:field]` reaches the view lowering already grounded, as the pipeline grounds it
+    roundhouse::lower::apply_errors_index_lowering(&mut app);
+
+    // First pass: build view ClassInfo entries from per-view lowering
+    // (cheap — only need the method signatures for the registry, not
+    // typed bodies). Pass these as extras to the model lowerer.
+    let preliminary_views: Vec<LibraryClass> = app
+        .views
+        .iter()
+        .map(|v| lower_view_to_library_class(v, &app))
+        .collect();
+    let view_extras = build_class_info_extras(&preliminary_views);
+
+    // Collect controller `permit(...)` specs so the model lowerer can
+    // synthesize `from_params(p: <Resource>Params)` factories. Without
+    // this, the controller body's `Article.from_params(article_params)`
+    // call has no signature in the registry and types as `TyVar(0)`.
+    let params_specs =
+        roundhouse::lower::controller_to_library::params::collect_specs(&app.controllers);
+
+    // Models go through the registry-returning bulk entry so
+    // controllers and views can reuse the SAME registry — keeps the
+    // ApplicationRecord baseline (find/all/where/etc) visible to
+    // dispatch on Article.find(...).
+    let (model_lcs, model_registry) =
+        roundhouse::lower::lower_models_with_registry_and_params(
+            &app.models,
+            &app.schema,
+            view_extras,
+            &params_specs,
+        );
+
+    // Re-lower views via the bulk entry, passing the model registry
+    // as extras. The bulk entry adds framework stubs (ViewHelpers,
+    // RouteHelpers, Inflector, String) and runs body-typing with the
+    // merged map so view bodies dispatch correctly on helpers and
+    // sibling-view Sends.
+    let view_lcs = lower_views_to_library_classes(
+        &app.views,
+        &app,
+        model_registry.clone().into_iter().collect(),
+    );
+
+    // Controllers extend the model registry with views + their own
+    // entries. Pass model_registry as extras so cross-class dispatch
+    // (Article.find inside an action) sees the full baseline.
+    let mut controller_extras: Vec<(ClassId, roundhouse::analyze::ClassInfo)> =
+        model_registry.clone().into_iter().collect();
+    controller_extras.extend(build_class_info_extras(&view_lcs));
+    let controller_lcs = roundhouse::lower::lower_controllers_with_arel_and_views(
+        &app.controllers,
+        controller_extras,
+        Some(&app.schema),
+        &app.views,
+    );
+
+    // Fixtures lower to ArticlesFixtures / CommentsFixtures classes;
+    // test bodies' `articles(:one)` calls get rewritten to
+    // `ArticlesFixtures.one()` so fixture classes need to be in the
+    // shared registry.
+    let fixture_lcs = lower_fixtures_to_library_classes(&app);
+
+    // Test modules — same shared-registry pattern.
+    let mut test_extras: Vec<(ClassId, roundhouse::analyze::ClassInfo)> =
+        model_registry.into_iter().collect();
+    test_extras.extend(build_class_info_extras(&view_lcs));
+    test_extras.extend(build_class_info_extras(&controller_lcs));
+    test_extras.extend(build_class_info_extras(&fixture_lcs));
+    let test_lcs = lower_test_modules_to_library_classes(
+        &app.test_modules,
+        &app.fixtures,
+        &app.models,
+        test_extras,
+        &roundhouse::lower::routes::helper_id_segments(&app),
+        &roundhouse::lower::routes::direct_helper_names(&app),
+    );
+
+    let mut all_untyped: Vec<String> = Vec::new();
+    let mut total_classes = 0usize;
+    for lc in model_lcs
+        .iter()
+        .chain(&view_lcs)
+        .chain(&controller_lcs)
+        .chain(&test_lcs)
+    {
+        total_classes += 1;
+        for method in &lc.methods {
+            let path = format!("{}#{}", lc.name.0.as_str(), method.name.as_str());
+            collect_untyped_lowered(&method.body, &path, &mut all_untyped);
+        }
+    }
+
+    eprintln!(
+        "lowered real-blog: {} untyped sub-expressions across {} classes \
+         ({} models, {} views, {} controllers, {} test modules)",
+        all_untyped.len(),
+        total_classes,
+        model_lcs.len(),
+        view_lcs.len(),
+        controller_lcs.len(),
+        test_lcs.len(),
+    );
+    if std::env::var("DUMP_RESIDUAL").is_ok() {
+        for (i, s) in all_untyped.iter().enumerate() {
+            eprintln!("  {i}: {s}");
+        }
+    }
+
+    // Floor reached on real-blog: 0 untyped sub-exprs across all 19
+    // lowered classes (3 models, 9 views, 3 controllers, 4 test
+    // modules). Tracker — fail loud on regression. Run `DUMP_RESIDUAL=1
+    // cargo test ... -- --nocapture` to inspect.
+    const CEILING: usize = 0;
+    assert!(
+        all_untyped.len() <= CEILING,
+        "{} untyped sub-expressions on lowered real-blog — \
+         exceeds ceiling of {CEILING}.\nFirst 20:\n  {}",
+        all_untyped.len(),
+        all_untyped
+            .iter()
+            .take(20)
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join("\n  "),
+    );
+}
+
+#[test]
+fn unclaimed_model_dsl_reports_spanned_warning() {
+    use roundhouse::analyze::Severity;
+    use roundhouse::diagnostic::DiagnosticKind;
+    use roundhouse::ingest::ingest_model;
+    use roundhouse::schema::Schema;
+
+    // `unclaimed_macro` stands in for any Unknown DSL; `has_one_attached`
+    // and `has_many_attached` are both claimed by lower::attached and
+    // must not report beside it.
+    let source = br#"class Clip < ApplicationRecord
+  has_one_attached :audio
+  has_many_attached :stems
+  unclaimed_macro :flag
+
+  validates :name, presence: true
+end
+"#;
+    let model = ingest_model(source, "app/models/clip.rb", &Schema::default(), &Default::default())
+        .expect("ingest")
+        .expect("model");
+
+    let (_lc, diags) = roundhouse::emit::diagnostics::scope(|| {
+        lower_model_to_library_class(&model, &Schema::default())
+    });
+
+    let unsupported: Vec<_> = diags
+        .iter()
+        .filter(|d| matches!(&d.kind, DiagnosticKind::Unsupported { construct, .. }
+            if construct.as_str() == "unclaimed_macro"))
+        .collect();
+    assert_eq!(unsupported.len(), 1, "exactly one report: {diags:?}");
+    assert!(
+        !diags.iter().any(|d| matches!(&d.kind, DiagnosticKind::Unsupported { construct, .. }
+            if construct.as_str() == "has_one_attached" || construct.as_str() == "has_many_attached")),
+        "has_*_attached are claimed by lower::attached and must not report: {diags:?}"
+    );
+    let d = unsupported[0];
+    assert_eq!(d.severity, Severity::Warning, "tolerable per-app: warning, not error");
+    assert!(!d.span.is_synthetic(), "declaration site is located");
+    // validates was claimed by the recognizer; only the unclaimed DSL reports.
+    assert!(
+        !diags.iter().any(|d| matches!(&d.kind, DiagnosticKind::Unsupported { construct, .. }
+            if construct.as_str() == "validates")),
+        "claimed DSL must not report: {diags:?}"
+    );
+}
+
+#[test]
+fn unclaimed_model_class_writes_report_spanned_warnings() {
+    use roundhouse::diagnostic::{DiagnosticKind, Severity};
+    use roundhouse::ingest::ingest_model;
+    use roundhouse::schema::Schema;
+
+    for (statement, setter) in [
+        ("self.probe_flag = true", "probe_flag="),
+        ("self.table_name_prefix = computed_prefix", "table_name_prefix="),
+    ] {
+        let source = format!("class Widget < ApplicationRecord\n  {statement}\nend\n");
+        let model = ingest_model(
+            source.as_bytes(), "app/models/widget.rb", &Schema::default(), &Default::default(),
+        ).expect("ingest").expect("model");
+        let (_, diags) = roundhouse::emit::diagnostics::scope(|| {
+            lower_model_to_library_class(&model, &Schema::default())
+        });
+        assert_eq!(diags.len(), 1, "dropped class-body write must report: {diags:?}");
+        let d = &diags[0];
+        assert_eq!(d.severity, Severity::Warning);
+        assert!(matches!(&d.kind, DiagnosticKind::Unsupported { construct, .. }
+            if construct.as_str() == setter));
+        assert_eq!(&source[d.span.start as usize..d.span.end as usize], statement);
+        assert!(d.message.contains("Widget"), "{d:?}");
+    }
+}
+
+#[test]
+fn computed_model_table_names_fail_before_lowering() {
+    let source = b"class Widget < ApplicationRecord\n  self.table_name = computed_table\nend\n";
+    let error = roundhouse::ingest::ingest_model(
+        source, "app/models/widget.rb", &roundhouse::schema::Schema::default(), &Default::default(),
+    ).expect_err("a computed table must not bind Widget to a guessed schema");
+    assert!(error.to_string().contains("table_name binding"), "{error}");
+}
+
+#[test]
+fn claimed_model_settings_and_method_body_writes_do_not_warn() {
+    use roundhouse::ingest::ingest_model;
+    use roundhouse::schema::Schema;
+
+    let source = br#"class Widget < ApplicationRecord
+  self.table_name = "custom_widgets"
+  self.table_name_prefix = "custom_"
+  self.primary_key = :uuid
+  FLAG = true
+
+  def update_flag
+    self.probe_flag = true
+  end
+end
+"#;
+    let model = ingest_model(source, "app/models/widget.rb", &Schema::default(), &Default::default())
+        .expect("ingest").expect("model");
+    let (lc, diags) = roundhouse::emit::diagnostics::scope(|| {
+        lower_model_to_library_class(&model, &Schema::default())
+    });
+    assert!(diags.is_empty(), "claimed declarations and emitted methods must not warn: {diags:?}");
+    assert_eq!(model.table.0.as_str(), "custom_widgets");
+    assert_eq!(model.primary_key.as_ref().unwrap().as_str(), "uuid");
+    assert!(lc.methods.iter().any(|m| m.name.as_str() == "update_flag"));
+}
+
+// ── to_param ─────────────────────────────────────────────────────────
+//
+// Rails gives every ActiveRecord::Base a `to_param` (`id&.to_s`); the
+// lowered model gets a synthesized `@id.to_s`. The definition that
+// existed before lived in the CRuby overlay's core_ext, which strict
+// targets never apply — campfire's avatar helper stringifies a User
+// through it on every room page, so every avatar 500'd on the binary.
+
+#[test]
+fn every_concrete_model_gains_to_param() {
+    let lc = lower("Article");
+    let m = lc
+        .methods
+        .iter()
+        .find(|m| m.name.as_str() == "to_param")
+        .expect("to_param not synthesized");
+    assert!(matches!(m.receiver, MethodReceiver::Instance));
+    assert!(m.params.is_empty());
+    // The body is the id slot stringified — pinned loosely (an ivar
+    // read under a to_s send) so the assertion survives body-typer
+    // stamping.
+    let body = format!("{:?}", m.body);
+    assert!(body.contains("to_s"), "body should stringify: {body}");
+    assert!(body.contains("Ivar"), "body should read the id slot: {body}");
+}
+
+#[test]
+fn an_abstract_model_gains_no_to_param() {
+    let lc = lower("ApplicationRecord");
+    assert!(
+        !lc.methods.iter().any(|m| m.name.as_str() == "to_param"),
+        "abstract classes are never instantiated"
+    );
+}
+
+#[test]
+fn a_models_own_to_param_wins_over_the_synthesized_one() {
+    // lobsters' User#to_param answers the username; no in-tree fixture
+    // carries an override, so inject one into Article's body and lower.
+    let app = ingest_app(fixture_path()).expect("ingest real-blog");
+    let mut model = app
+        .models
+        .iter()
+        .find(|m| m.name.0.as_str() == "Article")
+        .expect("Article not in real-blog")
+        .clone();
+    let own = roundhouse::dialect::MethodDef {
+        visibility: roundhouse::dialect::MethodVisibility::Public,
+        unsupported_formals: None,
+        has_anonymous_block: false,
+        name_span: roundhouse::span::Span::synthetic(),
+        name: Symbol::from("to_param"),
+        receiver: MethodReceiver::Instance,
+        params: Vec::new(),
+        body: roundhouse::expr::Expr::new(
+            roundhouse::span::Span::synthetic(),
+            roundhouse::expr::ExprNode::Lit {
+                value: roundhouse::expr::Literal::Str { value: "custom".into() },
+            },
+        ),
+        signature: None,
+        effects: Default::default(),
+        enclosing_class: Some(model.name.0.clone()),
+        kind: roundhouse::dialect::AccessorKind::Method,
+        is_async: false,
+        mutates_self: false,
+        block_param: None,
+    };
+    model.body.push(roundhouse::dialect::ModelBodyItem::Method {
+        method: own,
+        leading_comments: Vec::new(),
+        leading_blank_line: false,
+    });
+    let lc = lower_model_to_library_class(&model, &app.schema);
+    let params: Vec<_> = lc.methods.iter().filter(|m| m.name.as_str() == "to_param").collect();
+    assert_eq!(params.len(), 1, "exactly one to_param");
+    let body = format!("{:?}", params[0].body);
+    assert!(body.contains("custom"), "the model's own body should win: {body}");
+}
+
+// ── dom_record_key ───────────────────────────────────────────────────
+//
+// The identity half of dom_id, as one String per model — Rails derives
+// it from `record.to_key.join("_")`, which campfire's Message overrides
+// to `[client_message_id]` (that match is what lets Turbo's append
+// replace the sender's optimistic echo instead of duplicating the row).
+
+#[test]
+fn every_concrete_model_gains_dom_record_key_from_its_id() {
+    let lc = lower("Article");
+    let m = lc
+        .methods
+        .iter()
+        .find(|m| m.name.as_str() == "dom_record_key")
+        .expect("dom_record_key not synthesized");
+    assert!(matches!(m.receiver, MethodReceiver::Instance));
+    let body = format!("{:?}", m.body);
+    assert!(body.contains("Ivar"), "default body reads the id slot: {body}");
+    assert!(body.contains("to_s"), "default body stringifies: {body}");
+    assert!(!body.contains("join"), "no to_key, no join: {body}");
+}
+
+#[test]
+fn a_models_own_to_key_feeds_dom_record_key() {
+    let app = ingest_app(fixture_path()).expect("ingest real-blog");
+    let mut model = app
+        .models
+        .iter()
+        .find(|m| m.name.0.as_str() == "Article")
+        .expect("Article not in real-blog")
+        .clone();
+    let own = roundhouse::dialect::MethodDef {
+        visibility: roundhouse::dialect::MethodVisibility::Public,
+        unsupported_formals: None,
+        has_anonymous_block: false,
+        name_span: roundhouse::span::Span::synthetic(),
+        name: Symbol::from("to_key"),
+        receiver: MethodReceiver::Instance,
+        params: Vec::new(),
+        body: roundhouse::expr::Expr::new(
+            roundhouse::span::Span::synthetic(),
+            roundhouse::expr::ExprNode::Lit {
+                value: roundhouse::expr::Literal::Str { value: "stub".into() },
+            },
+        ),
+        signature: None,
+        effects: Default::default(),
+        enclosing_class: Some(model.name.0.clone()),
+        kind: roundhouse::dialect::AccessorKind::Method,
+        is_async: false,
+        mutates_self: false,
+        block_param: None,
+    };
+    model.body.push(roundhouse::dialect::ModelBodyItem::Method {
+        method: own,
+        leading_comments: Vec::new(),
+        leading_blank_line: false,
+    });
+    let lc = lower_model_to_library_class(&model, &app.schema);
+    let m = lc
+        .methods
+        .iter()
+        .find(|m| m.name.as_str() == "dom_record_key")
+        .expect("dom_record_key not synthesized");
+    let body = format!("{:?}", m.body);
+    assert!(
+        body.contains("to_key") && body.contains("join"),
+        "an own to_key should feed the key via join: {body}"
+    );
+}
+
+#[test]
+fn an_sti_base_dom_prefix_dispatches_on_the_type_column() {
+    let app = ingest_app(fixture_path()).expect("ingest real-blog");
+    let mut model = app
+        .models
+        .iter()
+        .find(|m| m.name.0.as_str() == "Article")
+        .expect("Article not in real-blog")
+        .clone();
+    // What lower::sti_scope stamps for a base with subclasses.
+    model.sti_subclass_names =
+        vec![ClassId(Symbol::from("Articles::Draft")), ClassId(Symbol::from("Articles::Pinned"))];
+    let lc = lower_model_to_library_class(&model, &app.schema);
+    let m = lc
+        .methods
+        .iter()
+        .find(|m| m.name.as_str() == "dom_prefix")
+        .expect("dom_prefix not synthesized");
+    let body = format!("{:?}", m.body);
+    assert!(body.contains("Case"), "an STI base dispatches: {body}");
+    assert!(
+        body.contains("articles_draft") && body.contains("articles_pinned"),
+        "each subclass answers its own dom class: {body}"
+    );
+    assert!(
+        body.contains("\"article\""),
+        "the wildcard arm keeps the base's prefix: {body}"
+    );
+}

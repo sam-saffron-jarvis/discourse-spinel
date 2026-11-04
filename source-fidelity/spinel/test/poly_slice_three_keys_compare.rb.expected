@@ -1,0 +1,3 @@
+three keys ok
+two keys ok
+{"endpoint" => "e", "p256dh_key" => "p", "auth_key" => "a", "extra" => "x"}

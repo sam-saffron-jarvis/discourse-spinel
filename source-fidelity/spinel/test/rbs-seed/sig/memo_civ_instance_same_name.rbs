@@ -1,0 +1,13 @@
+class MixedMemoOwner
+  def initialize: () -> void
+  def marker: () -> Integer
+  def self.table: () -> Hash[String, String]
+  def self.populate: () -> String
+end
+
+class MixedArrayOwner
+  def initialize: () -> void
+  def marker: () -> String
+  def self.items: () -> Array[String]
+  def self.populate: () -> Array[String]
+end

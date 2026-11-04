@@ -1,0 +1,24 @@
+"eyJ0eXAiOiJKV1QiLCJhbGciOiJFUzI1NiJ9.eyJhdWQiOiJodHRwczovL3B1c2guZXhhbXBsZS5uZXQiLCJleHAiOjE3MzU2ODk2MDAsInN1YiI6Im1haWx0bzpvcHNAZXhhbXBsZS5jb20ifQ"
+true
+64
+86
+3
+true
+true
+true
+true
+true
+true
+false
+false
+false
+false
+false
+false
+96
+true
+ECError: sign_raw needs a private key; this one is public only
+ECError: dh_compute_key needs a private key; this one is public only
+ECError: public key is not a point on this curve: error:0800006B:elliptic curve routines::point is not on curve
+ECError: a key needs a private scalar or public bytes
+OpenSSL::Digest::DigestError: unsupported digest algorithm: MD5

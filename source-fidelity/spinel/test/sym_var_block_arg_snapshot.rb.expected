@@ -1,0 +1,14 @@
+"AB"
+"AB"
+"AB"
+["AB", "CD"]
+["AB", "cd"]
+["AB", "ab"]
+6
+["XY"]
+["xy"]
+[:downcase, "ab"]
+[:upcase, :downcase, "cd"]
+[:upcase, :swapcase, "Cd"]
+[[:upcase], :downcase, "cd"]
+[{k: :upcase}, :swapcase, "Cd"]

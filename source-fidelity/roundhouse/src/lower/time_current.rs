@@ -1,0 +1,352 @@
+//! Time-vocabulary grounding: the Rails-isms on a `Time` that no
+//! target's `Time` answers — `Time.current`, `httpdate`, and `to_fs`.
+//!
+//! Plain Ruby has no `Time.current` — the Rails-ism is as undefined on
+//! the CRuby tree as under spinel AOT, just lazily so — and the corpus
+//! apps run UTC, where the two are second-for-second equivalent.
+//! Grounding it here keeps `Time` un-reopened (built-in reopening in
+//! the shared runtime is off-limits) and lands on vocabulary every
+//! emitter already speaks: all target families handle `Time.now` and a
+//! zero-arg `.utc`, while only the ruby family ever knew `current`.
+//!
+//! Runs post-analyze (with `apply_blank_lowering`, see
+//! `apply_post_analyze_lowerings`): the rewrite is shape-directed, not
+//! type-directed, but rewriting after the analyzer means `Time.current`
+//! stays typeable as a registered class method and the new nodes can be
+//! stamped from the types analyze already assigned. No residue policy —
+//! the match (`Time.current`, zero args, no block) is unconditional and
+//! the rewrite total, so there is no diagnostic to return.
+//!
+//! View bodies are deliberately not walked — same carve-out as the
+//! blank pass: the view pipeline still applies the ruby-family emit
+//! copy of this rewrite (`emit::ruby::library::apply_time_current_
+//! lowering`) to lowered view classes, and rejoins the shared home when
+//! views migrate. Test-module and fixture bodies are not walked either
+//! (they run on CRuby; extendable when a strict-target test lane needs
+//! it).
+//!
+//! ## `to_fs(:format)`
+//!
+//! `to_fs` is a hole we opened ourselves: `analyze::body::send`
+//! TYPES it (Str) and `routes_to_library::direct` EMITS
+//! `updated_at.to_fs(:number)` into every `direct`-generated URL
+//! helper, while no target implements it — so campfire's sign-in page
+//! raised on `fresh_account_logo_path` and its message list raised
+//! inside a `rescue Exception` that hid the cause.
+//!
+//! Rails resolves it through `ActiveSupport::TimeFormats`, a table of
+//! strftime strings and lambdas, and its whole body is:
+//!
+//! ```ruby
+//! formatter.respond_to?(:call) ? formatter.call(self).to_s : strftime(formatter)
+//! ```
+//!
+//! Every part of that is compile-time knowledge, so it expands here
+//! rather than becoming a runtime method on nine `Time`s: a string
+//! format becomes the `strftime` every emitter already speaks, and a
+//! lambda inlines its body with the receiver substituted. The trailing
+//! `.to_s` on the call arm is Rails', and it is what makes campfire's
+//! Integer-returning `:epoch` agree with the `Str` the analyzer types
+//! this call as.
+//!
+//! An app's own formats come from the initializer scan
+//! (`App::time_formats`) in both spellings Rails accepts — the current
+//! `ActiveSupport::TimeFormats.register(:name, fmt)` and the
+//! DEPRECATED `Time::DATE_FORMATS[:name] = fmt` that campfire still
+//! writes — and win over a built-in of the same name, because
+//! `register` merges into that very table.
+//!
+//! An unrecognized format DECLINES, loudly. Rails' own fallback is
+//! `to_s`, and emitting that would be the worst outcome available: "we
+//! do not know this format" is not the same fact as "Rails does not
+//! know it", and the two disagree exactly when an app defines a format
+//! somewhere the initializer scan did not look.
+
+use std::collections::BTreeMap;
+
+use crate::app::App;
+use crate::expr::{Expr, ExprNode};
+use crate::ident::Symbol;
+use crate::ty::Ty;
+
+/// App-defined `to_fs` formats, as the lowering consults them.
+pub(crate) type TimeFormats = BTreeMap<Symbol, crate::app::TimeFormat>;
+
+/// Rewrite `Time.current` sends across every app body the post-analyze
+/// hook owns (models, library classes, controllers, seeds — not views).
+pub fn apply_time_current_lowering(app: &mut App) {
+    let formats = std::mem::take(&mut app.time_formats);
+    super::for_each_hook_body(app, &mut |body| rewrite_time_current(body, &formats));
+    // TEST BODIES TOO, for the reason the `to_fs` note above gives: it
+    // is a hole we opened ourselves, and a test body reaches it the
+    // same way an app body does — campfire's
+    // `rooms/refreshes_controller_test` asserts against
+    // `message.created_at.to_fs(:number)`, the exact spelling
+    // `routes_to_library::direct` emits into the URL it is checking.
+    // Both halves of this pass expand into vocabulary every target
+    // already speaks (`Time.now.utc`, `strftime`), so nothing here
+    // leans on a CRuby overlay the strict-target test lanes lack.
+    super::for_each_test_body(app, &mut |body| rewrite_time_current(body, &formats));
+    app.time_formats = formats;
+}
+
+/// `Time.current` → `Time.now.utc`, in place, recursively. The original
+/// `Time` const node moves into the new tree (keeping its stamped type),
+/// the synthesized `now` send takes the site's own type (`Time.now` and
+/// `Time.current` type identically), and the outer expr keeps its type.
+/// Also the implementation behind the ruby emitter's view-pipeline copy.
+pub(crate) fn rewrite_time_current(expr: &mut Expr, formats: &TimeFormats) {
+    expr.node
+        .for_each_child_mut(&mut |c| rewrite_time_current(c, formats));
+    rewrite_node(expr, formats);
+}
+
+pub(crate) fn rewrite_node(expr: &mut Expr, formats: &TimeFormats) {
+    rewrite_node_inner(expr, formats);
+    // `Time.current` and `to_fs(:iso8601)` just became `Time.now.utc` and
+    // zero-arg `iso8601`. Crystal's spelling is applied here so every
+    // caller of this function (hooks, tests, route helpers, view classes)
+    // lands on one form.
+    super::time_calendar::ground_crystal_time_bridge(expr);
+}
+
+fn rewrite_node_inner(expr: &mut Expr, formats: &TimeFormats) {
+    let is_target = matches!(
+        &*expr.node,
+        ExprNode::Send { recv: Some(r), method, args, block: None, .. }
+            if method.as_str() == "current"
+                && args.is_empty()
+                && matches!(&*r.node,
+                    ExprNode::Const { path } if path.len() == 1 && path[0].as_str() == "Time")
+    );
+    if is_target {
+        let span = expr.span;
+        let node = std::mem::replace(&mut *expr.node, ExprNode::Seq { exprs: vec![] });
+        let ExprNode::Send { recv: Some(time_const), .. } = node else { unreachable!() };
+        let mut now = Expr::new(
+            span,
+            ExprNode::Send {
+                recv: Some(time_const),
+                method: Symbol::from("now"),
+                args: vec![],
+                block: None,
+                parenthesized: false,
+            },
+        );
+        now.ty = expr.ty.clone();
+        *expr.node = ExprNode::Send {
+            recv: Some(now),
+            method: Symbol::from("utc"),
+            args: vec![],
+            block: None,
+            parenthesized: false,
+        };
+        return;
+    }
+    // `t.httpdate` — stdlib-`time` sugar neither the CRuby tree
+    // (without a `require "time"`) nor AOT targets know. Ground to
+    // its definition: `t.getutc.strftime("%a, %d %b %Y %H:%M:%S
+    // GMT")` — `getutc`, not `utc`, which mutates its receiver.
+    // Shape-directed on the zero-arg name; `httpdate` is
+    // Time-specific vocabulary.
+    //
+    // `t.rfc822` / `t.rfc2822` the same way. On Rails' app times (a
+    // TimeWithZone) it is `to_fs(:rfc822)` —
+    // `"%a, %d %b %Y %H:%M:%S %z"` in the app's zone, which is UTC for
+    // the corpus (the premise `Time.current` above rests on), so
+    // `+0000`. lobsters stamps every RSS item's `pubDate` this way.
+    let format = match &*expr.node {
+        ExprNode::Send { recv: Some(_), method, args, block: None, .. } if args.is_empty() => {
+            match method.as_str() {
+                "httpdate" => Some("%a, %d %b %Y %H:%M:%S GMT"),
+                "rfc822" | "rfc2822" => Some("%a, %d %b %Y %H:%M:%S %z"),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    if let Some(format) = format {
+        let span = expr.span;
+        let node = std::mem::replace(&mut *expr.node, ExprNode::Seq { exprs: vec![] });
+        let ExprNode::Send { recv: Some(t), .. } = node else { unreachable!() };
+        // Built after analysis, so typed here: `getutc` answers a Time
+        // for any time the receiver is, and stays gradual on an untyped
+        // receiver (`1.hour.from_now`). Untyped, it read to the
+        // post-lowering diagnostics as a method nothing defines.
+        let getutc_ty = match t.ty.as_ref() {
+            None | Some(Ty::Var { .. }) => None,
+            Some(Ty::Untyped) => Some(Ty::Untyped),
+            Some(_) => Some(Ty::Time),
+        };
+        let mut getutc = Expr::new(
+            span,
+            ExprNode::Send {
+                recv: Some(t),
+                method: Symbol::from("getutc"),
+                args: vec![],
+                block: None,
+                parenthesized: false,
+            },
+        );
+        getutc.ty = getutc_ty;
+        let fmt = Expr::new(
+            span,
+            ExprNode::Lit {
+                value: crate::expr::Literal::Str { value: format.into() },
+            },
+        );
+        *expr.node = ExprNode::Send {
+            recv: Some(getutc),
+            method: Symbol::from("strftime"),
+            args: vec![fmt],
+            block: None,
+            parenthesized: true,
+        };
+        return;
+    }
+    rewrite_to_fs(expr, formats);
+}
+
+/// Rails' built-in formats, from `ActiveSupport::TimeFormats`' own
+/// table (`activesupport/lib/active_support/time_formats.rb`) and
+/// confirmed by running each one.
+///
+/// `Strftime` covers the entries Rails stores as plain strings.
+/// `Method` covers two it stores as one-line lambdas over a method the
+/// pipeline already handles — `->(time) { time.iso8601 }` and
+/// `->(time) { time.rfc2822 }` — so they cost a rename, not a format.
+///
+/// The rest of the table is deliberately absent, each for a reason:
+/// `:usec` / `:nsec` / `:inspect` need `%6N` / `%9N`, which our
+/// per-target strftime mappings do not all carry, and `:long_ordinal`
+/// / `:rfc822` are lambdas that interpolate a computed piece (an
+/// ordinalized day, `formatted_offset(false)`) into the format string.
+/// They decline, and say so, rather than shipping a rendering nobody
+/// measured.
+enum Builtin {
+    Strftime(&'static str),
+    Method(&'static str),
+}
+
+fn builtin_time_format(name: &str) -> Option<Builtin> {
+    Some(match name {
+        "db" => Builtin::Strftime("%Y-%m-%d %H:%M:%S"),
+        "number" => Builtin::Strftime("%Y%m%d%H%M%S"),
+        "time" => Builtin::Strftime("%H:%M"),
+        "short" => Builtin::Strftime("%d %b %H:%M"),
+        "long" => Builtin::Strftime("%B %d, %Y %H:%M"),
+        "iso8601" => Builtin::Method("iso8601"),
+        "rfc2822" => Builtin::Method("rfc2822"),
+        _ => return None,
+    })
+}
+
+/// `<time>.strftime("<fmt>")`.
+fn strftime_call(recv: Expr, fmt: &str, span: crate::span::Span) -> ExprNode {
+    ExprNode::Send {
+        recv: Some(recv),
+        method: Symbol::from("strftime"),
+        args: vec![Expr::new(
+            span,
+            ExprNode::Lit { value: crate::expr::Literal::Str { value: fmt.to_string() } },
+        )],
+        block: None,
+        parenthesized: true,
+    }
+}
+
+/// `<time>.to_fs(:format)` / `to_formatted_s(:format)` → what the format
+/// is defined as. See the header for why an unknown one declines.
+fn rewrite_to_fs(expr: &mut Expr, formats: &TimeFormats) {
+    let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &*expr.node else {
+        return;
+    };
+    if !matches!(method.as_str(), "to_fs" | "to_formatted_s") {
+        return;
+    }
+    // Bare `to_fs` IS `to_s` — Rails' default format. Left alone: every
+    // target answers `to_s`, and the no-arg call is not what breaks.
+    let [format] = args.as_slice() else { return };
+    let Some(name) = format_name(format) else {
+        return decline(expr, "the format is not a literal");
+    };
+    let recv = recv.clone();
+    let span = expr.span;
+
+    // An app's registration wins over a built-in of the same name, as
+    // it does in Rails — `register` merges into that very table.
+    if let Some(format) = formats.get(&Symbol::from(name.as_str())) {
+        match format {
+            crate::app::TimeFormat::Strftime { format } => {
+                *expr.node = strftime_call(recv, format, span);
+            }
+            crate::app::TimeFormat::Lambda { method } => {
+                let Some(param) = method.params.first() else {
+                    return decline(expr, "the app's format lambda takes no parameter");
+                };
+                // The receiver is substituted into the body once per
+                // mention of the parameter, so a re-evaluated one would
+                // be a behavior change, not just a slower one.
+                if !crate::lower::case_lambda::is_pure_read(&recv) {
+                    return decline(expr, "the receiver is not a pure read to substitute");
+                }
+                let mut body = method.body.clone();
+                crate::lower::case_lambda::subst(&mut body, &param.name, &recv);
+                // The lambda was not in the tree this walk already grounded.
+                super::time_calendar::ground_crystal_time_bridge_tree(&mut body);
+                // `to_fs` is `formatter.call(self).to_s` — the `.to_s` is
+                // Rails', not ours, and it is what makes campfire's
+                // Integer-returning `:epoch` agree with the Str the
+                // analyzer types this call as.
+                *expr.node = ExprNode::Send {
+                    recv: Some(body),
+                    method: Symbol::from("to_s"),
+                    args: vec![],
+                    block: None,
+                    parenthesized: false,
+                };
+            }
+        }
+        return;
+    }
+
+    match builtin_time_format(&name) {
+        Some(Builtin::Strftime(fmt)) => *expr.node = strftime_call(recv, fmt, span),
+        Some(Builtin::Method(m)) => {
+            *expr.node = ExprNode::Send {
+                recv: Some(recv),
+                method: Symbol::from(m),
+                args: vec![],
+                block: None,
+                parenthesized: false,
+            }
+        }
+        None => decline(expr, &format!("`{name}` is not a format we have measured")),
+    }
+}
+
+/// The format name a `to_fs` argument spells, if it is a literal.
+fn format_name(e: &Expr) -> Option<String> {
+    match &*e.node {
+        ExprNode::Lit { value: crate::expr::Literal::Sym { value } } => {
+            Some(value.as_str().to_string())
+        }
+        ExprNode::Lit { value: crate::expr::Literal::Str { value } } => Some(value.clone()),
+        _ => None,
+    }
+}
+
+fn decline(expr: &Expr, why: &str) {
+    crate::emit::diagnostics::push(crate::lower::residue_diagnostic(
+        "time_to_fs",
+        "to_fs",
+        expr.span,
+        why,
+        format!(
+            "`to_fs` left in source shape ({why}) — no target implements it, \
+             so this call will raise. Rails' own fallback is `to_s`, which is \
+             deliberately NOT emitted here: it would render a readable date \
+             where the app asked for a format, silently"
+        ),
+    ));
+}

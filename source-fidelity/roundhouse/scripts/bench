@@ -1,0 +1,1562 @@
+#!/usr/bin/env bash
+# scripts/bench — per-target HTTP throughput + memory benchmark.
+#
+# Measures req/sec, p50/p99 latency, and resident-set-size at sustained
+# load, then computes the cost-economics headline: req/sec per GB of
+# resident memory. That ratio captures what cloud bills actually charge
+# for — CRuby's GVL-fork tax means each worker carries ~200-400MB of
+# framework regardless of activity; compiled targets handle the same
+# concurrency in one shared image at ~30-50MB.
+#
+# Usage:  scripts/bench [options] [TARGET ...]
+#
+#   TARGET ∈ { rails | rails-int | ruby | ruby-int | typescript |
+#              crystal | rust | spinel | go | python | elixir }
+#              (default: rails ruby)
+#
+#   `go` = Roundhouse-emit Go (single AOT binary, net/http server,
+#          modernc.org/sqlite). Built from `cmd/v2/main.go`.
+#   `elixir` = Roundhouse-emit Elixir (BEAM, Plug.Cowboy + Exqlite).
+#          One node, scheduler concurrency — `--workers` is ignored.
+#   `python` = Roundhouse-emit Python (single-process aiohttp, stdlib
+#          sqlite3). Async event loop — `--workers` is ignored.
+#
+#   `rails`     = Rails reference (Puma + YJIT, production env)
+#   `rails-int` = Rails reference (Puma, YJIT disabled, baseline)
+#   `ruby`      = Roundhouse-emit Ruby (Puma + YJIT)
+#   `ruby-int`  = Roundhouse-emit Ruby (Puma, YJIT disabled, baseline)
+#
+# Options:
+#   --workers N         Puma WEB_CONCURRENCY for Ruby targets (default 1)
+#                       Pass repeatedly to sweep: --workers 1 --workers 4
+#   --threads N         RAILS_MAX_THREADS per worker (default 5)
+#   --duration SEC      Measurement window (default 20)
+#   --warmup SEC        Warmup before each measurement (default 20)
+#   --connections N     wrk concurrency (default 64)
+#   --wrk-threads N     wrk client threads (default 2)
+#   --runs N            Repeated measurement runs per cell (default 3)
+#   --endpoint PATH     URL path to bench (repeatable)
+#                       Default: /articles /articles/1 /articles/new
+#                                /articles.json /articles/1.json
+#                       (JSON endpoints exercise the jbuilder lowerer
+#                       end-to-end; every currently-supported bench
+#                       target handles `.json` suffix routing —
+#                       rails/rails-int via respond_to in the
+#                       articles_controller fixture, ruby/ruby-int via
+#                       the ruby_overlay main.rb's .json strip,
+#                       crystal/typescript/spinel/go/rust via each
+#                       target's server-side .json suffix handling.)
+#   --port N            Base port; targets get N, N+1, ... (default 9000)
+#   --out DIR           Results dir (default bench/results)
+#   --keep              Don't tear down servers / build trees on exit
+#   --skip-emit         Reuse existing build trees
+#
+# Output:
+#   bench/results/<timestamp>/per-run.json        # raw per-run data
+#   bench/results/<timestamp>/summary.json        # median + computed metrics
+#   bench/results/<timestamp>/summary.md          # rendered table
+#   bench/results/<timestamp>/skipped.json        # lanes that produced no
+#                                                 # measurements, with the
+#                                                 # stage and log tail
+#
+# Environment:
+#   On Linux: assumes `cpupower frequency-set -g performance` and boost
+#   off (`echo 0 > /sys/devices/system/cpu/cpufreq/boost`) — on the bench
+#   box a systemd oneshot (cpu-bench-pin.service) applies both at boot,
+#   because cpupower's setting is not persistent and a June 2026 reboot
+#   silently ran three months of nightlies on schedutil with boost on.
+#   The script doesn't change these; env.json records what it found and
+#   the page prints it, so check the machine line. On macOS: no-op; numbers will be M-class baseline.
+
+set -euo pipefail
+
+# ── arg parsing ──────────────────────────────────────────────────────
+
+# Preserve original invocation for env.json reproducibility metadata.
+ORIG_ARGS=("$@")
+
+TARGETS=()
+WORKERS=()
+THREADS=5
+DURATION=20
+WARMUP=20
+CONNECTIONS=64
+WRK_THREADS=2
+RUNS=3
+ENDPOINTS=()
+BASE_PORT=9000
+OUT_DIR=""
+KEEP=0
+SKIP_EMIT=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --workers)        WORKERS+=("$2"); shift 2 ;;
+        --threads)        THREADS="$2"; shift 2 ;;
+        --duration)       DURATION="$2"; shift 2 ;;
+        --warmup)         WARMUP="$2"; shift 2 ;;
+        --connections)    CONNECTIONS="$2"; shift 2 ;;
+        --wrk-threads)    WRK_THREADS="$2"; shift 2 ;;
+        --runs)           RUNS="$2"; shift 2 ;;
+        --endpoint)       ENDPOINTS+=("$2"); shift 2 ;;
+        --port)           BASE_PORT="$2"; shift 2 ;;
+        --out)            OUT_DIR="$2"; shift 2 ;;
+        --keep)           KEEP=1; shift ;;
+        --skip-emit)      SKIP_EMIT=1; shift ;;
+        -h|--help)        sed -n '2,/^$/p' "$0" | sed 's/^# \?//'; exit 0 ;;
+        -*)               echo "unknown flag: $1" >&2; exit 2 ;;
+        *)                TARGETS+=("$1"); shift ;;
+    esac
+done
+
+# Defaults
+[[ ${#TARGETS[@]} -eq 0 ]] && TARGETS=(rails ruby)
+[[ ${#WORKERS[@]} -eq 0 ]] && WORKERS=(1)
+if [[ ${#ENDPOINTS[@]} -eq 0 ]]; then
+    ENDPOINTS=(/articles /articles/1 /articles/new)
+    # JSON endpoints — exercise the jbuilder lowerer end-to-end.
+    # Mirrors scripts/compare's per-target JSON path additions (case
+    # branch at scripts/compare:132); all currently-supported bench
+    # targets (rails, rails-int, ruby, ruby-int, typescript, crystal,
+    # rust, spinel, go, elixir) strip the `.json` suffix before routing
+    # and dispatch on `controller.request_format`. Add `--endpoint` to
+    # override entirely; this default is the publication-grade mix.
+    ENDPOINTS+=(/articles.json /articles/1.json)
+fi
+
+# Validate + normalize targets
+NORMALIZED=()
+for t in "${TARGETS[@]}"; do
+    case "$t" in
+        rails|rails-int|ruby|ruby-int|jruby|rails-jruby|truffleruby|rails-truffleruby|typescript|crystal|rust|spinel|spinel-fiber|go|elixir|python|kotlin|swift|csharp|csharp-aot) NORMALIZED+=("$t") ;;
+        jr) NORMALIZED+=(jruby) ;;
+        tr) NORMALIZED+=(truffleruby) ;;
+        ts) NORMALIZED+=(typescript) ;;
+        cr) NORMALIZED+=(crystal) ;;
+        rs) NORMALIZED+=(rust) ;;
+        sp) NORMALIZED+=(spinel) ;;
+        ex) NORMALIZED+=(elixir) ;;
+        py) NORMALIZED+=(python) ;;
+        kt) NORMALIZED+=(kotlin) ;;
+        sw) NORMALIZED+=(swift) ;;
+        cs) NORMALIZED+=(csharp) ;;
+        cs-aot) NORMALIZED+=(csharp-aot) ;;
+        *) echo "target not yet supported in this initial cut: $t" >&2
+           echo "supported: rails rails-int ruby ruby-int jruby rails-jruby truffleruby rails-truffleruby typescript crystal rust spinel spinel-fiber go elixir python kotlin swift csharp csharp-aot" >&2; exit 2 ;;
+    esac
+done
+TARGETS=("${NORMALIZED[@]}")
+
+# ── paths ────────────────────────────────────────────────────────────
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+FIXTURE="$REPO_ROOT/fixtures/real-blog"
+# Rails 8.0 sibling fixture for the `rails-jruby` baseline — stock Rails
+# on the JVM. Separate from real-blog (8.1) because the only AR-JDBC that
+# runs on JRuby 10 (80.0.pre1) pins activerecord ~> 8.0.0; see the
+# rails-jruby build_target branch.
+FIXTURE80="$REPO_ROOT/fixtures/real-blog-rails80"
+RUBY_OUT="$REPO_ROOT/build/transpiled-blog-ruby"
+# JRuby target — byte-identical emit to the ruby tree but the JDBC db
+# backend (runtime/db.rb = db_jruby.rb) and a JRuby-resolved bundle.
+# `bin/rh transpile jruby` writes here; matches scripts/compare's
+# BUILD_DIR for the jruby target.
+JRUBY_OUT="$REPO_ROOT/build/transpiled-blog-jruby"
+# scripts/compare's typescript path — emit_preview always writes here,
+# so we reuse it to share the npm-install cache across compare runs.
+TS_OUT="/tmp/rh-ts-pass2"
+# Crystal target — same scratch-dir convention as scripts/compare.
+CR_OUT="/tmp/rh-cr-pass2"
+# Rust target — same scratch-dir convention as scripts/compare.
+RS_OUT="/tmp/rh-rs-pass2"
+# Spinel target — uses `bin/rh transpile spinel`, which writes here
+# (matches scripts/compare's BUILD_DIR for the spinel target).
+SP_OUT="$REPO_ROOT/build/transpiled-blog-spinel"
+# Go target — `bin/rh transpile go` writes here. v2 binary lives at
+# `cmd/v2/main.go`; staged DB at `storage/development.sqlite3` (the
+# default path `runtime/go/v2/server.go` looks for when DATABASE_PATH
+# is unset).
+GO_OUT="$REPO_ROOT/build/transpiled-blog-go"
+# Elixir target — emit_preview writes here (matches scripts/compare's
+# BUILD_DIR for the elixir target). `Server.start` opens the staged DB at
+# `storage/development.sqlite3` relative to this dir.
+EX_OUT="/tmp/rh-ex-pass2"
+# Python target — emit_preview writes here (matches scripts/compare's
+# BUILD_DIR for the python target). aiohttp server lives in a uv-managed
+# venv; `python3 -m app` boots `Server.start`, which opens the staged DB
+# at `storage/development.sqlite3` relative to this dir.
+PY_OUT="/tmp/rh-py-pass2"
+# Kotlin target — emit_preview writes here (matches scripts/compare's
+# BUILD_DIR). `gradle installDist` builds a self-contained launcher; Main.kt
+# reads BLOG_DB + PORT and serves via Javalin on the JVM.
+KT_OUT="/tmp/rh-kt-pass2"
+# Swift target — emit_preview writes here (matches scripts/compare's
+# BUILD_DIR). `swift build -c release` produces a single AOT binary;
+# main.swift reads BLOG_DB + PORT and serves via Hummingbird.
+SW_OUT="/tmp/rh-swift-pass2"
+# C# / .NET target — emit_preview writes here (matches scripts/compare's
+# BUILD_DIR). `csharp` runs the JIT build (dotnet build -c Release → the
+# DLL); `csharp-aot` runs the NativeAOT publish (a single native binary).
+# Program.cs/Server.cs/Db.cs read BLOG_DB + PORT and serve via Kestrel.
+CS_OUT="/tmp/rh-cs-pass2"
+# JDK for the kotlin build/run (non-interactive shells otherwise resolve an
+# older `java` via PATH). Honors $KOTLIN_JAVA_HOME, then an existing
+# $JAVA_HOME (e.g. mise's `mise where java`), then the macOS Homebrew path.
+KOTLIN_JAVA_HOME="${KOTLIN_JAVA_HOME:-${JAVA_HOME:-/opt/homebrew/opt/openjdk}}"
+TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
+[[ -z "$OUT_DIR" ]] && OUT_DIR="$REPO_ROOT/bench/results/$TIMESTAMP"
+mkdir -p "$OUT_DIR"
+
+# Snapshot the machine + harness invocation into env.json. Opportunistic
+# capture; runs even if some toolchains/probes aren't available.
+"$REPO_ROOT/scripts/bench-env" \
+    --workers     "${WORKERS[*]}" \
+    --concurrency "$CONNECTIONS" \
+    --runs        "$RUNS" \
+    --duration    "$DURATION" \
+    --warmup      "$WARMUP" \
+    --threads     "$THREADS" \
+    --wrk-threads "$WRK_THREADS" \
+    --endpoints   "${ENDPOINTS[*]}" \
+    --targets     "${TARGETS[*]}" \
+    --command     "scripts/bench ${ORIG_ARGS[*]}" \
+    > "$OUT_DIR/env.json" || true
+
+# Lane logs are request logs and grow by gigabytes; the exit trap trims
+# them to their tails (scripts/lib/trim-logs.sh says why).
+LOG_DIR="$(mktemp -d -t rh-bench-logs.XXXXXX)"
+. "$REPO_ROOT/scripts/lib/trim-logs.sh"
+
+# Every lane the run asked for and could not measure, one JSON line each:
+# {"target","stage","reason","log_tail"}. Written empty up front so a run
+# with nothing to report says so by an empty file rather than a missing
+# one — a missing file means a harness that predates the record. The
+# report reads it for its "Incomplete run" banner. Until this existed the
+# nine lanes lost on 2026-09-02 left one line each in the nightly's log
+# ("rust failed to build; skipping target") and nothing in the run
+# directory, so the page could say WHICH lanes were missing and not WHY.
+SKIPPED_JSON="$OUT_DIR/skipped.json"
+: > "$SKIPPED_JSON"
+
+# ── helpers ──────────────────────────────────────────────────────────
+
+# fd 3 is the console. build_target's every tool now writes to a per-lane
+# build log (so a failure carries its own reason), and these three write
+# to the console THROUGH that capture, so the progress lines still read
+# as they always did while the tool output lands in the log.
+exec 3>&1
+step() { printf '\033[36m→\033[0m %s\n' "$*" >&3; }
+ok()   { printf '\033[32m✓\033[0m %s\n' "$*" >&3; }
+fail() { printf '\033[31m✗\033[0m %s\n' "$*" >&2; }
+
+# Record a lane that produced no measurements: which stage lost it
+# (build, db, start) and the tail of the log that stage wrote. The
+# `reason` is the log's last non-blank line — for a compiler abort that
+# is "fatal runtime error: stack overflow, aborting", for a missing
+# module the ModuleNotFoundError — the one line a reader of the page
+# needs before deciding whether to open the tail.
+record_skip() {
+    local target="$1" stage="$2" log="$3"
+    ruby - "$SKIPPED_JSON" "$target" "$stage" "$log" <<'RUBY'
+# encoding: utf-8
+# The magic comment and the explicit read encoding: a script on stdin
+# takes its source encoding from the locale, and a log's bytes take
+# theirs from it too. cron supplies one here; a bare `env -i` does not,
+# and a build log full of cargo's arrows must not take the record down.
+require "json"
+path, target, stage, log = ARGV
+lines  = File.exist?(log) ? File.readlines(log, chomp: true, encoding: "UTF-8").map(&:scrub) : []
+tail   = lines.last(40).map { |l| l.gsub(/\e\[[0-9;]*m/, "") }
+reason = tail.reverse.find { |l| !l.strip.empty? }.to_s.strip
+File.open(path, "a") do |f|
+  f.puts JSON.generate(target: target, stage: stage, reason: reason, log_tail: tail)
+end
+RUBY
+}
+
+wait_for_port() {
+    local url="$1"
+    local label="$2"
+    # Optional readiness budget (seconds); defaults to 30. JRuby needs a
+    # larger one — JVM boot + JRuby startup is slower than an MRI boot.
+    local budget="${3:-30}"
+    local deadline=$(( $(date +%s) + budget ))
+    while (( $(date +%s) < deadline )); do
+        if curl --silent --fail --output /dev/null "$url" 2>/dev/null; then
+            return 0
+        fi
+        sleep 0.3
+    done
+    fail "$label did not come up within ${budget}s ($url)"
+    return 1
+}
+
+# Recursive kill — kills children before parent so Puma workers get hit
+# before the master signals them.
+kill_tree() {
+    local pid="$1"
+    [[ -z "$pid" ]] && return 0
+    local children
+    children="$(pgrep -P "$pid" 2>/dev/null || true)"
+    for child in $children; do
+        kill_tree "$child"
+    done
+    kill -TERM "$pid" 2>/dev/null || true
+    # Give a beat, then force-kill if it didn't die
+    sleep 0.2
+    kill -KILL "$pid" 2>/dev/null || true
+}
+
+# Sum RSS (in KB) across a PID and all its descendants. macOS and Linux
+# both have `ps -o rss=` that returns KB. Reads /proc on Linux too as
+# a cross-check but ps suffices for both.
+sum_rss_kb() {
+    local pid="$1"
+    [[ -z "$pid" ]] && { echo 0; return; }
+    # Gather PID + descendants
+    local pids="$pid"
+    local stack="$pid"
+    while [[ -n "$stack" ]]; do
+        local next=""
+        for p in $stack; do
+            local kids
+            kids="$(pgrep -P "$p" 2>/dev/null || true)"
+            for k in $kids; do
+                pids="$pids $k"
+                next="$next $k"
+            done
+        done
+        stack="$next"
+    done
+    local total=0
+    for p in $pids; do
+        local r
+        r="$(ps -o rss= -p "$p" 2>/dev/null | tr -d ' ' || echo 0)"
+        [[ -z "$r" ]] && r=0
+        total=$(( total + r ))
+    done
+    echo "$total"
+}
+
+# Parse wrk's stdout for Requests/sec and Latency percentiles.
+# wrk's --latency flag enables percentile output. Output is fixed-shape
+# enough that awk pulls it out reliably.
+parse_wrk() {
+    local out="$1"
+    local req_sec p50 p99
+    req_sec="$(grep -E '^Requests/sec:' "$out" | awk '{print $2}')"
+    # Latency Distribution block lines look like:
+    #     50%    1.23ms
+    #     99%   12.5ms
+    p50="$(awk '/Latency Distribution/{flag=1; next} flag && /^[[:space:]]*50%/{print $2; exit}' "$out")"
+    p99="$(awk '/Latency Distribution/{flag=1; next} flag && /^[[:space:]]*99%/{print $2; exit}' "$out")"
+    # Strip 'ms'/'us'/'s' suffix and normalize to ms. Use awk for the
+    # regex split — bash glob `[a-z]*` matches only one char per the
+    # shortest-match `%` operator, so "776.00us" yields num="776.00u".
+    # awk's gsub on /[a-z]+$/ handles the full suffix cleanly.
+    normalize_latency() {
+        local v="$1"
+        [[ -z "$v" ]] && { echo "null"; return; }
+        awk -v v="$v" 'BEGIN {
+            n = v; gsub(/[a-zA-Z]+$/, "", n)
+            u = v; sub(/^[0-9.]+/, "", u)
+            if (u == "us") printf "%.3f", n/1000
+            else if (u == "ms") printf "%.3f", n+0
+            else if (u == "s")  printf "%.3f", n*1000
+            else printf "null"
+        }'
+    }
+    p50="$(normalize_latency "$p50")"
+    p99="$(normalize_latency "$p99")"
+    [[ -z "$req_sec" ]] && req_sec="null"
+    # wrk counts every response toward Requests/sec, including a 500 —
+    # and a Rails 500 page is cheap to serve. The line four above the
+    # rate says how many were errors; absent when all were 2xx/3xx. A
+    # cell with ANY is not a measurement of the endpoint: its rate is
+    # reported as null (the page prints "—" and the banner says why)
+    # with the counts kept beside it, so the record shows what was seen.
+    # Found the hard way: the rails-jruby JSON cell published ~1,100
+    # req/s of error pages for months (jruby#9531, fixed in 10.1.1.0).
+    local requests non_2xx
+    requests="$(awk '/ requests in /{print $1; exit}' "$out")"
+    non_2xx="$(awk '/^ *Non-2xx or 3xx responses:/{print $NF; exit}' "$out")"
+    [[ -z "$requests" ]] && requests=0
+    [[ -z "$non_2xx" ]] && non_2xx=0
+    if (( non_2xx > 0 )); then
+        echo "{\"req_sec\":null,\"p50_ms\":null,\"p99_ms\":null,\"requests\":$requests,\"non_2xx\":$non_2xx}"
+    else
+        echo "{\"req_sec\":$req_sec,\"p50_ms\":$p50,\"p99_ms\":$p99,\"requests\":$requests,\"non_2xx\":0}"
+    fi
+}
+
+# ── target lifecycle ─────────────────────────────────────────────────
+
+TARGET_PID=""
+TARGET_BUILD_DIR=""
+TARGET_GEMFILE=""
+
+cleanup() {
+    local code=$?
+    if (( KEEP == 0 )); then
+        kill_tree "$TARGET_PID"
+        sleep 0.3
+        wait 2>/dev/null || true
+        # Not under --keep: the server still writing its log would keep
+        # writing to the unlinked original.
+        trim_logs "${LOG_DIR:-}"
+    else
+        if [[ -n "$TARGET_PID" ]]; then
+            echo
+            step "--keep: server PID=$TARGET_PID still running"
+        fi
+    fi
+    exit "$code"
+}
+trap cleanup EXIT INT TERM
+
+build_target() {
+    local target="$1"
+    case "$target" in
+        rails|rails-int)
+            TARGET_BUILD_DIR="$FIXTURE"
+            TARGET_GEMFILE=""  # uses fixture's own Gemfile
+            if [[ ! -f "$FIXTURE/storage/development.sqlite3" ]]; then
+                step "regenerating fixtures/real-blog"
+                (cd "$REPO_ROOT" && bin/rh fixture) || return 1
+            fi
+            # Gems install into the active Ruby's gem dir, which is
+            # per-version: a Ruby bump (or pruning the old version) leaves
+            # the new Ruby's dir empty and boot dies with GemNotFound. Keep
+            # the build self-healing — bundle check is a fast no-op when the
+            # bundle is satisfied, install runs only when it isn't.
+            step "bundling rails fixture"
+            (cd "$FIXTURE" && bundle check >/dev/null 2>&1 || bundle install >/dev/null) || return 1
+            ;;
+        rails-jruby)
+            TARGET_BUILD_DIR="$FIXTURE80"
+            TARGET_GEMFILE=""  # uses the sibling fixture's own Gemfile
+            # Stock Rails on the JVM. Same blog app as real-blog, pinned to
+            # Rails 8.0 (the only line AR-JDBC drives on JRuby 10 today:
+            # 80.0.pre1 requires activerecord ~> 8.0.0). bin/rh fixture
+            # generates + migrates + seeds under CRuby.
+            if [[ ! -f "$FIXTURE80/storage/development.sqlite3" ]]; then
+                step "generating rails 8.0 fixture (bin/rh fixture --rails)"
+                (cd "$REPO_ROOT" && bin/rh fixture --rails '~> 8.0.0' "$FIXTURE80") || return 1
+            fi
+            # Swap the SQLite stack for JRuby: the sqlite3 C-ext gem has no
+            # JRuby build → JDBC adapter; kamal/thruster pull C-ext deps
+            # (bcrypt_pbkdf) that don't build on JRuby → MRI-only.
+            if ! grep -q 'activerecord-jdbcsqlite3-adapter' "$FIXTURE80/Gemfile"; then
+                step "patching rails 8.0 Gemfile for jruby (jdbc adapter)"
+                perl -0pi -e 's/^gem "sqlite3"([^\n]*)/gem "sqlite3"$1, platform: :mri\ngem "activerecord-jdbcsqlite3-adapter", "80.0.pre1", platform: :jruby/m' "$FIXTURE80/Gemfile" || return 1
+                perl -0pi -e 's/^gem "kamal", require: false/gem "kamal", require: false, platform: :mri/m; s/^gem "thruster", require: false/gem "thruster", require: false, platform: :mri/m' "$FIXTURE80/Gemfile" || return 1
+            fi
+            # JRuby bundle (JDBC adapter + JRuby puma/rack), isolated under
+            # the fixture's own gem dir so it doesn't collide with the
+            # CRuby bundle bin/rh fixture installed for migrate/seed.
+            if [[ ! -d "$FIXTURE80/.bundle-jruby" ]]; then
+                step "installing jruby bundle (rails 8.0)"
+                (cd "$FIXTURE80" && \
+                    BUNDLE_PATH="$FIXTURE80/.bundle-jruby" \
+                    BUNDLE_WITHOUT="development:test" \
+                    jruby -S bundle install) || return 1
+            fi
+            ;;
+        ruby|ruby-int)
+            TARGET_BUILD_DIR="$RUBY_OUT"
+            TARGET_GEMFILE="$REPO_ROOT/runtime/spinel/scaffold/Gemfile"
+            if (( SKIP_EMIT == 0 )) || [[ ! -d "$RUBY_OUT" ]]; then
+                step "regenerating ruby target (bin/rh transpile ruby)"
+                (cd "$REPO_ROOT" && bin/rh transpile ruby) || return 1
+            fi
+            # Same per-version gem-dir hazard as the rails cells: make sure
+            # the scaffold bundle is satisfied for the active Ruby before the
+            # asset build and the puma boot rely on it.
+            step "bundling ruby target"
+            (cd "$RUBY_OUT" && BUNDLE_GEMFILE="$TARGET_GEMFILE" bundle check >/dev/null 2>&1 \
+                || BUNDLE_GEMFILE="$TARGET_GEMFILE" bundle install) || return 1
+            # Assets — Tailwind compile + JS deps. Needed for full
+            # response bytes; without it the index page is naked.
+            if [[ ! -f "$RUBY_OUT/static/assets/tailwind.css" ]]; then
+                step "building ruby assets"
+                (cd "$RUBY_OUT" && BUNDLE_GEMFILE="$TARGET_GEMFILE" bundle exec rake assets) || return 1
+            fi
+            ;;
+        jruby)
+            TARGET_BUILD_DIR="$JRUBY_OUT"
+            # The transpiled tree's own Gemfile — its Gemfile.lock and
+            # vendored gems live in $JRUBY_OUT, isolated from the CRuby
+            # ruby tree's bundle (they resolve different platform gems).
+            TARGET_GEMFILE="$JRUBY_OUT/Gemfile"
+            if (( SKIP_EMIT == 0 )) || [[ ! -d "$JRUBY_OUT" ]]; then
+                step "regenerating jruby target (bin/rh transpile jruby)"
+                (cd "$REPO_ROOT" && bin/rh transpile jruby) || return 1
+            fi
+            # JRuby resolves the jdbc-sqlite3 driver (and JRuby builds of
+            # puma/rack/etc.) into this tree. The transpile drops the MRI
+            # lock so this resolves a fresh, java-only lock — but a lock left
+            # from a prior run survives the re-emit, and if it carries a CRuby
+            # platform (e.g. x86_64-linux) a later `bundle exec` dies with
+            # GemNotFound, since JRuby can't build C-ext gems for it. So
+            # re-resolve whenever the bundle isn't satisfied (bundle check),
+            # clearing any stale lock first so the resolve stays java-only.
+            # Slow under the JVM, hence gated rather than run every build.
+            if (( SKIP_EMIT == 0 )) || \
+               ! (cd "$JRUBY_OUT" && BUNDLE_GEMFILE="$TARGET_GEMFILE" jruby -S bundle check >/dev/null 2>&1); then
+                step "installing jruby bundle"
+                rm -f "$JRUBY_OUT/Gemfile.lock"
+                (cd "$JRUBY_OUT" && BUNDLE_GEMFILE="$TARGET_GEMFILE" jruby -S bundle install) || return 1
+            fi
+            # Assets — Tailwind + JS deps. The output is byte-identical to
+            # the ruby tree, so reuse those when present (avoids a second
+            # asset build under the JVM); otherwise build under JRuby.
+            if [[ ! -f "$JRUBY_OUT/static/assets/tailwind.css" ]]; then
+                if [[ -f "$RUBY_OUT/static/assets/tailwind.css" ]]; then
+                    step "copying ruby assets into jruby tree"
+                    mkdir -p "$JRUBY_OUT/static"
+                    cp -R "$RUBY_OUT/static/assets" "$JRUBY_OUT/static/assets"
+                else
+                    step "building jruby assets"
+                    (cd "$JRUBY_OUT" && BUNDLE_GEMFILE="$TARGET_GEMFILE" jruby -S bundle exec rake assets) || return 1
+                fi
+            fi
+            ;;
+        truffleruby)
+            # The ruby tree, UNMODIFIED, under TruffleRuby: it compiles the
+            # sqlite3 gem (and nokogiri, puma, nio4r) itself, so it needs
+            # neither jruby's JDBC db.rb nor a target of its own — the
+            # published ruby.tgz is what a TruffleRuby user runs. Shares
+            # RUBY_OUT with the ruby lane; assets are built there under MRI
+            # (`rake assets` shells `bundle exec ruby`, MRI-only, the same
+            # reason the jruby lane copies them). Bundles like jruby does:
+            # the interpreter's own gem home, against the EMITTED tree's
+            # Gemfile — the committed scaffold lock is MRI-only, and
+            # `bin/rh transpile` wipes the tree, so a bundle inside it
+            # would not survive a nightly. No `fork` on TruffleRuby:
+            # WEB_CONCURRENCY=0, threads only, like the JVM cells.
+            TARGET_BUILD_DIR="$RUBY_OUT"
+            TARGET_GEMFILE="$RUBY_OUT/Gemfile"
+            if (( SKIP_EMIT == 0 )) || [[ ! -d "$RUBY_OUT" ]]; then
+                step "regenerating ruby target (bin/rh transpile ruby)"
+                (cd "$REPO_ROOT" && bin/rh transpile ruby) || return 1
+            fi
+            if [[ ! -f "$RUBY_OUT/static/assets/tailwind.css" ]]; then
+                step "building ruby assets (MRI) for the truffleruby lane"
+                (cd "$RUBY_OUT" && BUNDLE_GEMFILE="$REPO_ROOT/runtime/spinel/scaffold/Gemfile" bundle check >/dev/null 2>&1 \
+                    || BUNDLE_GEMFILE="$REPO_ROOT/runtime/spinel/scaffold/Gemfile" bundle install) || return 1
+                (cd "$RUBY_OUT" && BUNDLE_GEMFILE="$REPO_ROOT/runtime/spinel/scaffold/Gemfile" bundle exec rake assets) || return 1
+            fi
+            if ! (cd "$RUBY_OUT" && BUNDLE_GEMFILE="$TARGET_GEMFILE" truffleruby -S bundle check >/dev/null 2>&1); then
+                step "installing truffleruby bundle (compiles the C extensions)"
+                (cd "$RUBY_OUT" && BUNDLE_GEMFILE="$TARGET_GEMFILE" truffleruby -S bundle install) || return 1
+            fi
+            ;;
+        rails-truffleruby)
+            # Stock Rails under TruffleRuby — the SAME 8.1 fixture the rails
+            # lane serves, not a sibling: TruffleRuby builds the sqlite3 C
+            # extension, so there is no JDBC adapter pinning it to an older
+            # Rails the way rails-jruby is pinned to 8.0. The C extensions
+            # must be compiled BY truffleruby, so it bundles into its own
+            # path in the fixture (which `bin/rh fixture` only regenerates
+            # when the DB is missing), like rails-jruby does.
+            TARGET_BUILD_DIR="$FIXTURE"
+            TARGET_GEMFILE=""
+            if [[ ! -f "$FIXTURE/storage/development.sqlite3" ]]; then
+                step "regenerating fixtures/real-blog"
+                (cd "$REPO_ROOT" && bin/rh fixture) || return 1
+            fi
+            if ! (cd "$FIXTURE" && BUNDLE_PATH="$FIXTURE/.bundle-truffleruby" BUNDLE_WITHOUT="development:test" truffleruby -S bundle check >/dev/null 2>&1); then
+                step "installing truffleruby bundle (rails 8.1; compiles the C extensions)"
+                (cd "$FIXTURE" && \
+                    BUNDLE_PATH="$FIXTURE/.bundle-truffleruby" \
+                    BUNDLE_WITHOUT="development:test" \
+                    truffleruby -S bundle install) || return 1
+            fi
+            ;;
+        typescript)
+            TARGET_BUILD_DIR="$TS_OUT"
+            TARGET_GEMFILE=""
+            if (( SKIP_EMIT == 0 )) || [[ ! -f "$TS_OUT/main.ts" ]]; then
+                step "regenerating typescript target (emit_preview)"
+                (cd "$REPO_ROOT" && cargo run --quiet --bin emit_preview -- --target typescript "$FIXTURE") || return 1
+            fi
+            if [[ ! -d "$TS_OUT/node_modules" ]]; then
+                step "installing npm deps"
+                (cd "$TS_OUT" && npm install --silent --no-audit --no-fund) || return 1
+            fi
+            ;;
+        crystal)
+            TARGET_BUILD_DIR="$CR_OUT"
+            TARGET_GEMFILE=""
+            if (( SKIP_EMIT == 0 )) || [[ ! -f "$CR_OUT/src/main.cr" ]]; then
+                step "regenerating crystal target (emit_preview)"
+                (cd "$REPO_ROOT" && cargo run --quiet --bin emit_preview -- --target crystal "$FIXTURE") || return 1
+            fi
+            if [[ ! -x "$CR_OUT/.bin/server" ]]; then
+                step "building crystal target (release)"
+                (cd "$CR_OUT" && mkdir -p .bin && shards install --quiet && crystal build --release --no-debug src/main.cr -o .bin/server) || return 1
+            fi
+            ;;
+        kotlin)
+            # emit_preview → $KT_OUT, then `gradle installDist` builds a
+            # self-contained launcher at build/install/roundhouse-app/bin/.
+            # JVM warmup caveat: JIT means cold-start throughput understates
+            # steady-state; the wrk warmup run (below) amortizes it.
+            TARGET_BUILD_DIR="$KT_OUT"
+            TARGET_GEMFILE=""
+            if (( SKIP_EMIT == 0 )) || [[ ! -f "$KT_OUT/src/main/kotlin/Main.kt" ]]; then
+                step "regenerating kotlin target (emit_preview)"
+                (cd "$REPO_ROOT" && cargo run --quiet --bin emit_preview -- --target kotlin "$FIXTURE") || return 1
+            fi
+            if (( SKIP_EMIT == 0 )) || [[ ! -x "$KT_OUT/build/install/roundhouse-app/bin/roundhouse-app" ]]; then
+                step "building kotlin target (gradle installDist)"
+                (cd "$KT_OUT" && JAVA_HOME="$KOTLIN_JAVA_HOME" PATH="$KOTLIN_JAVA_HOME/bin:$PATH" gradle installDist --console=plain -q) || return 1
+            fi
+            ;;
+        swift)
+            # emit_preview → $SW_OUT, then SPM release build → a single
+            # AOT binary (.build/release/App). No VM warmup concern.
+            TARGET_BUILD_DIR="$SW_OUT"
+            TARGET_GEMFILE=""
+            if (( SKIP_EMIT == 0 )) || [[ ! -f "$SW_OUT/Sources/App/main.swift" ]]; then
+                step "regenerating swift target (emit_preview)"
+                (cd "$REPO_ROOT" && cargo run --quiet --bin emit_preview -- --target swift "$FIXTURE") || return 1
+            fi
+            if (( SKIP_EMIT == 0 )) || [[ ! -x "$SW_OUT/.build/release/App" ]]; then
+                step "building swift target (swift build -c release)"
+                (cd "$SW_OUT" && swift build -c release) || return 1
+            fi
+            ;;
+        csharp)
+            # JIT: emit_preview → $CS_OUT, then `dotnet build -c Release` →
+            # bin/Release/net10.0/roundhouse-app.dll (run via `dotnet <dll>`).
+            TARGET_BUILD_DIR="$CS_OUT"
+            TARGET_GEMFILE=""
+            if (( SKIP_EMIT == 0 )) || [[ ! -f "$CS_OUT/Program.cs" ]]; then
+                step "regenerating csharp target (emit_preview)"
+                (cd "$REPO_ROOT" && cargo run --quiet --bin emit_preview -- --target csharp "$FIXTURE") || return 1
+            fi
+            if (( SKIP_EMIT == 0 )) || [[ ! -f "$CS_OUT/bin/Release/net10.0/roundhouse-app.dll" ]]; then
+                step "building csharp target (dotnet build -c Release)"
+                (cd "$CS_OUT" && dotnet build -c Release -nologo -v q) || return 1
+            fi
+            ;;
+        csharp-aot)
+            # NativeAOT: emit_preview → $CS_OUT, then `dotnet publish` with
+            # PublishAot → a single native binary (publish-aot/roundhouse-app).
+            TARGET_BUILD_DIR="$CS_OUT"
+            TARGET_GEMFILE=""
+            if (( SKIP_EMIT == 0 )) || [[ ! -f "$CS_OUT/Program.cs" ]]; then
+                step "regenerating csharp target (emit_preview)"
+                (cd "$REPO_ROOT" && cargo run --quiet --bin emit_preview -- --target csharp "$FIXTURE") || return 1
+            fi
+            if (( SKIP_EMIT == 0 )) || [[ ! -x "$CS_OUT/publish-aot/roundhouse-app" ]]; then
+                local rid
+                case "$(uname -s)-$(uname -m)" in
+                    Darwin-arm64)   rid=osx-arm64 ;;
+                    Darwin-x86_64)  rid=osx-x64 ;;
+                    Linux-x86_64)   rid=linux-x64 ;;
+                    Linux-aarch64)  rid=linux-arm64 ;;
+                    *)              rid=osx-arm64 ;;
+                esac
+                # macOS: the NativeAOT link needs the keg-only openssl
+                # (libssl/libcrypto) + brotli on the linker path; clang honors
+                # LIBRARY_PATH. No-op on Linux (system libs on the default path).
+                local libpath=""
+                if [[ "$(uname -s)" == Darwin ]]; then
+                    libpath="$(brew --prefix openssl@3 2>/dev/null)/lib:/opt/homebrew/lib:/usr/local/lib"
+                fi
+                step "publishing csharp NativeAOT (dotnet publish -r $rid -p:PublishAot=true)"
+                (cd "$CS_OUT" && LIBRARY_PATH="$libpath" dotnet publish -c Release -r "$rid" -p:PublishAot=true -o publish-aot -nologo -v q) || return 1
+            fi
+            ;;
+        rust)
+            TARGET_BUILD_DIR="$RS_OUT"
+            TARGET_GEMFILE=""
+            if (( SKIP_EMIT == 0 )) || [[ ! -f "$RS_OUT/Cargo.toml" ]]; then
+                step "regenerating rust target (emit_preview)"
+                (cd "$REPO_ROOT" && cargo run --quiet --bin emit_preview -- --target rust "$FIXTURE") || return 1
+            fi
+            if [[ ! -x "$RS_OUT/target/release/app" ]]; then
+                step "building rust target (release)"
+                (cd "$RS_OUT" && cargo build --release --quiet) || return 1
+            fi
+            ;;
+        spinel|spinel-fiber)
+            # `spinel-fiber` is the SAME binary started with TEP_SERVER=fiber
+            # (runtime/spinel/tep/server_scheduled.rb): one emit, one build,
+            # two server designs. A second lane in the same invocation
+            # reuses what the first built.
+            if [[ -n "${SP_BUILT:-}" ]]; then
+                TARGET_BUILD_DIR="$SP_OUT"
+                TARGET_GEMFILE="$REPO_ROOT/runtime/spinel/scaffold/Gemfile"
+                return 0
+            fi
+            # `bin/rh transpile spinel` writes to $SP_OUT and additionally
+            # vendors Tep transport (sphttp.c) + per-target Makefile;
+            # `make assets` builds Tailwind + turbo.min.js; `make build`
+            # AOT-compiles main.rb to ./build/blog via the `spinel`
+            # binary (needs to be on PATH, e.g. ~/git/spinel).
+            TARGET_BUILD_DIR="$SP_OUT"
+            TARGET_GEMFILE="$REPO_ROOT/runtime/spinel/scaffold/Gemfile"
+            if (( SKIP_EMIT == 0 )) || [[ ! -f "$SP_OUT/main.rb" ]]; then
+                step "regenerating spinel target (bin/rh transpile spinel)"
+                (cd "$REPO_ROOT" && bin/rh transpile spinel) || return 1
+            fi
+            if [[ ! -f "$SP_OUT/static/assets/tailwind.css" ]]; then
+                step "building spinel assets (tailwind + turbo.min.js)"
+                # `make assets` shells `bundle exec` (gem_dir for turbo.min.js),
+                # so the scaffold bundle must be satisfied for the active CRuby.
+                # After a Ruby bump the new Ruby's gem dir is empty → bundle exec
+                # returns nothing → the Makefile cp collapses to /app/... and
+                # aborts. Self-heal first; bundle check is a fast no-op when set.
+                (cd "$SP_OUT" && BUNDLE_GEMFILE="$TARGET_GEMFILE" bundle check >/dev/null 2>&1 \
+                    || BUNDLE_GEMFILE="$TARGET_GEMFILE" bundle install) || return 1
+                (cd "$SP_OUT" && BUNDLE_GEMFILE="$TARGET_GEMFILE" make assets) || return 1
+            fi
+            # Recompile whenever we re-emitted (SKIP_EMIT==0) — the spinel
+            # COMPILER may have changed under us (git pull && make), and
+            # `make`'s mtime check alone can miss that, so force a clean
+            # build. Skipping a stale build/blog here silently re-ran an
+            # old binary across compiler updates.
+            if (( SKIP_EMIT == 0 )) || [[ ! -x "$SP_OUT/build/blog" ]]; then
+                step "AOT-compiling main.rb → build/blog (spinel)"
+                (cd "$SP_OUT" && rm -f build/blog && make build) || return 1
+            fi
+            SP_BUILT=1
+            ;;
+        go)
+            # `bin/rh transpile go` writes to $GO_OUT; build the v2
+            # binary from cmd/v2/ (the legacy root main.go is a thin
+            # forward but cmd/v2 is the canonical entry point). Single
+            # binary, no per-target asset or gem dependencies.
+            TARGET_BUILD_DIR="$GO_OUT"
+            TARGET_GEMFILE=""
+            if (( SKIP_EMIT == 0 )) || [[ ! -f "$GO_OUT/go.mod" ]]; then
+                step "regenerating go target (bin/rh transpile go)"
+                (cd "$REPO_ROOT" && bin/rh transpile go) || return 1
+            fi
+            if [[ ! -x "$GO_OUT/.bin/server" ]]; then
+                step "building go target (cmd/v2/, release shape)"
+                (cd "$GO_OUT" && go mod tidy && mkdir -p .bin && go build -o .bin/server ./cmd/v2/) || return 1
+            fi
+            ;;
+        elixir)
+            # `emit_preview --target elixir` writes the lowered-IR Elixir
+            # app to $EX_OUT; `mix compile` builds it. The shared
+            # `Roundhouse.Db` connection opens the staged DB (see stage_db).
+            TARGET_BUILD_DIR="$EX_OUT"
+            TARGET_GEMFILE=""
+            if (( SKIP_EMIT == 0 )) || [[ ! -f "$EX_OUT/mix.exs" ]]; then
+                step "regenerating elixir target (emit_preview)"
+                (cd "$REPO_ROOT" && cargo run --quiet --bin emit_preview -- --target elixir "$FIXTURE") || return 1
+            fi
+            step "building elixir target (mix compile)"
+            (cd "$EX_OUT" && mix deps.get && MIX_ENV=prod mix compile) || return 1
+            ;;
+        python)
+            # `emit_preview --target python` writes the lowered-IR Python
+            # app to $PY_OUT; aiohttp lives in a uv-managed venv declared by
+            # the emitted pyproject.toml. Wipe pycache so emitter changes
+            # aren't masked by stale bytecode, sync the venv, and validate
+            # imports so a startup failure surfaces here, not as HTTP diffs.
+            # Mirrors scripts/compare's python branch — INCLUDING the module
+            # it names: this check said `app.routes` for two weeks after the
+            # overlay moved routing under app/v2 (c80bb3c3), and every
+            # nightly from 2026-08-20 dropped python for a module that no
+            # longer existed. `app.v2.dispatch` is the live dispatch path.
+            TARGET_BUILD_DIR="$PY_OUT"
+            TARGET_GEMFILE=""
+            if (( SKIP_EMIT == 0 )) || [[ ! -f "$PY_OUT/pyproject.toml" ]]; then
+                step "regenerating python target (emit_preview)"
+                (cd "$REPO_ROOT" && cargo run --quiet --bin emit_preview -- --target python "$FIXTURE") || return 1
+            fi
+            step "syncing python venv (uv) + validating imports"
+            (cd "$PY_OUT" && find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null; uv sync --quiet && uv run python3 -c "import app, app.server, app.v2.dispatch") || return 1
+            ;;
+    esac
+}
+
+# Stage the seeded DB. Each target gets its own copy so writes don't
+# bleed across runs. Note: bench is read-only by default, so the seed
+# isn't reapplied between measurement windows.
+stage_db() {
+    local target="$1"
+    case "$target" in
+        rails|rails-int|rails-truffleruby)
+            # Production Rails reads storage/production.sqlite3 — clone
+            # the seeded dev DB into place so the fixture serves real
+            # rows. SQLite3's `.backup` produces a clean copy without
+            # WAL/SHM artifacts.
+            local prod="$FIXTURE/storage/production.sqlite3"
+            local dev="$FIXTURE/storage/development.sqlite3"
+            rm -f "$prod" "$prod-wal" "$prod-shm"
+            sqlite3 "$dev" ".backup $prod"
+            ;;
+        rails-jruby)
+            # Same production-DB staging as rails, in the 8.0 sibling.
+            local prod="$FIXTURE80/storage/production.sqlite3"
+            local dev="$FIXTURE80/storage/development.sqlite3"
+            rm -f "$prod" "$prod-wal" "$prod-shm"
+            sqlite3 "$dev" ".backup $prod"
+            ;;
+        ruby|ruby-int|truffleruby)
+            local db="$RUBY_OUT/storage/development.sqlite3"
+            mkdir -p "$(dirname "$db")"
+            rm -f "$db" "$db-wal" "$db-shm"
+            sqlite3 "$FIXTURE/storage/development.sqlite3" ".backup $db"
+            ;;
+        jruby)
+            local db="$JRUBY_OUT/storage/development.sqlite3"
+            mkdir -p "$(dirname "$db")"
+            rm -f "$db" "$db-wal" "$db-shm"
+            sqlite3 "$FIXTURE/storage/development.sqlite3" ".backup $db"
+            ;;
+        typescript)
+            local db="$TS_OUT/storage/development.sqlite3"
+            mkdir -p "$(dirname "$db")"
+            rm -f "$db" "$db-wal" "$db-shm"
+            sqlite3 "$FIXTURE/storage/development.sqlite3" ".backup $db"
+            ;;
+        crystal)
+            local db="$CR_OUT/storage/development.sqlite3"
+            mkdir -p "$(dirname "$db")"
+            rm -f "$db" "$db-wal" "$db-shm"
+            sqlite3 "$FIXTURE/storage/development.sqlite3" ".backup $db"
+            ;;
+        kotlin)
+            local db="$KT_OUT/storage/development.sqlite3"
+            mkdir -p "$(dirname "$db")"
+            rm -f "$db" "$db-wal" "$db-shm"
+            sqlite3 "$FIXTURE/storage/development.sqlite3" ".backup $db"
+            ;;
+        swift)
+            local db="$SW_OUT/storage/development.sqlite3"
+            mkdir -p "$(dirname "$db")"
+            rm -f "$db" "$db-wal" "$db-shm"
+            sqlite3 "$FIXTURE/storage/development.sqlite3" ".backup $db"
+            ;;
+        csharp|csharp-aot)
+            local db="$CS_OUT/storage/development.sqlite3"
+            mkdir -p "$(dirname "$db")"
+            rm -f "$db" "$db-wal" "$db-shm"
+            sqlite3 "$FIXTURE/storage/development.sqlite3" ".backup $db"
+            ;;
+        rust)
+            local db="$RS_OUT/storage/development.sqlite3"
+            mkdir -p "$(dirname "$db")"
+            rm -f "$db" "$db-wal" "$db-shm"
+            sqlite3 "$FIXTURE/storage/development.sqlite3" ".backup $db"
+            ;;
+        spinel|spinel-fiber)
+            local db="$SP_OUT/storage/development.sqlite3"
+            mkdir -p "$(dirname "$db")"
+            rm -f "$db" "$db-wal" "$db-shm"
+            sqlite3 "$FIXTURE/storage/development.sqlite3" ".backup $db"
+            ;;
+        go)
+            # Default path the v2 server.go reads when DATABASE_PATH is
+            # unset; mirrors scripts/compare's go DB_DEST.
+            local db="$GO_OUT/storage/development.sqlite3"
+            mkdir -p "$(dirname "$db")"
+            rm -f "$db" "$db-wal" "$db-shm"
+            sqlite3 "$FIXTURE/storage/development.sqlite3" ".backup $db"
+            ;;
+        elixir)
+            # Path `Server.start` opens (relative to $EX_OUT); mirrors
+            # scripts/compare's elixir DB_DEST.
+            local db="$EX_OUT/storage/development.sqlite3"
+            mkdir -p "$(dirname "$db")"
+            rm -f "$db" "$db-wal" "$db-shm"
+            sqlite3 "$FIXTURE/storage/development.sqlite3" ".backup $db"
+            ;;
+        python)
+            # Default path `server.start` opens (relative to $PY_OUT);
+            # mirrors scripts/compare's python DB_DEST.
+            local db="$PY_OUT/storage/development.sqlite3"
+            mkdir -p "$(dirname "$db")"
+            rm -f "$db" "$db-wal" "$db-shm"
+            sqlite3 "$FIXTURE/storage/development.sqlite3" ".backup $db"
+            ;;
+    esac
+}
+
+start_target() {
+    local target="$1"
+    local port="$2"
+    local workers="$3"
+    local log="$LOG_DIR/${target}-${workers}w.log"
+
+    case "$target" in
+        rails)
+            # `RAILS_LOG_LEVEL=${BENCH_RAILS_LOG_LEVEL:-info}` lets the
+            # operator opt into a quieter Rails (warn) to isolate the
+            # per-request log-write cost from the rest of the stack.
+            # Default is `info` — the Rails 8 production-env default —
+            # so the headline comparison reflects a stock Rails install.
+            (cd "$FIXTURE" && \
+                RAILS_ENV=production \
+                RAILS_MAX_THREADS="$THREADS" \
+                WEB_CONCURRENCY="$workers" \
+                RAILS_LOG_LEVEL="${BENCH_RAILS_LOG_LEVEL:-info}" \
+                SECRET_KEY_BASE=bench-secret-key \
+                RUBYOPT=--yjit \
+                bin/rails server -p "$port" -e production \
+                >"$log" 2>&1) &
+            TARGET_PID=$!
+            disown 2>/dev/null || true
+            ;;
+        rails-int)
+            # Same as `rails` minus RUBYOPT=--yjit — isolates the
+            # YJIT-attributable share of the rails baseline.
+            (cd "$FIXTURE" && \
+                RAILS_ENV=production \
+                RAILS_MAX_THREADS="$THREADS" \
+                WEB_CONCURRENCY="$workers" \
+                RAILS_LOG_LEVEL="${BENCH_RAILS_LOG_LEVEL:-info}" \
+                SECRET_KEY_BASE=bench-secret-key \
+                bin/rails server -p "$port" -e production \
+                >"$log" 2>&1) &
+            TARGET_PID=$!
+            disown 2>/dev/null || true
+            ;;
+        rails-jruby)
+            # Stock Rails on the JVM via jruby (no YJIT — that's an MRI
+            # flag). Single-process (WEB_CONCURRENCY=0 — Puma cluster mode
+            # forks, unsupported on the JVM); concurrency is RAILS_MAX_THREADS
+            # (JRuby has no GVL). Heap pinned to 512 MB so RSS is a budget,
+            # like the emitted jruby cell. Boots `bin/rails server` through
+            # jruby's bundle (JDBC adapter), reading the staged production DB.
+            (cd "$FIXTURE80" && \
+                RAILS_ENV=production \
+                RAILS_MAX_THREADS="$THREADS" \
+                WEB_CONCURRENCY=0 \
+                RAILS_LOG_LEVEL="${BENCH_RAILS_LOG_LEVEL:-info}" \
+                SECRET_KEY_BASE=bench-secret-key \
+                BUNDLE_PATH="$FIXTURE80/.bundle-jruby" \
+                BUNDLE_WITHOUT="development:test" \
+                JRUBY_OPTS="-J-Xmx512m -J-Xms512m" \
+                jruby -S bundle exec rails server -p "$port" -e production \
+                >"$log" 2>&1) &
+            TARGET_PID=$!
+            disown 2>/dev/null || true
+            ;;
+        ruby)
+            (cd "$RUBY_OUT" && \
+                BUNDLE_GEMFILE="$TARGET_GEMFILE" \
+                BLOG_DB=storage/development.sqlite3 \
+                RAILS_MAX_THREADS="$THREADS" \
+                WEB_CONCURRENCY="$workers" \
+                RAILS_ENV=production \
+                PORT="$port" \
+                RUBYOPT=--yjit \
+                bundle exec puma -C config/puma.rb config.ru \
+                >"$log" 2>&1) &
+            TARGET_PID=$!
+            disown 2>/dev/null || true
+            ;;
+        ruby-int)
+            (cd "$RUBY_OUT" && \
+                BUNDLE_GEMFILE="$TARGET_GEMFILE" \
+                BLOG_DB=storage/development.sqlite3 \
+                RAILS_MAX_THREADS="$THREADS" \
+                WEB_CONCURRENCY="$workers" \
+                RAILS_ENV=production \
+                PORT="$port" \
+                bundle exec puma -C config/puma.rb config.ru \
+                >"$log" 2>&1) &
+            TARGET_PID=$!
+            disown 2>/dev/null || true
+            ;;
+        jruby)
+            # JRuby on the JVM. Single-process, multi-threaded: Puma
+            # cluster mode forks, which the JVM can't, so force
+            # WEB_CONCURRENCY=0 (`workers` is ignored, the per-cell row
+            # records workers=1) and lean on RAILS_MAX_THREADS — JRuby has
+            # no GVL, so threads run truly parallel. No RUBYOPT=--yjit
+            # (that's an MRI flag); JRuby's JIT warms during the harness's
+            # warmup window. The RSS sampler walks the process tree, so the
+            # JVM child is accounted for.
+            #
+            # Heap is pinned to 512 MB (-Xmx == -Xms) so the RSS column is a
+            # deliberate budget, comparable to the other cells' working
+            # sets. Uncapped, the JVM grabs ~25% of host RAM and its RSS
+            # climbs with cumulative load across the sequential endpoint
+            # measurements — a host-dependent artifact, not a footprint.
+            (cd "$JRUBY_OUT" && \
+                BUNDLE_GEMFILE="$JRUBY_OUT/Gemfile" \
+                BLOG_DB=storage/development.sqlite3 \
+                RAILS_MAX_THREADS="$THREADS" \
+                WEB_CONCURRENCY=0 \
+                RAILS_ENV=production \
+                PORT="$port" \
+                JRUBY_OPTS="-J-Xmx512m -J-Xms512m" \
+                jruby -S bundle exec puma -C config/puma.rb config.ru \
+                >"$log" 2>&1) &
+            TARGET_PID=$!
+            disown 2>/dev/null || true
+            ;;
+        truffleruby)
+            # The ruby tree under TruffleRuby's native standalone (the
+            # `truffleruby` build; the JVM standalone is a separate
+            # download and led it by nothing this lane needs to publish —
+            # env.json records `truffleruby --version`, which names the
+            # mode). Single process, WEB_CONCURRENCY=0: no `fork`. Heap
+            # pinned to 512 MB like the jruby cell — measured at -3%
+            # against the default, which otherwise grows to ~3.7 GB.
+            (cd "$RUBY_OUT" && \
+                BUNDLE_GEMFILE="$RUBY_OUT/Gemfile" \
+                BLOG_DB=storage/development.sqlite3 \
+                RAILS_MAX_THREADS="$THREADS" \
+                WEB_CONCURRENCY=0 \
+                RAILS_ENV=production \
+                PORT="$port" \
+                TRUFFLERUBYOPT="--vm.Xmx512m" \
+                truffleruby -S bundle exec puma -C config/puma.rb config.ru \
+                >"$log" 2>&1) &
+            TARGET_PID=$!
+            disown 2>/dev/null || true
+            ;;
+        rails-truffleruby)
+            # Stock Rails 8.1 under TruffleRuby, the rails lane's fixture
+            # and env minus YJIT (an MRI flag). Heap pinned to 1 GB, not
+            # the 512 MB the other managed cells get: stock Rails OOMs at
+            # 512 MB under TruffleRuby within a minute of load (measured
+            # 2026-09-18); 1 GB serves at -9% against the default.
+            (cd "$FIXTURE" && \
+                RAILS_ENV=production \
+                RAILS_MAX_THREADS="$THREADS" \
+                WEB_CONCURRENCY=0 \
+                RAILS_LOG_LEVEL="${BENCH_RAILS_LOG_LEVEL:-info}" \
+                SECRET_KEY_BASE=bench-secret-key \
+                BUNDLE_PATH="$FIXTURE/.bundle-truffleruby" \
+                BUNDLE_WITHOUT="development:test" \
+                TRUFFLERUBYOPT="--vm.Xmx1g" \
+                truffleruby -S bundle exec rails server -p "$port" -e production \
+                >"$log" 2>&1) &
+            TARGET_PID=$!
+            disown 2>/dev/null || true
+            ;;
+        typescript)
+            # Single-process node (no worker / preload concept) —
+            # `workers` is ignored and the per-cell row records workers=1.
+            (cd "$TS_OUT" && \
+                PORT="$port" \
+                npm start \
+                >"$log" 2>&1) &
+            TARGET_PID=$!
+            disown 2>/dev/null || true
+            ;;
+        crystal)
+            # AOT-compiled binary — single-process, no workers concept.
+            (cd "$CR_OUT" && \
+                PORT="$port" \
+                ./.bin/server \
+                >"$log" 2>&1) &
+            TARGET_PID=$!
+            disown 2>/dev/null || true
+            ;;
+        kotlin)
+            # JVM (Javalin) — single process, scheduler-level concurrency,
+            # no worker concept (`workers` ignored, per-cell row records
+            # workers=1 like go/elixir). The installDist launcher reads
+            # BLOG_DB + PORT, and honors JAVA_OPTS — heap pinned to 512 MB
+            # (-Xmx==-Xms) to match the jruby cell's methodology so the RSS
+            # comparison is apples-to-apples across the two JVM targets.
+            (cd "$KT_OUT" && \
+                JAVA_HOME="$KOTLIN_JAVA_HOME" \
+                JAVA_OPTS="-Xmx512m -Xms512m" \
+                BLOG_DB="storage/development.sqlite3" \
+                PORT="$port" \
+                ./build/install/roundhouse-app/bin/roundhouse-app \
+                >"$log" 2>&1) &
+            TARGET_PID=$!
+            disown 2>/dev/null || true
+            ;;
+        swift)
+            # AOT binary (Hummingbird/SwiftNIO) — single process,
+            # NIOThreadPool concurrency, no worker concept (workers=1
+            # recorded like go/kotlin). No heap pin needed: native memory
+            # management, RSS is the honest number.
+            (cd "$SW_OUT" && \
+                BLOG_DB="storage/development.sqlite3" \
+                PORT="$port" \
+                ./.build/release/App \
+                >"$log" 2>&1) &
+            TARGET_PID=$!
+            disown 2>/dev/null || true
+            ;;
+        csharp)
+            # .NET JIT (Kestrel) — single process, scheduler concurrency, no
+            # worker concept (workers=1 recorded like go/kotlin/swift). The
+            # GC heap is capped at 512 MB (DOTNET_GCHeapHardLimit, the -Xmx
+            # analog) so the RSS comparison is apples-to-apples with the JVM
+            # targets' -Xmx512m pin — without it Server GC reserves memory
+            # proportional to core count. Run the DLL via the runtime host.
+            (cd "$CS_OUT" && \
+                BLOG_DB="storage/development.sqlite3" \
+                PORT="$port" \
+                DOTNET_GCHeapHardLimit=0x20000000 \
+                dotnet bin/Release/net10.0/roundhouse-app.dll \
+                >"$log" 2>&1) &
+            TARGET_PID=$!
+            disown 2>/dev/null || true
+            ;;
+        csharp-aot)
+            # NativeAOT (Kestrel) — single native binary. Same 512 MB GC heap
+            # cap as the JIT cell (and the JVM targets) for an apples-to-apples
+            # RSS comparison.
+            (cd "$CS_OUT" && \
+                BLOG_DB="storage/development.sqlite3" \
+                PORT="$port" \
+                DOTNET_GCHeapHardLimit=0x20000000 \
+                ./publish-aot/roundhouse-app \
+                >"$log" 2>&1) &
+            TARGET_PID=$!
+            disown 2>/dev/null || true
+            ;;
+        rust)
+            # AOT-compiled binary — single-process, no workers concept.
+            (cd "$RS_OUT" && \
+                PORT="$port" \
+                ./target/release/app \
+                >"$log" 2>&1) &
+            TARGET_PID=$!
+            disown 2>/dev/null || true
+            ;;
+        spinel-fiber)
+            # The spinel binary's OTHER server: Tep::Server::Scheduled, a
+            # fiber per connection on one thread (TEP_SERVER=fiber), the
+            # design Tep::Server::Threaded replaced. Same binary, same DB,
+            # same pool; only the environment differs, so the `spinel` /
+            # `spinel-fiber` pair measures the scheduler design alone
+            # (matz/spinel#4306). SPINEL_WORKERS=1 is declared because the
+            # server runs on the main thread and the other workers would
+            # only idle; `workers` is ignored and the row records 1.
+            (cd "$SP_OUT" && \
+                TEP_SERVER=fiber \
+                SPINEL_WORKERS=1 \
+                BLOG_DB=storage/development.sqlite3 \
+                PORT="$port" \
+                DATABASE_POOL_SIZE="$CONNECTIONS" \
+                ./build/blog \
+                >"$log" 2>&1) &
+            TARGET_PID=$!
+            disown 2>/dev/null || true
+            ;;
+        spinel)
+            # AOT-compiled native binary (Spinel codegen) — single-process,
+            # Tep::Server::Threaded, a green thread per connection on the
+            # runtime's autodetected OS worker count (SPINEL_WORKERS caps
+            # it). `workers` is ignored and the per-cell row records
+            # workers=1.
+            # Size the connection pool to the wrk concurrency: the
+            # fiber-per-connection server serves up to `c` requests at
+            # once, so a smaller pool would make fibers park on a handle.
+            # Same DATABASE_POOL_SIZE knob the rust target reads.
+            (cd "$SP_OUT" && \
+                BLOG_DB=storage/development.sqlite3 \
+                PORT="$port" \
+                DATABASE_POOL_SIZE="$CONNECTIONS" \
+                ./build/blog \
+                >"$log" 2>&1) &
+            TARGET_PID=$!
+            disown 2>/dev/null || true
+            ;;
+        go)
+            # AOT-compiled binary — single-process, net/http server,
+            # no workers concept. `workers` ignored; per-cell row
+            # records workers=1. Deliberately does NOT pass
+            # DATABASE_POOL_SIZE=$CONNECTIONS the way rust/spinel do:
+            # the Go target is backed by pure-Go modernc sqlite, whose
+            # internal locking collapses under a wrk-concurrency-sized
+            # pool (measured: pool=64 → ~half the throughput of pool=4).
+            # The runtime defaults the pool to runtime.NumCPU(), which
+            # sits on modernc's throughput plateau.
+            (cd "$GO_OUT" && \
+                PORT="$port" \
+                ./.bin/server \
+                >"$log" 2>&1) &
+            TARGET_PID=$!
+            disown 2>/dev/null || true
+            ;;
+        elixir)
+            # BEAM VM — one node, scheduler-level concurrency. No worker
+            # processes: `workers` is ignored and per-cell rows record
+            # workers=1 (like go). `Main.run` boots Plug.Cowboy via
+            # `Server.start`, which opens the staged DB and blocks.
+            (cd "$EX_OUT" && \
+                PORT="$port" \
+                MIX_ENV=prod \
+                mix run --no-halt -e 'Main.run' \
+                >"$log" 2>&1) &
+            TARGET_PID=$!
+            disown 2>/dev/null || true
+            ;;
+        python)
+            # Single-process aiohttp (async event loop) — no worker /
+            # preload concept, so `workers` is ignored and the per-cell row
+            # records workers=1 (like node/go/elixir). `python3 -m app`
+            # boots `server.start`, which opens the staged DB and blocks.
+            # The RSS sampler + teardown walk the process tree, so the
+            # `uv run` → python child is accounted for.
+            (cd "$PY_OUT" && \
+                PORT="$port" \
+                uv run python3 -m app \
+                >"$log" 2>&1) &
+            TARGET_PID=$!
+            disown 2>/dev/null || true
+            ;;
+    esac
+    # JRuby boots the JVM before serving — give it a larger readiness
+    # budget than the 30s default the other targets use.
+    local ready_budget=30
+    [[ "$target" == jruby || "$target" == rails-jruby ]] && ready_budget=90
+    wait_for_port "http://localhost:$port/articles" "$target" "$ready_budget" || {
+        echo "--- $target log ---" >&2
+        tail -40 "$log" >&2
+        kill_tree "$TARGET_PID"
+        TARGET_PID=""
+        return 1
+    }
+}
+
+# ── measurement ──────────────────────────────────────────────────────
+
+# RSS sampler: poll every 1s while wrk runs, write samples to a file.
+# Caller starts it in the background, kills when wrk exits.
+rss_sampler() {
+    local pid="$1"
+    local out="$2"
+    : > "$out"
+    while kill -0 "$pid" 2>/dev/null; do
+        sum_rss_kb "$pid" >> "$out"
+        sleep 1
+    done
+}
+
+# Median of a list of integers (one per line). Used for RSS samples
+# to get steady-state memory (peak is too noisy on macOS).
+median() {
+    sort -n | awk '
+        { a[NR] = $1 }
+        END {
+            n = NR
+            if (n == 0) { print 0; exit }
+            if (n % 2 == 1) print a[(n+1)/2]
+            else print int((a[n/2] + a[n/2+1]) / 2)
+        }
+    '
+}
+
+# Run one measurement (warmup + DURATION-second wrk). Captures req/sec,
+# p50, p99, and a steady-state RSS sample. Emits a single-line JSON
+# record on stdout.
+measure_one() {
+    local target="$1"
+    local workers="$2"
+    local port="$3"
+    local endpoint="$4"
+    local run_n="$5"
+
+    local url="http://localhost:$port$endpoint"
+
+    # Warmup wrk run — discarded. Runs before EVERY measurement, so run
+    # N of a cell has seen N warmups: the 20s default gives the median
+    # run 40s, enough for the emit under JRuby (plateaus inside 30s).
+    # Three lanes need more. Floors were first set from an M4 laptop
+    # (60s/120s for the TruffleRuby lanes, 2026-09-18); the box's first
+    # night on them (2026-09-19, Ryzen 5 3600, six cores shared with
+    # Graal's compiler threads) said they were short — its own
+    # stability section flagged the cells: rails-truffleruby /articles
+    # 979 -> 1,756 -> 1,874 across runs warmed 120/240/360s, so the
+    # median was a run still climbing; truffleruby 7,864 -> 9,121 ->
+    # 9,036 at 60/120/180s, flat from 120s; rails-jruby 588 -> 1,007 ->
+    # 1,021 at 20/40/60s, flat from 40s. Floors are set where each
+    # curve went flat ON THE BOX, so the median run is steady state. A
+    # lane floor rather than a bigger global default, so the other
+    # lanes do not pay for these; --warmup above the floor still wins,
+    # and the record carries the value used.
+    local warm="$WARMUP"
+    case "$target" in
+        truffleruby)       (( warm < 120 )) && warm=120 ;;
+        rails-truffleruby) (( warm < 240 )) && warm=240 ;;
+        rails-jruby)       (( warm < 60 ))  && warm=60 ;;
+    esac
+    wrk -t"$WRK_THREADS" -c"$CONNECTIONS" -d"${warm}s" "$url" \
+        >/dev/null 2>&1 || true
+
+    # Measurement window — RSS sampler in parallel
+    local wrk_out="$LOG_DIR/wrk-${target}-${workers}w-${run_n}.txt"
+    local rss_out="$LOG_DIR/rss-${target}-${workers}w-${run_n}.txt"
+    rss_sampler "$TARGET_PID" "$rss_out" &
+    local rss_pid=$!
+    wrk -t"$WRK_THREADS" -c"$CONNECTIONS" -d"${DURATION}s" --latency \
+        "$url" >"$wrk_out" 2>&1 || true
+    kill "$rss_pid" 2>/dev/null || true
+    wait "$rss_pid" 2>/dev/null || true
+
+    local wrk_json
+    wrk_json="$(parse_wrk "$wrk_out")"
+    # An error-bearing cell is recorded like a lane that stopped
+    # answering: skipped.json carries the reason the page prints.
+    if [[ "$wrk_json" == *'"req_sec":null'* ]] && grep -q '^ *Non-2xx or 3xx responses:' "$wrk_out"; then
+        local n_err
+        n_err="$(awk '/^ *Non-2xx or 3xx responses:/{print $NF; exit}' "$wrk_out")"
+        fail "$target $endpoint run $run_n: $n_err responses were not 2xx/3xx; cell recorded as no data ($wrk_out)"
+        printf '%s\n' "$endpoint: $n_err of $(awk '/ requests in /{print $1; exit}' "$wrk_out") responses were not 2xx/3xx — the server answered, with errors; see the lane log" > "$wrk_out.errors"
+        record_skip "$target" errors "$wrk_out.errors"
+    fi
+    local rss_median_kb
+    rss_median_kb="$(median < "$rss_out")"
+    [[ -z "$rss_median_kb" || "$rss_median_kb" == "0" ]] && rss_median_kb=0
+
+    # Emit one JSON record
+    cat <<EOF
+{"target":"$target","workers":$workers,"endpoint":"$endpoint","run":$run_n,"warmup_sec":$warm,"rss_kb":$rss_median_kb,$(echo "$wrk_json" | sed 's/^{//;s/}$//')}
+EOF
+}
+
+# ── main loop ────────────────────────────────────────────────────────
+
+PER_RUN_JSON="$OUT_DIR/per-run.json"
+: > "$PER_RUN_JSON"
+
+port="$BASE_PORT"
+for target in "${TARGETS[@]}"; do
+    step "build_target $target"
+    # Build/compile failures (e.g. a spinel AOT-compile error) skip just
+    # this target instead of aborting the whole run, so the remaining
+    # languages still get measured. The `if !` context suppresses set -e
+    # inside build_target — that's why each build step there ends in
+    # `|| return 1`, so the first failure propagates here.
+    # Everything the build's tools print goes to the lane's build log —
+    # stdout too, because dotnet and gradle put their errors there — and
+    # a failure hands the reader the tail of it, on stderr for the nightly
+    # log and in skipped.json for the page. Progress lines (`step`) reach
+    # the console through fd 3, above.
+    build_log="$LOG_DIR/build-${target}.log"
+    if ! build_target "$target" >"$build_log" 2>&1; then
+        fail "$target failed to build; skipping target"
+        echo "--- $target build log (last 40 lines: $build_log) ---" >&2
+        tail -40 "$build_log" >&2
+        record_skip "$target" build "$build_log"
+        continue
+    fi
+    if ! stage_db "$target" >>"$build_log" 2>&1; then
+        fail "$target DB staging failed; skipping target"
+        tail -20 "$build_log" >&2
+        record_skip "$target" db "$build_log"
+        continue
+    fi
+
+    seen_cells=""
+    for workers in "${WORKERS[@]}"; do
+        # Ruby targets honor WEB_CONCURRENCY; other targets ignore it
+        # (and we record the field as 1 for those).
+        case "$target" in
+            rails|rails-int|ruby|ruby-int) effective_workers="$workers" ;;
+            *)                    effective_workers=1 ;;
+        esac
+
+        # Skip dupes — non-worker-honoring targets collapse all
+        # `--workers N` iterations onto a single workers=1 cell.
+        if [[ " $seen_cells " == *" $effective_workers "* ]]; then
+            continue
+        fi
+        seen_cells="$seen_cells $effective_workers"
+
+        step "start $target (workers=$effective_workers, port=$port)"
+        start_target "$target" "$port" "$effective_workers" || {
+            fail "$target failed to start; skipping cell"
+            record_skip "$target" start "$LOG_DIR/${target}-${effective_workers}w.log"
+            port=$(( port + 1 ))
+            continue
+        }
+        ok "$target up on :$port"
+
+        for endpoint in "${ENDPOINTS[@]}"; do
+            for run in $(seq 1 "$RUNS"); do
+                step "measure $target w=$effective_workers $endpoint run=$run/$RUNS"
+                rec="$(measure_one "$target" "$effective_workers" "$port" "$endpoint" "$run")"
+                echo "$rec" >> "$PER_RUN_JSON"
+                printf '  '
+                # Pretty-print the cell so the user sees progress
+                echo "$rec" | awk -F'[,:]' '{
+                    for(i=1;i<=NF;i++) {
+                        gsub(/["{}]/, "", $i)
+                        if($i=="req_sec") req=$(i+1)
+                        if($i=="p99_ms") p99=$(i+1)
+                        if($i=="rss_kb") rss=$(i+1)
+                    }
+                    gsub(/["{}]/, "", req); gsub(/["{}]/, "", p99); gsub(/["{}]/, "", rss)
+                    printf "req/sec=%s  p99=%sms  rss=%dMB\n", req, p99, int(rss/1024)
+                }'
+                # Cooldown between runs to let thermals settle
+                sleep 2
+            done
+        done
+
+        kill_tree "$TARGET_PID"
+        TARGET_PID=""
+        sleep 0.5
+        port=$(( port + 1 ))
+    done
+done
+
+# ── aggregation ──────────────────────────────────────────────────────
+
+step "aggregating $(wc -l < "$PER_RUN_JSON") runs → $OUT_DIR/summary.md"
+
+# Aggregate via Ruby (always present on dev machines, and we ship Ruby
+# targets so it's guaranteed available). Median across runs per
+# (target, workers, endpoint) cell. Compute req/sec/GB.
+ruby - "$PER_RUN_JSON" "$OUT_DIR/summary.json" "$OUT_DIR/summary.md" <<'RUBY'
+# encoding: utf-8
+require "json"
+
+per_run_path, summary_json_path, summary_md_path = ARGV
+
+records = File.readlines(per_run_path, chomp: true).reject(&:empty?).map { |l| JSON.parse(l) }
+
+# Group by (target, workers, endpoint), median across runs
+def median(xs)
+  xs = xs.compact.sort
+  return nil if xs.empty?
+  n = xs.size
+  n.odd? ? xs[n / 2] : ((xs[n / 2 - 1] + xs[n / 2]) / 2.0)
+end
+
+cells = records.group_by { |r| [r["target"], r["workers"], r["endpoint"]] }.map do |(target, workers, endpoint), runs|
+  req_sec = median(runs.map { |r| r["req_sec"] })
+  p50     = median(runs.map { |r| r["p50_ms"] })
+  p99     = median(runs.map { |r| r["p99_ms"] })
+  # A zero RSS is never a measurement — it means the sampler's `kill -0`
+  # found no process, which is what a server that died mid-run leaves
+  # behind. Kept as nil so the renderers can say "no data" instead of
+  # charting a lane at 0 MB, which reads as an impossibly lean one.
+  rss_kb  = median(runs.map { |r| r["rss_kb"] }.reject { |v| v.to_i.zero? })
+  rss_gb  = rss_kb ? rss_kb / 1024.0 / 1024.0 : nil
+  rps_per_gb = (req_sec && rss_gb && rss_gb > 0) ? req_sec / rss_gb : nil
+  {
+    target: target, workers: workers, endpoint: endpoint,
+    runs: runs.size,
+    req_sec: req_sec, p50_ms: p50, p99_ms: p99,
+    rss_kb: rss_kb, rss_mb: rss_kb ? rss_kb / 1024.0 : nil,
+    rps_per_gb: rps_per_gb,
+    # Responses wrk saw that were not 2xx/3xx, summed over the runs. A
+    # cell with any has req_sec nil (parse_wrk), and the page says why.
+    non_2xx: runs.sum { |r| r["non_2xx"].to_i },
+  }
+end
+
+File.write(summary_json_path, JSON.pretty_generate(cells))
+
+# Markdown table grouped by endpoint
+by_endpoint = cells.group_by { |c| c[:endpoint] }
+md = +""
+md << "# Benchmark results\n\n"
+md << "_#{records.size} measurements across #{cells.size} cells_\n\n"
+
+by_endpoint.each do |endpoint, eg_cells|
+  md << "## `#{endpoint}`\n\n"
+  md << "| target | workers | req/sec | p50 (ms) | p99 (ms) | RSS (MB) | req/sec/GB |\n"
+  md << "|--------|--------:|--------:|---------:|---------:|---------:|-----------:|\n"
+  # `—` rather than 0 for a cell that was never measured: a 0 in a
+  # req/sec column is a claim about the runtime, and this table has no
+  # other way to say the server wasn't answering when wrk ran.
+  cell = ->(v, places) { v.nil? ? "—" : ("%.#{places}f" % v) }
+  eg_cells.sort_by { |c| [c[:target], c[:workers]] }.each do |c|
+    md << "| %s | %d | %s | %s | %s | %s | %s |\n" % [
+      c[:target], c[:workers],
+      cell.(c[:req_sec], 0), cell.(c[:p50_ms], 2), cell.(c[:p99_ms], 2),
+      cell.(c[:rss_mb], 0), cell.(c[:rps_per_gb], 0),
+    ]
+  end
+  md << "\n"
+end
+
+File.write(summary_md_path, md)
+RUBY
+
+ok "summary written to $OUT_DIR/summary.md"
+
+# ---------------------------------------------------------------------
+# Publish the emitted spinel tree as a per-run tarball beside the numbers
+# it was measured with. Mirrors bench-lobsters' pack_tree.
+#
+# The REPRODUCE.md names the roundhouse revision that emitted the tree and
+# the spinel it was built against. Without that stamp a downloaded archive
+# is a moving target: matz/spinel#4100 lost a reproduction to exactly this
+# ("that may have been a roundhouse revision difference"), because the
+# Pages copy at browse/spinel.tgz is regenerated on every push and carries
+# no revision of its own. Per-run directories under bench/results are
+# dated and are not overwritten, so this copy is citable from an issue.
+#
+# `fail` rather than `warn`: scripts/bench has no warn (bench-lobsters
+# defined one only after pack_tree called it and aborted the lane). A
+# missing tree is not fatal to the run — the numbers are already written —
+# so this returns 0 either way.
+# ---------------------------------------------------------------------
+pack_spinel_tree() {
+    local dir="$SP_OUT"
+    [[ -d "$dir" && -f "$dir/main.rb" ]] || {
+        fail "no spinel tree at $dir — not packed"
+        return 0
+    }
+    local rh sp
+    rh="$(cd "$REPO_ROOT" && git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+    sp="$(command -v spinel >/dev/null 2>&1 && spinel --version 2>/dev/null || echo 'not on PATH')"
+
+    cat > "$dir/REPRODUCE.md" <<REPRO
+# blog — spinel tree, as benchmarked
+
+Emitted by roundhouse \`$rh\` from the reference Rails blog fixture. This is
+the tree the published numbers were measured on, minus build output.
+
+    roundhouse : $rh
+    spinel     : $sp
+    packed     : $(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+## Build it
+
+    # needs spinel + spinel_rbs_extract on PATH
+    make build
+
+That compiles \`main.rb\` (plus its whole require graph) to \`build/blog\`.
+The \`sig/\` tree ships with the archive and the Makefile passes it as
+\`--rbs sig\` automatically; building without it exercises a different and
+much less exercised path.
+
+## What it is
+
+A whole-program Rails emit in the spinel subset: the application, its
+views desugared into methods, and the framework runtime reified as plain
+Ruby. Nothing here is hand-written — regenerating it from the same
+roundhouse revision reproduces it byte for byte.
+
+Static assets under \`static/assets/\` are checked in as built. The seed
+database is excluded; \`make db\` recreates it.
+REPRO
+
+    tar czf "$OUT_DIR/spinel-tree.tgz" -C "$(dirname "$dir")" \
+        --exclude=build --exclude=bench-work --exclude=storage \
+        --exclude='*.sqlite3' --exclude='*.o' --exclude='*.log' \
+        --exclude=spin.lock --exclude=node_modules \
+        "$(basename "$dir")" 2>/dev/null \
+      && ok "packed spinel tree -> $OUT_DIR/spinel-tree.tgz ($(du -h "$OUT_DIR/spinel-tree.tgz" 2>/dev/null | cut -f1))" \
+      || fail "could not pack the spinel tree"
+    rm -f "$dir/REPRODUCE.md"
+}
+pack_spinel_tree
+
+# Atomically repoint bench/results/latest at this run. Symlink because
+# POSIX doesn't permit hard-linking directories. -n keeps `ln -f` from
+# dereferencing the existing symlink and creating a nested link inside.
+if [[ "$OUT_DIR" == "$REPO_ROOT/bench/results/"* ]]; then
+    ln -sfn "$(basename "$OUT_DIR")" "$REPO_ROOT/bench/results/latest"
+    ok "bench/results/latest → $(basename "$OUT_DIR")"
+fi
+
+echo
+cat "$OUT_DIR/summary.md"

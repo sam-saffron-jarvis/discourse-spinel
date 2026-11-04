@@ -1,0 +1,2418 @@
+//! Method catalog — the IDL-shaped single source of truth for what
+//! the compiler knows about framework and runtime method surfaces.
+//!
+//! ## Why this exists
+//!
+//! Before the catalog, knowledge about ActiveRecord methods was
+//! scattered across five places: `SqliteAdapter.classify_ar_method`
+//! (effect classification), `Analyzer::new` class_methods HashMap
+//! (return types), `lower::controller::is_query_builder_method`
+//! (chain classification), hand-coded emitter templates (emission
+//! shapes), and per-target runtime stubs (actual implementations).
+//! Adding a new AR method meant editing N places, and drift was
+//! inevitable.
+//!
+//! The catalog is the authoritative declarative record. Each entry
+//! captures the facets every consumer needs: identity (name +
+//! receiver context), side-effect class, chain semantics (for
+//! terminal-vs-builder distinction), and — growing over time —
+//! return-type signature, capability gate, per-target runtime
+//! symbol maps.
+//!
+//! ## What this is not
+//!
+//! - Not an external DSL today. Entries live as Rust code (static
+//!   table). If/when externalization is needed (gem-author RBS,
+//!   user annotations), a parser will populate the same
+//!   `CatalogedMethod` struct.
+//! - Not a type system. The analyzer still owns type inference; the
+//!   catalog just declares what's available for dispatch.
+//! - Not a capability profile. Adapters declare *which* catalog
+//!   entries they support; the catalog itself is adapter-neutral.
+//!
+//! ## What's in the minimum viable version
+//!
+//! AR methods only. The catalog will grow to include view helpers
+//! (`form_with`, `link_to`, `render`), controller helpers (`render`,
+//! `redirect_to`, `head`), and route DSL over time — but today's
+//! scope is the AR method surface the compiler recognizes.
+//!
+//! Return types are the `return_kind` facet (`ReturnKind`), keyed to
+//! the receiver context — in `Relation` context, `Self` means the
+//! relation's element model. See `ReceiverContext` below.
+
+use std::collections::BTreeSet;
+
+pub mod gems;
+pub mod string_kernel;
+pub use gems::{GemClass, GemTy, GEM_CATALOG};
+
+/// One cataloged method. Static-lifetime strings keep entries
+/// zero-allocation at runtime — the catalog is const data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CatalogedMethod {
+    /// Method name as written in Ruby source. Bang variants
+    /// (`save!`, `destroy!`) are distinct entries from their
+    /// non-bang counterparts.
+    pub name: &'static str,
+    /// Where the method is called — on the class, on an instance,
+    /// on a Relation, or on an association. Same method name
+    /// (`find`, `create`) can mean different things in different
+    /// receiver contexts; the catalog keys on `(name, receiver)`.
+    pub receiver: ReceiverContext,
+    /// Side-effect class. `DbRead` / `DbWrite` attach a
+    /// corresponding `Effect::DbRead { table }` / `Effect::DbWrite
+    /// { table }` when the analyzer visits the Send site. `Pure`
+    /// attaches nothing (e.g., attribute readers, to_s).
+    pub effect: EffectClass,
+    /// For Relation-builder methods, whether this call is the
+    /// terminal step (executes the query) or a chainable step
+    /// (builds the query further). `NotApplicable` covers writes
+    /// (which always execute) and non-relation methods.
+    pub chain: ChainKind,
+    /// Declared return-type shape, parametric on the receiver's
+    /// Self type. The analyzer instantiates this against each
+    /// model class when building `class_methods` / `instance_
+    /// methods` registries — `ArrayOfSelf` for `Article` becomes
+    /// `Ty::Array<Ty::Class(Article)>`, etc. `None` means the
+    /// return type isn't declared in the catalog; the analyzer
+    /// falls back to not populating a method-signature entry,
+    /// leaving downstream type inference to produce Unknown.
+    pub return_kind: Option<ReturnKind>,
+}
+
+/// Which receiver shape this method is defined on. Distinguishing
+/// these is load-bearing: `find` on a class looks up by primary key
+/// (`User.find(1)`), while `find` on an association looks up within
+/// a scope (`user.posts.find(1)`). Same method name, different
+/// semantics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ReceiverContext {
+    /// Called on the model class: `User.find(1)`, `User.all`.
+    Class,
+    /// Called on a model instance: `user.save`, `post.destroy`.
+    Instance,
+    /// Called on a `Ty::Relation`-typed receiver: `Story.recent
+    /// .where(...)`, `tag.stories.order(...)`. For entries in this
+    /// context, "Self" in a [`ReturnKind`] denotes the relation's
+    /// *element* model (`Relation { of }`'s `of`), so `SelfOrNil`
+    /// reads "element or nil" (`first`/`take`) and `ArrayOfSelf`
+    /// reads "materialized array of the element" (`to_a`).
+    ///
+    /// Association reads fold into this context rather than getting
+    /// their own: an association read *is* a relation whose base
+    /// predicate is the FK match (`tag.stories` ≡ `Story.where(
+    /// tag_id: tag.id)` modulo join tables), so the method surface
+    /// callable on it is exactly the relation surface. If a
+    /// CollectionProxy-only method (`tag.stories << story`) ever
+    /// needs cataloging, that's the moment to revisit — not before.
+    Relation,
+}
+
+/// Side-effect class of a cataloged method. Maps onto the
+/// `Effect::DbRead` / `Effect::DbWrite` / (nothing) triad the
+/// analyzer's effect inference produces today.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EffectClass {
+    /// Method executes a SELECT-equivalent — `find`, `all`,
+    /// `where`, `count`, `pluck`, …
+    DbRead,
+    /// Method executes an INSERT / UPDATE / DELETE — `save`,
+    /// `destroy`, `update_all`, `create`, …
+    DbWrite,
+    /// No database effect. In-memory operations like `Model.new`
+    /// (constructs an instance; doesn't hit the DB until `.save`),
+    /// attribute accessors, format conversions.
+    Pure,
+}
+
+/// Return-type shape for a cataloged method, parametric on the
+/// receiver's Self type. Consumers (analyzer building
+/// class_methods registries) instantiate these against the
+/// concrete model class — `ArrayOfSelf` for the `Article` model
+/// becomes `Ty::Array<Ty::Class(Article)>`.
+///
+/// Covers the five shapes the current analyzer declares inline.
+/// Grows naturally (HashOf, ClassRef for ActiveModel::Errors,
+/// etc.) as more of the AR surface comes into the catalog.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReturnKind {
+    /// Returns the receiver type itself (the model class).
+    /// Example: `Model.new`, `Model.create`, `Model.find` (by
+    /// primary key — non-nullable; find raises if not found).
+    SelfType,
+    /// Returns `Array<Self>` — a concrete materialized collection
+    /// of records. Example: `Model.all`, `Model.where(...)`,
+    /// `Model.limit(5)`. Note: catalog doesn't yet distinguish
+    /// `Relation<T>` from `Array<T>` — terminal-vs-builder
+    /// distinction is tracked via `ChainKind`, not the return
+    /// type. When `Relation<T>` arrives, these split.
+    ArrayOfSelf,
+    /// Returns `Self | Nil`. Example: `Model.find_by(...)`,
+    /// `Model.first`, `Model.last` — lookups that may return
+    /// nothing without raising.
+    SelfOrNil,
+    /// Returns `Int`. Example: `Model.count`.
+    Int,
+    /// Returns `Int | Nil`. Example: `relation.next_page`,
+    /// nil on the last page.
+    IntOrNil,
+    /// Returns `Bool`. Example: `Model.exists?`, `#save`,
+    /// `#valid?`, `#persisted?`.
+    Bool,
+    /// Returns `Hash<Sym, Str>`. Example: `#attributes` on an
+    /// ActiveRecord instance — the canonical schema-derived
+    /// attribute dictionary. Specific rather than generic because
+    /// this one shape is what the Rails dialect emits; if/when
+    /// another Hash shape enters the catalog, generalize to a
+    /// `HashOf(PrimKind, PrimKind)` variant.
+    HashSymStr,
+    /// Returns `Hash<Str, untyped>`. Example:
+    /// `#attributes_before_type_cast` — each column's raw stored value,
+    /// String-keyed as Rails keys it.
+    HashStrUntyped,
+    /// Returns `Array<Sym>`. Example: `.schema_column_names` on
+    /// an ActiveRecord class — the schema column list the lowerer
+    /// will emit per-model once `Base`'s `attr_accessor` override
+    /// is removed.
+    ArrayOfSym,
+    /// Returns `Str`. Example: `#read_attribute`, `#[]`, `#[]=`
+    /// on an ActiveRecord instance — declared per the current
+    /// `Base.rbs` contract. Imprecise for non-string columns
+    /// (`article[:id]` is actually Int), but matches the existing
+    /// declared shape and isn't worse than today.
+    Str,
+    /// Returns `Str | Nil`. Example: `Base#cache_version` — nil on a
+    /// model with no `updated_at` column.
+    StrOrNil,
+    /// Reference to a concrete class by dotted-name path
+    /// (e.g. `"ActiveModel::Errors"`). Analyzer instantiates as
+    /// `Ty::Class { id: ClassId(<path>), args: vec![].into() }`.
+    /// Used by `#errors` to reference the ActiveModel::Errors
+    /// class without needing it to be a user-defined model.
+    ClassRef(&'static str),
+    /// Returns `Ty::Relation { of: Self }` — an unmaterialized
+    /// query preserving the receiver's element model. The chain-
+    /// builder surface under [`ReceiverContext::Relation`]
+    /// (`where`, `order`, `limit`, …) declares this: builders
+    /// keep the relation representation; only terminals
+    /// materialize.
+    RelationOfSelf,
+    /// Returns `Array<Int>`. Example: `relation.ids` — the
+    /// primary-key projection.
+    ArrayOfInt,
+    /// Returns `Array<Untyped>`. Example: `relation.pluck(*cols)`
+    /// — the column types aren't derivable from the method name
+    /// alone, so the element stays gradual (call sites that need
+    /// precision get it from the arel lowering, not the catalog).
+    ArrayOfUntyped,
+    /// Returns `Untyped` — the gradual escape, for methods whose
+    /// value genuinely can't be shaped without argument analysis.
+    /// Example: `relation.pick(*cols)` (a single column value or
+    /// nil), `relation.arel` (raw Arel escape).
+    Untyped,
+}
+
+/// Chain semantics for a Relation-builder method.
+///
+/// ActiveRecord's query builder is lazy: `Article.where(...)`
+/// returns a `Relation` that hasn't executed yet; only terminal
+/// operations (`.to_a`, `.first`, `.count`) trigger the actual
+/// SELECT. This distinction matters for async emission — only the
+/// terminal step needs `await` under an async adapter; chainable
+/// steps don't hit the database.
+///
+/// Today's classification is coarse: everything is Terminal
+/// because the emitter doesn't yet distinguish chain-builder from
+/// terminal, and the SqliteAdapter (current sole adapter) is sync
+/// so it doesn't matter. When async adapters and `Relation<T>`
+/// typing land, Builder-marked methods stop producing DbRead
+/// effects (the Relation carries them; only the Terminal step
+/// emits them).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChainKind {
+    /// Method executes the query — `all`, `find`, `first`,
+    /// `to_a`, `count`, `pluck`, …
+    Terminal,
+    /// Method builds the query further without executing —
+    /// `where`, `limit`, `order`, `includes`, `joins`, …
+    Builder,
+    /// Chain semantic doesn't apply — all writes, and reads that
+    /// aren't part of a relation chain (e.g., aggregate class
+    /// methods that always execute).
+    NotApplicable,
+}
+
+/// The AR method catalog — every ActiveRecord method the compiler
+/// recognizes today. Ordered roughly by: class-method reads,
+/// class-method writes, instance-method writes.
+///
+/// Adding a new AR method: add one entry here. Consumers
+/// (SqliteAdapter classifier, future effect inference, future
+/// emitter templates) all pick it up via the single source.
+pub const AR_CATALOG: &[CatalogedMethod] = &[
+    // ---- Class-method factory ----
+    // `Model.new(attrs)` — constructs an in-memory instance; no
+    // database hit until `.save`. Tracked here (rather than
+    // omitted) because the analyzer's `class_methods` registry
+    // includes it, and consolidating both return-type + effect
+    // declarations in one place is the catalog's purpose.
+    CatalogedMethod {
+        name: "new",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::Pure,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::SelfType),
+    },
+    // ---- Class-method reads (query surface) ----
+    // Terminal reads — execute a SELECT and return results.
+    CatalogedMethod {
+        name: "all",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    CatalogedMethod {
+        name: "find",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::SelfType),
+    },
+    CatalogedMethod {
+        name: "find_by",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::SelfOrNil),
+    },
+    CatalogedMethod {
+        name: "find_by!",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        // `find_by!` raises rather than returning nil, so the result is the
+        // record itself (not `Self | Nil` like `find_by`).
+        return_kind: Some(ReturnKind::SelfType),
+    },
+    // `sole` / `find_sole_by` (Rails 7.0) raise unless exactly one row
+    // matches, so they answer the record itself, like `find_by!`.
+    CatalogedMethod {
+        name: "sole",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::SelfType),
+    },
+    CatalogedMethod {
+        name: "find_sole_by",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::SelfType),
+    },
+    // `find_or_initialize_by` reads, and on a miss builds an unsaved
+    // instance in memory — a SELECT with no write either way.
+    CatalogedMethod {
+        name: "find_or_initialize_by",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::SelfType),
+    },
+    // `find_or_create_by(!)` reads, and on a miss INSERTs — classify by
+    // the stronger effect. Both forms return the record (the bang form
+    // raises on validation failure; the plain form returns the invalid
+    // unsaved record, still Self-typed).
+    CatalogedMethod {
+        name: "find_or_create_by",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbWrite,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::SelfType),
+    },
+    CatalogedMethod {
+        name: "find_or_create_by!",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbWrite,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::SelfType),
+    },
+    CatalogedMethod {
+        name: "create_or_find_by",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbWrite,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::SelfType),
+    },
+    CatalogedMethod {
+        name: "create_or_find_by!",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbWrite,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::SelfType),
+    },
+    // Pagination entry point (`Model.page(n)`). Not core AR, but it
+    // shares the relation-builder shape and is called on every model
+    // class, so the AR catalog is its mechanical home (the gem catalog
+    // keys on concrete class names and can't say "every model"). The
+    // Array<Model> receiver form lives in `array_method`'s relation
+    // branch alongside `per`/`padding`/`without_count`.
+    CatalogedMethod {
+        name: "page",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    // `Model.paginate` — `page` under another spelling. Accepts a
+    // positional page number or `page:` / `per_page:` keywords (the
+    // LIMIT/OFFSET window under the kwargs form).
+    CatalogedMethod {
+        name: "paginate",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    // `has_secure_password`'s `Model.authenticate_by(email:, password:)`
+    // (Rails 7.1) — a lookup that answers the record or nil, delegated
+    // on a relation receiver too (`User.active.authenticate_by(...)`).
+    CatalogedMethod {
+        name: "authenticate_by",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::SelfOrNil),
+    },
+    // `Model.destroy_by(conditions)` — the class-side spelling of the
+    // Relation entry below; answers the destroyed records.
+    CatalogedMethod {
+        name: "destroy_by",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbWrite,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::ArrayOfSelf),
+    },
+    // Async query surface — returns an ActiveRecord::Promise handle
+    // (cataloged in GEM_CATALOG) whose `.value` yields the count.
+    CatalogedMethod {
+        name: "async_count",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::ClassRef("ActiveRecord::Promise")),
+    },
+    CatalogedMethod {
+        name: "first",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::SelfOrNil),
+    },
+    CatalogedMethod {
+        name: "last",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::SelfOrNil),
+    },
+    CatalogedMethod {
+        name: "take",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::SelfOrNil),
+    },
+    CatalogedMethod {
+        name: "count",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::Int),
+    },
+    CatalogedMethod {
+        name: "exists?",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::Bool),
+    },
+    // `Model.any?` / `Model.none?` — the UNSCOPED emptiness predicates.
+    // `runtime/ruby/active_record/base.rb` has carried both for a while
+    // (`count > 0` / `count == 0`, with the scoped forms going through
+    // Relation beside them) and the catalog did not, so campfire's
+    // `Account.any?` and `User.none?` typed to nothing and read as
+    // dispatch failures. A method the runtime answers and the catalog
+    // does not is modeling debt reported as a compiler gap.
+    CatalogedMethod {
+        name: "any?",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::Bool),
+    },
+    CatalogedMethod {
+        name: "none?",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::Bool),
+    },
+    CatalogedMethod {
+        name: "pluck",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: None,
+    },
+    CatalogedMethod {
+        name: "pick",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: None,
+    },
+    CatalogedMethod {
+        name: "sum",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: None,
+    },
+    CatalogedMethod {
+        name: "average",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: None,
+    },
+    CatalogedMethod {
+        name: "maximum",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: None,
+    },
+    CatalogedMethod {
+        name: "minimum",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: None,
+    },
+    // Builder reads — chain further without executing. When the
+    // analyzer grows Relation<T>, these stop producing effects
+    // (the terminal .to_a / .first / .count does). Today they
+    // classify as DbRead because the analyzer treats every
+    // class-method read uniformly.
+    CatalogedMethod {
+        name: "where",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    CatalogedMethod {
+        name: "limit",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    CatalogedMethod {
+        name: "offset",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    CatalogedMethod {
+        name: "order",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    CatalogedMethod {
+        name: "group",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    CatalogedMethod {
+        name: "having",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    CatalogedMethod {
+        name: "joins",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    CatalogedMethod {
+        name: "includes",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    CatalogedMethod {
+        name: "preload",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    CatalogedMethod {
+        name: "select",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        // `Model.select(:col)` is a relation builder (column projection).
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    // Recursive CTE and FROM source (Rails 7.1) — lobsters' `Comment#parents`.
+    CatalogedMethod {
+        name: "with_recursive",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    CatalogedMethod {
+        name: "from",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    CatalogedMethod {
+        name: "distinct",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    // Remaining relation builders. These were modeled for the relation
+    // (`Array[Self]`) receiver but missing from the class surface, so a
+    // chain that *opens* with one — `Comment.eager_load(:user)…` — left
+    // the whole relation untyped. Same DbRead/Builder/ArrayOfSelf shape
+    // as the builders above; kept in sync with the relation-method list
+    // in `analyze::body::send::array_method`.
+    CatalogedMethod {
+        name: "eager_load",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    CatalogedMethod {
+        name: "left_outer_joins",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    // Rails 7 `where.not(id: …)` in one hop. A chain that continues
+    // through it (`user.searches.excluding(…).destroy_all`) has to stay
+    // on Relation; `without` is the same method (see [`BUILDER_ALIASES`]).
+    CatalogedMethod {
+        name: "excluding",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    CatalogedMethod {
+        name: "references",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    CatalogedMethod {
+        name: "reorder",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    CatalogedMethod {
+        name: "rewhere",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    CatalogedMethod {
+        name: "unscope",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    CatalogedMethod {
+        name: "readonly",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    CatalogedMethod {
+        name: "reselect",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    CatalogedMethod {
+        name: "extending",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    CatalogedMethod {
+        name: "merge",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    // ---- Class-method writes ----
+    // Bulk / class-level mutations — always execute, no chain
+    // semantic (you can't chain after `create_all`, you just run
+    // it and get a result).
+    CatalogedMethod {
+        name: "create",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbWrite,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::SelfType),
+    },
+    CatalogedMethod {
+        name: "create!",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbWrite,
+        chain: ChainKind::NotApplicable,
+        // Same as `create` — raises on failure rather than returning
+        // false, but on success still returns the instance.
+        return_kind: Some(ReturnKind::SelfType),
+    },
+    CatalogedMethod {
+        name: "update_all",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbWrite,
+        chain: ChainKind::NotApplicable,
+        return_kind: None,
+    },
+    CatalogedMethod {
+        // `Model.update_counters(id, counter: n)` — atomic counter
+        // bump; returns the affected-row count.
+        name: "update_counters",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbWrite,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::Int),
+    },
+    // `Model.increment_counter(:counter, id)` / `decrement_counter` —
+    // sugar over `update_counters`; same shape.
+    CatalogedMethod {
+        name: "increment_counter",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbWrite,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::Int),
+    },
+    CatalogedMethod {
+        name: "decrement_counter",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbWrite,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::Int),
+    },
+    CatalogedMethod {
+        name: "destroy_all",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbWrite,
+        chain: ChainKind::NotApplicable,
+        return_kind: None,
+    },
+    CatalogedMethod {
+        name: "delete_all",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbWrite,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::Int),
+    },
+    // The Ruby-family runtime's single-row inserts answer Rails'
+    // `ActiveRecord::Result`, as `insert_all!` does.
+    CatalogedMethod {
+        name: "insert",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbWrite,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::ClassRef("ActiveRecord::Result")),
+    },
+    CatalogedMethod {
+        name: "insert!",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbWrite,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::ClassRef("ActiveRecord::Result")),
+    },
+    // The one bulk write with a return type, because it is the one
+    // with a LOWERING: `scope_chain` inlines `Model.insert_all(rows)`
+    // to `rows.each { … }`, whose value is `rows` — an Array of
+    // attribute hashes. Rails answers an `ActiveRecord::Result`
+    // instead; every corpus site discards the value, and the
+    // divergence is ledgered in docs/pipeline/runtime.md. Saying
+    // nothing here was not neutral: a catalog entry with no return
+    // kind falls through to the same place an UNKNOWN name does, so
+    // campfire's `Membership.insert_all(…)` reported `no known method
+    // insert_all` while the emitted code was the inlined loop.
+    CatalogedMethod {
+        name: "insert_all",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbWrite,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::ArrayOfUntyped),
+    },
+    // The raising twin, inlined beside it to `ActiveRecord::Result
+    // .new(rows.map { … })` — Rails answers the same class.
+    CatalogedMethod {
+        name: "insert_all!",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbWrite,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::ClassRef("ActiveRecord::Result")),
+    },
+    // The runtime's `upsert_all` answers Rails' `ActiveRecord::Result`,
+    // its `affected_rows` the count.
+    CatalogedMethod {
+        name: "upsert",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbWrite,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::ClassRef("ActiveRecord::Result")),
+    },
+    CatalogedMethod {
+        name: "upsert_all",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbWrite,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::ClassRef("ActiveRecord::Result")),
+    },
+    CatalogedMethod {
+        name: "touch_all",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::DbWrite,
+        chain: ChainKind::NotApplicable,
+        return_kind: None,
+    },
+    // ---- Instance-method writes ----
+    // Mutations on a loaded record. Rails bangs-vs-non-bangs
+    // convention: non-bang returns Bool (success/failure); bangs that
+    // share the compiled `Base` method (`save!`/`destroy`/`destroy!`)
+    // return `ActiveRecord::Base` per the sidecar (not Self — see
+    // `save!` below); monomorphized constructors stay SelfType.
+    CatalogedMethod {
+        name: "save",
+        receiver: ReceiverContext::Instance,
+        effect: EffectClass::DbWrite,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::Bool),
+    },
+    // `save!` is declared `() -> Base` in
+    // `runtime/ruby/active_record/base.rbs`, literally — not `self` or
+    // `instance` (RBS self-types the parser doesn't read yet, per that
+    // file's own comment). Unlike `find`/`create!`, `save!` is never
+    // monomorphized per model at emit time: every model shares the one
+    // compiled `Base#save!`, which returns a `Base`-typed value no
+    // matter which subclass calls it. Seeding `SelfType` here told a
+    // caller like `WidgetStamp#run` (whose tail is `widget.save!`) that
+    // the call answers `Widget`, so roundhouse emitted `-> Widget` for
+    // `run` — a claim the shared runtime function can't back, and
+    // spinel's AOT build refused the mismatched pointer types
+    // (roundhouse#296). `ClassRef` matches the sidecar literally.
+    CatalogedMethod {
+        name: "save!",
+        receiver: ReceiverContext::Instance,
+        effect: EffectClass::DbWrite,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::ClassRef("ActiveRecord::Base")),
+    },
+    CatalogedMethod {
+        name: "update",
+        receiver: ReceiverContext::Instance,
+        effect: EffectClass::DbWrite,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::Bool),
+    },
+    CatalogedMethod {
+        name: "update!",
+        receiver: ReceiverContext::Instance,
+        effect: EffectClass::DbWrite,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::SelfType),
+    },
+    // `destroy`/`destroy!` are `() -> Base` in the same sidecar, for
+    // the same reason `save!` is — see the comment there.
+    CatalogedMethod {
+        name: "destroy",
+        receiver: ReceiverContext::Instance,
+        effect: EffectClass::DbWrite,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::ClassRef("ActiveRecord::Base")),
+    },
+    CatalogedMethod {
+        name: "destroy!",
+        receiver: ReceiverContext::Instance,
+        effect: EffectClass::DbWrite,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::ClassRef("ActiveRecord::Base")),
+    },
+    CatalogedMethod {
+        name: "delete",
+        receiver: ReceiverContext::Instance,
+        effect: EffectClass::DbWrite,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::Bool),
+    },
+    CatalogedMethod {
+        name: "increment!",
+        receiver: ReceiverContext::Instance,
+        effect: EffectClass::DbWrite,
+        chain: ChainKind::NotApplicable,
+        return_kind: None,
+    },
+    CatalogedMethod {
+        name: "decrement!",
+        receiver: ReceiverContext::Instance,
+        effect: EffectClass::DbWrite,
+        chain: ChainKind::NotApplicable,
+        return_kind: None,
+    },
+    CatalogedMethod {
+        name: "touch",
+        receiver: ReceiverContext::Instance,
+        effect: EffectClass::DbWrite,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::Bool),
+    },
+    // ---- Instance-method reads ----
+    // `#reload` refreshes from the DB — writes-vs-reads-wise it's
+    // a read, but carries the DbRead effect because it issues a
+    // SELECT. Also `() -> Base` in the sidecar — see `save!` above.
+    CatalogedMethod {
+        name: "reload",
+        receiver: ReceiverContext::Instance,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::ClassRef("ActiveRecord::Base")),
+    },
+    // `#lock!` (`ActiveRecord::Locking::Pessimistic`) reloads with a
+    // row lock and answers the reloaded record — on sqlite (single
+    // writer, no `SELECT … FOR UPDATE` support) the runtime
+    // implements it as a plain `reload`, so it shares `reload`'s
+    // classification exactly: DbRead effect, `() -> Base` per the
+    // shared-runtime-method sidecar convention (see `save!` above;
+    // `lock!` is `Base#lock!`, not monomorphized per model).
+    CatalogedMethod {
+        name: "lock!",
+        receiver: ReceiverContext::Instance,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::ClassRef("ActiveRecord::Base")),
+    },
+    // `#with_lock` runs `lock!` then yields inside a transaction,
+    // answering the block's value — same gradual escape as
+    // `ActiveRecord::Base.transaction` (`analyze/registry/ar.rs`):
+    // the return type isn't statically tracked, so `Untyped`. Its
+    // own direct effect (before the block's statements are visited
+    // and classified independently) is the `lock!` read; any writes
+    // the block performs attach to their own Send nodes.
+    CatalogedMethod {
+        name: "with_lock",
+        receiver: ReceiverContext::Instance,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::Untyped),
+    },
+    // ---- Instance-method state predicates ----
+    // Pure — query in-memory flags the record already carries.
+    // `#persisted?` / `#new_record?` check loaded state;
+    // `#valid?` / `#invalid?` run validations (arguably pure
+    // against the catalog's effect classification since they
+    // don't hit the DB, though they may trigger user code).
+    CatalogedMethod {
+        name: "valid?",
+        receiver: ReceiverContext::Instance,
+        effect: EffectClass::Pure,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::Bool),
+    },
+    CatalogedMethod {
+        name: "invalid?",
+        receiver: ReceiverContext::Instance,
+        effect: EffectClass::Pure,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::Bool),
+    },
+    CatalogedMethod {
+        name: "persisted?",
+        receiver: ReceiverContext::Instance,
+        effect: EffectClass::Pure,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::Bool),
+    },
+    CatalogedMethod {
+        name: "new_record?",
+        receiver: ReceiverContext::Instance,
+        effect: EffectClass::Pure,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::Bool),
+    },
+    CatalogedMethod {
+        name: "destroyed?",
+        receiver: ReceiverContext::Instance,
+        effect: EffectClass::Pure,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::Bool),
+    },
+    CatalogedMethod {
+        name: "changed?",
+        receiver: ReceiverContext::Instance,
+        effect: EffectClass::Pure,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::Bool),
+    },
+    // ---- Instance-method accessors (state / metadata) ----
+    // `#attributes` returns Hash<Sym, Str>; `#errors` returns the
+    // per-instance ActiveModel::Errors collection. Both pure
+    // (no DB hit); both structural rather than expression-
+    // dispatchable.
+    CatalogedMethod {
+        name: "attributes",
+        receiver: ReceiverContext::Instance,
+        effect: EffectClass::Pure,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::HashSymStr),
+    },
+    CatalogedMethod {
+        name: "attributes_before_type_cast",
+        receiver: ReceiverContext::Instance,
+        effect: EffectClass::Pure,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::HashStrUntyped),
+    },
+    CatalogedMethod {
+        name: "errors",
+        receiver: ReceiverContext::Instance,
+        effect: EffectClass::Pure,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::ClassRef("ActiveModel::Errors")),
+    },
+    // ---- Per-model accessors ----
+    // These methods exist on every model. The lowerer emits typed
+    // per-column bodies into each model class (no reflective base
+    // implementation in scope today).
+    // Cataloguing the contract here keeps the analyzer's per-model
+    // registry honest: callers like `article[:title]` resolve
+    // regardless of which model class the body lives on.
+    CatalogedMethod {
+        name: "instantiate",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::Pure,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::SelfType),
+    },
+    CatalogedMethod {
+        name: "schema_column_names",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::Pure,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::ArrayOfSym),
+    },
+    // Association introspection used by Action Text / attachment macro
+    // helpers (`safe_markdown_attribute`, `with_attached_*` guards).
+    // Returns a reflection handle (or nil at runtime); the analyzer
+    // keeps the handle shape so `.klass` / presence checks type.
+    CatalogedMethod {
+        name: "reflect_on_association",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::Pure,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::ClassRef(
+            "ActiveRecord::Reflection::AssociationReflection",
+        )),
+    },
+    // Class-level default for `has_rich_text` / `has_markdown`
+    // `strict_loading:` kwargs — a Bool reader on every AR model.
+    CatalogedMethod {
+        name: "strict_loading_by_default",
+        receiver: ReceiverContext::Class,
+        effect: EffectClass::Pure,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::Bool),
+    },
+    CatalogedMethod {
+        name: "read_attribute",
+        receiver: ReceiverContext::Instance,
+        effect: EffectClass::Pure,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::Str),
+    },
+    CatalogedMethod {
+        name: "write_attribute",
+        receiver: ReceiverContext::Instance,
+        effect: EffectClass::Pure,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::Str),
+    },
+    // `record.slice(:id, :name)`: the named attributes, String-keyed as
+    // Rails' indifferent Hash keys them. `lower::record_slice` grounds a
+    // typed site into reader calls; the ruby family answers the rest.
+    CatalogedMethod {
+        name: "slice",
+        receiver: ReceiverContext::Instance,
+        effect: EffectClass::Pure,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::HashStrUntyped),
+    },
+    CatalogedMethod {
+        name: "[]",
+        receiver: ReceiverContext::Instance,
+        effect: EffectClass::Pure,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::Str),
+    },
+    CatalogedMethod {
+        name: "[]=",
+        receiver: ReceiverContext::Instance,
+        effect: EffectClass::Pure,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::Str),
+    },
+    // `cache_key` / `cache_version` / `cache_key_with_version`
+    // (`runtime/ruby/active_record/base.rb`): a single record's half
+    // of the fragment-cache key Relation's own trio answers for a
+    // collection — see the `cache_key`/`cache_version`/
+    // `cache_key_with_version` entries under `ReceiverContext::Relation`
+    // below for the companion case and why both are cataloged here
+    // rather than parsed from base.rbs/relation.rbs.
+    CatalogedMethod {
+        name: "cache_key",
+        receiver: ReceiverContext::Instance,
+        effect: EffectClass::Pure,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::Str),
+    },
+    CatalogedMethod {
+        name: "cache_version",
+        receiver: ReceiverContext::Instance,
+        effect: EffectClass::Pure,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::StrOrNil),
+    },
+    CatalogedMethod {
+        name: "cache_key_with_version",
+        receiver: ReceiverContext::Instance,
+        effect: EffectClass::Pure,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::Str),
+    },
+    // Rails' `SignedId#signed_id(purpose:, expires_in:)` — a signed
+    // token, and a String however it is produced.
+    //
+    // Registered here because `lower::signed_id` runs POST-ANALYZE: it
+    // rewrites the call to `ActiveRecord::SignedId.generate(...)`,
+    // whose runtime RBS already says `-> String`, but by then the
+    // analyzer has typed the method that wraps it. campfire's
+    // `User::Transferable#transfer_id` is a one-line `signed_id(purpose:
+    // :transfer, expires_in: D)`, so it harvested `untyped`, and the
+    // view's `session_transfer_url(user.transfer_id)` carried no
+    // evidence for `string_segment_demand` — leaving that route's
+    // `id` segment on its name-based Integer default and the emitted
+    // signature contradicting its only call site.
+    //
+    // Not a lowering detail leaking into the catalog: `signed_id` is
+    // ActiveRecord's own instance method and returns a String in Rails
+    // too. The catalog was simply missing it.
+    CatalogedMethod {
+        name: "signed_id",
+        receiver: ReceiverContext::Instance,
+        effect: EffectClass::Pure,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::Str),
+    },
+    // ---- Relation-context surface ----
+    // The methods callable on a relation-shaped receiver — a
+    // `Ty::Relation` (scope results, relation-returning class
+    // methods) or the `Array<model>` inline-chain representation.
+    // Consumed by BOTH dispatch paths in `analyze/body/send.rs`:
+    // the `Ty::Relation` arm instantiates via
+    // `instantiate_return_kind` (builders preserve the relation),
+    // the `Array` branch via `relation_return_on_array_repr`
+    // (builders preserve the array). Return kinds reproduce exactly
+    // the types the former hand-written arms produced (settled
+    // decision: terminal result types must not change); the
+    // `relation_context_mirrors_send_rs_relation_branch` test pins
+    // the surface. Facets mirror the Class-context entry where the
+    // same name exists there.
+    //
+    // The two receiver-blind NAME-based consumers
+    // (`SqliteAdapter::classify_ar_method`, `Analyzer::
+    // is_builder_chain`) still filter this context out so these
+    // entries cannot shift effect classification of names that had
+    // no catalog entry before (`to_a`, `page`, `merge`, …); moving
+    // query-execution effects to the terminal step of Relation-typed
+    // chains is logged follow-on work, not name-classification work.
+    //
+    // Builders — preserve the relation, no SQL executes.
+    CatalogedMethod {
+        name: "where",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    CatalogedMethod {
+        name: "order",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    CatalogedMethod {
+        name: "limit",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    CatalogedMethod {
+        name: "offset",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    CatalogedMethod {
+        name: "includes",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    CatalogedMethod {
+        name: "preload",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    CatalogedMethod {
+        name: "joins",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    CatalogedMethod {
+        name: "left_outer_joins",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    // Same hop as the class entry. `without` is its alias.
+    CatalogedMethod {
+        name: "excluding",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    CatalogedMethod {
+        name: "with_recursive",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    CatalogedMethod {
+        name: "from",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    CatalogedMethod {
+        name: "distinct",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    CatalogedMethod {
+        name: "group",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    CatalogedMethod {
+        name: "having",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    CatalogedMethod {
+        name: "references",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    CatalogedMethod {
+        name: "eager_load",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    CatalogedMethod {
+        name: "readonly",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    CatalogedMethod {
+        name: "reorder",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    // `order(Arel.sql(…))` / `reorder(Arel.sql(…))`, renamed by
+    // `lower::arel_sql_order` so the fragment skips the column check.
+    CatalogedMethod {
+        name: "order_sql",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    CatalogedMethod {
+        name: "reorder_sql",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    CatalogedMethod {
+        name: "skip_preloading!",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    CatalogedMethod {
+        name: "preload_associations",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::ArrayOfSelf),
+    },
+    CatalogedMethod {
+        name: "rewhere",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    CatalogedMethod {
+        name: "merge",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    CatalogedMethod {
+        name: "merge!",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    CatalogedMethod {
+        name: "extending",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    CatalogedMethod {
+        name: "unscope",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    // `where.not(...)` / `.or(...)` / `.and(...)` — WhereChain and
+    // combinators; the chain lands on a Relation receiver so they
+    // resolve here.
+    CatalogedMethod {
+        name: "not",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    CatalogedMethod {
+        name: "or",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    CatalogedMethod {
+        name: "and",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    CatalogedMethod {
+        name: "none",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    CatalogedMethod {
+        name: "load",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    // Rails schedules the query; the runtime loads now (same records,
+    // no executor to overlap with). lobsters' story page.
+    CatalogedMethod {
+        name: "load_async",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    CatalogedMethod {
+        name: "reload",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    CatalogedMethod {
+        name: "reselect",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    // `paginate` on a relation — same LIMIT/OFFSET builder as `page`.
+    CatalogedMethod {
+        name: "paginate",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    CatalogedMethod {
+        name: "authenticate_by",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::SelfOrNil),
+    },
+    // Pagination chain — same builder shape.
+    CatalogedMethod {
+        name: "page",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    CatalogedMethod {
+        name: "per",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    CatalogedMethod {
+        name: "padding",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    CatalogedMethod {
+        name: "without_count",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    // Paginator readers on a paged relation
+    // (runtime/ruby/active_record/relation.rb). The page arithmetic is
+    // LIMIT/OFFSET; the readers that need the total run COUNT without
+    // that window.
+    CatalogedMethod {
+        name: "limit_value",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::Pure,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::IntOrNil),
+    },
+    CatalogedMethod {
+        name: "offset_value",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::Pure,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::IntOrNil),
+    },
+    CatalogedMethod {
+        name: "current_page",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::Pure,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::Int),
+    },
+    CatalogedMethod {
+        name: "total_count",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::Int),
+    },
+    CatalogedMethod {
+        name: "total_pages",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::Int),
+    },
+    CatalogedMethod {
+        name: "first_page?",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::Pure,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::Bool),
+    },
+    CatalogedMethod {
+        name: "last_page?",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::Bool),
+    },
+    CatalogedMethod {
+        name: "out_of_range?",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::Bool),
+    },
+    CatalogedMethod {
+        name: "next_page",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::IntOrNil),
+    },
+    CatalogedMethod {
+        name: "prev_page",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::IntOrNil),
+    },
+    // Terminals — execute the query; result types are exactly what
+    // the `array_method` arms produce today.
+    CatalogedMethod {
+        name: "to_a",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::ArrayOfSelf),
+    },
+    CatalogedMethod {
+        name: "first",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::SelfOrNil),
+    },
+    CatalogedMethod {
+        name: "last",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::SelfOrNil),
+    },
+    // `Model.where(…).new(attrs)` — Rails builds a record carrying the
+    // scope's own conditions as attributes, and answers the RECORD.
+    // `build` (its alias) was already here and `new` was not, so
+    // campfire's `User.active_bots.new` fell through to the array
+    // fallback and typed to nothing — which then cost the ivar it was
+    // assigned to (`@bot`) its type in two templates as well. One
+    // missing entry, three reported errors.
+    CatalogedMethod {
+        name: "new",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::Pure,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::SelfType),
+    },
+    CatalogedMethod {
+        name: "find_by",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::SelfOrNil),
+    },
+    CatalogedMethod {
+        name: "take",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::SelfOrNil),
+    },
+    CatalogedMethod {
+        name: "find",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::SelfType),
+    },
+    CatalogedMethod {
+        name: "find!",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::SelfType),
+    },
+    CatalogedMethod {
+        name: "find_by!",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::SelfType),
+    },
+    CatalogedMethod {
+        name: "find_sole_by",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::SelfType),
+    },
+    CatalogedMethod {
+        name: "first!",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::SelfType),
+    },
+    CatalogedMethod {
+        name: "last!",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::SelfType),
+    },
+    CatalogedMethod {
+        name: "take!",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::SelfType),
+    },
+    CatalogedMethod {
+        name: "sole",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::SelfType),
+    },
+    CatalogedMethod {
+        name: "sole!",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::SelfType),
+    },
+    CatalogedMethod {
+        name: "count",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::Int),
+    },
+    // sum/average approximate as Int — the same deliberate approximation
+    // the send.rs arm makes (float sums/averages are rare in controller
+    // code). Extrema are schema-indexed at the call site; a catalog-wide
+    // Int would mis-type Date, Time, String, and grouped results.
+    CatalogedMethod {
+        name: "sum",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::Int),
+    },
+    CatalogedMethod {
+        name: "average",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::Int),
+    },
+    CatalogedMethod {
+        name: "minimum",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: None,
+    },
+    CatalogedMethod {
+        name: "maximum",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: None,
+    },
+    CatalogedMethod {
+        name: "exists?",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::Bool),
+    },
+    // Rails AssociationProxy `#loaded?` is rewritten by `assoc_loaded`
+    // onto `<assoc>_loaded?`. Do NOT catalog Relation `#loaded?` as
+    // Bool: that would silence residual sites with no runtime method
+    // (invariant 6). Unrewritten `.loaded?` stays a dispatch failure.
+    CatalogedMethod {
+        name: "more_than?",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::Bool),
+    },
+    CatalogedMethod {
+        name: "ids",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::ArrayOfInt),
+    },
+    CatalogedMethod {
+        name: "to_sql",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::Pure,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::Str),
+    },
+    // `cache_key` / `cache_version` / `cache_key_with_version`
+    // (`runtime/ruby/active_record/relation.rb`): the fragment-cache
+    // key a jbuilder `json.cache!` wraps around a whole collection.
+    // `DbRead`, not `Pure`, like `count`/`maximum` above — the key
+    // queries COUNT/MAX under the hood. Without a catalog entry here,
+    // `send.rs`'s `Ty::Relation` arm never reaches the runtime method
+    // at all (dispatch on a Relation receiver goes through THIS
+    // catalog, not a parse of relation.rbs — that file is the sidecar
+    // emitted next to relation.rb, not an analysis source), so every
+    // `@widgets.cache_key_with_version` call failed `check` as "no
+    // known method" before it ever got far enough to raise at runtime.
+    CatalogedMethod {
+        name: "cache_key",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::Str),
+    },
+    CatalogedMethod {
+        name: "cache_version",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::Str),
+    },
+    CatalogedMethod {
+        name: "cache_key_with_version",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::Str),
+    },
+    CatalogedMethod {
+        name: "pluck",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::ArrayOfUntyped),
+    },
+    CatalogedMethod {
+        name: "pick",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::Untyped),
+    },
+    CatalogedMethod {
+        name: "async_count",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::ClassRef("ActiveRecord::Promise")),
+    },
+    // Batch iteration — yields elements; the value materializes as
+    // the element array (what the send.rs arm returns).
+    CatalogedMethod {
+        name: "find_each",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::ArrayOfSelf),
+    },
+    CatalogedMethod {
+        name: "find_in_batches",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::ArrayOfSelf),
+    },
+    CatalogedMethod {
+        name: "in_batches",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Builder,
+        return_kind: Some(ReturnKind::RelationOfSelf),
+    },
+    // Constructors / first-or-X — return an element instance.
+    CatalogedMethod {
+        name: "build",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::Pure,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::SelfType),
+    },
+    CatalogedMethod {
+        name: "create",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbWrite,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::SelfType),
+    },
+    CatalogedMethod {
+        name: "create!",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbWrite,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::SelfType),
+    },
+    CatalogedMethod {
+        name: "first_or_initialize",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::SelfType),
+    },
+    CatalogedMethod {
+        name: "first_or_create",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbWrite,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::SelfType),
+    },
+    CatalogedMethod {
+        name: "first_or_create!",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbWrite,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::SelfType),
+    },
+    CatalogedMethod {
+        name: "find_or_initialize_by",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbRead,
+        chain: ChainKind::Terminal,
+        return_kind: Some(ReturnKind::SelfType),
+    },
+    CatalogedMethod {
+        name: "find_or_create_by",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbWrite,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::SelfType),
+    },
+    CatalogedMethod {
+        name: "find_or_create_by!",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbWrite,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::SelfType),
+    },
+    CatalogedMethod {
+        name: "create_or_find_by",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbWrite,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::SelfType),
+    },
+    CatalogedMethod {
+        name: "create_or_find_by!",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbWrite,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::SelfType),
+    },
+    // Writes through the relation.
+    CatalogedMethod {
+        name: "update_all",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbWrite,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::Int),
+    },
+    CatalogedMethod {
+        name: "touch_all",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbWrite,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::Int),
+    },
+    CatalogedMethod {
+        name: "delete_all",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbWrite,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::Int),
+    },
+    CatalogedMethod {
+        name: "destroy_all",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbWrite,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::ArrayOfSelf),
+    },
+    // `destroy_by` / `delete_by` — `where` plus the write above it, and
+    // real `Relation` methods in Rails and in `runtime/ruby/
+    // active_record/relation.rb` alike. At a CLASS root
+    // `lower::destroy_by` splits them earlier; on an ASSOCIATION READ
+    // (`Current.user.push_subscriptions.destroy_by(id: …)`) the
+    // receiver is Array-representation, which resolves through this
+    // context — so leaving them out of it reported `no known method
+    // destroy_by on Array { Push::Subscription }` about the one method
+    // Rails and our Relation both define.
+    CatalogedMethod {
+        name: "destroy_by",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbWrite,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::ArrayOfSelf),
+    },
+    CatalogedMethod {
+        name: "delete_by",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::DbWrite,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::Int),
+    },
+    // Introspection. `relation.model` is the element's class object;
+    // `SelfType` reproduces the send.rs arm's `elem.clone()` (the
+    // class/instance conflation is the arm's, kept deliberately).
+    CatalogedMethod {
+        name: "model",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::Pure,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::SelfType),
+    },
+    // `relation.arel` exposes the underlying Arel select manager.
+    // Matches today's Array-representation behavior: the dispatch
+    // intercept in send.rs returns `Arel::SelectManager` for a
+    // model-element receiver BEFORE `array_method`'s (dead) Untyped
+    // arm can fire, so the select-manager type is the live spec.
+    CatalogedMethod {
+        name: "arel",
+        receiver: ReceiverContext::Relation,
+        effect: EffectClass::Pure,
+        chain: ChainKind::NotApplicable,
+        return_kind: Some(ReturnKind::ClassRef("Arel::SelectManager")),
+    },
+];
+
+/// Alternate spellings of a [`ChainKind::Builder`] entry. The chain and
+/// refiner predicates read these together with the Builder names. Each
+/// pair is `(alias, canonical)`.
+///
+/// `left_joins` is `left_outer_joins`. `where!` and `order!` are the
+/// in-place spellings of `where` and `order`, `joins!` of `joins`.
+/// `without` is `excluding`.
+pub(crate) const BUILDER_ALIASES: &[(&str, &str)] = &[
+    ("left_joins", "left_outer_joins"),
+    ("where!", "where"),
+    ("order!", "order"),
+    ("without", "excluding"),
+    ("joins!", "joins"),
+];
+
+/// True when `name` is a [`ChainKind::Builder`] entry, on any receiver,
+/// or an alias of one ([`BUILDER_ALIASES`]), and every catalog entry for
+/// that name agrees.
+///
+/// This is the membership test for name-only chain hops and for arel
+/// refiners. A terminal (`first`, `all`, `pluck`) stays out. So does a
+/// name that is a Builder on one receiver and something else on another:
+/// `reload` is a Relation builder and an Instance read that returns the
+/// record. Treating every `reload` as a relation hop keeps
+/// `article = Model.where(…).find { … }; article.reload` on the runtime
+/// relation, and `find` then ignores the block.
+pub(crate) fn is_relation_builder_name(name: &str) -> bool {
+    let canonical = BUILDER_ALIASES
+        .iter()
+        .find(|(alias, _)| *alias == name)
+        .map(|(_, canonical)| *canonical)
+        .unwrap_or(name);
+    let mut saw_builder = false;
+    for entry in AR_CATALOG.iter().filter(|entry| entry.name == canonical) {
+        if entry.chain != ChainKind::Builder {
+            return false;
+        }
+        saw_builder = true;
+    }
+    saw_builder
+}
+
+/// Counted `first(n)` / `last(n)` on a relation: one positional argument
+/// and no block. The runtime spells these `first_n` / `last_n` because
+/// one method cannot return both a record and an Array.
+///
+/// The name is a catalog terminal on both the class and the relation,
+/// and [`is_relation_builder_name`] rejects it. `take(n)` is the same
+/// terminal shape and stays `take` — this predicate does not rename it.
+/// Enumerable `Array#first(n)` and `String#split.last(n)` share the
+/// call shape; a caller renames only after it has proved a relation.
+pub(crate) fn counted_relation_terminal(
+    name: &str,
+    argc: usize,
+    has_block: bool,
+) -> Option<&'static str> {
+    if argc != 1 || has_block || is_relation_builder_name(name) {
+        return None;
+    }
+    let runtime = match name {
+        "first" => "first_n",
+        "last" => "last_n",
+        _ => return None,
+    };
+    let class = lookup(name, ReceiverContext::Class)?;
+    let relation = lookup(name, ReceiverContext::Relation)?;
+    if class.chain != ChainKind::Terminal || relation.chain != ChainKind::Terminal {
+        return None;
+    }
+    Some(runtime)
+}
+
+/// True when the Relation-context entry for `name` is a Builder.
+///
+/// Callers that already know the receiver is a relation use this so
+/// `relation.reload` stays a hop. Name-only sites keep
+/// [`is_relation_builder_name`], which rejects `reload`.
+pub(crate) fn is_relation_context_builder(name: &str) -> bool {
+    lookup(name, ReceiverContext::Relation)
+        .is_some_and(|entry| entry.chain == ChainKind::Builder)
+}
+
+/// Look up a method in the catalog by name + receiver context.
+/// Returns the single matching entry or None. Used by adapters
+/// that need the full record (effect + chain + future facets).
+pub fn lookup(name: &str, receiver: ReceiverContext) -> Option<&'static CatalogedMethod> {
+    AR_CATALOG
+        .iter()
+        .find(|m| m.name == name && m.receiver == receiver)
+}
+
+/// Look up a method by name only, returning all matching entries
+/// across receiver contexts. Used by consumers that don't track
+/// receiver context yet (the current `SqliteAdapter.classify_ar_
+/// method`, which takes only a method name).
+pub fn lookup_any(name: &str) -> impl Iterator<Item = &'static CatalogedMethod> {
+    AR_CATALOG.iter().filter(move |m| m.name == name)
+}
+
+/// Every receiver context that has at least one cataloged method.
+/// Used by tests and by adapter introspection.
+pub fn receivers_for(name: &str) -> BTreeSet<ReceiverContext> {
+    lookup_any(name).map(|m| m.receiver).collect()
+}
+
+/// Query-builder method names whose scaffold-runtime handling is
+/// "collapse the chain to an empty collection of the target model
+/// type." This is a **runtime-capability** question, not a Ruby/
+/// Rails semantics question — it reflects what the current per-
+/// target runtime stubs (Juntos, rusqlite wrappers, etc.) actually
+/// implement.
+///
+/// The 13 methods listed here match the pre-catalog hand-rolled
+/// list in `src/lower/controller.rs` — preserved verbatim during
+/// the catalog migration to keep emit output byte-stable. They
+/// intentionally overlap with but don't equal the catalog's
+/// Class-receiver DbRead set: aggregate methods (`count`,
+/// `exists?`, `sum`, `average`, etc.) are excluded because their
+/// runtime handling is pass-through (the Juntos stub implements
+/// `.count()` directly), not collapse-to-empty.
+///
+/// **TODO**: this belongs on `DatabaseAdapter` eventually — it's a
+/// per-backend capability declaration, not a universal classifier.
+/// Different adapters will support different subsets of the AR
+/// surface at their runtime. Today's single-SQLite world lets us
+/// keep the list catalog-local; the adapter trait method can
+/// subsume it when a second runtime arrives.
+/// The curated relation-chain surface the lowerer walks: methods whose
+/// presence in a Send chain marks it as a query-builder chain
+/// (`chain.rs::collect_chain_modifiers`, `controller/send.rs`'s
+/// `QueryChain` classification).
+///
+/// NOTE — do NOT "simplify" this into `AR_CATALOG` `chain ∈ {Builder,
+/// Terminal}` lookup: that set is a strict *superset* of this list. The
+/// catalog marks `find`, `find_by`, `count`, `sum`, `average`, `exists?`,
+/// `pick`, `take`, `page`, `having`, `preload`, `eager_load`, `merge`,
+/// `reorder`, … as Builder/Terminal too, and pulling them into this
+/// predicate would reclassify those Sends as query chains — a behavior
+/// change, not a refactor. This list is a deliberately narrower curation
+/// of the "common relation-building/terminal" methods the lowerer
+/// handles, and is not derivable from any single existing catalog field.
+/// (See the maintainability plan's Execution log, 4.1.) The unit test
+/// `query_builder_methods_are_all_cataloged` guards the one invariant
+/// that IS true: every method here has a Builder/Terminal catalog entry.
+pub fn is_query_builder_method(method: &str) -> bool {
+    matches!(
+        method,
+        "all"
+            | "includes"
+            | "order"
+            | "where"
+            | "group"
+            | "limit"
+            | "offset"
+            | "joins"
+            | "distinct"
+            | "select"
+            | "pluck"
+            | "first"
+            | "last"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn catalog_entries_are_unique_per_name_and_receiver() {
+        // (name, receiver) must be unique; same method name can
+        // appear on multiple receivers (e.g., `create` on Class
+        // and `create` on Association later).
+        let mut seen: BTreeSet<(&str, ReceiverContext)> = BTreeSet::new();
+        for m in AR_CATALOG {
+            assert!(
+                seen.insert((m.name, m.receiver)),
+                "duplicate entry: ({}, {:?})",
+                m.name,
+                m.receiver,
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_covers_expected_read_methods() {
+        // Regression anchor: every method the pre-catalog
+        // SqliteAdapter classified as Read must still be in the
+        // catalog as DbRead under at least one receiver context.
+        for m in [
+            "all", "find", "find_by", "find_by!", "sole", "find_sole_by", "first", "last",
+            "where", "limit", "offset", "order", "group", "having",
+            "joins", "includes", "preload", "select", "distinct",
+            "count", "exists?", "pluck", "pick", "take",
+            "sum", "average", "maximum", "minimum",
+        ] {
+            let found: Vec<_> = lookup_any(m)
+                .filter(|e| e.effect == EffectClass::DbRead)
+                .collect();
+            assert!(
+                !found.is_empty(),
+                "expected at least one DbRead entry for `{m}`",
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_covers_expected_write_methods() {
+        for m in [
+            "save", "save!", "create", "create!", "update", "update!",
+            "update_all", "destroy", "destroy!", "destroy_all",
+            "delete", "delete_all", "increment!", "decrement!",
+            "touch", "touch_all", "insert", "insert!", "insert_all",
+            "upsert", "upsert_all",
+        ] {
+            let found: Vec<_> = lookup_any(m)
+                .filter(|e| e.effect == EffectClass::DbWrite)
+                .collect();
+            assert!(
+                !found.is_empty(),
+                "expected at least one DbWrite entry for `{m}`",
+            );
+        }
+    }
+
+    #[test]
+    fn builder_reads_are_classified() {
+        // Chain-builder methods — the round-3 distinction that
+        // matters once Relation<T> typing lands. Today's classifier
+        // ignores the chain facet, but the catalog already carries
+        // it so the future work is data-in-place.
+        for m in [
+            "where", "limit", "offset", "order", "group", "having",
+            "joins", "left_outer_joins", "excluding", "includes", "preload", "select", "distinct",
+        ] {
+            let entry = lookup(m, ReceiverContext::Class)
+                .unwrap_or_else(|| panic!("no Class entry for `{m}`"));
+            assert_eq!(
+                entry.chain,
+                ChainKind::Builder,
+                "`{m}` should be Builder",
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_reads_are_classified() {
+        for m in [
+            "all", "find", "find_by", "find_by!", "sole", "find_sole_by", "first", "last",
+            "take", "count", "exists?", "pluck", "pick",
+            "sum", "average", "maximum", "minimum",
+        ] {
+            let entry = lookup(m, ReceiverContext::Class)
+                .unwrap_or_else(|| panic!("no Class entry for `{m}`"));
+            assert_eq!(
+                entry.chain,
+                ChainKind::Terminal,
+                "`{m}` should be Terminal",
+            );
+        }
+    }
+
+    #[test]
+    fn per_model_accessors_are_cataloged() {
+        // The five accessors moving out of `Base`'s reflective
+        // implementations into per-model lowered bodies. Cataloguing
+        // them here keeps the analyzer's per-model registry honest
+        // both before and after that move.
+        for (name, recv, kind) in [
+            ("instantiate",         ReceiverContext::Class,    ReturnKind::SelfType),
+            ("schema_column_names", ReceiverContext::Class,    ReturnKind::ArrayOfSym),
+            ("read_attribute",      ReceiverContext::Instance, ReturnKind::Str),
+            ("[]",                  ReceiverContext::Instance, ReturnKind::Str),
+            ("[]=",                 ReceiverContext::Instance, ReturnKind::Str),
+        ] {
+            let entry = lookup(name, recv)
+                .unwrap_or_else(|| panic!("missing catalog entry for `{name}` on {recv:?}"));
+            assert_eq!(entry.return_kind, Some(kind), "wrong return_kind for `{name}`");
+            assert_eq!(entry.effect, EffectClass::Pure, "`{name}` should be Pure");
+        }
+    }
+
+    #[test]
+    fn writes_are_not_chainable() {
+        // Writes have chain=NotApplicable uniformly — you don't
+        // chain after save.
+        for entry in AR_CATALOG {
+            if entry.effect == EffectClass::DbWrite {
+                assert_eq!(
+                    entry.chain,
+                    ChainKind::NotApplicable,
+                    "write `{}` should have chain=NotApplicable",
+                    entry.name,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn relation_context_mirrors_send_rs_relation_branch() {
+        // The Relation-context surface is populated from the relation
+        // branch of `analyze/body/send.rs::array_method` — the arms
+        // are the spec. This pins the two facets dispatch will rely
+        // on: every chain builder from the arm's preserve-list keeps
+        // the relation representation (`RelationOfSelf` + Builder),
+        // and the terminals that downstream view typing depends on
+        // produce exactly the arm's result shapes.
+        for m in [
+            "where", "order", "limit", "offset", "includes", "preload",
+            "joins", "left_outer_joins", "excluding", "distinct", "group", "having",
+            "references", "eager_load", "readonly", "reorder", "rewhere",
+            "merge", "merge!", "extending", "unscope", "not", "or", "and",
+            "none", "load", "load_async", "reload", "reselect",
+            "page", "per", "padding", "without_count", "paginate",
+        ] {
+            let entry = lookup(m, ReceiverContext::Relation)
+                .unwrap_or_else(|| panic!("no Relation entry for `{m}`"));
+            assert_eq!(entry.chain, ChainKind::Builder, "`{m}` should be Builder");
+            assert_eq!(
+                entry.return_kind,
+                Some(ReturnKind::RelationOfSelf),
+                "builder `{m}` must preserve the relation",
+            );
+        }
+        for (m, kind) in [
+            ("to_a", ReturnKind::ArrayOfSelf),
+            ("first", ReturnKind::SelfOrNil),
+            ("take", ReturnKind::SelfOrNil),
+            ("find_by", ReturnKind::SelfOrNil),
+            ("count", ReturnKind::Int),
+            ("exists?", ReturnKind::Bool),
+            ("more_than?", ReturnKind::Bool),
+            ("pluck", ReturnKind::ArrayOfUntyped),
+            ("pick", ReturnKind::Untyped),
+            ("ids", ReturnKind::ArrayOfInt),
+        ] {
+            let entry = lookup(m, ReceiverContext::Relation)
+                .unwrap_or_else(|| panic!("no Relation entry for `{m}`"));
+            assert_eq!(entry.return_kind, Some(kind), "wrong return_kind for `{m}`");
+        }
+        for method in ["minimum", "maximum"] {
+            let entry = lookup(method, ReceiverContext::Relation)
+                .unwrap_or_else(|| panic!("no Relation entry for `{method}`"));
+            assert_eq!(entry.return_kind, None, "`{method}` is schema-indexed at its call site");
+        }
+    }
+
+    #[test]
+    fn query_builder_methods_are_all_cataloged() {
+        // The lowerer's curated query-chain surface
+        // (`is_query_builder_method`) is a strict *subset* of the
+        // catalog's Builder/Terminal methods — every method the
+        // predicate recognizes must have a Builder/Terminal catalog
+        // entry (the reverse does NOT hold; see the predicate's doc).
+        // This guards the one direction that is an invariant, so a
+        // rename/removal in AR_CATALOG can't silently desync it.
+        for name in [
+            "all", "includes", "order", "where", "group", "limit", "offset", "joins",
+            "distinct", "select", "pluck", "first", "last",
+        ] {
+            assert!(
+                is_query_builder_method(name),
+                "`{name}` should be recognized by is_query_builder_method",
+            );
+            let cataloged = AR_CATALOG.iter().any(|m| {
+                m.name == name
+                    && matches!(m.chain, ChainKind::Builder | ChainKind::Terminal)
+            });
+            assert!(
+                cataloged,
+                "query-builder method `{name}` has no Builder/Terminal AR_CATALOG entry",
+            );
+        }
+    }
+
+    #[test]
+    fn relation_chain_and_refiners_match_builder_entries() {
+        // Both directions. A name whose every catalog entry is a Builder,
+        // or a [`BUILDER_ALIASES`] spelling of such a name, is a chain hop
+        // and a refiner. Any other catalog name is neither. A mixed name
+        // (`reload`: Relation builder, Instance read) is neither.
+        // Reintroducing a hand list on either side fails one of the asserts.
+        let mut uniform_builder: std::collections::BTreeMap<&str, bool> =
+            std::collections::BTreeMap::new();
+        for entry in AR_CATALOG {
+            let is_builder = entry.chain == ChainKind::Builder;
+            uniform_builder
+                .entry(entry.name)
+                .and_modify(|all| *all &= is_builder)
+                .or_insert(is_builder);
+        }
+        let mut builders: BTreeSet<&str> = BTreeSet::new();
+        for (name, all_builder) in &uniform_builder {
+            if *all_builder {
+                builders.insert(*name);
+            }
+        }
+        assert_eq!(
+            uniform_builder.get("reload"),
+            Some(&false),
+            "reload should stay a mixed chain kind so the predicate cannot treat every reload as a relation hop",
+        );
+        assert!(!is_relation_builder_name("reload"));
+        assert!(is_relation_context_builder("reload"));
+        let mut seen_alias: BTreeSet<&str> = BTreeSet::new();
+        for (alias, canonical) in BUILDER_ALIASES {
+            assert!(
+                builders.contains(canonical),
+                "alias `{alias}` points at `{canonical}`, which has no Builder entry",
+            );
+            assert!(
+                seen_alias.insert(alias),
+                "duplicate builder alias `{alias}`",
+            );
+            assert!(
+                !AR_CATALOG.iter().any(|entry| entry.name == *alias),
+                "alias `{alias}` is also a catalog entry",
+            );
+            builders.insert(alias);
+        }
+        for name in ["left_joins", "where!", "order!", "without", "excluding"] {
+            assert!(
+                builders.contains(name),
+                "`{name}` dropped out of the builder/alias set",
+            );
+        }
+        for name in &builders {
+            assert!(
+                crate::lower::scope_chain::is_relation_chain_method(name),
+                "`{name}` is a Builder or alias but is_relation_chain_method rejects it",
+            );
+            assert!(
+                crate::lower::arel::is_relation_refiner(name),
+                "`{name}` is a Builder or alias but the arel refiner rejects it",
+            );
+        }
+        for entry in AR_CATALOG {
+            if builders.contains(entry.name) {
+                continue;
+            }
+            assert!(
+                !crate::lower::scope_chain::is_relation_chain_method(entry.name),
+                "`{}` is not a Builder but is_relation_chain_method accepts it",
+                entry.name,
+            );
+            assert!(
+                !crate::lower::arel::is_relation_refiner(entry.name),
+                "`{}` is not a Builder but the arel refiner accepts it",
+                entry.name,
+            );
+        }
+    }
+}

@@ -1,0 +1,932 @@
+//! Wasm entry point exposing roundhouse's transpile pipeline as a single
+//! `transpile(json) -> json` C-ABI function.
+//!
+//! Memory protocol — the host (browser JS) does:
+//!   1. `rh_alloc(input_len)` → returns a `*mut u8` into wasm linear memory.
+//!   2. Write the input JSON (UTF-8) into that buffer.
+//!   3. `transpile(ptr, input_len)` → returns a packed `u64` where the low
+//!      32 bits are the output ptr and the high 32 bits are the output len.
+//!   4. Read the UTF-8 output JSON from wasm memory.
+//!   5. `rh_dealloc(input_ptr, input_len)` and `rh_dealloc(out_ptr, out_len)`.
+//!
+//! Input JSON shape:
+//!   `{"language": "typescript", "src": {"app/models/article.rb": "...", ...}}`
+//!
+//! Output JSON shape (success):
+//!   `{"language": "typescript", "files": [{"path": "...", "content": "..."}, ...]}`
+//!
+//! Output JSON shape (error):
+//!   `{"error": "..."}`
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+use roundhouse::analyze::{diagnose, Analyzer, Severity};
+use roundhouse::emit::ruby::ty_to_rbs;
+use roundhouse::emit::{crystal, csharp, elixir, go, kotlin, python, ruby, rust, swift, typescript};
+use roundhouse::ingest::ingest_app_from_tree;
+use roundhouse::profile::DeploymentProfile;
+use serde::{Deserialize, Serialize};
+
+#[derive(Deserialize)]
+struct TranspileInput {
+    language: String,
+    src: HashMap<String, String>,
+    /// Optional deployment profile, only meaningful for `typescript`:
+    /// `worker` (SharedWorker browser app — what /studio/ runs), `node-async`,
+    /// `node-sync`. Absent/`default` ⇒ the plain `emit()` (what /playground/
+    /// shows). Ignored by every other target.
+    #[serde(default)]
+    profile: Option<String>,
+}
+
+#[derive(Serialize)]
+struct TranspileOutput<'a> {
+    language: &'a str,
+    files: Vec<EmittedFile>,
+    /// Analyzer diagnostics (inference results) attributed to source
+    /// positions. Target-independent — the same Ruby types (or fails to)
+    /// regardless of the emit backend, so this is identical across targets.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    diagnostics: Vec<DiagnosticOut>,
+    /// Inferred type at each source expression (RBS string form), for hovers.
+    /// Also target-independent. Unresolved placeholders (`Ty::Var`) are
+    /// dropped; everything else (incl. the gradual `untyped`) is kept.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    inferred_types: Vec<TypeOut>,
+}
+
+#[derive(Serialize)]
+struct EmittedFile {
+    path: String,
+    content: String,
+}
+
+/// A diagnostic resolved to a 1-based source location (UTF-8 char columns),
+/// ready for the playground to drop as a Monaco marker on the source file.
+#[derive(Serialize)]
+struct DiagnosticOut {
+    path: String,
+    start_line: u32,
+    start_col: u32,
+    end_line: u32,
+    end_col: u32,
+    severity: &'static str,
+    code: &'static str,
+    message: String,
+}
+
+/// An inferred type at a 1-based source span, rendered to its RBS string.
+#[derive(Serialize)]
+struct TypeOut {
+    path: String,
+    start_line: u32,
+    start_col: u32,
+    end_line: u32,
+    end_col: u32,
+    ty: String,
+}
+
+#[derive(Serialize)]
+struct ErrorOutput {
+    error: String,
+}
+
+fn transpile_inner(json_in: &str) -> String {
+    let input: TranspileInput = match serde_json::from_str(json_in) {
+        Ok(v) => v,
+        Err(e) => return error_json(&format!("invalid input JSON: {e}")),
+    };
+
+    // Futamura's output is the app's own tree with specializations
+    // spliced in, so it keeps the source map (the CLI walks the app dir).
+    let futamura_tree: Option<Vec<(String, String)>> = (input.language == "futamura").then(|| {
+        let mut files: Vec<(String, String)> =
+            input.src.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+        files
+    });
+
+    let tree: HashMap<PathBuf, Vec<u8>> = input
+        .src
+        .into_iter()
+        .map(|(k, v)| (PathBuf::from(k), v.into_bytes()))
+        .collect();
+
+    // Survey mode: real apps (Lobsters, Mastodon) always reach for constructs
+    // the subset doesn't model yet. Rather than abort at the first one, ingest
+    // past it (a Nil-substituted placeholder, or a skipped file) and record
+    // each as a gap. The emitted project is then the honest work-in-progress,
+    // and every gap surfaces as a coverage-note diagnostic on its source line —
+    // the same "show the gap, don't hide the app" bar the /ide/ skin uses.
+    roundhouse::ingest::survey::activate();
+    let (result, parse_diags) =
+        roundhouse::ingest::prism::scope(|| ingest_app_from_tree(tree));
+    let mut gaps = roundhouse::ingest::survey::drain();
+    let mut app = match result {
+        Ok(app) => app,
+        Err(e) => return error_json(&format!("ingest: {e}")),
+    };
+
+    // The Roda conversion target is source-to-source from the
+    // INGEST-shape IR — same contract as the CLI (bin/roundhouse):
+    // lowering would rewrite the controller bodies into runtime
+    // vocabulary, the wrong altitude to re-idiomize into Sequel/Roda
+    // from. See `emit::roda`.
+    let is_roda = input.language.as_str() == "roda";
+
+    // (The analyzer is constructed either way — the LAST_GOOD query
+    // snapshot at the bottom owns it; on a roda run it simply never
+    // analyzed, so completions/hover answer empty rather than stale.)
+    let mut analyzer = Analyzer::new(&app);
+    let lower_diags = if is_roda {
+        Vec::new()
+    } else if futamura_tree.is_some() {
+        // Futamura needs the types but none of the lowerings: those
+        // rewrite into the runtime's vocabulary, and its specializations
+        // call Rails (same split as bin/roundhouse).
+        analyzer.analyze(&mut app);
+        Vec::new()
+    } else {
+        roundhouse::lower::i18n_translate::with_plan_cache(|| {
+            analyzer.analyze(&mut app);
+
+            // Same post-analyze shared lowerings as the CLI transpile driver
+            // (bin/roundhouse): the playground emits from the same IR the CLI
+            // does. Residue joins the diagnostics below; synthetic spans drop
+            // out in the existing filter.
+            roundhouse::lower::apply_post_analyze_lowerings(&mut app, analyzer.class_registry())
+        })
+    };
+
+    // Analyzer diagnostics + gap-attributed coverage notes (Info severity),
+    // resolved to source positions. Synthetic spans (no source site) are
+    // dropped — there's nowhere to put a marker. (Roda: analyze never
+    // ran, so its walker diagnostics would be all noise.)
+    let mut diags = if is_roda { app.routes.diagnostics.clone() } else { diagnose(&app) };
+    roundhouse::analyze::attribution::attribute_ingest_gaps(&mut diags, &app, &gaps);
+    roundhouse::analyze::attribution::attribute_analysis_gaps(&mut diags, &app, &mut gaps);
+    diags.extend(parse_diags);
+    diags.extend(lower_diags);
+    let diagnostics: Vec<DiagnosticOut> = diags
+        .into_iter()
+        .filter_map(|d| {
+            if d.span.is_synthetic() {
+                return None;
+            }
+            let sf = app.sources.get((d.span.file.0 as usize).checked_sub(1)?)?;
+            let (start_line, start_col) = sf.line_col(d.span.start);
+            let (end_line, end_col) = sf.line_col(d.span.end);
+            let severity = match d.severity {
+                Severity::Error => "error",
+                Severity::Warning => "warning",
+                Severity::Info => "info",
+            };
+            let code = d.code();
+            Some(DiagnosticOut {
+                path: sf.path.clone(),
+                start_line,
+                start_col,
+                end_line,
+                end_col,
+                severity,
+                code,
+                message: d.message,
+            })
+        })
+        .collect();
+
+    // Inferred type at each source expression, for hover tooltips. Drop
+    // unresolved `Ty::Var` placeholders (they'd render a misleading
+    // "untyped") and anything without a real source span.
+    let inferred_types: Vec<TypeOut> = roundhouse::analyze::inferred_types(&app)
+        .into_iter()
+        .filter_map(|(span, ty)| {
+            if span.is_synthetic() || matches!(ty, roundhouse::ty::Ty::Var { .. }) {
+                return None;
+            }
+            let sf = app.sources.get((span.file.0 as usize).checked_sub(1)?)?;
+            let (start_line, start_col) = sf.line_col(span.start);
+            let (end_line, end_col) = sf.line_col(span.end);
+            Some(TypeOut {
+                path: sf.path.clone(),
+                start_line,
+                start_col,
+                end_line,
+                end_col,
+                ty: ty_to_rbs(&ty),
+            })
+        })
+        .collect();
+
+    if let Some(mut files) = futamura_tree {
+        if let Err(e) = roundhouse::emit::futamura::specialize(&app, &mut files) {
+            return error_json(&format!("futamura: {e}"));
+        }
+        let out = TranspileOutput {
+            language: &input.language,
+            files: files
+                .into_iter()
+                .map(|(path, content)| EmittedFile { path, content })
+                .collect(),
+            diagnostics,
+            inferred_types,
+        };
+        let json = serde_json::to_string(&out)
+            .unwrap_or_else(|e| error_json(&format!("serialize: {e}")));
+        LAST_GOOD.with(|l| *l.borrow_mut() = Some(Analysis { app, analyzer, gaps }));
+        return json;
+    }
+
+    let emitted = match input.language.as_str() {
+        "typescript" | "ts" => match input.profile.as_deref() {
+            Some("worker") => typescript::emit_with_profile(&app, &DeploymentProfile::worker()),
+            Some("node-async") => {
+                typescript::emit_with_profile(&app, &DeploymentProfile::node_async())
+            }
+            Some("node-sync") => {
+                typescript::emit_with_profile(&app, &DeploymentProfile::node_sync())
+            }
+            None | Some("default") => typescript::emit(&app),
+            Some(other) => return error_json(&format!("unknown profile: {other}")),
+        },
+        "rust" | "rs" => rust::emit(&app),
+        "crystal" | "cr" => crystal::emit(&app),
+        "python" | "py" => python::emit(&app),
+        "elixir" | "ex" => elixir::emit(&app),
+        "go" => go::emit(&app),
+        "kotlin" | "kt" => kotlin::emit(&app),
+        "swift" | "sw" => swift::emit(&app),
+        "csharp" | "cs" => csharp::emit(&app),
+        // Ruby/spinel's aggregate emitter is `emit_spinel` (legacy name); it
+        // returns the full project (.rb + .rbs sidecars) like the others' emit().
+        "ruby" | "spinel" => ruby::emit_spinel(&app),
+        // Rails → Roda + Sequel source conversion (issue #67): runs on
+        // the real roda/sequel gems, emitted from the ingest-shape IR
+        // (see the is_roda gate above).
+        "roda" => roundhouse::emit::roda::emit(&app),
+        other => return error_json(&format!("unknown language: {other}")),
+    };
+
+    let files: Vec<EmittedFile> = emitted
+        .into_iter()
+        .map(|f| EmittedFile {
+            path: f.path.display().to_string(),
+            content: f.content,
+        })
+        .collect();
+
+    let out = TranspileOutput {
+        language: &input.language,
+        files,
+        diagnostics,
+        inferred_types,
+    };
+
+    let json =
+        serde_json::to_string(&out).unwrap_or_else(|e| error_json(&format!("serialize: {e}")));
+    // Refresh the query snapshot last — every borrow of `app` above has
+    // ended, and `complete`/`type_at` now answer against exactly the
+    // analysis this transpile ran, carrying the same survey gaps.
+    LAST_GOOD.with(|l| *l.borrow_mut() = Some(Analysis { app, analyzer, gaps }));
+    json
+}
+
+fn error_json(msg: &str) -> String {
+    serde_json::to_string(&ErrorOutput {
+        error: msg.to_string(),
+    })
+    .unwrap_or_else(|_| String::from(r#"{"error":"unserializable error"}"#))
+}
+
+// ── Analysis-only entry (the IDE skin) ───────────────────────────────
+//
+// The /ide/ page doesn't emit code; it queries. `analyze` ingests in
+// *survey mode* (real apps always have constructs the subset doesn't
+// model — the gaps drive note-severity attribution, exactly like the
+// LSP/MCP skins), runs the whole-app analysis, publishes the marker
+// list, and stashes the typed App + class registry in a thread-local
+// as the **last-good snapshot** that `complete` (and future queries)
+// answer from. Wasm is single-threaded, so the thread-local is the
+// whole story — no locks, no worker plumbing on this side.
+
+use std::cell::RefCell;
+
+struct Analysis {
+    app: roundhouse::App,
+    /// The whole analyzer (registry + call-site-inferred params), kept
+    /// so traceroute's gap footer can pre-fill candidate signatures.
+    analyzer: Analyzer,
+    /// Survey-recovered ingest gaps from the same pass — the footer's
+    /// tool-coverage attribution input.
+    gaps: Vec<roundhouse::ingest::IngestError>,
+}
+
+thread_local! {
+    static LAST_GOOD: RefCell<Option<Analysis>> = const { RefCell::new(None) };
+}
+
+#[derive(Deserialize)]
+struct AnalyzeInput {
+    src: HashMap<String, String>,
+}
+
+#[derive(Serialize)]
+struct AnalyzeOutput {
+    /// Marker-ready diagnostics (notes carry severity "info").
+    diagnostics: Vec<DiagnosticOut>,
+    /// Recovered ingest gaps (file + message) — the coverage ledger.
+    gaps: Vec<GapOut>,
+    /// Ingested source files (path list, for pickers).
+    files: Vec<String>,
+    /// Registered classes (models/controllers/concerns/lib), for
+    /// go-to-class search.
+    classes: Vec<String>,
+    /// The gem census (direct dependencies classified) when the bundle
+    /// carried a Gemfile.lock, plus its one-line summary.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gems: Option<roundhouse::gems::GemCensus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gems_summary: Option<String>,
+}
+
+#[derive(Serialize)]
+struct GapOut {
+    file: String,
+    message: String,
+}
+
+fn analyze_app_inner(json_in: &str) -> String {
+    let input: AnalyzeInput = match serde_json::from_str(json_in) {
+        Ok(v) => v,
+        Err(e) => return error_json(&format!("invalid input JSON: {e}")),
+    };
+    let tree: HashMap<PathBuf, Vec<u8>> = input
+        .src
+        .into_iter()
+        .map(|(k, v)| (PathBuf::from(k), v.into_bytes()))
+        .collect();
+
+    roundhouse::ingest::survey::activate();
+    let (result, parse_diags) =
+        roundhouse::ingest::prism::scope(|| ingest_app_from_tree(tree));
+    let mut gaps = roundhouse::ingest::survey::drain();
+    let mut app = match result {
+        Ok(app) => app,
+        Err(e) => return error_json(&format!("ingest: {e}")),
+    };
+    let mut analyzer = Analyzer::new(&app);
+    analyzer.analyze(&mut app);
+
+    let mut diags = diagnose(&app);
+    roundhouse::analyze::attribution::attribute_ingest_gaps(&mut diags, &app, &gaps);
+    roundhouse::analyze::attribution::attribute_analysis_gaps(&mut diags, &app, &mut gaps);
+    roundhouse::analyze::attribution::attribute_unknown_gems(&mut diags, &app);
+    diags.extend(parse_diags);
+
+    let diagnostics: Vec<DiagnosticOut> = diags
+        .into_iter()
+        .filter_map(|d| {
+            if d.span.is_synthetic() {
+                return None;
+            }
+            let sf = app.sources.get((d.span.file.0 as usize).checked_sub(1)?)?;
+            let (start_line, start_col) = sf.line_col(d.span.start);
+            let (end_line, end_col) = sf.line_col(d.span.end);
+            let severity = match d.severity {
+                Severity::Error => "error",
+                Severity::Warning => "warning",
+                Severity::Info => "info",
+            };
+            Some(DiagnosticOut {
+                path: sf.path.clone(),
+                start_line,
+                start_col,
+                end_line,
+                end_col,
+                severity,
+                code: d.code(),
+                message: d.message,
+            })
+        })
+        .collect();
+
+    let gaps_out: Vec<GapOut> = gaps
+        .iter()
+        .filter_map(|g| match g {
+            roundhouse::ingest::IngestError::Unsupported { file, message }
+            | roundhouse::ingest::IngestError::Parse { file, message } => Some(GapOut {
+                file: file.clone(),
+                message: message.clone(),
+            }),
+            _ => None,
+        })
+        .collect();
+
+    let files: Vec<String> = app.sources.iter().map(|s| s.path.clone()).collect();
+    let mut classes: Vec<String> =
+        analyzer.class_registry().keys().map(|c| c.0.as_str().to_string()).collect();
+    classes.sort();
+
+    let gems = app.gem_lock.as_ref().map(roundhouse::gems::GemCensus::of);
+    let gems_summary = gems.as_ref().map(|c| c.summary());
+    let out = AnalyzeOutput { diagnostics, gaps: gaps_out, files, classes, gems, gems_summary };
+    let json =
+        serde_json::to_string(&out).unwrap_or_else(|e| error_json(&format!("serialize: {e}")));
+    LAST_GOOD.with(|l| *l.borrow_mut() = Some(Analysis { app, analyzer, gaps }));
+    json
+}
+
+/// Pack a String into the (ptr,len) u64 protocol shared with `transpile`.
+fn pack(result: String) -> u64 {
+    let bytes = result.into_bytes();
+    let len = bytes.len() as u64;
+    let mut boxed = bytes.into_boxed_slice();
+    let ptr = boxed.as_mut_ptr() as u64;
+    std::mem::forget(boxed);
+    (ptr & 0xFFFF_FFFF) | (len << 32)
+}
+
+/// Analysis-only entry: same memory protocol as `transpile`, input
+/// `{"src": {...}}`, output `AnalyzeOutput` (or `{"error": ...}`).
+/// Side effect: refreshes the last-good snapshot queries answer from.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn analyze_app(input_ptr: *const u8, input_len: u32) -> u64 {
+    let input = unsafe { std::slice::from_raw_parts(input_ptr, input_len as usize) };
+    let json_in = std::str::from_utf8(input).unwrap_or("{}");
+    pack(analyze_app_inner(json_in))
+}
+
+// ── Queries over the last-good snapshot ──────────────────────────────
+
+#[derive(Deserialize)]
+struct CompleteInput {
+    path: String,
+    /// The *current* buffer text — ahead of the analyzed snapshot by
+    /// the keystroke(s) that triggered the request, same contract as
+    /// the LSP skin.
+    text: String,
+    line: u32,
+    character: u32,
+}
+
+#[derive(Serialize)]
+struct CandidateOut {
+    label: String,
+    kind: &'static str,
+    detail: String,
+    sort_text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    insert_text: Option<String>,
+}
+
+fn complete_inner(json_in: &str) -> String {
+    let input: CompleteInput = match serde_json::from_str(json_in) {
+        Ok(v) => v,
+        Err(e) => return error_json(&format!("invalid input JSON: {e}")),
+    };
+    LAST_GOOD.with(|l| {
+        let borrow = l.borrow();
+        let Some(a) = borrow.as_ref() else {
+            return error_json("no analysis yet — call analyze_app first");
+        };
+        let pos = roundhouse::ide::Position { line: input.line, character: input.character };
+        let offset = roundhouse::ide::position_to_offset(&input.text, pos) as usize;
+        let cands = roundhouse::ide::complete_at(&a.app, a.analyzer.class_registry(), &input.path, &input.text, offset)
+            .unwrap_or_default();
+        let out: Vec<CandidateOut> = cands
+            .into_iter()
+            .map(|c| CandidateOut {
+                sort_text: format!("{}{}", c.rank, c.label),
+                kind: match c.kind {
+                    roundhouse::ide::CandidateKind::Column => "column",
+                    roundhouse::ide::CandidateKind::Association => "association",
+                    roundhouse::ide::CandidateKind::Scope => "scope",
+                    roundhouse::ide::CandidateKind::Accessor => "accessor",
+                    roundhouse::ide::CandidateKind::Method => "method",
+                    roundhouse::ide::CandidateKind::Ivar => "ivar",
+                    roundhouse::ide::CandidateKind::Kwarg => "kwarg",
+                },
+                label: c.label,
+                detail: c.detail,
+                insert_text: c.insert_text,
+            })
+            .collect();
+        serde_json::to_string(&out).unwrap_or_else(|e| error_json(&format!("serialize: {e}")))
+    })
+}
+
+/// Completion against the last-good snapshot + the passed current
+/// buffer. Input `{"path", "text", "line", "character"}` (0-based,
+/// UTF-16 character — Monaco/LSP convention), output a candidate array.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn complete(input_ptr: *const u8, input_len: u32) -> u64 {
+    let input = unsafe { std::slice::from_raw_parts(input_ptr, input_len as usize) };
+    pack(complete_inner(std::str::from_utf8(input).unwrap_or("{}")))
+}
+
+#[derive(Deserialize)]
+struct PositionInput {
+    path: String,
+    line: u32,
+    character: u32,
+}
+
+#[derive(Serialize)]
+struct TypeAtOut {
+    display: String,
+    nilable: bool,
+    node_kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
+}
+
+fn type_at_inner(json_in: &str) -> String {
+    let input: PositionInput = match serde_json::from_str(json_in) {
+        Ok(v) => v,
+        Err(e) => return error_json(&format!("invalid input JSON: {e}")),
+    };
+    LAST_GOOD.with(|l| {
+        let borrow = l.borrow();
+        let Some(a) = borrow.as_ref() else {
+            return error_json("no analysis yet — call analyze_app first");
+        };
+        let pos = roundhouse::ide::Position { line: input.line, character: input.character };
+        match roundhouse::ide::type_at_position(&a.app, &input.path, pos) {
+            Some(info) => serde_json::to_string(&TypeAtOut {
+                display: info.display,
+                nilable: info.nilable,
+                node_kind: info.node_kind,
+                note: info.note,
+            })
+            .unwrap_or_else(|e| error_json(&format!("serialize: {e}"))),
+            None => "null".to_string(),
+        }
+    })
+}
+
+/// Hover: inferred type at a position in the *analyzed* text (the
+/// snapshot's own source — positions drift at most one edit, exactly
+/// like the LSP's hover). Output `{"display","nilable","node_kind"}`
+/// or `null`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn type_at(input_ptr: *const u8, input_len: u32) -> u64 {
+    let input = unsafe { std::slice::from_raw_parts(input_ptr, input_len as usize) };
+    pack(type_at_inner(std::str::from_utf8(input).unwrap_or("{}")))
+}
+
+/// One source location, as the editor addresses it: zero-based
+/// line/character (UTF-16, Monaco's unit) in `path`.
+#[derive(Serialize)]
+struct LocationOut {
+    path: String,
+    line: u32,
+    character: u32,
+    end_line: u32,
+    end_character: u32,
+    /// The location is a write (the definition / an assignment), not a
+    /// read. Only on `references`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    write: bool,
+}
+
+fn location_out(app: &roundhouse::App, span: roundhouse::span::Span, write: bool) -> Option<LocationOut> {
+    let src = roundhouse::ide::source(app, span.file)?;
+    let start = roundhouse::ide::offset_to_position(&src.text, span.start);
+    let end = roundhouse::ide::offset_to_position(&src.text, span.end);
+    Some(LocationOut {
+        path: src.path.clone(),
+        line: start.line,
+        character: start.character,
+        end_line: end.line,
+        end_character: end.character,
+        write,
+    })
+}
+
+/// Shared prologue of the two position → locations queries: the file
+/// and byte offset the editor's position names in the analyzed text.
+fn with_offset<T>(
+    json_in: &str,
+    f: impl FnOnce(&roundhouse::App, roundhouse::span::FileId, u32) -> T,
+) -> Result<Option<T>, String> {
+    let input: PositionInput =
+        serde_json::from_str(json_in).map_err(|e| format!("invalid input JSON: {e}"))?;
+    LAST_GOOD.with(|l| {
+        let borrow = l.borrow();
+        let Some(a) = borrow.as_ref() else {
+            return Err("no analysis yet — call analyze_app first".to_string());
+        };
+        let Some(file) = roundhouse::ide::file_id(&a.app, &input.path) else { return Ok(None) };
+        let Some(src) = roundhouse::ide::source(&a.app, file) else { return Ok(None) };
+        let pos = roundhouse::ide::Position { line: input.line, character: input.character };
+        let offset = roundhouse::ide::position_to_offset(&src.text, pos);
+        Ok(Some(f(&a.app, file, offset)))
+    })
+}
+
+fn definition_inner(json_in: &str) -> String {
+    match with_offset(json_in, |app, file, offset| {
+        roundhouse::ide::definition(app, file, offset).and_then(|s| location_out(app, s, true))
+    }) {
+        Ok(Some(Some(loc))) => serde_json::to_string(&loc).unwrap_or_else(|e| error_json(&format!("serialize: {e}"))),
+        Ok(_) => "null".to_string(),
+        Err(e) => error_json(&e),
+    }
+}
+
+/// Go to definition: the write that binds the variable at a position
+/// (a local's assignment, an ivar's first assignment on the class), or
+/// the method a typed explicit-receiver call resolves to. Output a
+/// location `{"path","line","character","end_line","end_character"}`
+/// or `null`. Same resolution as the LSP's `textDocument/definition`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn definition(input_ptr: *const u8, input_len: u32) -> u64 {
+    let input = unsafe { std::slice::from_raw_parts(input_ptr, input_len as usize) };
+    pack(definition_inner(std::str::from_utf8(input).unwrap_or("{}")))
+}
+
+fn references_inner(json_in: &str) -> String {
+    match with_offset(json_in, |app, file, offset| {
+        roundhouse::ide::references(app, file, offset)
+            .into_iter()
+            // Type-certain matches only — the same set the LSP returns;
+            // name-only method matches are the MCP's, which can label
+            // them uncertain.
+            .filter(|r| r.certain)
+            .filter_map(|r| location_out(app, r.span, r.write))
+            .collect::<Vec<_>>()
+    }) {
+        Ok(Some(locs)) => serde_json::to_string(&locs).unwrap_or_else(|e| error_json(&format!("serialize: {e}"))),
+        Ok(None) => "[]".to_string(),
+        Err(e) => error_json(&e),
+    }
+}
+
+/// Find references: every read and write of the variable at a position
+/// (locals by binding, ivars by name across the class), or every typed
+/// call of the method named there. Output an array of locations, each
+/// with `"write": true` on assignments. Same resolution as the LSP's
+/// `textDocument/references`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn references(input_ptr: *const u8, input_len: u32) -> u64 {
+    let input = unsafe { std::slice::from_raw_parts(input_ptr, input_len as usize) };
+    pack(references_inner(std::str::from_utf8(input).unwrap_or("{}")))
+}
+
+#[derive(Deserialize)]
+struct RelatedInput {
+    path: String,
+}
+
+#[derive(Serialize)]
+struct RelatedOut {
+    kind: &'static str,
+    label: String,
+    path: String,
+}
+
+fn related_files_inner(json_in: &str) -> String {
+    let input: RelatedInput = match serde_json::from_str(json_in) {
+        Ok(v) => v,
+        Err(e) => return error_json(&format!("invalid input JSON: {e}")),
+    };
+    LAST_GOOD.with(|l| {
+        let borrow = l.borrow();
+        let Some(a) = borrow.as_ref() else {
+            return error_json("no analysis yet — call analyze_app first");
+        };
+        let rel = roundhouse::ide::related_files(&a.app, &input.path);
+        let out: Vec<RelatedOut> = rel
+            .into_iter()
+            .map(|r| RelatedOut {
+                kind: match r.kind {
+                    roundhouse::ide::RelatedKind::View => "view",
+                    roundhouse::ide::RelatedKind::Partial => "partial",
+                    roundhouse::ide::RelatedKind::Renderer => "renderer",
+                    roundhouse::ide::RelatedKind::Controller => "controller",
+                    roundhouse::ide::RelatedKind::Concern => "concern",
+                    roundhouse::ide::RelatedKind::Includer => "includer",
+                    roundhouse::ide::RelatedKind::Model => "model",
+                },
+                label: r.label,
+                path: r.path,
+            })
+            .collect();
+        serde_json::to_string(&out).unwrap_or_else(|e| error_json(&format!("serialize: {e}")))
+    })
+}
+
+/// Rails-aware related files for a path, from the inferred render
+/// graph + include edges. Input `{"path"}`, output an array of
+/// `{"kind","label","path"}`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn related_files(input_ptr: *const u8, input_len: u32) -> u64 {
+    let input = unsafe { std::slice::from_raw_parts(input_ptr, input_len as usize) };
+    pack(related_files_inner(std::str::from_utf8(input).unwrap_or("{}")))
+}
+
+
+// ── Traceroute (#63): the request chain + gap footer ─────────────────
+
+#[derive(Deserialize)]
+struct TracerouteInput {
+    query: String,
+}
+
+fn traceroute_inner(json_in: &str) -> String {
+    let input: TracerouteInput = match serde_json::from_str(json_in) {
+        Ok(v) => v,
+        Err(e) => return error_json(&format!("invalid input JSON: {e}")),
+    };
+    LAST_GOOD.with(|l| {
+        let borrow = l.borrow();
+        let Some(a) = borrow.as_ref() else {
+            return error_json("no analysis yet — call analyze_app first");
+        };
+        let Some(trace) = roundhouse::ide::traceroute(&a.app, &input.query) else {
+            return error_json(&format!(
+                "no trace for `{}` — not a known route or Controller#action",
+                input.query
+            ));
+        };
+        let report =
+            roundhouse::ide::trace_gap_report(&a.app, &trace, &a.gaps, Some(&a.analyzer));
+        // The identical wire shape the MCP tool returns — one query
+        // layer, one format, N skins.
+        serde_json::to_string(&roundhouse::ide::trace_json(&trace, &report))
+            .unwrap_or_else(|e| error_json(&format!("serialize: {e}")))
+    })
+}
+
+/// The full static request flow for `{"query": "Controller#action" |
+/// "[VERB ]/path"}` — hops, coverage triple, priced gap footer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn traceroute(input_ptr: *const u8, input_len: u32) -> u64 {
+    let input = unsafe { std::slice::from_raw_parts(input_ptr, input_len as usize) };
+    pack(traceroute_inner(std::str::from_utf8(input).unwrap_or("{}")))
+}
+
+#[derive(Serialize)]
+struct TraceTargetOut {
+    label: String,
+    query: String,
+    controller: String,
+}
+
+fn trace_targets_inner() -> String {
+    LAST_GOOD.with(|l| {
+        let borrow = l.borrow();
+        let Some(a) = borrow.as_ref() else {
+            return error_json("no analysis yet — call analyze_app first");
+        };
+        let out: Vec<TraceTargetOut> = roundhouse::ide::trace_targets(&a.app)
+            .into_iter()
+            .map(|t| TraceTargetOut { label: t.label, query: t.query, controller: t.controller })
+            .collect();
+        serde_json::to_string(&out).unwrap_or_else(|e| error_json(&format!("serialize: {e}")))
+    })
+}
+
+/// Everything traceroute can trace (routes + unrouted view-rendering
+/// actions), for the trace picker. Input is ignored.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn trace_targets(_input_ptr: *const u8, _input_len: u32) -> u64 {
+    pack(trace_targets_inner())
+}
+
+/// Which analyzer answered. The /ide/ summary line carries this so a
+/// number someone pastes from a local-folder analysis names the build it
+/// came from: the crate version always, and the commit the library's
+/// build script stamped (`ROUNDHOUSE_COMMIT` from the environment — CI
+/// sets `github.sha` — else `git rev-parse` on the checkout; a tarball
+/// build has none). Input is ignored.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn version(_input_ptr: *const u8, _input_len: u32) -> u64 {
+    let out = serde_json::json!({
+        "version": roundhouse::version::VERSION,
+        "commit": roundhouse::version::COMMIT,
+    });
+    pack(out.to_string())
+}
+
+// ── Fractal pass explorer ────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct FractalInput {
+    src: HashMap<String, String>,
+    /// The files to compile (`--file`), relative to the app root.
+    #[serde(default)]
+    files: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct FractalOutput {
+    #[serde(flatten)]
+    stages: roundhouse::emit::fractal::stages::Stages,
+    /// Ruby files under `app/` the explorer can offer to compile.
+    candidates: Vec<String>,
+    /// Ingest gaps, as `path: message`.
+    gaps: Vec<String>,
+}
+
+fn fractal_stages_inner(json_in: &str) -> String {
+    use roundhouse::emit::fractal;
+    let input: FractalInput = match serde_json::from_str(json_in) {
+        Ok(v) => v,
+        Err(e) => return error_json(&format!("invalid input JSON: {e}")),
+    };
+    let mut candidates: Vec<String> =
+        input.src.keys().filter(|p| p.starts_with("app/") && p.ends_with(".rb")).cloned().collect();
+    candidates.sort();
+    let lockfile = input.src.get("Gemfile.lock").cloned();
+    let mut sources: Vec<roundhouse::span::SourceFile> = input
+        .src
+        .iter()
+        .filter(|(path, _)| path.ends_with(".rb"))
+        .map(|(path, text)| roundhouse::span::SourceFile { path: path.clone(), text: text.clone() })
+        .collect();
+    sources.sort_by(|a, b| a.path.cmp(&b.path));
+    let tree: HashMap<PathBuf, Vec<u8>> =
+        input.src.into_iter().map(|(k, v)| (PathBuf::from(k), v.into_bytes())).collect();
+    roundhouse::ingest::survey::activate();
+    let (result, parse_diags) = roundhouse::ingest::prism::scope(|| ingest_app_from_tree(tree));
+    let gaps = roundhouse::ingest::survey::drain();
+    let mut app = match result {
+        Ok(app) => app,
+        Err(e) => return error_json(&format!("ingest: {e}")),
+    };
+    let mut untrusted: Vec<String> = Vec::new();
+    for d in parse_diags.iter().filter(|d| d.severity == Severity::Error) {
+        if let Some(source) = (d.span.file.0 as usize).checked_sub(1).and_then(|i| app.sources.get(i)) {
+            untrusted.push(source.path.clone());
+        }
+    }
+    let mut gaps_out = Vec::new();
+    for gap in &gaps {
+        if let roundhouse::ingest::IngestError::Unsupported { file, message }
+        | roundhouse::ingest::IngestError::Parse { file, message } = gap
+        {
+            untrusted.push(file.clone());
+            gaps_out.push(format!("{file}: {message}"));
+        }
+    }
+    Analyzer::new(&app).analyze(&mut app);
+    let passes = fractal::pass::registered();
+    let passes: Vec<&dyn fractal::Pass> = passes.iter().map(|p| p.as_ref()).collect();
+    let root = std::path::Path::new("");
+    let context = fractal::Context::in_memory(&app, root, sources, lockfile.as_deref());
+    match fractal::stages::stages(&app, &context, &input.files, &untrusted, &passes) {
+        Ok(stages) => serde_json::to_string(&FractalOutput { stages, candidates, gaps: gaps_out })
+            .unwrap_or_else(|e| error_json(&format!("serialize: {e}"))),
+        Err(e) => error_json(&e),
+    }
+}
+
+/// The Fractal pass explorer's entry: input `{"src": {...}, "files": [...]}`,
+/// output the compiled files after each registered pass (see
+/// `roundhouse::emit::fractal::stages`), or `{"error": ...}`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fractal_stages(input_ptr: *const u8, input_len: u32) -> u64 {
+    let input = unsafe { std::slice::from_raw_parts(input_ptr, input_len as usize) };
+    pack(fractal_stages_inner(std::str::from_utf8(input).unwrap_or("{}")))
+}
+
+// ── C ABI exports ────────────────────────────────────────────────────
+
+/// Allocate a buffer of the given size in wasm linear memory and return
+/// a pointer to it. Caller is responsible for calling `rh_dealloc`.
+#[unsafe(no_mangle)]
+pub extern "C" fn rh_alloc(size: u32) -> *mut u8 {
+    let mut v: Vec<u8> = Vec::with_capacity(size as usize);
+    let ptr = v.as_mut_ptr();
+    std::mem::forget(v);
+    ptr
+}
+
+/// Free a buffer previously returned by `rh_alloc` or `transpile`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rh_dealloc(ptr: *mut u8, size: u32) {
+    if ptr.is_null() || size == 0 {
+        return;
+    }
+    let _ = unsafe { Vec::from_raw_parts(ptr, 0, size as usize) };
+}
+
+/// Run the transpile pipeline on a UTF-8 JSON input. Returns a packed
+/// `(ptr, len)` in a single `u64` — the low 32 bits are the pointer to
+/// the result buffer, the high 32 bits are its length in bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn transpile(input_ptr: *const u8, input_len: u32) -> u64 {
+    let input = unsafe { std::slice::from_raw_parts(input_ptr, input_len as usize) };
+    let json_in = std::str::from_utf8(input).unwrap_or("{}");
+    let result = transpile_inner(json_in);
+
+    let bytes = result.into_bytes();
+    let len = bytes.len() as u64;
+    let mut boxed = bytes.into_boxed_slice();
+    let ptr = boxed.as_mut_ptr() as u64;
+    std::mem::forget(boxed);
+
+    (ptr & 0xFFFF_FFFF) | (len << 32)
+}

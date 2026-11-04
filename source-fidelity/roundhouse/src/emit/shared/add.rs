@@ -1,0 +1,303 @@
+//! Shared classifier for `+` emission.
+//!
+//! Ruby's `+` is receiver-overloaded (Int/Float/String/Array each
+//! defines it differently; most other types don't define it at all).
+//! Targets split that single operator into multiple emission forms —
+//! native `+` for the cases they support, per-target idioms for the
+//! ones they don't, and a hard refusal for cases Ruby itself would
+//! raise on (`1 + "hello"` → TypeError).
+//!
+//! Callers consult [`classify_add`] on the two operands' `.ty`
+//! annotations (populated by the body-typer) and switch on the
+//! returned [`AddCase`]. Without type information on both sides we
+//! return [`AddCase::Unknown`] so emitters fall back to native
+//! infix — always safe.
+
+use crate::expr::Expr;
+use crate::ty::Ty;
+
+/// What kind of `+` this is, in enough detail for a target emitter
+/// to pick the right output form.
+pub enum AddCase {
+    /// Int + Int or Float + Float — emit as native `+`.
+    Numeric,
+    /// Int + Float or Float + Int — most targets auto-coerce; Rust
+    /// and Go need explicit casts on the Int side.
+    NumericPromote,
+    /// Str + Str — concatenation per target idiom (Elixir: `<>`,
+    /// Rust: `format!`, others: native `+`).
+    StringConcat,
+    /// A collection `+` a collection — concat per target idiom
+    /// (Elixir: `++`, Go: `append(a, b...)`, Rust: `.concat()`, TS:
+    /// spread, others: native `+`). Either side may be a `Relation`
+    /// rather than an `Array`: Rails' `Relation#+` materializes and
+    /// concatenates, so the two spellings are one case here.
+    ArrayConcat {
+        /// A representative element type — lhs's when it has one.
+        /// Owned rather than borrowed because a `Relation`'s element
+        /// is derived, not stored.
+        elem: Ty,
+    },
+    /// Both sides typed concretely but `+` isn't defined in Ruby
+    /// for that pair (`Int + Str`, `Hash + Hash`, etc.). Ruby would
+    /// raise at runtime; callers emit a target-language
+    /// raise-equivalent at the expression site so the compiled
+    /// program also raises if execution reaches that point. This
+    /// matches Ruby's behavior (not stricter, not looser) and keeps
+    /// the rest of the compilation going — one bad `+` doesn't halt
+    /// emission, it just produces a program that fails at the
+    /// specific bad line if run.
+    Incompatible,
+    /// Type info missing on either side — fall back to native infix.
+    /// Matches the conservative policy: emit what we'd emit without
+    /// this classifier.
+    Unknown,
+}
+
+/// Classify a pair of operands for `+` emission.
+fn is_time(ty: &Ty) -> bool {
+    matches!(ty, Ty::Time) || matches!(ty, Ty::Class { id, .. } if id.0.as_str() == "Time")
+}
+
+pub fn classify_add(lhs: &Expr, rhs: &Expr) -> AddCase {
+    let lhs_ty = lhs.ty.as_ref();
+    let rhs_ty = rhs.ty.as_ref();
+
+    use super::operand::{is_gradual_operand, is_set_receiver};
+    if is_gradual_operand(lhs_ty) || is_gradual_operand(rhs_ty) {
+        return AddCase::Unknown;
+    }
+    // Not `Incompatible` (a raise) nor `ArrayConcat` (an Array, not a Set).
+    if is_set_receiver(lhs_ty) {
+        return AddCase::Unknown;
+    }
+
+    // `Time + seconds` / `Time + Duration` is a Time; only `Time + Time`
+    // (and `Time + String`) is the TypeError.
+    if is_time(lhs_ty.unwrap()) && !is_time(rhs_ty.unwrap()) && !matches!(rhs_ty, Some(Ty::Str)) {
+        return AddCase::Unknown;
+    }
+    if super::operand::is_user_operator_receiver(lhs) {
+        return AddCase::Unknown;
+    }
+
+    let lhs_ty = lhs_ty.unwrap();
+    let rhs_ty = rhs_ty.unwrap();
+
+    match (lhs_ty, rhs_ty) {
+        (Ty::Int, Ty::Int) | (Ty::Float, Ty::Float) => AddCase::Numeric,
+        (Ty::Int, Ty::Float) | (Ty::Float, Ty::Int) => AddCase::NumericPromote,
+        (l, r) if super::operand::is_number(l) && super::operand::is_number(r) => {
+            AddCase::NumericPromote
+        }
+        (Ty::Str, Ty::Str) => AddCase::StringConcat,
+        // Date + Integer is Ruby (and ActiveSupport) day arithmetic.
+        // Lowering grounds it to `date_days_since` for Spinel; CRuby
+        // keeps native `+`. Not Incompatible.
+        (Ty::Date, Ty::Int) => AddCase::Unknown,
+        _ => {
+            // Collection `+` collection is *always* valid Ruby — it
+            // concatenates regardless of element types, yielding
+            // `Array<lhs_elem | rhs_elem>`. Do not require matching
+            // element types: a heterogeneous concat
+            // (`Story.select(:id)… + [self.id]`) is real code, not an
+            // error. Asking each side for its element (rather than
+            // matching `Ty::Array` twice) is what lets a lazy
+            // `Relation` operand through: that lobsters site's lhs is
+            // exactly one. `elem` is a representative (lhs's); every
+            // emitter consumes `ArrayConcat { .. }` ignoring it, and
+            // the expression's true (union-element) result type is
+            // computed by the body typer, not here.
+            match (lhs_ty.collection_elem(), rhs_ty.collection_elem()) {
+                (Some(elem), Some(_)) => AddCase::ArrayConcat { elem },
+                _ => AddCase::Incompatible,
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::expr::{ExprNode, Literal};
+    use crate::ident::{ClassId, Symbol, VarId};
+    use crate::span::Span;
+
+    fn with_ty(node: ExprNode, ty: Ty) -> Expr {
+        let mut e = Expr::new(Span::synthetic(), node);
+        e.ty = Some(ty);
+        e
+    }
+
+    fn var_with(name: &str, ty: Ty) -> Expr {
+        with_ty(
+            ExprNode::Var {
+                id: VarId(0),
+                name: Symbol::from(name),
+            },
+            ty,
+        )
+    }
+
+    fn int_lit(value: i64) -> Expr {
+        with_ty(ExprNode::Lit { value: Literal::Int { value } }, Ty::Int)
+    }
+
+    fn untyped_var(name: &str) -> Expr {
+        Expr::new(
+            Span::synthetic(),
+            ExprNode::Var {
+                id: VarId(0),
+                name: Symbol::from(name),
+            },
+        )
+    }
+
+    #[test]
+    fn int_plus_int_is_numeric() {
+        assert!(matches!(
+            classify_add(&int_lit(1), &int_lit(2)),
+            AddCase::Numeric
+        ));
+    }
+
+    #[test]
+    fn float_plus_float_is_numeric() {
+        let l = var_with("a", Ty::Float);
+        let r = var_with("b", Ty::Float);
+        assert!(matches!(classify_add(&l, &r), AddCase::Numeric));
+    }
+
+    #[test]
+    fn int_plus_float_is_numeric_promote() {
+        let l = var_with("a", Ty::Int);
+        let r = var_with("b", Ty::Float);
+        assert!(matches!(classify_add(&l, &r), AddCase::NumericPromote));
+    }
+
+    #[test]
+    fn float_plus_int_is_numeric_promote() {
+        let l = var_with("a", Ty::Float);
+        let r = var_with("b", Ty::Int);
+        assert!(matches!(classify_add(&l, &r), AddCase::NumericPromote));
+    }
+
+    #[test]
+    fn str_plus_str_is_string_concat() {
+        let l = var_with("a", Ty::Str);
+        let r = var_with("b", Ty::Str);
+        assert!(matches!(classify_add(&l, &r), AddCase::StringConcat));
+    }
+
+    #[test]
+    fn array_plus_array_matching_elem_is_array_concat() {
+        let a_ty = Ty::Array { elem: std::sync::Arc::new(Ty::Int) };
+        let l = var_with("a", a_ty.clone());
+        let r = var_with("b", a_ty);
+        let case = classify_add(&l, &r);
+        let AddCase::ArrayConcat { elem } = case else {
+            panic!("expected ArrayConcat");
+        };
+        assert_eq!(elem, Ty::Int);
+    }
+
+    #[test]
+    fn relation_plus_array_is_array_concat() {
+        // lobsters `story.rb`'s `merged_comments`: a lazy relation
+        // concatenated with a literal array. `Relation#+` materializes
+        // and concatenates, so this is a concat, not an error — and it
+        // is the site that regressed when class-side chain starts
+        // converged onto `Relation`.
+        let l = var_with(
+            "a",
+            Ty::Relation { of: ClassId(Symbol::from("Story")) },
+        );
+        let r = var_with("b", Ty::Array { elem: std::sync::Arc::new(Ty::Int) });
+        let case = classify_add(&l, &r);
+        let AddCase::ArrayConcat { elem } = case else {
+            panic!("expected ArrayConcat");
+        };
+        assert!(matches!(elem, Ty::Class { .. }));
+    }
+
+    #[test]
+    fn array_plus_array_different_elem_is_concat() {
+        let l = var_with(
+            "a",
+            Ty::Array { elem: std::sync::Arc::new(Ty::Int) },
+        );
+        let r = var_with(
+            "b",
+            Ty::Array { elem: std::sync::Arc::new(Ty::Str) },
+        );
+        // Mismatched element types are still a valid Ruby concat
+        // (producing Array<Int|Str>) — not `Incompatible`. Every target
+        // emits its concat idiom; `nil.join`-style raises come from the
+        // receiver, never from `Array#+`.
+        assert!(matches!(classify_add(&l, &r), AddCase::ArrayConcat { .. }));
+    }
+
+    #[test]
+    fn int_plus_str_is_incompatible() {
+        let l = var_with("a", Ty::Int);
+        let r = var_with("b", Ty::Str);
+        // Ruby raises TypeError. We refuse at emit.
+        assert!(matches!(classify_add(&l, &r), AddCase::Incompatible));
+    }
+
+    #[test]
+    fn hash_plus_hash_is_incompatible() {
+        let h = Ty::Hash {
+            key: std::sync::Arc::new(Ty::Sym),
+            value: std::sync::Arc::new(Ty::Int),
+        };
+        let l = var_with("a", h.clone());
+        let r = var_with("b", h);
+        // Ruby raises NoMethodError (Hash doesn't define `+`). Refuse.
+        assert!(matches!(classify_add(&l, &r), AddCase::Incompatible));
+    }
+
+    #[test]
+    fn unknown_lhs_is_unknown() {
+        let l = untyped_var("a");
+        let r = int_lit(2);
+        assert!(matches!(classify_add(&l, &r), AddCase::Unknown));
+    }
+
+    #[test]
+    fn unknown_rhs_is_unknown() {
+        let l = int_lit(1);
+        let r = untyped_var("b");
+        assert!(matches!(classify_add(&l, &r), AddCase::Unknown));
+    }
+
+    #[test]
+    fn untyped_operand_is_unknown_not_incompatible() {
+        // `untyped + 1` is the gradual escape — must fall through to
+        // native infix, not refuse with a runtime raise.
+        let l = var_with("a", Ty::Untyped);
+        let r = int_lit(2);
+        assert!(matches!(classify_add(&l, &r), AddCase::Unknown));
+        // A union with a gradual arm collapses the same way.
+        let u = var_with(
+            "a",
+            Ty::Union {
+                variants: vec![Ty::Float, Ty::Untyped].into(),
+            },
+        );
+        let s = var_with("b", Ty::Str);
+        assert!(matches!(classify_add(&u, &s), AddCase::Unknown));
+    }
+
+    #[test]
+    fn ty_var_counts_as_unknown() {
+        let l = var_with(
+            "a",
+            Ty::Var {
+                var: crate::ident::TyVar(0),
+            },
+        );
+        let r = int_lit(2);
+        assert!(matches!(classify_add(&l, &r), AddCase::Unknown));
+    }
+}

@@ -1,0 +1,5 @@
+NoMethodError: private method 'hid?' called for an instance of Bar
+NoMethodError: protected method 'prot' called for an instance of Bar
+[true]
+[true]
+[7]

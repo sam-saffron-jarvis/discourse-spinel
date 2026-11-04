@@ -1,0 +1,75 @@
+--- Dir
+mkdir existing: Errno::EEXIST: File exists @ dir_s_mkdir - /tmp/sp_syscall_errno
+mkdir under a missing parent: Errno::ENOENT: No such file or directory @ dir_s_mkdir - /tmp/sp_syscall_errno/missing/child
+mkdir => 0
+rmdir => 0
+rmdir missing: Errno::ENOENT: No such file or directory @ dir_s_rmdir - /tmp/sp_syscall_errno/missing
+rmdir non-empty: Errno::ENOTEMPTY: Directory not empty @ dir_s_rmdir - /tmp/sp_syscall_errno/sub
+rmdir a file: Errno::ENOTDIR: Not a directory @ dir_s_rmdir - /tmp/sp_syscall_errno/file.txt
+delete missing: Errno::ENOENT: No such file or directory @ dir_s_rmdir - /tmp/sp_syscall_errno/missing
+unlink missing: Errno::ENOENT: No such file or directory @ dir_s_rmdir - /tmp/sp_syscall_errno/missing
+chdir missing: Errno::ENOENT: No such file or directory @ chdir_path - /tmp/sp_syscall_errno/missing
+chdir a file: Errno::ENOTDIR: Not a directory @ chdir_path - /tmp/sp_syscall_errno/file.txt
+--- File
+delete missing: Errno::ENOENT: No such file or directory @ apply2files - /tmp/sp_syscall_errno/missing
+unlink missing: Errno::ENOENT: No such file or directory @ apply2files - /tmp/sp_syscall_errno/missing
+delete => 1
+delete two, second missing: Errno::ENOENT: No such file or directory @ apply2files - /tmp/sp_syscall_errno/missing
+deleted the first before raising => false
+second path evaluated
+delete two, first missing: Errno::ENOENT: No such file or directory @ apply2files - /tmp/sp_syscall_errno/missing
+delete two, nil second: TypeError: no implicit conversion of nil into String
+the first survives a nil later in the list => true
+rename missing: Errno::ENOENT: No such file or directory @ rb_file_s_rename - (/tmp/sp_syscall_errno/missing, /tmp/sp_syscall_errno/file.txt)
+rename into a missing directory: Errno::ENOENT: No such file or directory @ rb_file_s_rename - (/tmp/sp_syscall_errno/file.txt, /tmp/sp_syscall_errno/missing/x)
+rename => 0
+rename back => 0
+truncate negative: Errno::EINVAL: Invalid argument @ rb_file_s_truncate - /tmp/sp_syscall_errno/file.txt
+truncate missing: Errno::ENOENT: No such file or directory @ rb_file_s_truncate - /tmp/sp_syscall_errno/missing
+truncate => 0
+size missing: Errno::ENOENT: No such file or directory @ rb_file_s_size - /tmp/sp_syscall_errno/missing
+atime missing: Errno::ENOENT: No such file or directory @ rb_file_s_atime - /tmp/sp_syscall_errno/missing
+mtime missing: Errno::ENOENT: No such file or directory @ rb_file_s_mtime - /tmp/sp_syscall_errno/missing
+ctime missing: Errno::ENOENT: No such file or directory @ rb_file_s_ctime - /tmp/sp_syscall_errno/missing
+birthtime missing: Errno::ENOENT: No such file or directory @ rb_file_s_birthtime - /tmp/sp_syscall_errno/missing
+--- errnos with a class of their own
+mkdir name too long: Errno::ENAMETOOLONG: File name too long @ dir_s_mkdir - /tmp/sp_syscall_errno/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+chdir symlink loop: Errno::ELOOP: Too many levels of symbolic links @ chdir_path - /tmp/sp_syscall_errno/loop
+delete through a symlink loop: Errno::ELOOP: Too many levels of symbolic links @ apply2files - /tmp/sp_syscall_errno/loop/x
+--- a nil path
+mkdir nil: TypeError: no implicit conversion of nil into String
+rmdir nil: TypeError: no implicit conversion of nil into String
+chdir nil: TypeError: no implicit conversion of nil into String
+delete nil: TypeError: no implicit conversion of nil into String
+rename nil: TypeError: no implicit conversion of nil into String
+truncate nil: TypeError: no implicit conversion of nil into String
+--- a failing call inside Dir.chdir's block
+inside the block: Errno::ENOENT
+cwd restored: true
+chdir block into a missing directory: Errno::ENOENT: No such file or directory @ dir_chdir0 - /tmp/sp_syscall_errno/missing
+nested chdir blocks answer sub and restore: true
+--- rescue shapes
+Errno::ENOENT caught: No such file or directory @ dir_s_rmdir - /tmp/sp_syscall_errno/missing
+[true, true, Errno::ENOENT]
+:already_there
+--- Pathname
+rmdir: Errno::ENOENT: No such file or directory @ dir_s_rmdir - /tmp/sp_syscall_errno/missing
+delete: Errno::ENOENT: No such file or directory @ dir_s_rmdir - /tmp/sp_syscall_errno/missing
+unlink: Errno::ENOENT: No such file or directory @ dir_s_rmdir - /tmp/sp_syscall_errno/missing
+rename: Errno::ENOENT: No such file or directory @ rb_file_s_rename - (/tmp/sp_syscall_errno/missing, /tmp/sp_syscall_errno/elsewhere)
+size: Errno::ENOENT: No such file or directory @ rb_file_s_size - /tmp/sp_syscall_errno/missing
+mkdir existing: Errno::EEXIST: File exists @ dir_s_mkdir - /tmp/sp_syscall_errno/sub
+mkdir => 0
+rmdir made => 0
+--- Pathname#rmtree and #mkpath
+rmtree missing => #<Pathname:/tmp/sp_syscall_errno/missing>
+rmtree answers its receiver => true
+rmtree_entry is not public => false
+rmtree deep missing => #<Pathname:/tmp/sp_syscall_errno/missing/deeper>
+rmtree a tree => [Pathname, false]
+mkpath => [Pathname, true]
+mkpath again => Pathname
+mkpath through a file: Errno::EEXIST: File exists @ dir_s_mkdir - /tmp/sp_syscall_errno/file.txt
+rmtree cleans up => [Pathname, false]
+rmtree a tree 120 deep => [Pathname, false]
+false

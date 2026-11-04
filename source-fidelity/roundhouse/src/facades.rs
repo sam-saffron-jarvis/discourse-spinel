@@ -1,0 +1,161 @@
+//! Vendored-extras façades — the table, shared by ingest and emit.
+//!
+//! This lives outside `emit/` because the façade is not only an emit-time
+//! substitution: its hand-written `.rbs` is the typing contract ANALYSIS
+//! must see. Leaving the table in the emitter meant the contract could
+//! only ever be applied after inference had already run, which is how
+//! `OpenSSL::Random.random_bytes` stayed untyped and cost lobsters two C
+//! errors ten inference links downstream.
+
+/// App-defined classes whose bodies drive un-modeled native/stdlib
+/// surface or a spinel-refused control-flow shape. Spinel AOT prices
+/// every method body in the reachable require graph, and these bodies
+/// cannot compile — so the scaffold base swaps their emitted files for
+/// hand-written raising façades at the SAME emit path, leaving the
+/// require graph untouched. The CRuby tree, where the real gems/stdlib
+/// exist and the source runs as written, restores the verbatim emit via
+/// `restore_extras_facades`. Same raise-loudly contract as
+/// runtime/ruby/gem_facades.rb.
+///
+/// - Markdowner walks a Markly DOM with a recursive block-driving helper
+///   (`walk_text_nodes` forwards `&block` through `Markly::Node#each`);
+///   that identity-forwarding block-through-a-yielding-method recursion
+///   is a deliberate spinel always-inline boundary (matz/spinel#2948).
+///   All consumers are write-path (`markeddown_*` precomputed on save),
+///   so the read benchmark never renders markdown. Real fix = a
+///   Commonmarker façade over the gem's iterative `Node#walk`.
+/// - FlaggedCommenters computes flag statistics with MySQL-only SQL
+///   (stddev(), if()) under `Rails.cache.fetch` blocks whose bodies
+///   also carry un-modeled calls (`exec_query().first.symbolize_keys!`,
+///   select-alias readers); the lobsters-bench capture disables the
+///   feature rather than port that SQL to SQLite. Constructor and
+///   readers stay real; the statistics methods raise. Current lobsters
+///   registers both functions for SQLite, and then the real class
+///   serves (`lifted_by_sql_functions`).
+pub struct Facade {
+    /// Emit path stem, no extension (`app/models/sponge`).
+    pub stem: &'static str,
+    /// The class the façade defines, as written. Explicit rather than
+    /// camelized from `stem`: a rule table beats a derivation, and the
+    /// inflector has no business in a four-row list.
+    pub class_name: &'static str,
+    pub rb: &'static str,
+    pub rbs: &'static str,
+    /// SQL functions whose absence is the reason for this façade. When
+    /// the app registers every one of them in an initializer (and so the
+    /// spinel tree installs them — `project::spinel_sql_functions_file`),
+    /// the real body compiles and serves, and the façade stands aside.
+    /// Empty for a façade that stands in for something else.
+    pub lifted_by_sql_functions: &'static [&'static str],
+    /// Constants whose spin packages stand in for this façade's reason.
+    /// When the app's own class names every one of them, the spinel tree
+    /// carries those packages (project::spin_shape) and the real body
+    /// compiles and serves, so the façade stands aside. Empty for a façade
+    /// that stands in for something else.
+    pub lifted_by_constants: &'static [&'static str],
+}
+
+impl Facade {
+    /// Whether this façade replaces the app's class for `app`.
+    pub fn applies(&self, app: &crate::App) -> bool {
+        let lifted_by_sql = !self.lifted_by_sql_functions.is_empty()
+            && self
+                .lifted_by_sql_functions
+                .iter()
+                .all(|name| app.sql_functions.iter().any(|f| f.name == *name));
+        let lifted_by_packages = !self.lifted_by_constants.is_empty()
+            && self
+                .lifted_by_constants
+                .iter()
+                .all(|name| class_names_constant(app, self.class_name, name));
+        !lifted_by_sql && !lifted_by_packages
+    }
+}
+
+/// Whether the app's class `class_name` reads the top-level constant
+/// `name` anywhere in its methods or constant values.
+fn class_names_constant(app: &crate::App, class_name: &str, name: &str) -> bool {
+    fn walk(e: &crate::expr::Expr, name: &str) -> bool {
+        if let crate::expr::ExprNode::Const { path } = &*e.node {
+            if path.first().is_some_and(|p| p.as_str() == name) {
+                return true;
+            }
+        }
+        let mut found = false;
+        e.node.for_each_child(&mut |c| {
+            if !found && walk(c, name) {
+                found = true;
+            }
+        });
+        found
+    }
+    app.library_classes.iter().filter(|lc| lc.name.0.as_str() == class_name).any(|lc| {
+        lc.methods.iter().any(|m| walk(&m.body, name)) || lc.constants.iter().any(|(_, v)| walk(v, name))
+    })
+}
+
+pub const EXTRAS_FACADES: &[Facade] = &[
+    Facade {
+        stem: "app/models/markdowner",
+        class_name: "Markdowner",
+        rb: include_str!("../runtime/spinel/facades/markdowner.rb"),
+        rbs: include_str!("../runtime/spinel/facades/markdowner.rbs"),
+        lifted_by_sql_functions: &[],
+        // Current lobsters' Markdowner renders through commonmarker and
+        // post-processes through Nokogiri; with both spin packages the
+        // body compiles as written (the 2023 snapshot's uses Markly, and
+        // keeps the façade).
+        lifted_by_constants: &["Commonmarker", "Nokogiri"],
+    },
+    Facade {
+        stem: "app/models/flagged_commenters",
+        class_name: "FlaggedCommenters",
+        rb: include_str!("../runtime/spinel/facades/flagged_commenters.rb"),
+        rbs: include_str!("../runtime/spinel/facades/flagged_commenters.rbs"),
+        lifted_by_sql_functions: &["stddev", "if"],
+        lifted_by_constants: &[],
+    },
+    Facade {
+        stem: "app/models/html_encoder",
+        class_name: "HtmlEncoder",
+        rb: include_str!("../runtime/spinel/facades/html_encoder.rb"),
+        rbs: include_str!("../runtime/spinel/facades/html_encoder.rbs"),
+        lifted_by_sql_functions: &[],
+        lifted_by_constants: &[],
+    },
+];
+
+/// The façade contracts, parsed into analysis signatures, for those
+/// façades whose class this app actually defines. Gated the same way
+/// `apply_extras_facades` is a no-op on an absent path — an app with no
+/// `Markdowner` must not acquire one's signatures.
+///
+/// Merged into `app.rbs_signatures`, which the analyzer already overlays
+/// onto its hardcoded catalog (see `analyzer_rbs_signatures_overlay_the_hardcoded_catalog`).
+pub fn signatures_for(
+    app: &crate::App,
+) -> crate::det::HashMap<crate::ClassId, crate::det::HashMap<crate::Symbol, crate::Ty>>
+{
+    let mut out: crate::det::HashMap<
+        crate::ClassId,
+        crate::det::HashMap<crate::Symbol, crate::Ty>,
+    > = crate::det::HashMap::default();
+    for f in EXTRAS_FACADES {
+        let defined = app
+            .library_classes
+            .iter()
+            .any(|lc| lc.name.0.as_str() == f.class_name);
+        if !defined || !f.applies(app) {
+            continue;
+        }
+        // A malformed façade contract is a build-time authoring error in
+        // THIS repo, not app input; skipping keeps ingest total, and the
+        // emitted `.rbs` still carries the text for spinel to read.
+        if let Ok(sigs) = crate::rbs::parse_app_signatures(f.rbs) {
+            for (class_id, methods) in sigs {
+                out.entry(class_id).or_default().extend(methods);
+            }
+        }
+    }
+    out
+}

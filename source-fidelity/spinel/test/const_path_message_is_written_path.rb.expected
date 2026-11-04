@@ -1,0 +1,4 @@
+uninitialized constant A
+uninitialized constant Foo
+uninitialized constant AlsoMissing
+after

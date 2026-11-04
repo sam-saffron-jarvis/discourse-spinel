@@ -1,0 +1,17 @@
+["https", "example.com", 8443, "/a/b", "q=1", "frag"]
+"/a/b?q=1"
+"https://example.com:8443/a/b?q=1#frag"
+80
+"/"
+"user:pw"
+"a+b%26c%3Dd"
+"a b&c=d"
+"a=1&b=x+y"
+"https://example.com/a/c"
+"https://example.com/z"
+true
+"https://fxtwitter.com/user/status/1?x=1"
+"http://fxtwitter.com:8443/other#f"
+["example.org", "example.org"]
+"http://example.org/other#f"
+"http://me:pw@example.org/other#f"

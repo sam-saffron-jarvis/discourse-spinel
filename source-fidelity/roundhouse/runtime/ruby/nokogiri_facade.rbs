@@ -1,0 +1,43 @@
+# Typing contract for the Nokogiri raising façade (nokogiri_facade.rb).
+module Nokogiri
+  def self.HTML: (String _html) -> Nokogiri::Document
+
+  class Attr
+    def text: () -> String
+    def to_s: () -> String
+  end
+
+  class Element
+    def name=: (String _value) -> String
+    def []: (untyped _key) -> String?
+    def []=: (untyped _key, String _value) -> String
+    def text: () -> String
+    def inner_html: () -> String
+    def attributes: () -> Hash[String, Attr]
+    def content=: (untyped _value) -> untyped
+    def replace: (Element | HTML5::DocumentFragment _node) -> void
+    def to_html: () -> String
+  end
+
+  class NodeSet
+    def each: () { (Element) -> void } -> void
+  end
+
+  class Document
+    def css: (String _selector) -> NodeSet
+    def meta_encoding: () -> String?
+    def at_css: (String _selector) -> Element?
+    def create_element: (String _name) -> Element
+  end
+
+  module HTML5
+    def self.fragment: (String _html) -> HTML5::DocumentFragment
+
+    class DocumentFragment
+      def xpath: (String _path) -> NodeSet
+      def css: (String _selector) -> NodeSet
+      def at_css: (String _selector) -> Element?
+      def to_html: (?preserve_newline: bool) -> String
+    end
+  end
+end

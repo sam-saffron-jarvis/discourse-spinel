@@ -1,0 +1,10 @@
+Yielder(9,18)
+Forwarder(3,4)
+NoArgs(5)
+1
+Plain(1)
+Yielder(1,none)
+SubYielder(1,none)
+3
+Forwarder(4,bare)
+NoArgs(42)

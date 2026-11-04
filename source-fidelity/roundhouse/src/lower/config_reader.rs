@@ -1,0 +1,551 @@
+//! `Rails.application.config.<key>` → `Rails.application.<key>`.
+//!
+//! Rails' config object takes arbitrary keys, so an app-defined one has
+//! no structure to model: `config.app_version = …` in an initializer IS
+//! the definition, and ingest lifts each assignment to a reader on the
+//! `Rails::Application` reopen (see `extract_config_assignments`). This
+//! is the other half — the reads, rewritten to call that reader.
+//!
+//! Dropping the `config` hop rather than synthesizing a config object
+//! keeps one shape for every application-level value the app asks for:
+//! a lifted config key now reads exactly like `Rails.application.domain`
+//! (lobsters' `class << Rails.application` idiom), which the runtime and
+//! every emitter already handle.
+//!
+//! Only rewrites keys the lift actually produced. A read of a framework
+//! key — `Rails.application.config.eager_load` — is left alone to fail
+//! visibly rather than silently answering nil from a reader nobody
+//! defined.
+//!
+//! ## Writes, and the `tap` a test writes through
+//!
+//! Ingest lifts a WRITER beside every reader (`<key>=`), because a
+//! test can assign a config key the way the initializer did: campfire's
+//! `test/test_helper.rb` replaces the web-push pool before every test,
+//!
+//! ```ruby
+//! Rails.configuration.tap do |config|
+//!   config.x.web_push_pool.shutdown
+//!   config.x.web_push_pool = WebPush::Pool.new(…)
+//! end
+//! ```
+//!
+//! and both halves of that are handled here: the `tap` is unwrapped
+//! (its parameter IS the receiver, so every use of `config` becomes
+//! `Rails.configuration` and the block body runs in place), and an
+//! assignment whose target chain peels to a lifted key becomes a call
+//! on the writer. TEST BODIES ARE WALKED for the same reason — the
+//! reads above were only ever app-side until a test asked the
+//! configuration for the pool it was waiting on.
+//!
+//! ## Framework config the emit fixes by construction
+//!
+//! One framework read is different, and gets grounded to its VALUE
+//! rather than left to fail: `ActionCable.server.config.mount_path`. The
+//! "fail visibly" rule above is for keys whose value we do not know — but
+//! this one we do, because we choose it: every lane mounts the cable
+//! endpoint at `/cable` (`runtime/spinel/scaffold/main.rb`,
+//! `runtime/rust/server.rs`), and it is not configurable. Campfire's
+//! cable helper joins it with `request.script_name` to build the socket
+//! URL, so it is read on every page that renders the layout.
+//!
+//! Grounding it to the literal beats shipping an `ActionCable.server.
+//! config` object chain: three objects deep, existing only to answer one
+//! constant, and the kind of dynamic surface a strict target cannot
+//! resolve.
+
+use crate::app::App;
+use crate::expr::{Expr, ExprNode, Literal};
+
+/// Where every lane serves the Action Cable WebSocket.
+const CABLE_MOUNT_PATH: &str = "/cable";
+
+pub fn apply_config_reader_lowering(app: &mut App) {
+    // Reader name -> the type of the value it answers, from the lifted
+    // method's own body. Stamped onto each rewritten read for the same
+    // reason the synthesized `application` hop below is stamped: this
+    // node is BORN after the analyzer has run, so nothing else will ever
+    // type it, and a later pass that grounds by receiver type would see
+    // nothing where the source plainly names a Hash.
+    // `Analyzer::type_rails_application_body` is what puts a type on
+    // those bodies at all.
+    //
+    // A memoized leaf reader's own body ends in a slot read, which the
+    // analyzer cannot type; the expression it memoizes lives in the
+    // `<key>__build` sibling ingest lifted beside it, so that is where
+    // the leaf's type is read from.
+    let lifted: Vec<(crate::ident::Symbol, Option<crate::ty::Ty>)> = match &app.rails_application {
+        Some(lc) => lc
+            .methods
+            .iter()
+            .filter(|m| !m.name.as_str().ends_with("__build") && !m.name.as_str().ends_with('='))
+            .map(|m| {
+                let build = format!("{}__build", m.name.as_str());
+                let ty = lc
+                    .methods
+                    .iter()
+                    .find(|b| b.name.as_str() == build)
+                    .map_or_else(|| body_ty(&m.body), |b| body_ty(&b.body));
+                (m.name.clone(), ty)
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    // Cable, credentials, and lifted config reads used to be three
+    // hook+view walks. They match disjoint chains, so one walk is
+    // equivalent: config peels outermost-first (longest chain wins),
+    // then cable/credentials apply post-order on the way back. Tests
+    // see the config rewrite and the cable mount path.
+    let key_mutators = super::symbolize_keys::key_mutators(app);
+    super::for_each_hook_body(app, &mut |e| {
+        super::symbolize_keys::invalidate_key_evidence(e, &key_mutators);
+        rewrite_fused(e, &lifted, true);
+    });
+    super::for_each_test_body(app, &mut |e| {
+        super::symbolize_keys::invalidate_key_evidence(e, &key_mutators);
+        rewrite(e, &lifted);
+        rewrite_cable_tree(e);
+    });
+    for view in &mut app.views {
+        super::symbolize_keys::invalidate_key_evidence(&mut view.body, &key_mutators);
+        rewrite_fused(&mut view.body, &lifted, true);
+    }
+}
+
+/// Combined cable + credentials + config rewrite. `config` is
+/// outermost-first; cable/credentials are post-order. An empty lifted
+/// list still rewrites framework defaults that are known without app readers.
+fn rewrite_fused(
+    expr: &mut Expr,
+    lifted: &[(crate::ident::Symbol, Option<crate::ty::Ty>)],
+    cable_and_credentials: bool,
+) {
+    unwrap_config_tap(expr);
+    if rewrite_write_here(expr, lifted) {
+        super::symbolize_keys::rewrite_node(expr);
+        // rewrite_write_here only config-rewrites the value. Cable,
+        // credentials, and nested symbolize_keys used to reach it
+        // on their own walks; apply them to the new arguments.
+        if let ExprNode::Send { args, .. } = &mut *expr.node {
+            for arg in args {
+                rewrite_fused(arg, lifted, cable_and_credentials);
+            }
+        }
+        return;
+    }
+    if rewrite_here(expr, lifted) {
+        super::symbolize_keys::rewrite_node(expr);
+        return;
+    }
+    expr.node.for_each_child_mut(&mut |c| rewrite_fused(c, lifted, cable_and_credentials));
+    if cable_and_credentials {
+        rewrite_cable_node(expr);
+        rewrite_credentials_node(expr);
+    }
+    // After `config_reader`: a lifted group reader is the receiver
+    // `symbolize_keys` keys on, and that receiver does not exist until
+    // this walk peels the `config` chain. Post-order on the parent
+    // (`hash.symbolize_keys`) sees the rewritten, typed child. Tests
+    // never ran `symbolize_keys`, so they stay on `rewrite` above.
+    super::symbolize_keys::rewrite_node(expr);
+}
+
+/// The type a reader answers: its body's, or its last statement's when
+/// the body is a sequence.
+fn body_ty(body: &Expr) -> Option<crate::ty::Ty> {
+    let last = match &*body.node {
+        ExprNode::Seq { exprs } => exprs.last()?,
+        _ => body,
+    };
+    last.ty.clone().filter(|t| !matches!(t, crate::ty::Ty::Var { .. } | crate::ty::Ty::Untyped))
+}
+
+/// `Rails.application.credentials.pushover` → `Rails.application
+/// .credentials[:pushover]`.
+///
+/// Rails' credentials object is an `ActiveSupport::EncryptedConfiguration`
+/// that answers any key as a method — nil when the key is absent — and
+/// apps read it that way (lobsters' `Pushover.enabled?` is
+/// `credentials.pushover&.api_token.present?`, on every settings page).
+/// The runtime's store is a Hash, deliberately EMPTY (the master key is
+/// not in the repo — see `Rails::Application#credentials`), so the
+/// method spelling was a NoMethodError where Rails answers nil. The
+/// index is the same question, asked of the store we have. A `!` key
+/// (`credentials.x!`, "raise when absent") and the Hash's own methods
+/// are left alone.
+fn rewrite_credentials_node(expr: &mut Expr) {
+    let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &*expr.node else {
+        return;
+    };
+    const HASH_METHODS: &[&str] = &[
+        "dig", "fetch", "[]", "key?", "has_key?", "include?", "each", "keys", "values",
+        "to_h", "empty?", "any?", "present?", "blank?", "nil?", "config", "merge",
+    ];
+    let key = method.as_str();
+    if !args.is_empty()
+        || HASH_METHODS.contains(&key)
+        || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        || !is_credentials_root(r)
+    {
+        return;
+    }
+    let span = expr.span;
+    let mut index = Expr::new(
+        span,
+        ExprNode::Send {
+            recv: Some(r.clone()),
+            method: crate::ident::Symbol::from("[]"),
+            args: vec![Expr::new(
+                span,
+                ExprNode::Lit { value: Literal::Sym { value: crate::ident::Symbol::from(key) } },
+            )],
+            block: None,
+            parenthesized: true,
+        },
+    );
+    index.ty = Some(crate::ty::Ty::Untyped);
+    *expr = index;
+}
+
+/// `Rails.application.credentials`, exactly.
+fn is_credentials_root(e: &Expr) -> bool {
+    let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &*e.node else {
+        return false;
+    };
+    if method.as_str() != "credentials" || !args.is_empty() {
+        return false;
+    }
+    let ExprNode::Send { recv: Some(rr), method: m2, args: a2, block: None, .. } = &*r.node else {
+        return false;
+    };
+    m2.as_str() == "application"
+        && a2.is_empty()
+        && matches!(&*rr.node, ExprNode::Const { path } if path.len() == 1 && path[0].as_str() == "Rails")
+}
+
+/// `rewrite_cable_node` over a whole test body: a connection test asks
+/// for the mount path to build its socket's request
+/// (`TestSocket.build_request(ActionCable.server.config.mount_path || "/cable", …)`).
+fn rewrite_cable_tree(expr: &mut Expr) {
+    expr.node.for_each_child_mut(&mut |c| rewrite_cable_tree(c));
+    rewrite_cable_node(expr);
+}
+
+/// `ActionCable.server.config.mount_path` → `"/cable"`.
+fn rewrite_cable_node(expr: &mut Expr) {
+    if !is_cable_mount_path(expr) {
+        return;
+    }
+    let span = expr.span;
+    let mut lit = Expr::new(
+        span,
+        ExprNode::Lit { value: Literal::Str { value: CABLE_MOUNT_PATH.to_string() } },
+    );
+    lit.ty = Some(crate::ty::Ty::Str);
+    *expr = lit;
+}
+
+/// The exact `ActionCable.server.config.mount_path` chain — walked hop
+/// by hop so no shorter or differently-rooted chain matches.
+fn is_cable_mount_path(expr: &Expr) -> bool {
+    let mut cur = &*expr.node;
+    for step in ["mount_path", "config", "server"] {
+        let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = cur else {
+            return false;
+        };
+        if method.as_str() != step || !args.is_empty() {
+            return false;
+        }
+        cur = &r.node;
+    }
+    matches!(cur, ExprNode::Const { path }
+        if path.last().is_some_and(|s| s.as_str() == "ActionCable"))
+}
+
+/// THE LONGEST CHAIN WINS, so this walks OUTERMOST-FIRST.
+///
+/// `config.x.vapid.public_key` contains `config.x.vapid`, and since the
+/// group lift both names are now lifted readers. Rewriting children
+/// first replaced the INNER one and left `Rails.application.x_vapid
+/// .public_key` — `undefined method 'public_key' for an instance of
+/// Hash`, on every page whose layout reads the VAPID key. Peeling the
+/// whole node before descending takes the longest key the chain spells,
+/// which is the one the reader was lifted from.
+///
+/// A node that does not peel still recurses, so a chain nested inside
+/// an argument or a block is reached exactly as before; a node that
+/// DOES peel has nothing left to walk but its `Rails` anchor.
+fn rewrite(expr: &mut Expr, lifted: &[(crate::ident::Symbol, Option<crate::ty::Ty>)]) {
+    unwrap_config_tap(expr);
+    if rewrite_write_here(expr, lifted) {
+        return;
+    }
+    if !rewrite_here(expr, lifted) {
+        expr.node.for_each_child_mut(&mut |c| rewrite(c, lifted));
+    }
+}
+
+/// `Rails.configuration.tap do |config| … end` → the block body in
+/// place, every `config` read as `Rails.configuration`. `tap` yields
+/// its receiver and answers it, so the block's parameter is a second
+/// name for the receiver and nothing else; substituting the receiver
+/// for the name is the whole meaning. The body's statements then peel
+/// like any other config chain.
+fn unwrap_config_tap(expr: &mut Expr) {
+    let ExprNode::Send { recv: Some(r), method, args, block: Some(b), .. } = &*expr.node else {
+        return;
+    };
+    if method.as_str() != "tap" || !args.is_empty() || !is_config_root(r) {
+        return;
+    }
+    let ExprNode::Lambda { extra_params, params, body, rest_param: None, block_param: None, .. } = &*b.node else {
+        return;
+    };
+    if !extra_params.is_empty() {
+        return;
+    }
+    let [param] = params.as_slice() else { return };
+    let receiver = r.clone();
+    let mut body = body.clone();
+    substitute_var(&mut body, param, &receiver);
+    let span = expr.span;
+    let exprs = match *body.node {
+        ExprNode::Seq { exprs } => exprs,
+        _ => vec![body],
+    };
+    // The statements alone. `tap` answers its receiver, but there is
+    // no config OBJECT in the emit to answer with — every key is a
+    // reader on `Rails.application` — and a bare `Rails.configuration`
+    // left in the sequence is a NameError. A config `tap` is written
+    // for its statements; its value is the one thing not modeled.
+    *expr = Expr::new(span, ExprNode::Seq { exprs });
+}
+
+/// `Rails.configuration` / `Rails.application.config` — the two
+/// spellings of the object a config chain hangs off.
+fn is_config_root(expr: &Expr) -> bool {
+    let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &*expr.node else {
+        return false;
+    };
+    if !args.is_empty() {
+        return false;
+    }
+    match method.as_str() {
+        "configuration" => is_rails_const(r),
+        "config" => matches!(&*r.node, ExprNode::Send { recv: Some(rr), method, args, block: None, .. }
+            if method.as_str() == "application" && args.is_empty() && is_rails_const(rr)),
+        _ => false,
+    }
+}
+
+fn is_rails_const(expr: &Expr) -> bool {
+    matches!(&*expr.node, ExprNode::Const { path } if path.len() == 1 && path[0].as_str() == "Rails")
+}
+
+/// Replace every read of local `name` in `expr` with `with`.
+fn substitute_var(expr: &mut Expr, name: &crate::ident::Symbol, with: &Expr) {
+    if let ExprNode::Var { name: n, .. } = &*expr.node {
+        if n == name {
+            let span = expr.span;
+            let mut replacement = with.clone();
+            replacement.span = span;
+            *expr = replacement;
+            return;
+        }
+    }
+    expr.node.for_each_child_mut(&mut |c| substitute_var(c, name, with));
+}
+
+/// `Rails.configuration.x.web_push_pool = value` →
+/// `Rails.application.x_web_push_pool=(value)`, when the target chain
+/// peels to a lifted key. Descends into the value first: it is app code
+/// and may itself read the key being replaced (campfire's does —
+/// `WebPush::Pool.new(invalid_subscription_handler: config.x
+/// .web_push_pool.invalid_subscription_handler)`).
+fn rewrite_write_here(
+    expr: &mut Expr,
+    lifted: &[(crate::ident::Symbol, Option<crate::ty::Ty>)],
+) -> bool {
+    // Ingest spells `a.b = v` as a Send of `b=`; the `Attr` LValue is
+    // the op-assign forms' spelling. Both are the same write.
+    let (recv, name, value) = match &*expr.node {
+        ExprNode::Send { recv: Some(r), method, args, block: None, .. }
+            if args.len() == 1 && method.as_str().ends_with('=') && !method.as_str().ends_with("==") =>
+        {
+            (r, method.as_str().trim_end_matches('=').to_string(), &args[0])
+        }
+        ExprNode::Assign { target: crate::expr::LValue::Attr { recv, name }, value } => {
+            (recv, name.as_str().to_string(), value)
+        }
+        _ => return false,
+    };
+    let Some((application, mut segments)) = peel_config_chain(recv) else {
+        return false;
+    };
+    segments.push(name);
+    let key = crate::ident::Symbol::from(segments.join("_"));
+    if !lifted.iter().any(|(n, _)| n == &key) {
+        return false;
+    }
+    let mut value = value.clone();
+    rewrite(&mut value, lifted);
+    let span = expr.span;
+    let ty = value.ty.clone();
+    *expr = Expr::new(
+        span,
+        ExprNode::Send {
+            recv: Some(application),
+            method: crate::ident::Symbol::from(format!("{}=", key.as_str())),
+            args: vec![value],
+            block: None,
+            parenthesized: true,
+        },
+    );
+    expr.ty = ty;
+    true
+}
+
+/// Rewrite this node if it is a lifted config read; `false` when it is
+/// not, and the caller then descends.
+/// `Rails.application.config.<key>` for framework keys whose default
+/// Rails defines as a constant, read when no `config.<key> = …` was
+/// lifted. `content_security_policy_nonce_generator` is nil unless an app
+/// configures one; campfire's `CachedResponses` reuses a page only then.
+const UNASSIGNED_FRAMEWORK_DEFAULTS: &[(&str, fn() -> Literal)] = &[
+    ("content_security_policy_nonce_generator", || Literal::Nil),
+];
+
+fn rewrite_here(
+    expr: &mut Expr,
+    lifted: &[(crate::ident::Symbol, Option<crate::ty::Ty>)],
+) -> bool {
+    let Some((application, segments)) = peel_config_chain(expr) else {
+        return false;
+    };
+    let key = crate::ident::Symbol::from(segments.join("_"));
+    let Some((_, reader_ty)) = lifted.iter().find(|(name, _)| name == &key) else {
+        // A framework key the app never assigns reads Rails' own default,
+        // when that default is a constant (`UNASSIGNED_FRAMEWORK_DEFAULTS`).
+        // Anything else stays the unmodelled chain it was.
+        if let [only] = segments.as_slice()
+            && let Some((_, value)) = UNASSIGNED_FRAMEWORK_DEFAULTS.iter().find(|(k, _)| k == only)
+        {
+            let span = expr.span;
+            *expr = Expr::new(span, ExprNode::Lit { value: value() });
+            expr.ty = Some(crate::ty::Ty::Nil);
+            return true;
+        }
+        return false;
+    };
+    let span = expr.span;
+    // THE READER'S OWN BODY WINS. What the analyzer stamped on the
+    // `config` chain is what it could say about a chain of unmodeled
+    // hops — `Untyped` — while the reader's body is the value this now
+    // calls. Keeping the chain's answer would leave the rewritten node
+    // saying `untyped` about a method that plainly returns a Hash.
+    let ty = reader_ty.clone().or_else(|| expr.ty.clone());
+    *expr = Expr::new(
+        span,
+        ExprNode::Send {
+            recv: Some(application),
+            method: key,
+            args: vec![],
+            block: None,
+            parenthesized: false,
+        },
+    );
+    expr.ty = ty;
+    true
+}
+
+/// Peel a config READ back to its anchor, returning the
+/// `Rails.application` expression and the key segments below `config`.
+///
+/// `Rails.application.config.app_version` → `(Rails.application,
+/// ["app_version"])`; `Rails.configuration.x.vapid.public_key` →
+/// `(Rails.application, ["x", "vapid", "public_key"])`. The caller joins
+/// the segments with `_`, which is exactly how `config_receiver_path`
+/// names the reader it lifted — the two halves meet at one name.
+///
+/// `Rails.configuration` is Rails' own alias for
+/// `Rails.application.config`, so it anchors the same chain and the
+/// `application` hop is synthesized to match.
+fn peel_config_chain(expr: &Expr) -> Option<(Expr, Vec<String>)> {
+    let mut segments: Vec<String> = Vec::new();
+    let mut cur = expr;
+    // Bounded so a pathological chain cannot spin; Rails' `x` namespace
+    // is arbitrarily deep in principle but two levels in practice.
+    for _ in 0..8 {
+        let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &*cur.node else {
+            return None;
+        };
+        if !args.is_empty() {
+            return None;
+        }
+        match method.as_str() {
+            "config" => {
+                segments.reverse();
+                return Some((r.clone(), segments));
+            }
+            "configuration" => {
+                segments.reverse();
+                let mut app = Expr::new(
+                    r.span,
+                    ExprNode::Send {
+                        recv: Some(r.clone()),
+                        method: crate::ident::Symbol::from("application"),
+                        args: vec![],
+                        block: None,
+                        parenthesized: false,
+                    },
+                );
+                // The hop is synthesized after the analyzer has run, so
+                // nothing else will ever type it. `Rails.application` is
+                // `Untyped` in the stdlib registry — the answer the
+                // analyzer would have given had the source written the
+                // hop out — and an unstamped node here reads on the
+                // ledger as `no known method application on Class(Rails)`
+                // against a class that plainly has one.
+                app.ty = Some(crate::ty::Ty::Untyped);
+                return Some((app, segments));
+            }
+            _ => {
+                segments.push(method.as_str().to_string());
+                cur = r;
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod framework_default_tests {
+    use super::*;
+
+    fn send(recv: Expr, method: &str) -> Expr {
+        Expr::new(
+            crate::span::Span::synthetic(),
+            ExprNode::Send {
+                recv: Some(recv),
+                method: crate::ident::Symbol::from(method),
+                args: vec![],
+                block: None,
+                parenthesized: false,
+            },
+        )
+    }
+
+    #[test]
+    fn known_framework_default_is_rewritten_without_lifted_readers() {
+        let rails = Expr::new(
+            crate::span::Span::synthetic(),
+            ExprNode::Const { path: vec![crate::ident::Symbol::from("Rails")] },
+        );
+        let config = send(send(rails, "application"), "config");
+        let mut read = send(config, "content_security_policy_nonce_generator");
+
+        rewrite_fused(&mut read, &[], false);
+
+        assert!(matches!(&*read.node, ExprNode::Lit { value: Literal::Nil }));
+    }
+}

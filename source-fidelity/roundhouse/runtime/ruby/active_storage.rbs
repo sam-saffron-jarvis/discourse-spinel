@@ -1,0 +1,350 @@
+# Typing contract for active_storage.rb beside this file.
+#
+# Rows are answered here; bytes go through `Service`, whose methods
+# raise in the shared runtime and are reopened per target; variants are
+# identity (see the .rb header).
+module ActiveStorage
+  def self.default_variable_content_types: () -> Array[String]
+  def self.variable_content_types: () -> Array[String]
+  def self.variable_content_type?: (String content_type) -> bool
+  # Executable locations (`:ffmpeg`, `:ffprobe`, …). Values are path strings.
+  self.@paths: Hash[Symbol, String]?
+  def self.paths: () -> Hash[Symbol, String]
+  def self.paths=: (Hash[Symbol, String] value) -> Hash[Symbol, String]
+  def self.video_preview_arguments: () -> String
+  def self.video_preview_vf_filter: () -> String
+  def self.previewers: () -> Array[untyped]
+  def self.content_type_for_format: (String format) -> String
+  def self.format_for_content_type: (String content_type) -> String
+  def self.filename_base: (String filename) -> String
+  def self.content_type_for_filename: (String filename) -> String
+  def self.url_filename: (String filename) -> String
+
+  class Service
+    def path_for: (String key) -> String
+    def upload: (String key, String data) -> void
+    def download: (String key) -> String
+    def delete: (String key) -> void
+    def exist?: (String key) -> bool
+  end
+
+  class BlobMetadata
+    @width: Integer
+    @height: Integer
+    def initialize: (Integer width, Integer height) -> void
+    def []: (Symbol key) -> Integer?
+    def width: () -> Integer
+    def height: () -> Integer
+    def values_at: (*Symbol keys) -> Array[Integer?]
+    def to_json: () -> String
+    def self.int_field: (String json, String name) -> Integer
+    def self.parse: (String json) -> ActiveStorage::BlobMetadata
+  end
+
+  class Filename
+    @filename: String
+    def initialize: (String filename) -> void
+    def to_s: () -> String
+    def extension_with_delimiter: () -> String
+    def extension_without_delimiter: () -> String
+    def extension: () -> String
+    def base: () -> String
+    def sanitized: () -> String
+    def as_json: () -> String
+  end
+
+  class Blob
+    @id: Integer
+    @key: String
+    @filename: String
+    @content_type: String
+    @byte_size: Integer
+    @metadata: ActiveStorage::BlobMetadata
+    def initialize: (Integer id, String key, String filename, String content_type, Integer byte_size, ActiveStorage::BlobMetadata metadata) -> void
+    def id: () -> Integer
+    def key: () -> String
+    def filename: () -> ActiveStorage::Filename
+    def content_type: () -> String
+    def byte_size: () -> Integer
+    def metadata: () -> ActiveStorage::BlobMetadata
+    def self.columns: (String alias_prefix) -> String
+    def self.from_row: (Hash[String, untyped] row) -> ActiveStorage::Blob
+    def self.find: (Integer id) -> ActiveStorage::Blob?
+    def self.find_by_key: (String key) -> ActiveStorage::Blob?
+    def self.find_signed: (String signed_id) -> ActiveStorage::Blob?
+    def signed_id: () -> String
+    def self.service: () -> ActiveStorage::Service
+    def self.generate_key: (String filename, Integer byte_size) -> String
+    # `data` is the file's CONTENTS — the lowering reads the io at the
+    # call site so nothing here has to name a File.
+    def self.create_and_upload!: (String data, String filename, String content_type) -> ActiveStorage::Blob
+    def self.create_before_direct_upload!: (String filename, Integer byte_size, String checksum, String content_type) -> ActiveStorage::Blob
+    def self.count: () -> Integer
+    # Rails' attachable coercion (an uploaded file, a blob, …). Raises
+    # here; the ruby family reopens it with the class tests.
+    def self.from_attachable: (untyped value) -> ActiveStorage::Blob?
+    def download: () -> String
+    def purge: () -> nil
+    def purge_later: () -> nil
+    def variant: (ActiveStorage::Variation variation) -> ActiveStorage::VariantWithRecord
+    def video?: () -> bool
+    def previewable?: () -> bool
+    def preview_image: () -> ActiveStorage::Attached
+    def image?: () -> bool
+    def audio?: () -> bool
+    def variable?: () -> bool
+    def redirect_url: (String disposition) -> String
+    def proxy_url: (String disposition) -> String
+    def service_route: (String kind, String disposition) -> String
+    def content_type_for_serving: () -> String
+    def forced_disposition_for_serving: () -> String
+    def url: (?String disposition) -> String
+  end
+
+  def self.content_types_to_serve_as_binary: () -> Array[String]
+  def self.content_types_allowed_inline: () -> Array[String]
+
+  module DiskKey
+    def self.expiry: () -> String
+    def self.encode: (String key, String disposition) -> String
+    def self.decode: (String token) -> Array[String]
+    def self.disk_url: (ActiveStorage::Blob blob, String disposition) -> String
+    def self.encode_upload: (String key, String content_type, Integer content_length, String checksum) -> String
+    def self.decode_upload: (String token) -> Array[String]
+    def self.upload_url: (ActiveStorage::Blob blob, String checksum) -> String
+  end
+
+  module Current
+    self.@url_options: Hash[Symbol, String]?
+    def self.url_options: () -> Hash[Symbol, String]?
+    def self.url_options=: (Hash[Symbol, String]? options) -> Hash[Symbol, String]?
+    def self.base_url: () -> String
+  end
+
+  class ImageAnalyzer
+    def self.dimensions: (String data, String content_type) -> Array[Integer]
+  end
+
+  class Error < StandardError
+  end
+
+  class InvariableError < ActiveStorage::Error
+  end
+
+  class UnpreviewableError < ActiveStorage::Error
+  end
+
+  class UnrepresentableError < ActiveStorage::Error
+  end
+
+  class IntegrityError < ActiveStorage::Error
+  end
+
+  class FileNotFoundError < ActiveStorage::Error
+  end
+
+  class InvalidKeyError < ActiveStorage::Error
+  end
+
+  class PreviewError < ActiveStorage::Error
+  end
+
+  class Service
+    class GCSService < ActiveStorage::Service
+      class MetadataServerError < ActiveStorage::Error
+      end
+
+      class MetadataServerNotFoundError < ActiveStorage::Error
+      end
+    end
+  end
+
+  module Transformers
+    class Transformer
+    end
+
+    class ImageProcessingTransformer < ActiveStorage::Transformers::Transformer
+      class UnsupportedImageProcessingMethod < StandardError
+      end
+
+      class UnsupportedImageProcessingArgument < StandardError
+      end
+    end
+  end
+
+  class Previewer
+    def self.poster: (String path) -> String
+
+    class VideoPreviewer < ActiveStorage::Previewer
+      def self.preview_timeout: () -> (Integer | Float | nil)
+    end
+  end
+
+  class Preview
+    class UnprocessedError < StandardError
+    end
+
+    def initialize: (ActiveStorage::Blob? blob, ActiveStorage::Variation? variation) -> void
+    def blob: () -> ActiveStorage::Blob?
+    def variation: () -> ActiveStorage::Variation?
+    def image: () -> ActiveStorage::Attached
+    def processed?: () -> bool
+    def processed: () -> ActiveStorage::Preview
+    def process: () -> nil
+    def variant: () -> ActiveStorage::VariantWithRecord
+    def key: () -> String
+    def filename: () -> String
+    def url: () -> String
+  end
+
+  class Processor
+    def self.transform: (String data, String content_type, ActiveStorage::Variation variation) -> String
+  end
+
+  class Variation
+    @name: String
+    @width: Integer
+    @height: Integer
+    @format: String
+    def initialize: (String name, Integer width, Integer height, String format) -> void
+    def name: () -> String
+    def width: () -> Integer
+    def height: () -> Integer
+    def format: () -> String
+    def resize?: () -> bool
+    def output_format: (String source_content_type) -> String
+    def output_content_type: (String source_content_type) -> String
+    def encode: () -> String
+    def digest: () -> String
+    def self.decode: (String key) -> ActiveStorage::Variation?
+  end
+
+  class VariantWithRecord
+    @blob: ActiveStorage::Blob?
+    @variation: ActiveStorage::Variation?
+    @record_id: Integer
+    @image_blob: ActiveStorage::Blob?
+    def initialize: (ActiveStorage::Blob? blob, ActiveStorage::Variation? variation) -> void
+    def blob: () -> ActiveStorage::Blob?
+    def variation: () -> ActiveStorage::Variation?
+    def processed?: () -> bool
+    def processed: () -> ActiveStorage::VariantWithRecord
+    def self.record_select: (String where) -> String
+    def self.purge_records_of: (Integer blob_id) -> nil
+    def process: () -> nil
+    def image: () -> ActiveStorage::Attached?
+    def image_blob: () -> ActiveStorage::Blob?
+    def key: () -> String
+    def filename: () -> String
+    def url: () -> String
+  end
+
+  class Attached
+    @record_type: String
+    @record_id: Integer
+    @name: String
+    # The remembered attachment row: `attachment_id` 0 = nothing attached.
+    @row_loaded: bool
+    @attachment_id: Integer
+    @blob: ActiveStorage::Blob?
+    @variations: Array[ActiveStorage::Variation]
+    def initialize: (String record_type, Integer record_id, String name, Array[ActiveStorage::Variation] variations) -> void
+    def variations: () -> Array[ActiveStorage::Variation]
+    def load_row: () -> nil
+    def _preload_row: (Integer attachment_id, ActiveStorage::Blob? blob) -> nil
+    def attached?: () -> bool
+    def blob: () -> ActiveStorage::Blob?
+    def filename: () -> ActiveStorage::Filename?
+    def content_type: () -> String?
+    def download: () -> String?
+    def key: () -> String
+    def signed_id: () -> String
+    def byte_size: () -> Integer
+    def metadata: () -> ActiveStorage::BlobMetadata
+    def video?: () -> bool
+    def image?: () -> bool
+    def audio?: () -> bool
+    def variable?: () -> bool
+    def previewable?: () -> bool
+    def representable?: () -> bool
+    def analyze: () -> nil
+    # The named variant (`:thumb`) — a declared variation — or an
+    # inline transformation hash, which is the identity variant.
+    def variant: (Symbol | Hash[Symbol, untyped] | ActiveStorage::Variation transformations) -> ActiveStorage::VariantWithRecord
+    def representation: (Symbol | Hash[Symbol, untyped] transformations) -> ActiveStorage::VariantWithRecord
+    def find_variation: (Symbol | Hash[Symbol, untyped] | ActiveStorage::Variation | nil transformations) -> ActiveStorage::Variation?
+    def preview: (Symbol | ActiveStorage::Variation | nil transformations) -> ActiveStorage::Preview
+    def url: () -> String
+    def attach_blob: (ActiveStorage::Blob blob) -> nil
+    def attach: (String data, String filename, String content_type) -> nil
+    def purge: () -> nil
+    def purge_later: () -> nil
+    def detach_each: () -> Array[ActiveStorage::Blob]
+    # `Attached::One#destroy` — see the .rb: purge under Rails' name.
+    def destroy: () -> nil
+  end
+
+  # Join-row value behind `AttachedMany#attachments` — mirrors the
+  # Attachment MODEL surface the runtime cannot name without gradual.
+  class ManyAttachment
+    @id: Integer
+    @blob: ActiveStorage::Blob?
+    def initialize: (Integer id, ActiveStorage::Blob? blob) -> void
+    def id: () -> Integer
+    def blob: () -> ActiveStorage::Blob?
+    def filename: () -> ActiveStorage::Filename?
+    def content_type: () -> String?
+    def url: () -> String
+  end
+
+  # `has_many_attached` proxy — always non-nil; `attach_blob` appends.
+  class AttachedMany
+    @record_type: String
+    @record_id: Integer
+    @name: String
+    @rows: Array[ActiveStorage::ManyAttachment]
+    @rows_loaded: bool
+    def initialize: (String record_type, Integer record_id, String name) -> void
+    def attached?: () -> bool
+    def attachments: () -> Array[ActiveStorage::ManyAttachment]
+    def first: () -> ActiveStorage::ManyAttachment?
+    def _preload_rows: (Array[ActiveStorage::ManyAttachment] rows) -> nil
+    def each: () { (ActiveStorage::ManyAttachment) -> untyped } -> Array[ActiveStorage::ManyAttachment]
+    def map: () { (ActiveStorage::ManyAttachment) -> untyped } -> Array[untyped]
+    def size: () -> Integer
+    def empty?: () -> bool
+    def _sync_blob_ids: (Array[Integer] blob_ids) -> nil
+    def attach_blob: (ActiveStorage::Blob blob) -> nil
+    def attach: (String data, String filename, String content_type) -> nil
+    def purge: () -> nil
+    def purge_later: () -> nil
+    def detach_each: () -> Array[ActiveStorage::Blob]
+    def destroy: () -> nil
+  end
+
+  class PurgeJob
+    def perform: (ActiveStorage::Blob blob) -> nil
+    def self.perform_later: (ActiveStorage::Blob blob) -> nil
+  end
+
+  class VariantRecord
+    def self.count: () -> Integer
+  end
+end
+
+# See the .rb: Active Storage's engine-mounted route helpers, reopened
+# onto the app's generated RouteHelpers so a view that writes one
+# compiles on every target.
+module RouteHelpers
+  def self.rails_blob_path: (ActiveStorage::Attached attachment, ?disposition: String?, ?only_path: bool?) -> String
+  def self.rails_blob_url: (ActiveStorage::Attached attachment, ?disposition: String?, ?only_path: bool?) -> String
+  def self.rails_storage_proxy_path: (ActiveStorage::Attached | ActiveStorage::Blob model, ?disposition: String?, ?only_path: bool?) -> String
+  def self.rails_storage_proxy_url: (ActiveStorage::Attached | ActiveStorage::Blob model, ?disposition: String?, ?only_path: bool?) -> String
+  def self.rails_storage_redirect_path: (ActiveStorage::Attached | ActiveStorage::Blob model, ?disposition: String?, ?only_path: bool?) -> String
+  def self.rails_storage_redirect_url: (ActiveStorage::Attached | ActiveStorage::Blob model, ?disposition: String?, ?only_path: bool?) -> String
+  def self.storage_blob: (ActiveStorage::Attached | ActiveStorage::Blob model) -> ActiveStorage::Blob?
+  def self.rails_representation_path: (ActiveStorage::VariantWithRecord variant, ?only_path: bool?) -> String
+  def self.rails_representation_url: (ActiveStorage::VariantWithRecord variant, ?only_path: bool?) -> String
+  def self.rails_direct_uploads_path: () -> String
+  def self.rails_direct_uploads_url: () -> String
+end

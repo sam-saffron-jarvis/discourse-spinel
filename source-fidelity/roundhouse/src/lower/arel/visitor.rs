@@ -1,0 +1,2027 @@
+//! Per-backend visitors that turn an `ArelOp` into emitted `Expr`.
+//!
+//! Phase 1 ships `SqliteVisitor` — the only backend that has a Db
+//! primitive shim today (CRuby `sqlite3-ruby` + spinel-FFI
+//! `libsqlite3`). Future backends (postgres, libsql variants) will
+//! add sibling visitor structs; the IR shape doesn't change.
+//!
+//! The Expr shapes the visitor emits match what today's
+//! `lower::model_to_library::adapter_emit` synthesizes per shape —
+//! that's the migration target for Phase 1 step 5 (refactor
+//! adapter_emit to build Arel + call this visitor instead of
+//! synthesizing inline).
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use crate::dialect::AccessorKind;
+use crate::effect::EffectSet;
+use crate::expr::{ArrayStyle, BlockStyle, Expr, ExprNode, Literal, LValue};
+use crate::ident::{ClassId, Symbol, VarId};
+use crate::schema::{Column, ColumnType, Schema, Table};
+use crate::span::Span;
+use crate::ty::Ty;
+use crate::emit::shared::schema_sql::Dialect;
+
+use super::ir::{
+    ArelOp, ColumnSpec, Delete, Insert, Predicate, PreloadDirective, Select, Update,
+    Value, ValueType,
+};
+
+const DB_MOD: &str = "Db";
+
+/// A typed pending bind. Nullable predicates also select an SQL fragment.
+/// Their runtime branch reserves a position together with the `= ?` fragment;
+/// position zero means `IS NULL` and no bind. The RHS is evaluated just once.
+struct Bind {
+    expr: Expr,
+    ty: ValueType,
+    nullable_column: Option<String>,
+    parameterized: bool,
+}
+
+/// One shaped-read site gets one id so `__rh_value_0` from two reads in
+/// the same method cannot collide under Spinel's pinned local types.
+fn next_read_id() -> usize {
+    static NEXT: AtomicUsize = AtomicUsize::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+fn bind_local(kind: &str, i: usize, read_id: usize) -> Symbol {
+    Symbol::from(format!("__rh_{}_{}_{}", kind, i, read_id))
+}
+
+fn bind_index_local(read_id: usize) -> Symbol {
+    Symbol::from(format!("__rh_bind_index_{}", read_id))
+}
+
+fn has_shaped_predicates(binds: &[Bind]) -> bool {
+    binds.iter().any(|b| b.nullable_column.is_some())
+}
+
+/// No exponential code generation: one branch per nullable predicate. Up to
+/// seven predicates have at most 128 SQL shapes; larger combinations bypass
+/// the cache, including Spinel's cache which only trims at lease boundaries.
+const MAX_CACHED_NULLABLE_PREDICATES: usize = 7;
+
+fn emit_prepare(stmt: &Symbol, sql: Expr, binds: &[Bind], read_id: usize) -> Vec<Expr> {
+    let db = ClassId(Symbol::from(DB_MOD));
+    let mut out = Vec::new();
+    let shaped = has_shaped_predicates(binds);
+    let index = bind_index_local(read_id);
+    if shaped && binds.iter().any(|b| b.parameterized) {
+        out.push(assign_var(&index, lit_int(0)));
+    }
+    for (i, b) in binds.iter().enumerate() {
+        if !shaped { break; }
+        // Reserving the slot is the bind decision. The later typed bind
+        // consumes this position, never re-evaluating a nullable RHS.
+        let reserve = || vec![
+            assign_var(&index, send_to(var_ref(&index), "+", vec![lit_int(1)], false)),
+            assign_var(&bind_local("position", i, read_id), var_ref(&index)),
+        ];
+        if let Some(column) = &b.nullable_column {
+            let value = bind_local("value", i, read_id);
+            let fragment = bind_local("predicate", i, read_id);
+            out.push(assign_var(&value, b.expr.clone()));
+            if b.parameterized {
+                out.push(assign_var(&bind_local("position", i, read_id), lit_int(0)));
+            }
+            let non_nil_sql = if b.parameterized {
+                lit_str(format!("{} = ?", column))
+            } else {
+                concat_chain(vec![lit_str(format!("{} = ", column)), escape_value(&db,
+                    &Value::Runtime { expr: var_ref(&value), ty: b.ty })])
+            };
+            let mut non_nil = vec![assign_var(&fragment, non_nil_sql)];
+            if b.parameterized { non_nil.extend(reserve()); }
+            out.push(Expr::new(Span::synthetic(), ExprNode::If {
+                cond: send_to(var_ref(&value), "nil?", vec![], false),
+                then_branch: assign_var(&fragment, lit_str(format!("{} IS NULL", column))),
+                else_branch: seq(non_nil),
+            }));
+        } else {
+            out.push(assign_var(&bind_local("value", i, read_id), b.expr.clone()));
+            out.extend(reserve());
+        }
+    }
+    let nullable_count = binds.iter().filter(|b| b.nullable_column.is_some()).count();
+    let prepare = if nullable_count > MAX_CACHED_NULLABLE_PREDICATES && binds.iter().any(|b| b.parameterized) {
+        "prepare_uncached"
+    } else {
+        "prepare"
+    };
+    out.push(assign_var(stmt, db_call(&db, prepare, vec![sql])));
+    out
+}
+
+/// Fixed-shape queries keep literal positions. Shaped queries consume the
+/// positions reserved during SQL construction, skipping nil predicates.
+fn emit_bind_calls(stmt: &Symbol, binds: &[Bind], read_id: usize) -> Vec<Expr> {
+    let db = ClassId(Symbol::from(DB_MOD));
+    let shaped = has_shaped_predicates(binds);
+    binds.iter().enumerate().filter(|(_, b)| b.parameterized).map(|(i, b)| {
+        let method = match b.ty {
+            ValueType::Int => "bind_int",
+            ValueType::Str => "bind_text",
+            ValueType::Bool => "bind_bool",
+            ValueType::IntOpt => "bind_int_opt",
+            ValueType::StrOpt => "bind_text_opt",
+            ValueType::BoolOpt => "bind_bool_opt",
+            ValueType::FloatOpt => unreachable!("unserialized float in bind path"),
+        };
+        let position = if shaped {
+            var_ref(&bind_local("position", i, read_id))
+        } else {
+            lit_int((i + 1) as i64)
+        };
+        let value = if shaped {
+            var_ref(&bind_local("value", i, read_id))
+        } else {
+            b.expr.clone()
+        };
+        let call = db_call(&db, method, vec![var_ref(stmt), position.clone(), value]);
+        if b.nullable_column.is_some() {
+            Expr::new(Span::synthetic(), ExprNode::If {
+                cond: send_to(position, ">", vec![lit_int(0)], false),
+                then_branch: call,
+                else_branch: nil_lit(),
+            })
+        } else { call }
+    }).collect()
+}
+
+/// Render an Arel tree into an `Expr` that calls into the per-target
+/// `Db` primitive surface. `owner` is the model class that owns the
+/// emitted method (used by Select to construct hydrated instances);
+/// `schema` carries column ordering for `ColumnSpec::All` expansion
+/// and column types for hydration.
+pub trait ArelVisitor {
+    fn visit(&self, op: &ArelOp, schema: &Schema, owner: &ClassId) -> Expr;
+}
+
+/// Visitor for the sqlite backend (CRuby `sqlite3-ruby` + spinel FFI
+/// `libsqlite3`). Emits the same Expr shapes today's `adapter_emit`
+/// produces.
+#[derive(Clone, Copy, Default)]
+pub struct SqliteVisitor {
+    /// The selected target's Db shim supports typed positional binds.
+    /// Only runtime read predicates are bound; literals and writes stay inline.
+    pub param_binds: bool,
+}
+
+impl SqliteVisitor {
+    /// Execute an insert that returns selected columns from that same
+    /// statement. Generated-column persistence uses this to hydrate the
+    /// database-owned values without a second, post-commit SELECT.
+    pub(crate) fn visit_insert_returning(
+        &self,
+        ins: &Insert,
+        schema: &Schema,
+        returning_key: &Symbol,
+        key_is_integer: bool,
+        returning_columns: &[Symbol],
+    ) -> Expr {
+        let key_ident = crate::naming::sql_ident(returning_key.as_str());
+        // Spinel snapshots SQLite integer cells through sqlite3_column_int
+        // (32-bit). Return integer keys as text so the shared result capture
+        // does not truncate them before the adapter parses them back.
+        let key_projection = if key_is_integer {
+            format!("CAST({key_ident} AS TEXT)")
+        } else {
+            key_ident
+        };
+        let mut projection = vec![key_projection];
+        projection.extend(
+            returning_columns
+                .iter()
+                .map(|column| crate::naming::sql_ident(column.as_str())),
+        );
+        let projection = projection.join(", ");
+        let sql = concat_chain(vec![
+            insert_sql(ins, schema),
+            lit_str(format!(" RETURNING {projection}")),
+        ]);
+        db_call(
+            &ClassId(Symbol::from(DB_MOD)),
+            "exec_returning",
+            vec![sql],
+        )
+    }
+}
+
+impl ArelVisitor for SqliteVisitor {
+    fn visit(&self, op: &ArelOp, schema: &Schema, owner: &ClassId) -> Expr {
+        match op {
+            ArelOp::Select(s) => visit_select(s, schema, owner, self.param_binds),
+            ArelOp::Insert(i) => visit_insert(i, schema),
+            ArelOp::Update(u) => visit_update(u, schema),
+            ArelOp::Delete(d) => visit_delete(d, schema),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Select — four result shapes, dispatched by ColumnSpec + LimitSpec
+// ---------------------------------------------------------------------------
+
+fn visit_select(sel: &Select, schema: &Schema, owner: &ClassId, param: bool) -> Expr {
+    let table = lookup_table(schema, &sel.table.0);
+    match &sel.columns {
+        ColumnSpec::Count => emit_count(sel, table, param),
+        ColumnSpec::Exists => emit_exists(sel, table, param),
+        // Cardinality comes from the BUILDER (`single_record`), never
+        // from `LIMIT 1` — `find_by(x)` and `.limit(1)` render the same
+        // SQL and mean different things. See `Select::single_record`.
+        ColumnSpec::All if sel.single_record => {
+            emit_single_hydrate(sel, table, owner, param)
+        }
+        ColumnSpec::All => emit_multi_hydrate(sel, table, owner, schema, param),
+        ColumnSpec::Pluck(col) => emit_pluck(sel, table, col, param),
+        ColumnSpec::GroupCount(col) => emit_group_count(sel, table, col, param),
+        ColumnSpec::Named(_) => {
+            // Reserved — no Phase 1 builder produces Named yet (it's for
+            // find_by(<col>)). Degrade instead of crashing: report the
+            // gap to the emit sink (so the transpile path surfaces and
+            // gates on it) and return a stub node annotated with the
+            // diagnostic, so every per-target emitter drops a raise stub
+            // at the site via the `Expr.diagnostic` short-circuit.
+            let detail = "find_by(<col>) projection not yet wired";
+            // The arel IR doesn't carry spans — synthetic until it does.
+            crate::emit::diagnostics::push(crate::diagnostic::Diagnostic::unsupported(
+                crate::span::Span::synthetic(),
+                None,
+                "ColumnSpec::Named",
+                detail,
+            ));
+            let mut stub = nil_lit();
+            stub.set_diagnostic(Some(crate::diagnostic::DiagnosticKind::Unsupported {
+                target: None,
+                construct: Symbol::from("ColumnSpec::Named"),
+                detail: detail.to_string(),
+            }));
+            stub
+        }
+    }
+}
+
+/// `SELECT <cols> FROM <table> [WHERE …] LIMIT 1` →
+/// nilable single-instance hydrate.
+fn emit_single_hydrate(sel: &Select, table: &Table, owner: &ClassId, param: bool) -> Expr {
+    let stmt = Symbol::from("stmt");
+    let result = Symbol::from("result");
+    let db = ClassId(Symbol::from(DB_MOD));
+    let read_id = next_read_id();
+
+    let mut binds = Vec::new();
+    let sql = compose_sql_select(sel, table, param, &mut binds, read_id);
+    let prepare = emit_prepare(&stmt, sql, &binds, read_id);
+    let result_init = assign_var(&result, nil_lit());
+
+    // if Db.step?(stmt) ; result = <Owner>.from_stmt(stmt) ; end
+    // (`from_stmt` news the instance, reads every column, and marks it
+    // persisted — see `synth_from_stmt`. Sound here because a single
+    // hydrate is always `ColumnSpec::All`.)
+    let if_body = vec![assign_var(&result, model_from_stmt(owner, &stmt))];
+
+    let if_expr = Expr::new(
+        Span::synthetic(),
+        ExprNode::If {
+            cond: db_call(&db, "step?", vec![var_ref(&stmt)]),
+            then_branch: seq(if_body),
+            else_branch: nil_lit(),
+        },
+    );
+
+    let finalize = db_call(&db, "finalize", vec![var_ref(&stmt)]);
+    // stmt = prepare ; [bind …] ; result = nil ; if step? {…} ; finalize ; result
+    let mut stmts = prepare;
+    stmts.extend(emit_bind_calls(&stmt, &binds, read_id));
+    stmts.push(result_init);
+    stmts.push(if_expr);
+    stmts.push(finalize);
+    stmts.push(var_ref(&result));
+    seq(stmts)
+}
+
+/// `SELECT <cols> FROM <table> [WHERE …]` →
+/// `Array[<Owner>]` via `while step?` loop.
+fn emit_multi_hydrate(
+    sel: &Select,
+    table: &Table,
+    owner: &ClassId,
+    schema: &Schema,
+    param: bool,
+) -> Expr {
+    let stmt = Symbol::from("stmt");
+    let results = Symbol::from("results");
+    let db = ClassId(Symbol::from(DB_MOD));
+    let read_id = next_read_id();
+
+    let mut binds = Vec::new();
+    let sql = compose_sql_select(sel, table, param, &mut binds, read_id);
+    let prepare = emit_prepare(&stmt, sql, &binds, read_id);
+    // Empty Array literal carries an explicit `Array<Owner>` type
+    // annotation so strict-target emit (Crystal `[] of Owner`)
+    // matches the subsequent `results << instance` push semantics.
+    // The body-typer would otherwise type `[]` as `Array<Var>` and
+    // the Crystal emit's empty-array default (`[] of String`) would
+    // mismatch the appended instances.
+    let owner_array_ty = crate::ty::Ty::Array {
+        elem: std::sync::Arc::new(crate::ty::Ty::Class {
+            id: owner.clone(),
+            args: vec![].into(),
+        }),
+    };
+    let results_init = assign_var(
+        &results,
+        crate::lower::typing::with_ty(
+            Expr::new(
+                Span::synthetic(),
+                ExprNode::Array { elements: vec![], style: ArrayStyle::Brackets },
+            ),
+            owner_array_ty,
+        ),
+    );
+
+    // while Db.step?(stmt) ; results << <Owner>.from_stmt(stmt) ; end
+    // (`from_stmt` news + hydrates + marks persisted — see
+    // `synth_from_stmt`. Sound because a multi hydrate is `ColumnSpec::All`.)
+    let loop_body = vec![send_to(
+        var_ref(&results),
+        "<<",
+        vec![model_from_stmt(owner, &stmt)],
+        false,
+    )];
+
+    let while_loop = Expr::new(
+        Span::synthetic(),
+        ExprNode::While {
+            cond: db_call(&db, "step?", vec![var_ref(&stmt)]),
+            body: seq(loop_body),
+            until_form: false,
+        },
+    );
+
+    let finalize = db_call(&db, "finalize", vec![var_ref(&stmt)]);
+
+    // Base hydrate, then any `includes(:assoc)` preloads (issue #27).
+    // Each preload appends a batched `WHERE fk IN (ids)` query +
+    // distribute loop that fills the parents' association caches, all
+    // operating on `results` before it's returned. With no preloads
+    // this is byte-identical to the pre-#27 5-stmt Seq.
+    // Binds for the MAIN query land right after its prepare, before the
+    // hydrate loop. Preload sub-queries build their own statements and
+    // keep the inline `IN (…)` list (variable arity — not parameterized
+    // here; see the note in `push_preload_stmts`).
+    let mut stmts = prepare;
+    stmts.extend(emit_bind_calls(&stmt, &binds, read_id));
+    stmts.push(results_init);
+    stmts.push(while_loop);
+    stmts.push(finalize);
+    for directive in &sel.preloads {
+        push_preload_stmts(&mut stmts, directive, schema, owner, &results);
+    }
+    stmts.push(var_ref(&results));
+    seq(stmts)
+}
+
+/// Emit the eager-load steps for one `includes(:assoc)` directive,
+/// appending to `out`. Given the parent rows already hydrated into
+/// `parent_results`, this:
+///   1. collects parent ids,
+///   2. runs ONE `SELECT … WHERE fk IN (ids)` over the target table,
+///   3. distributes the loaded rows into each parent via the
+///      `_preload_<assoc>` setter the model lowerer synthesized.
+/// Turns Rails' eager-load into 2 queries total instead of 1 + N.
+fn push_preload_stmts(
+    out: &mut Vec<Expr>,
+    directive: &PreloadDirective,
+    schema: &Schema,
+    parent_owner: &ClassId,
+    parent_results: &Symbol,
+) {
+    let _ = parent_owner;
+    let db = ClassId(Symbol::from(DB_MOD));
+    let target_table = lookup_table(schema, &directive.target_table.0);
+    let assoc = directive.name.as_str();
+
+    let ids = Symbol::from(format!("__{}_ids", assoc));
+    let pstmt = Symbol::from(format!("__{}_stmt", assoc));
+    let loaded = Symbol::from(format!("__{}_loaded", assoc));
+
+    // ids = parent_results.map { |a| a.id }
+    let map_block = block1(
+        "a",
+        send_to(var_ref(&Symbol::from("a")), "id", vec![], false),
+    );
+    out.push(assign_var(&ids, send_block(var_ref(parent_results), "map", map_block)));
+
+    // pstmt = Db.prepare("SELECT <cols> FROM <tbl> WHERE <fk> IN (" + Db.escape_int_list(ids) + ")")
+    // A non-null fk distributes by binary search over the children's
+    // fks (`ActiveRecord.lower_bound`), which needs them sorted: `ORDER BY fk`,
+    // then the primary key so a parent's children keep the order the
+    // fk index would have returned them in (what Rails' unordered
+    // preload query sees on SQLite).
+    let fk_col = target_table.columns.iter().find(|c| c.name == directive.foreign_key);
+    let planned = fk_col.is_some_and(|c| !(c.nullable || c.read_nullable) && matches!(c.col_type, ColumnType::Integer | ColumnType::BigInt));
+    let mut close = ")".to_string();
+    if planned {
+        close.push_str(" ORDER BY ");
+        close.push_str(&crate::naming::sql_ident(directive.foreign_key.as_str()));
+        if let Some(pk) = target_table.columns.iter().find(|c| c.primary_key) {
+            close.push_str(", ");
+            close.push_str(&crate::naming::sql_ident(pk.name.as_str()));
+        }
+    }
+    let sql = concat_chain(vec![
+        lit_str(format!(
+            "SELECT {} FROM {} WHERE {} IN (",
+            select_cols_csv(target_table),
+            crate::naming::sql_ident(target_table.name.as_str()),
+            crate::naming::sql_ident(directive.foreign_key.as_str()),
+        )),
+        db_call(&db, "escape_int_list", vec![var_ref(&ids)]),
+        lit_str(close),
+    ]);
+    out.push(assign_var(&pstmt, db_call(&db, "prepare", vec![sql])));
+
+    // loaded = [] (typed Array<Target> so the `<<` push types cleanly)
+    let elem_ty = Ty::Class { id: directive.target_class.clone(), args: vec![].into() };
+    let loaded_init = crate::lower::typing::with_ty(
+        Expr::new(
+            Span::synthetic(),
+            ExprNode::Array { elements: vec![], style: ArrayStyle::Brackets },
+        ),
+        Ty::Array { elem: std::sync::Arc::new(elem_ty) },
+    );
+    out.push(assign_var(&loaded, loaded_init));
+
+    // while Db.step?(pstmt) { loaded << Target.from_stmt(pstmt) }
+    // The preload SQL is built from `select_cols_csv(target_table)` —
+    // full row in declaration order — so it's `ColumnSpec::All`-shaped
+    // by construction and `from_stmt`'s positional reads line up.
+    let loop_body = vec![send_to(
+        var_ref(&loaded),
+        "<<",
+        vec![model_from_stmt(&directive.target_class, &pstmt)],
+        false,
+    )];
+    out.push(Expr::new(
+        Span::synthetic(),
+        ExprNode::While {
+            cond: db_call(&db, "step?", vec![var_ref(&pstmt)]),
+            body: seq(loop_body),
+            until_form: false,
+        },
+    ));
+
+    // Db.finalize(pstmt)
+    out.push(db_call(&db, "finalize", vec![var_ref(&pstmt)]));
+
+    if planned {
+        push_planned_distribute(out, directive, parent_results, &loaded);
+        return;
+    }
+
+    // A nullable fk keeps the nested scan: its reads are `Integer?`, and
+    // `lower_bound` takes `Array[Integer]` — the IN filter means no
+    // loaded row is nil, but no target-neutral cast says so yet. This is
+    // the O(N * M) shape `push_planned_distribute` replaced.
+    //
+    // Distribute, grouping by FK with a portable nested loop rather than
+    // `loaded.select { … }` — Ruby's `Array#select` has no universal
+    // emitter mapping (Go has no `.Select`):
+    //   parent_results.each do |a|
+    //     group = []                       # Array<Target>
+    //     loaded.each { |r| group << r if r.<fk> == a.id }
+    //     a._preload_<assoc>(group)
+    //   end
+    let group = Symbol::from(format!("__{}_group", assoc));
+    let match_pred = Expr::new(
+        Span::synthetic(),
+        ExprNode::Send {
+            recv: Some(send_to(
+                var_ref(&Symbol::from("r")),
+                directive.foreign_key.as_str(),
+                vec![],
+                false,
+            )),
+            method: Symbol::from("=="),
+            args: vec![send_to(var_ref(&Symbol::from("a")), "id", vec![], false)],
+            block: None,
+            parenthesized: false,
+        },
+    );
+    let push_if = Expr::new(
+        Span::synthetic(),
+        ExprNode::If {
+            cond: match_pred,
+            then_branch: send_to(var_ref(&group), "<<", vec![var_ref(&Symbol::from("r"))], false),
+            else_branch: nil_lit(),
+        },
+    );
+    let group_init = crate::lower::typing::with_ty(
+        Expr::new(
+            Span::synthetic(),
+            ExprNode::Array { elements: vec![], style: ArrayStyle::Brackets },
+        ),
+        Ty::Array { elem: std::sync::Arc::new(Ty::Class { id: directive.target_class.clone(), args: vec![].into() }) },
+    );
+    let setter = format!("_preload_{}", assoc);
+    let each_block = block1(
+        "a",
+        seq(vec![
+            assign_var(&group, group_init),
+            send_block(var_ref(&loaded), "each", block1("r", push_if)),
+            send_to(var_ref(&Symbol::from("a")), &setter, vec![var_ref(&group)], true),
+        ]),
+    );
+    out.push(send_block(var_ref(parent_results), "each", each_block));
+}
+
+/// The O(N log M + M) distribute for a non-null fk. The preload query
+/// returned the children `ORDER BY fk`, so each parent's children are
+/// one contiguous run, found by two binary searches in the runtime's
+/// integer-only `ActiveRecord.lower_bound`:
+///
+///   fks = loaded.map { |r| r.<fk> }
+///   parent_results.each do |a|
+///     group = []                          # Array<Target>
+///     j = ActiveRecord.lower_bound(fks, a.id)
+///     stop = ActiveRecord.lower_bound(fks, a.id + 1)
+///     while j < stop
+///       group << loaded[j]
+///       j = j + 1
+///     end
+///     a._preload_<assoc>(group)
+///   end
+///
+/// The parents are still walked with `each`, as the nested scan walked
+/// them: on a target whose models are values (Rust) that is the
+/// in-place iteration, where indexing `parent_results[i]` would hand
+/// the setter a copy. Each iteration owns its locals -- a counter
+/// carried across iterations is a captured variable the block mutates,
+/// which TypeScript re-declares inside the closure. Nodes are typed
+/// here so the strict targets render the index by type
+/// (`loaded[j as usize]`); the re-typer keeps them, given the
+/// `lower_bound` signature in `insert_framework_stubs`.
+fn push_planned_distribute(
+    out: &mut Vec<Expr>,
+    directive: &PreloadDirective,
+    parent_results: &Symbol,
+    loaded: &Symbol,
+) {
+    use crate::lower::typing::with_ty;
+    let assoc = directive.name.as_str();
+    let fks = Symbol::from(format!("__{}_fks", assoc));
+    let j = Symbol::from(format!("__{}_j", assoc));
+    let stop = Symbol::from(format!("__{}_stop", assoc));
+    let group = Symbol::from(format!("__{}_group", assoc));
+
+    let int_array = || Ty::Array { elem: std::sync::Arc::new(Ty::Int) };
+    let target_ty = || Ty::Class { id: directive.target_class.clone(), args: vec![].into() };
+    let target_array = || Ty::Array { elem: std::sync::Arc::new(target_ty()) };
+    let int_var = |name: &Symbol| with_ty(var_ref(name), Ty::Int);
+    let typed_send = |recv: Expr, method: &str, args: Vec<Expr>, ty: Ty| {
+        with_ty(send_to(recv, method, args, false), ty)
+    };
+
+    // fks = loaded.map { |r| r.<fk> }
+    let r = with_ty(var_ref(&Symbol::from("r")), target_ty());
+    let fk_block = block1("r", typed_send(r, directive.foreign_key.as_str(), vec![], Ty::Int));
+    out.push(assign_var(
+        &fks,
+        with_ty(send_block(with_ty(var_ref(loaded), target_array()), "map", fk_block), int_array()),
+    ));
+
+    let parent_id = || typed_send(var_ref(&Symbol::from("a")), "id", vec![], Ty::Int);
+    let lower_bound = |value: Expr| {
+        with_ty(
+            db_call(
+                &ClassId(Symbol::from("ActiveRecord")),
+                "lower_bound",
+                vec![with_ty(var_ref(&fks), int_array()), value],
+            ),
+            Ty::Int,
+        )
+    };
+    let group_init = with_ty(
+        Expr::new(
+            Span::synthetic(),
+            ExprNode::Array { elements: vec![], style: ArrayStyle::Brackets },
+        ),
+        target_array(),
+    );
+    let walk = Expr::new(
+        Span::synthetic(),
+        ExprNode::While {
+            cond: typed_send(int_var(&j), "<", vec![int_var(&stop)], Ty::Bool),
+            body: seq(vec![
+                send_to(
+                    with_ty(var_ref(&group), target_array()),
+                    "<<",
+                    vec![typed_send(
+                        with_ty(var_ref(loaded), target_array()),
+                        "[]",
+                        vec![int_var(&j)],
+                        target_ty(),
+                    )],
+                    false,
+                ),
+                assign_var(&j, typed_send(int_var(&j), "+", vec![lit_int(1)], Ty::Int)),
+            ]),
+            until_form: false,
+        },
+    );
+    let setter = format!("_preload_{}", assoc);
+    let each_block = block1(
+        "a",
+        seq(vec![
+            assign_var(&group, group_init),
+            assign_var(&j, lower_bound(parent_id())),
+            assign_var(
+                &stop,
+                lower_bound(typed_send(parent_id(), "+", vec![lit_int(1)], Ty::Int)),
+            ),
+            walk,
+            send_to(var_ref(&Symbol::from("a")), &setter, vec![var_ref(&group)], true),
+        ]),
+    );
+    out.push(send_block(var_ref(parent_results), "each", each_block));
+}
+
+/// `SELECT <col> FROM <table> [WHERE …]` → `Array[<column ty>]`.
+///
+/// Same statement shape as `emit_multi_hydrate` with the hydrate
+/// swapped for a single positional column read: the projection is one
+/// column, so index 0 is the column, and the reader is the same
+/// schema-driven one the row hydrate uses — `column_read_method_for`,
+/// which is where the nullable `_opt` rule lives. Reusing it is the
+/// point: a second copy of that rule would be a second description of
+/// the same column.
+fn emit_pluck(sel: &Select, table: &Table, col: &super::ir::ColRef, param: bool) -> Expr {
+    let stmt = Symbol::from("stmt");
+    let results = Symbol::from("results");
+    let db = ClassId(Symbol::from(DB_MOD));
+
+    // The builder verified the column is in the table before it built
+    // the Pluck, so this lookup cannot miss.
+    let column = table
+        .columns
+        .iter()
+        .find(|c| c.name == col.column)
+        .unwrap_or_else(|| {
+            panic!(
+                "Arel visitor: pluck column {} not in table {}",
+                col.column.as_str(),
+                table.name.as_str(),
+            )
+        });
+    let read_method = crate::lower::model_to_library::schema::column_read_method_for(column);
+    let elem_ty = crate::lower::model_to_library::ty_of_column_slot(column);
+    let read_id = next_read_id();
+
+    let mut binds = Vec::new();
+    let sql = compose_sql_select(sel, table, param, &mut binds, read_id);
+    let prepare = emit_prepare(&stmt, sql, &binds, read_id);
+
+    // The element type is carried explicitly for the same reason the
+    // hydrate loop carries `Array<Owner>`: an untyped `[]` types as
+    // `Array<Var>` and the strict targets emit the wrong empty-array
+    // default under it.
+    let results_init = assign_var(
+        &results,
+        crate::lower::typing::with_ty(
+            Expr::new(
+                Span::synthetic(),
+                ExprNode::Array { elements: vec![], style: ArrayStyle::Brackets },
+            ),
+            crate::ty::Ty::Array { elem: std::sync::Arc::new(elem_ty) },
+        ),
+    );
+
+    // while Db.step?(stmt) ; results << Db.column_*(stmt, 0) ; end
+    let loop_body = vec![send_to(
+        var_ref(&results),
+        "<<",
+        vec![db_call(&db, read_method, vec![var_ref(&stmt), lit_int(0)])],
+        false,
+    )];
+    let while_loop = Expr::new(
+        Span::synthetic(),
+        ExprNode::While {
+            cond: db_call(&db, "step?", vec![var_ref(&stmt)]),
+            body: seq(loop_body),
+            until_form: false,
+        },
+    );
+
+    let mut stmts = prepare;
+    stmts.extend(emit_bind_calls(&stmt, &binds, read_id));
+    stmts.push(results_init);
+    stmts.push(while_loop);
+    stmts.push(db_call(&db, "finalize", vec![var_ref(&stmt)]));
+    stmts.push(var_ref(&results));
+    seq(stmts)
+}
+
+/// `SELECT <col>, COUNT(*) FROM <table> [WHERE …] GROUP BY <col>` →
+/// `Hash[<column ty>, Int]`, Rails' grouped count.
+///
+/// Statement shape is `emit_pluck`'s — prepare, bind, loop, finalize,
+/// answer the accumulator — with two differences, both of them the
+/// reason this shape had no precedent in the visitor: the row read is
+/// TWO positional reads (the group key at 0, the aggregate at 1), and
+/// the accumulator is a Hash rather than an Array. Every result shape
+/// emitted before this one was Array-of-model, Array-of-column, a
+/// single record, or a scalar.
+///
+/// The key read is the same schema-driven `column_read_method_for` the
+/// row hydrate and `pluck` use — that is where the nullable `_opt` rule
+/// lives, and a second copy of it would be a second description of the
+/// same column. The value read is `column_int` unconditionally:
+/// `COUNT(*)` is an integer whatever the grouped column is.
+///
+/// The empty-Hash seed carries its `Hash<K, Int>` type explicitly for
+/// the reason the pluck/hydrate seeds carry theirs: an untyped `{}`
+/// types as an open Hash and the strict targets emit the wrong empty-map
+/// default under it (rust picks its `HashMap` annotation off exactly
+/// this stamp, and routes `[]=` on a Hash-typed receiver to `.insert`
+/// rather than the index syntax `HashMap` has no `IndexMut` for). The
+/// receiver of each write carries it too, not just the seed.
+fn emit_group_count(
+    sel: &Select,
+    table: &Table,
+    col: &super::ir::ColRef,
+    param: bool,
+) -> Expr {
+    let stmt = Symbol::from("stmt");
+    let results = Symbol::from("results");
+    let db = ClassId(Symbol::from(DB_MOD));
+
+    // The builder verified the column is in the table before it built
+    // the GroupCount, so this lookup cannot miss.
+    let column = table
+        .columns
+        .iter()
+        .find(|c| c.name == col.column)
+        .unwrap_or_else(|| {
+            panic!(
+                "Arel visitor: group column {} not in table {}",
+                col.column.as_str(),
+                table.name.as_str(),
+            )
+        });
+    let key_read = crate::lower::model_to_library::schema::column_read_method_for(column);
+    let key_ty = crate::lower::model_to_library::ty_of_column_slot(column);
+    let hash_ty = crate::ty::Ty::Hash {
+        key: std::sync::Arc::new(key_ty),
+        value: std::sync::Arc::new(crate::ty::Ty::Int),
+    };
+    let read_id = next_read_id();
+
+    let mut binds = Vec::new();
+    let sql = compose_sql_select(sel, table, param, &mut binds, read_id);
+    let prepare = emit_prepare(&stmt, sql, &binds, read_id);
+
+    let results_init = assign_var(
+        &results,
+        crate::lower::typing::with_ty(
+            Expr::new(
+                Span::synthetic(),
+                ExprNode::Hash { entries: vec![], kwargs: false },
+            ),
+            hash_ty.clone(),
+        ),
+    );
+
+    // while Db.step?(stmt) ; results[Db.column_*(stmt, 0)] = Db.column_int(stmt, 1) ; end
+    //
+    // Written as the Send form of indexed assignment (`recv.[]=(k, v)`)
+    // rather than `LValue::Index`: it is the spelling every target's
+    // emitter already routes (the go emitter has no Index assign-target
+    // arm at all, and rust needs the Hash-receiver branch that only the
+    // Send form reaches).
+    let loop_body = vec![send_to(
+        crate::lower::typing::with_ty(var_ref(&results), hash_ty.clone()),
+        "[]=",
+        vec![
+            db_call(&db, key_read, vec![var_ref(&stmt), lit_int(0)]),
+            db_call(&db, "column_int", vec![var_ref(&stmt), lit_int(1)]),
+        ],
+        false,
+    )];
+    let while_loop = Expr::new(
+        Span::synthetic(),
+        ExprNode::While {
+            cond: db_call(&db, "step?", vec![var_ref(&stmt)]),
+            body: seq(loop_body),
+            until_form: false,
+        },
+    );
+
+    let mut stmts = prepare;
+    stmts.extend(emit_bind_calls(&stmt, &binds, read_id));
+    stmts.push(results_init);
+    stmts.push(while_loop);
+    stmts.push(db_call(&db, "finalize", vec![var_ref(&stmt)]));
+    stmts.push(crate::lower::typing::with_ty(var_ref(&results), hash_ty));
+    seq(stmts)
+}
+
+/// `SELECT COUNT(*) FROM <table> [WHERE …]` → integer scalar.
+fn emit_count(sel: &Select, table: &Table, param: bool) -> Expr {
+    let stmt = Symbol::from("stmt");
+    let result = Symbol::from("result");
+    let db = ClassId(Symbol::from(DB_MOD));
+    let read_id = next_read_id();
+
+    let mut segments: Vec<Expr> = vec![lit_str(format!(
+        "SELECT COUNT(*) FROM {}",
+        crate::naming::sql_ident(table.name.as_str())
+    ))];
+    let mut binds = Vec::new();
+    push_where_segments(&mut segments, sel.conditions.as_ref(), table, param, &mut binds, read_id);
+
+    let prepare = emit_prepare(&stmt, concat_chain(segments), &binds, read_id);
+    let step = db_call(&db, "step?", vec![var_ref(&stmt)]);
+    let read = db_call(&db, "column_int", vec![var_ref(&stmt), lit_int(0)]);
+    let result_assign = assign_var(&result, read);
+    let finalize = db_call(&db, "finalize", vec![var_ref(&stmt)]);
+
+    // stmt = prepare ; [bind …] ; step? ; result = column_int ; finalize ; result
+    let mut stmts = prepare;
+    stmts.extend(emit_bind_calls(&stmt, &binds, read_id));
+    stmts.push(step);
+    stmts.push(result_assign);
+    stmts.push(finalize);
+    stmts.push(var_ref(&result));
+    seq(stmts)
+}
+
+/// `SELECT 1 FROM <table> WHERE … LIMIT 1` → bool from `step?`.
+fn emit_exists(sel: &Select, table: &Table, param: bool) -> Expr {
+    let stmt = Symbol::from("stmt");
+    let result = Symbol::from("result");
+    let db = ClassId(Symbol::from(DB_MOD));
+    let read_id = next_read_id();
+
+    let mut segments: Vec<Expr> =
+        vec![lit_str(format!("SELECT 1 FROM {}", crate::naming::sql_ident(table.name.as_str())))];
+    let mut binds = Vec::new();
+    push_where_segments(&mut segments, sel.conditions.as_ref(), table, param, &mut binds, read_id);
+    if let Some(super::ir::LimitSpec(n)) = sel.limit {
+        segments.push(lit_str(format!(" LIMIT {}", n)));
+    }
+
+    let prepare = emit_prepare(&stmt, concat_chain(segments), &binds, read_id);
+    let result_assign = assign_var(&result, db_call(&db, "step?", vec![var_ref(&stmt)]));
+    let finalize = db_call(&db, "finalize", vec![var_ref(&stmt)]);
+
+    // stmt = prepare ; [bind …] ; result = step? ; finalize ; result
+    let mut stmts = prepare;
+    stmts.extend(emit_bind_calls(&stmt, &binds, read_id));
+    stmts.push(result_assign);
+    stmts.push(finalize);
+    stmts.push(var_ref(&result));
+    seq(stmts)
+}
+
+// ---------------------------------------------------------------------------
+// Insert / Update / Delete — exec-shaped, no hydration
+// ---------------------------------------------------------------------------
+
+fn visit_insert(ins: &Insert, schema: &Schema) -> Expr {
+    let db = ClassId(Symbol::from(DB_MOD));
+    let sql = insert_sql(ins, schema);
+    let exec_call = db_call(&db, "exec", vec![sql]);
+    if !ins.returns_rowid {
+        return exec_call;
+    }
+    let last_id = db_call(&db, "last_insert_rowid", vec![]);
+    seq(vec![exec_call, last_id])
+}
+
+/// Compose the INSERT statement before the visitor chooses `exec` or
+/// `exec_returning`. Keeping value escaping here ensures both paths retain
+/// the same inline, schema-ordered write semantics.
+fn insert_sql(ins: &Insert, schema: &Schema) -> Expr {
+    let _ = lookup_table(schema, &ins.table.0); // validates table exists; not consumed beyond that
+    let db = ClassId(Symbol::from(DB_MOD));
+    let sql = if ins.assignments.is_empty() {
+        lit_str(format!(
+            "INSERT INTO {} DEFAULT VALUES",
+            crate::naming::sql_ident(ins.table.0.as_str())
+        ))
+    } else {
+        let cols_csv = ins
+            .assignments
+            .iter()
+            .map(|a| crate::naming::sql_ident(a.column.as_str()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut segments = vec![lit_str(format!(
+            "INSERT INTO {} ({}) VALUES (",
+            crate::naming::sql_ident(ins.table.0.as_str()),
+            cols_csv
+        ))];
+        for (idx, a) in ins.assignments.iter().enumerate() {
+            if idx > 0 {
+                segments.push(lit_str(", ".to_string()));
+            }
+            segments.push(escape_value(&db, &a.value));
+        }
+        segments.push(lit_str(")".to_string()));
+        concat_chain(segments)
+    };
+    sql
+}
+
+fn visit_update(upd: &Update, schema: &Schema) -> Expr {
+    let table = lookup_table(schema, &upd.table.0);
+    let db = ClassId(Symbol::from(DB_MOD));
+
+    let mut segments: Vec<Expr> = vec![lit_str(format!("UPDATE {} SET ", crate::naming::sql_ident(upd.table.0.as_str())))];
+    for (idx, a) in upd.assignments.iter().enumerate() {
+        let prefix = if idx == 0 {
+            format!("{} = ", crate::naming::sql_ident(a.column.as_str()))
+        } else {
+            format!(", {} = ", crate::naming::sql_ident(a.column.as_str()))
+        };
+        segments.push(lit_str(prefix));
+        segments.push(escape_value(&db, &a.value));
+    }
+    // Writes go through `Db.exec` (`sqlite3_exec`), which never touches
+    // the prepared-statement cache — so the WHERE stays inline-escaped
+    // regardless of the placeholder-bind gate.
+    push_where_segments(&mut segments, upd.conditions.as_ref(), table, false, &mut Vec::new(), next_read_id());
+    db_call(&db, "exec", vec![concat_chain(segments)])
+}
+
+fn visit_delete(del: &Delete, schema: &Schema) -> Expr {
+    let table = lookup_table(schema, &del.table.0);
+    let db = ClassId(Symbol::from(DB_MOD));
+
+    let mut segments: Vec<Expr> = vec![lit_str(format!("DELETE FROM {}", crate::naming::sql_ident(del.table.0.as_str())))];
+    // Exec path — inline WHERE (see visit_update note); not cached.
+    push_where_segments(&mut segments, del.conditions.as_ref(), table, false, &mut Vec::new(), next_read_id());
+    let delete_call = db_call(&db, "exec", vec![concat_chain(segments)]);
+
+    // Truncate (Delete with no WHERE) — also reset the
+    // sqlite_sequence row for this table so the next INSERT picks up
+    // at id=1 instead of `max-id-ever-seen + 1`. Without this, fixture
+    // re-load between tests inserts at id=3, id=4, … and tests that
+    // assume id=1 (`Article.find(1)` from `ArticlesFixtures.one`)
+    // fail. The schema_sql emitter generates `INTEGER PRIMARY KEY
+    // AUTOINCREMENT` for every primary_key column, so sqlite_sequence
+    // is guaranteed to exist whenever this table has one — guard on
+    // that to avoid hitting "no such table: sqlite_sequence" on
+    // schemas with no AUTOINCREMENT tables. sqlite-specific —
+    // postgres / other backends would skip this branch in their own
+    // visitor.
+    let has_primary_key = table.columns.iter().any(|c| c.primary_key);
+    // PostgreSQL resets a table's identity sequences in the TRUNCATE
+    // itself; CASCADE, because a referencing table's rows would refuse
+    // it, and a full truncate empties every model's table anyway.
+    if del.conditions.is_none() && Dialect::current() == Dialect::Postgres {
+        let table = Dialect::Postgres.ident(del.table.0.as_str());
+        return db_call(&db, "exec", vec![lit_str(format!("TRUNCATE TABLE {table} RESTART IDENTITY CASCADE"))]);
+    }
+    if del.conditions.is_none() && has_primary_key {
+        let reset = db_call(
+            &db,
+            "exec",
+            // Here the physical name is a VALUE, not an identifier.
+            vec![concat_chain(vec![
+                lit_str("DELETE FROM sqlite_sequence WHERE name = ".to_string()),
+                escape_value(&db, &Value::LiteralStr(del.table.0.as_str().to_string())),
+            ])],
+        );
+        return seq(vec![delete_call, reset]);
+    }
+    delete_call
+}
+
+// ---------------------------------------------------------------------------
+// SQL composition helpers
+// ---------------------------------------------------------------------------
+
+/// Build the SELECT prefix `"SELECT <cols> FROM <table>[...]"` plus
+/// any WHERE / LIMIT segments, returning the concat chain.
+fn compose_sql_select(
+    sel: &Select,
+    table: &Table,
+    param: bool,
+    binds: &mut Vec<Bind>,
+    read_id: usize,
+) -> Expr {
+    let cols_csv = match &sel.columns {
+        ColumnSpec::All => select_cols_csv(table),
+        ColumnSpec::Named(refs) => refs
+            .iter()
+            .map(|r| crate::naming::sql_ident(r.column.as_str()))
+            .collect::<Vec<_>>()
+            .join(", "),
+        ColumnSpec::Count => "COUNT(*)".to_string(),
+        ColumnSpec::Exists => "1".to_string(),
+        ColumnSpec::Pluck(col) => crate::naming::sql_ident(col.column.as_str()),
+        // The grouped column is projected BESIDE the aggregate, in that
+        // order — the hydrate reads key at index 0, count at index 1.
+        ColumnSpec::GroupCount(col) => format!("{}, COUNT(*)", crate::naming::sql_ident(col.column.as_str())),
+    };
+    let mut segments: Vec<Expr> = vec![lit_str(format!(
+        "SELECT {} FROM {}",
+        cols_csv,
+        crate::naming::sql_ident(table.name.as_str())
+    ))];
+    push_where_segments(&mut segments, sel.conditions.as_ref(), table, param, binds, read_id);
+    // GROUP BY sits between WHERE and ORDER BY. Read off the
+    // projection rather than a `Select` field: the grouped column is
+    // the projection here (see `ColumnSpec::GroupCount`), so one place
+    // names it and the SELECT list and the GROUP BY cannot disagree.
+    if let ColumnSpec::GroupCount(col) = &sel.columns {
+        segments.push(lit_str(format!(" GROUP BY {}", crate::naming::sql_ident(col.column.as_str()))));
+    }
+    push_order_segment(&mut segments, &sel.orders, table);
+    if let Some(super::ir::LimitSpec(n)) = sel.limit {
+        segments.push(lit_str(format!(" LIMIT {}", n)));
+    }
+    concat_chain(segments)
+}
+
+/// Append `" ORDER BY col1 ASC, col2 DESC"` to the SQL composition
+/// when at least one order is present. Empty orders → no segment.
+/// Quote known physical columns. Other existing order spellings (such
+/// as `articles.title`) are SQL terms, not single physical identifiers.
+fn push_order_segment(segments: &mut Vec<Expr>, orders: &[super::ir::Order], table: &Table) {
+    if orders.is_empty() {
+        return;
+    }
+    let parts: Vec<String> = orders
+        .iter()
+        .map(|o| {
+            let dir = match o.direction {
+                super::ir::Direction::Asc => "ASC",
+                super::ir::Direction::Desc => "DESC",
+            };
+            let column = if table.columns.iter().any(|c| c.name == o.column.column) {
+                crate::naming::sql_ident(o.column.column.as_str())
+            } else {
+                o.column.column.as_str().to_string()
+            };
+            format!("{} {}", column, dir)
+        })
+        .collect();
+    segments.push(lit_str(format!(" ORDER BY {}", parts.join(", "))));
+}
+
+/// Append `" WHERE <pred-sql>"` segments if conditions are present.
+/// Walks the Predicate, emitting literal SQL chunks for column names
+/// and operators, and `Db.escape_<ty>(<expr>)` calls for Runtime
+/// values. Literal values are baked directly into the SQL string.
+fn push_where_segments(
+    segments: &mut Vec<Expr>,
+    preds: Option<&Predicate>,
+    _table: &Table,
+    param: bool,
+    binds: &mut Vec<Bind>,
+    read_id: usize,
+) {
+    let Some(pred) = preds else {
+        return;
+    };
+    segments.push(lit_str(" WHERE ".to_string()));
+    push_predicate_segments(segments, pred, param, binds, read_id);
+}
+
+fn push_predicate_segments(
+    segments: &mut Vec<Expr>,
+    pred: &Predicate,
+    param: bool,
+    binds: &mut Vec<Bind>,
+    read_id: usize,
+) {
+    match pred {
+        // SQL equality never matches NULL (`col = NULL` is three-valued
+        // unknown, i.e. no rows); a literal-nil condition is the IS NULL
+        // form, as Rails renders it.
+        Predicate::Eq(col, Value::LiteralNull) => {
+            segments.push(lit_str(format!("{} IS NULL", crate::naming::sql_ident(col.column.as_str()))));
+        }
+        Predicate::NullableEq(col, Value::Runtime { expr, ty }) => {
+            segments.push(var_ref(&bind_local("predicate", binds.len(), read_id)));
+            binds.push(Bind {
+                expr: expr.clone(), ty: *ty,
+                nullable_column: Some(crate::naming::sql_ident(col.column.as_str())),
+                parameterized: param && *ty != ValueType::FloatOpt,
+            });
+        }
+        Predicate::NullableEq(_, _) => unreachable!("only runtime predicates select a shape"),
+        Predicate::Eq(col, val) => {
+            segments.push(lit_str(format!("{} = ", crate::naming::sql_ident(col.column.as_str()))));
+            push_value_segment(segments, val, param, binds);
+        }
+        Predicate::And(l, r) => {
+            push_predicate_segments(segments, l, param, binds, read_id);
+            segments.push(lit_str(" AND ".to_string()));
+            push_predicate_segments(segments, r, param, binds, read_id);
+        }
+        Predicate::Or(l, r) => {
+            segments.push(lit_str("(".to_string()));
+            push_predicate_segments(segments, l, param, binds, read_id);
+            segments.push(lit_str(" OR ".to_string()));
+            push_predicate_segments(segments, r, param, binds, read_id);
+            segments.push(lit_str(")".to_string()));
+        }
+    }
+}
+
+/// Emit one SQL value segment. Literal values bake into the SQL string
+/// directly (they're part of the static query shape either way). A
+/// Runtime value becomes `Db.escape_<ty>(<expr>)` inline when `param`
+/// is off, or a `?` placeholder + a recorded `Bind` when on — so the
+/// composed SQL keys the prepared-statement cache by shape, not value.
+fn push_value_segment(segments: &mut Vec<Expr>, val: &Value, param: bool, binds: &mut Vec<Bind>) {
+    let db = ClassId(Symbol::from(DB_MOD));
+    match val {
+        Value::LiteralInt(n) => segments.push(lit_str(n.to_string())),
+        Value::LiteralStr(s) => segments.push(lit_str(format!("'{}'", s.replace('\'', "''")))),
+        Value::LiteralBool(b) => segments.push(lit_str(Dialect::current().boolean(*b).to_string())),
+        Value::LiteralNull => segments.push(lit_str("NULL".into())),
+        // One optional bind still occupies exactly one placeholder.
+        Value::Runtime { expr, ty } if param && *ty != ValueType::FloatOpt => {
+            segments.push(lit_str("?".to_string()));
+            binds.push(Bind { expr: expr.clone(), ty: *ty, nullable_column: None, parameterized: true });
+        }
+        Value::Runtime { .. } => segments.push(escape_value(&db, val)),
+    }
+}
+
+/// `Db.escape_<ty>(<expr>)` for a Runtime value; literals stringify
+/// inline. Callers that already split literal vs runtime can call
+/// `push_value_segment` instead.
+fn escape_value(db: &ClassId, val: &Value) -> Expr {
+    match val {
+        Value::Runtime { expr, ty } => {
+            let method = match ty {
+                ValueType::Int => "escape_int",
+                ValueType::Str => "escape_string",
+                ValueType::Bool => "escape_bool",
+                // Nullable columns: nil renders the SQL keyword NULL
+                // rather than the type's zero, so a column the schema
+                // declares nullable round-trips as nil.
+                ValueType::IntOpt => "escape_int_opt",
+                ValueType::StrOpt => "escape_string_opt",
+                ValueType::FloatOpt => "escape_float_opt",
+                ValueType::BoolOpt => "escape_bool_opt",
+            };
+            db_call(db, method, vec![expr.clone()])
+        }
+        Value::LiteralInt(n) => lit_str(n.to_string()),
+        Value::LiteralStr(s) => lit_str(format!("'{}'", s.replace('\'', "''"))),
+        Value::LiteralBool(b) => lit_str(Dialect::current().boolean(*b).to_string()),
+        Value::LiteralNull => lit_str("NULL".into()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Hydration
+// ---------------------------------------------------------------------------
+
+/// `<Owner>.from_stmt(stmt)` — the synthesized positional factory
+/// (`model_to_library::schema::synth_from_stmt`) that news an instance,
+/// reads every schema column from the prepared statement, marks it
+/// persisted, and returns it. Replaces the inline
+/// `new + per-column read + mark_persisted!` block at every
+/// `ColumnSpec::All` hydrate site (single, multi, and eager-load
+/// preload). The per-column read logic now lives once, in `from_stmt`'s
+/// body, rather than being re-emitted at each query site.
+fn model_from_stmt(owner: &ClassId, stmt: &Symbol) -> Expr {
+    Expr::new(
+        Span::synthetic(),
+        ExprNode::Send {
+            recv: Some(class_const(owner)),
+            method: Symbol::from("from_stmt"),
+            args: vec![var_ref(stmt)],
+            block: None,
+            parenthesized: true,
+        },
+    )
+}
+
+fn select_cols_csv(table: &Table) -> String {
+    table
+        .columns
+        .iter()
+        .map(|c| crate::naming::sql_ident(c.name.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+// ---------------------------------------------------------------------------
+// Expr builders — local copies of the small helpers also used by
+// model_to_library. Phase 1 step 5 collapses adapter_emit; at that
+// point the helper set consolidates in one place.
+// ---------------------------------------------------------------------------
+
+fn db_call(db: &ClassId, method: &str, args: Vec<Expr>) -> Expr {
+    Expr::new(
+        Span::synthetic(),
+        ExprNode::Send {
+            recv: Some(class_const(db)),
+            method: Symbol::from(method),
+            args,
+            block: None,
+            parenthesized: true,
+        },
+    )
+}
+
+fn send_to(recv: Expr, method: &str, args: Vec<Expr>, parenthesized: bool) -> Expr {
+    Expr::new(
+        Span::synthetic(),
+        ExprNode::Send {
+            recv: Some(recv),
+            method: Symbol::from(method),
+            args,
+            block: None,
+            parenthesized,
+        },
+    )
+}
+
+/// A single-param brace block `{ |name| <body> }`.
+fn block1(param: &str, body: Expr) -> Expr {
+    Expr::new(
+        Span::synthetic(),
+        ExprNode::Lambda { extra_params: Vec::new(), rest_param: None,
+            params: vec![Symbol::from(param)],
+            block_param: None,
+            body,
+            block_style: BlockStyle::Brace,
+        },
+    )
+}
+
+/// `recv.method { <block> }` — a Send carrying a block, no args.
+fn send_block(recv: Expr, method: &str, block: Expr) -> Expr {
+    Expr::new(
+        Span::synthetic(),
+        ExprNode::Send {
+            recv: Some(recv),
+            method: Symbol::from(method),
+            args: vec![],
+            block: Some(block),
+            parenthesized: false,
+        },
+    )
+}
+
+fn assign_var(name: &Symbol, value: Expr) -> Expr {
+    Expr::new(
+        Span::synthetic(),
+        ExprNode::Assign {
+            target: LValue::Var { id: VarId(0), name: name.clone() },
+            value,
+        },
+    )
+}
+
+fn class_const(id: &ClassId) -> Expr {
+    let path: Vec<Symbol> = id.0.as_str().split("::").map(Symbol::from).collect();
+    Expr::new(Span::synthetic(), ExprNode::Const { path })
+}
+
+fn var_ref(name: &Symbol) -> Expr {
+    Expr::new(Span::synthetic(), ExprNode::Var { id: VarId(0), name: name.clone() })
+}
+
+fn lit_str(s: String) -> Expr {
+    let mut e = Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Str { value: s } });
+    e.ty = Some(Ty::Str);
+    e
+}
+
+fn lit_int(value: i64) -> Expr {
+    let mut e = Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Int { value } });
+    e.ty = Some(Ty::Int);
+    e
+}
+
+fn nil_lit() -> Expr {
+    let mut e = Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil });
+    e.ty = Some(Ty::Nil);
+    e
+}
+
+fn seq(exprs: Vec<Expr>) -> Expr {
+    Expr::new(Span::synthetic(), ExprNode::Seq { exprs })
+}
+
+/// Fold SQL segments into a `+` chain, first merging adjacent string
+/// literals: the builders above push prefix / column / separator
+/// pieces separately, which would otherwise emit pure-literal runs
+/// like `"UPDATE t SET " + "a = " + …` in every target (flagged in
+/// the #67 review). `pub(crate)` — `model_to_library::adapter_emit`
+/// folds its SQL through the same helper.
+pub(crate) fn concat_chain(segments: Vec<Expr>) -> Expr {
+    let mut merged: Vec<Expr> = Vec::with_capacity(segments.len());
+    for seg in segments {
+        let text = match seg.node.as_ref() {
+            ExprNode::Lit { value: Literal::Str { value } } => Some(value.clone()),
+            _ => None,
+        };
+        if let Some(text) = text {
+            if let Some(last) = merged.last_mut() {
+                if let ExprNode::Lit { value: Literal::Str { value } } = last.node.as_mut() {
+                    value.push_str(&text);
+                    continue;
+                }
+            }
+        }
+        merged.push(seg);
+    }
+    let mut iter = merged.into_iter();
+    let mut acc = iter.next().expect("concat_chain needs at least one segment");
+    for next in iter {
+        acc = Expr::new(
+            Span::synthetic(),
+            ExprNode::Send {
+                recv: Some(acc),
+                method: Symbol::from("+"),
+                args: vec![next],
+                block: None,
+                parenthesized: false,
+            },
+        );
+    }
+    acc
+}
+
+fn lookup_table<'s>(schema: &'s Schema, name: &Symbol) -> &'s Table {
+    schema
+        .tables
+        .get(name)
+        .unwrap_or_else(|| panic!("Arel visitor: table {} not in schema", name.as_str()))
+}
+
+// Suppress unused-import warnings for symbols that future visitors
+// (postgres, libsql) and Phase 2 hooks will consume but that the
+// Phase 1 surface doesn't reach.
+#[allow(dead_code)]
+fn _phase2_anchor(_: AccessorKind, _: EffectSet, _: &Column) {}
+
+#[cfg(test)]
+mod tests {
+    use super::super::ir::{
+        Assignment, ColRef, ColumnSpec, Delete, Insert, LimitSpec, Predicate, Select, Update, Value,
+        ValueType,
+    };
+    use super::*;
+    use crate::ident::TableRef;
+    use crate::schema::{Column, ColumnType, Schema, Table};
+    use indexmap::IndexMap;
+
+    // Two-column "articles" table: id (Int), title (Str).
+    /// Creates the articles schema and model identifier used by Arel visitor tests.
+    fn fixture_schema() -> (Schema, ClassId) {
+        let mut tables = IndexMap::new();
+        tables.insert(
+            Symbol::from("articles"),
+            Table {
+                name: Symbol::from("articles"),
+                columns: vec![
+                    Column {
+                        name: Symbol::from("id"),
+                        col_type: ColumnType::Integer,
+                        nullable: false,
+                        default: None,
+                        primary_key: true,
+                        generated: None,
+                        generated_text_compatible: None,
+                        generated_int4_compatible: None,
+                        array: false,
+                        array_stored: false,
+                        read_nullable: false,
+                    },
+                    Column {
+                        name: Symbol::from("title"),
+                        col_type: ColumnType::Text,
+                        nullable: false,
+                        default: None,
+                        primary_key: false,
+                        generated: None,
+                        generated_text_compatible: None,
+                        generated_int4_compatible: None,
+                        array: false,
+                        array_stored: false,
+                        read_nullable: false,
+                    },
+                ],
+                indexes: vec![],
+                foreign_keys: vec![],
+                virtual_module: None,
+                known_keyless: false,
+                primary_key_columns: Vec::new(),
+            },
+        );
+        (Schema { tables }, ClassId(Symbol::from("Article")))
+    }
+
+    fn id_col() -> ColRef {
+        ColRef { table: TableRef(Symbol::from("articles")), column: Symbol::from("id") }
+    }
+
+    #[test]
+    fn ordering_preserves_existing_qualified_terms() {
+        let (schema, _) = fixture_schema();
+        let table = schema.tables.get(&Symbol::from("articles")).unwrap();
+        let mut segments = vec![];
+        push_order_segment(&mut segments, &[super::super::ir::Order {
+            column: ColRef {
+                table: TableRef(Symbol::from("articles")),
+                column: Symbol::from("articles.title"),
+            },
+            direction: super::super::ir::Direction::Desc,
+        }], table);
+        assert!(matches!(segments[0].node.as_ref(),
+            ExprNode::Lit { value: Literal::Str { value } }
+                if value == " ORDER BY articles.title DESC"));
+    }
+
+    // Rough shape probe — confirms the visitor returns a Seq whose
+    // body matches today's `_adapter_*` skeleton (prepare → init →
+    // body → finalize → return) for hydrate ops, and a Send/Seq for
+    // exec ops. We assert on the outer node kind and stmt count;
+    // byte-exact equivalence comes via the Ruby emit path in step 6.
+    fn outer_kind(e: &Expr) -> &'static str {
+        match e.node.as_ref() {
+            ExprNode::Seq { .. } => "seq",
+            ExprNode::Send { .. } => "send",
+            _ => "other",
+        }
+    }
+
+    fn seq_len(e: &Expr) -> usize {
+        match e.node.as_ref() {
+            ExprNode::Seq { exprs } => exprs.len(),
+            _ => 0,
+        }
+    }
+
+    #[test]
+    fn select_all_no_limit_emits_array_hydrate() {
+        let (schema, owner) = fixture_schema();
+        let op = ArelOp::Select(Select {
+            single_record: false,
+            table: TableRef(Symbol::from("articles")),
+            columns: ColumnSpec::All,
+            conditions: None,
+            orders: vec![],
+            limit: None,
+            joins: vec![],
+            preloads: vec![],
+        });
+        let body = SqliteVisitor::default().visit(&op, &schema, &owner);
+        // stmt = prepare ; results = [] ; while step? { ... } ; finalize ; results
+        assert_eq!(outer_kind(&body), "seq");
+        assert_eq!(seq_len(&body), 5);
+    }
+
+    #[test]
+    fn select_marked_single_record_emits_single_hydrate() {
+        let (schema, owner) = fixture_schema();
+        let op = ArelOp::Select(Select {
+            single_record: true,
+            table: TableRef(Symbol::from("articles")),
+            columns: ColumnSpec::All,
+            conditions: Some(Predicate::Eq(
+                id_col(),
+                Value::Runtime { expr: var_ref(&Symbol::from("id")), ty: ValueType::Int },
+            )),
+            orders: vec![],
+            limit: Some(LimitSpec(1)),
+            joins: vec![],
+            preloads: vec![],
+        });
+        let body = SqliteVisitor::default().visit(&op, &schema, &owner);
+        // stmt = prepare ; result = nil ; if step? { ... } ; finalize ; result
+        assert_eq!(outer_kind(&body), "seq");
+        assert_eq!(seq_len(&body), 5);
+    }
+
+    #[test]
+    fn limit_one_without_single_record_emits_array_hydrate() {
+        // The regression this field exists for. `Model.all.limit(1)`
+        // renders `LIMIT 1` and returns an Array of at most one — it is
+        // NOT `find_by`. Keying the hydrate shape off the limit handed
+        // the caller a bare record while its type said collection; the
+        // builder now says which it meant.
+        let (schema, owner) = fixture_schema();
+        let op = ArelOp::Select(Select {
+            single_record: false,
+            table: TableRef(Symbol::from("articles")),
+            columns: ColumnSpec::All,
+            conditions: None,
+            orders: vec![],
+            limit: Some(LimitSpec(1)),
+            joins: vec![],
+            preloads: vec![],
+        });
+        let body = SqliteVisitor::default().visit(&op, &schema, &owner);
+        // Both shapes are 5 statements, so length proves nothing. What
+        // separates them is the accumulator: the array hydrate seeds
+        // `results = []`, the single hydrate `result = nil`.
+        assert_eq!(outer_kind(&body), "seq");
+        let ExprNode::Seq { exprs } = body.node.as_ref() else { panic!("expected Seq") };
+        let ExprNode::Assign { value, .. } = exprs[1].node.as_ref() else {
+            panic!("expected an accumulator assignment, got {:?}", exprs[1].node)
+        };
+        assert!(
+            matches!(value.node.as_ref(), ExprNode::Array { .. }),
+            "expected the ARRAY hydrate for an unmarked LIMIT 1; accumulator seeded with {:?}",
+            value.node,
+        );
+    }
+
+    #[test]
+    fn select_count_emits_int_scalar() {
+        let (schema, owner) = fixture_schema();
+        let op = ArelOp::Select(Select {
+            single_record: false,
+            table: TableRef(Symbol::from("articles")),
+            columns: ColumnSpec::Count,
+            conditions: None,
+            orders: vec![],
+            limit: None,
+            joins: vec![],
+            preloads: vec![],
+        });
+        let body = SqliteVisitor::default().visit(&op, &schema, &owner);
+        // stmt = prepare ; step? ; result = column_int ; finalize ; result
+        assert_eq!(outer_kind(&body), "seq");
+        assert_eq!(seq_len(&body), 5);
+    }
+
+    #[test]
+    fn select_exists_emits_bool_from_step() {
+        let (schema, owner) = fixture_schema();
+        let op = ArelOp::Select(Select {
+            single_record: false,
+            table: TableRef(Symbol::from("articles")),
+            columns: ColumnSpec::Exists,
+            conditions: Some(Predicate::Eq(
+                id_col(),
+                Value::Runtime { expr: var_ref(&Symbol::from("id")), ty: ValueType::Int },
+            )),
+            orders: vec![],
+            limit: Some(LimitSpec(1)),
+            joins: vec![],
+            preloads: vec![],
+        });
+        let body = SqliteVisitor::default().visit(&op, &schema, &owner);
+        // stmt = prepare ; result = step? ; finalize ; result
+        assert_eq!(outer_kind(&body), "seq");
+        assert_eq!(seq_len(&body), 4);
+    }
+
+    #[test]
+    fn insert_emits_exec_then_last_insert_rowid() {
+        let (schema, _) = fixture_schema();
+        let op = ArelOp::Insert(Insert {
+            table: TableRef(Symbol::from("articles")),
+            assignments: vec![Assignment {
+                column: Symbol::from("title"),
+                value: Value::Runtime {
+                    expr: var_ref(&Symbol::from("title")),
+                    ty: ValueType::Str,
+                },
+            }],
+            returns_rowid: true,
+        });
+        let body = SqliteVisitor::default().visit(&op, &schema, &ClassId(Symbol::from("Article")));
+        // exec ; last_insert_rowid
+        assert_eq!(outer_kind(&body), "seq");
+        assert_eq!(seq_len(&body), 2);
+    }
+
+    #[test]
+    fn insert_without_assignments_uses_default_values() {
+        let (schema, owner) = fixture_schema();
+        for returns_rowid in [false, true] {
+            let op = ArelOp::Insert(Insert {
+                table: TableRef(Symbol::from("articles")),
+                assignments: vec![],
+                returns_rowid,
+            });
+            let body = SqliteVisitor::default().visit(&op, &schema, &owner);
+            let exec = if returns_rowid {
+                let ExprNode::Seq { exprs } = body.node.as_ref() else {
+                    panic!("insert must return the last row id");
+                };
+                assert_eq!(exprs.len(), 2);
+                &exprs[0]
+            } else {
+                &body
+            };
+            let ExprNode::Send { method, args, .. } = exec.node.as_ref() else {
+                panic!("insert must execute SQL");
+            };
+            assert_eq!(method.as_str(), "exec");
+            assert!(matches!(args[0].node.as_ref(),
+                ExprNode::Lit { value: Literal::Str { value } }
+                    if value == "INSERT INTO articles DEFAULT VALUES"));
+        }
+    }
+
+    #[test]
+    fn update_emits_single_exec() {
+        let (schema, _) = fixture_schema();
+        let op = ArelOp::Update(Update {
+            table: TableRef(Symbol::from("articles")),
+            assignments: vec![Assignment {
+                column: Symbol::from("title"),
+                value: Value::Runtime {
+                    expr: var_ref(&Symbol::from("title")),
+                    ty: ValueType::Str,
+                },
+            }],
+            conditions: Some(Predicate::Eq(
+                id_col(),
+                Value::Runtime { expr: var_ref(&Symbol::from("id")), ty: ValueType::Int },
+            )),
+        });
+        let body = SqliteVisitor::default().visit(&op, &schema, &ClassId(Symbol::from("Article")));
+        // single Db.exec(...) Send
+        assert_eq!(outer_kind(&body), "send");
+    }
+
+    #[test]
+    fn delete_emits_single_exec() {
+        let (schema, _) = fixture_schema();
+        let op = ArelOp::Delete(Delete {
+            table: TableRef(Symbol::from("articles")),
+            conditions: Some(Predicate::Eq(
+                id_col(),
+                Value::Runtime { expr: var_ref(&Symbol::from("id")), ty: ValueType::Int },
+            )),
+        });
+        let body = SqliteVisitor::default().visit(&op, &schema, &ClassId(Symbol::from("Article")));
+        assert_eq!(outer_kind(&body), "send");
+    }
+
+    #[test]
+    fn delete_no_conditions_is_truncate() {
+        // Truncate over an AUTOINCREMENT-bearing table emits a Seq:
+        // `Db.exec("DELETE FROM articles")` then
+        // `Db.exec("DELETE FROM sqlite_sequence WHERE name = 'articles'")`
+        // so the next INSERT restarts at id=1. Fixture has a
+        // primary_key column → both stmts emit.
+        let (schema, _) = fixture_schema();
+        let op = ArelOp::Delete(Delete {
+            table: TableRef(Symbol::from("articles")),
+            conditions: None,
+        });
+        let body = SqliteVisitor::default().visit(&op, &schema, &ClassId(Symbol::from("Article")));
+        assert_eq!(outer_kind(&body), "seq");
+        assert_eq!(seq_len(&body), 2);
+    }
+
+    #[test]
+    fn select_with_order_emits_order_by_segment() {
+        // Article.all.order(created_at: :desc) — multi-hydrate Seq
+        // shape (no LIMIT), but the prepare's SQL string must carry
+        // the ORDER BY clause.
+        use crate::ident::TableRef;
+        let (schema, owner) = fixture_schema();
+        let op = ArelOp::Select(Select {
+            single_record: false,
+            table: TableRef(Symbol::from("articles")),
+            columns: ColumnSpec::All,
+            conditions: None,
+            orders: vec![super::super::ir::Order {
+                column: super::super::ir::ColRef {
+                    table: TableRef(Symbol::from("articles")),
+                    column: Symbol::from("title"),
+                },
+                direction: super::super::ir::Direction::Desc,
+            }],
+            limit: None,
+            joins: vec![],
+            preloads: vec![],
+        });
+        let body = SqliteVisitor::default().visit(&op, &schema, &owner);
+        // Walk the body to the prepare call's SQL literal and assert
+        // it carries " ORDER BY title DESC". The body is a Seq whose
+        // first stmt is `stmt = Db.prepare(<sql>)`.
+        let ExprNode::Seq { exprs } = body.node.as_ref() else {
+            panic!("expected Seq body");
+        };
+        let ExprNode::Assign { value: prepare_call, .. } = exprs[0].node.as_ref() else {
+            panic!("expected Assign");
+        };
+        let ExprNode::Send { args, .. } = prepare_call.node.as_ref() else {
+            panic!("expected Send to Db.prepare");
+        };
+        // The SQL is a concat chain; flatten and stringify literal segments.
+        fn flatten_lits(e: &Expr, out: &mut String) {
+            match e.node.as_ref() {
+                ExprNode::Lit { value: Literal::Str { value } } => out.push_str(value),
+                ExprNode::Send { recv: Some(left), args, .. } => {
+                    flatten_lits(left, out);
+                    for a in args { flatten_lits(a, out); }
+                }
+                _ => out.push_str("<expr>"),
+            }
+        }
+        let mut sql = String::new();
+        flatten_lits(&args[0], &mut sql);
+        assert!(sql.contains("ORDER BY title DESC"), "expected ORDER BY in:\n{sql}");
+    }
+
+    #[test]
+    fn select_with_two_orders_emits_csv_order_by() {
+        use crate::ident::TableRef;
+        let (schema, owner) = fixture_schema();
+        let op = ArelOp::Select(Select {
+            single_record: false,
+            table: TableRef(Symbol::from("articles")),
+            columns: ColumnSpec::All,
+            conditions: None,
+            orders: vec![
+                super::super::ir::Order {
+                    column: super::super::ir::ColRef {
+                        table: TableRef(Symbol::from("articles")),
+                        column: Symbol::from("title"),
+                    },
+                    direction: super::super::ir::Direction::Asc,
+                },
+                super::super::ir::Order {
+                    column: super::super::ir::ColRef {
+                        table: TableRef(Symbol::from("articles")),
+                        column: Symbol::from("id"),
+                    },
+                    direction: super::super::ir::Direction::Desc,
+                },
+            ],
+            limit: None,
+            joins: vec![],
+            preloads: vec![],
+        });
+        let body = SqliteVisitor::default().visit(&op, &schema, &owner);
+        let ExprNode::Seq { exprs } = body.node.as_ref() else { panic!() };
+        let ExprNode::Assign { value: prepare_call, .. } = exprs[0].node.as_ref() else { panic!() };
+        let ExprNode::Send { args, .. } = prepare_call.node.as_ref() else { panic!() };
+        fn flatten_lits(e: &Expr, out: &mut String) {
+            match e.node.as_ref() {
+                ExprNode::Lit { value: Literal::Str { value } } => out.push_str(value),
+                ExprNode::Send { recv: Some(left), args, .. } => {
+                    flatten_lits(left, out);
+                    for a in args { flatten_lits(a, out); }
+                }
+                _ => out.push_str("<expr>"),
+            }
+        }
+        let mut sql = String::new();
+        flatten_lits(&args[0], &mut sql);
+        assert!(sql.contains("ORDER BY title ASC, id DESC"), "expected CSV ORDER BY in:\n{sql}");
+    }
+
+    #[test]
+    fn select_where_predicate_with_runtime_value_round_trips() {
+        let (schema, owner) = fixture_schema();
+        let op = ArelOp::Select(Select {
+            single_record: false,
+            table: TableRef(Symbol::from("articles")),
+            columns: ColumnSpec::All,
+            conditions: Some(Predicate::Eq(
+                id_col(),
+                Value::Runtime {
+                    expr: Expr::new(Span::synthetic(), ExprNode::Ivar { name: Symbol::from("id") }),
+                    ty: ValueType::Int,
+                },
+            )),
+            orders: vec![],
+            limit: None,
+            joins: vec![],
+            preloads: vec![],
+        });
+        // No-limit + ColumnSpec::All + WHERE → multi-hydrate (the
+        // has_many proxy shape: `Comment.where(article_id: @id)`).
+        let body = SqliteVisitor::default().visit(&op, &schema, &owner);
+        assert_eq!(outer_kind(&body), "seq");
+        assert_eq!(seq_len(&body), 5);
+    }
+
+    // ---- placeholder-bind emit ------------------------------------
+    // The visitor receives the capability explicitly, so these exercise
+    // the production entry point without mutating the process environment.
+
+    /// Flatten the literal-string segments of a `+` concat chain into
+    /// `out`; non-literal segments (escape calls, bind exprs) render as
+    /// the sentinel `«expr»` so their absence/presence is assertable.
+    fn flatten_sql(e: &Expr, out: &mut String) {
+        match e.node.as_ref() {
+            ExprNode::Lit { value: Literal::Str { value } } => out.push_str(value),
+            ExprNode::Send { recv: Some(left), args, method, .. } if method.as_str() == "+" => {
+                flatten_sql(left, out);
+                for a in args {
+                    flatten_sql(a, out);
+                }
+            }
+            _ => out.push_str("«expr»"),
+        }
+    }
+
+    /// The SQL string handed to the first `Db.prepare(...)` in a Seq
+    /// body (stmt = Db.prepare(<sql>) is always exprs[0]).
+    fn prepare_sql(body: &Expr) -> String {
+        let ExprNode::Seq { exprs } = body.node.as_ref() else { panic!("expected Seq") };
+        let ExprNode::Assign { value, .. } = exprs[0].node.as_ref() else {
+            panic!("expected `stmt = …`")
+        };
+        let ExprNode::Send { args, .. } = value.node.as_ref() else {
+            panic!("expected Db.prepare(…)")
+        };
+        let mut s = String::new();
+        flatten_sql(&args[0], &mut s);
+        s
+    }
+
+    /// Bare `Db.<method>(...)` statement calls in a Seq body, in order
+    /// (skips the `stmt = Db.prepare` Assign and any control flow).
+    fn db_stmt_calls(body: &Expr) -> Vec<(String, Vec<Expr>)> {
+        let ExprNode::Seq { exprs } = body.node.as_ref() else { return vec![] };
+        exprs
+            .iter()
+            .filter_map(|e| {
+                if let ExprNode::Send { recv: Some(r), method, args, .. } = e.node.as_ref() {
+                    if matches!(r.node.as_ref(), ExprNode::Const { .. }) {
+                        return Some((method.as_str().to_string(), args.clone()));
+                    }
+                }
+                None
+            })
+            .collect()
+    }
+
+    #[test]
+    fn param_on_single_hydrate_emits_placeholder_and_bind() {
+        let (schema, owner) = fixture_schema();
+        let sel = Select {
+            single_record: true,
+            table: TableRef(Symbol::from("articles")),
+            columns: ColumnSpec::All,
+            conditions: Some(Predicate::Eq(
+                id_col(),
+                Value::Runtime { expr: var_ref(&Symbol::from("id")), ty: ValueType::Int },
+            )),
+            orders: vec![],
+            limit: Some(LimitSpec(1)),
+            joins: vec![],
+            preloads: vec![],
+        };
+        let body = SqliteVisitor { param_binds: true }.visit(&ArelOp::Select(sel), &schema, &owner);
+
+        // SQL keys on the static shape — placeholder, no inline escape call.
+        let sql = prepare_sql(&body);
+        assert!(sql.contains("WHERE id = ?"), "expected placeholder WHERE; got:\n{sql}");
+        assert!(!sql.contains("«expr»"), "no inline value segment expected; got:\n{sql}");
+
+        // A `Db.bind_int(stmt, 1, id)` lands right after prepare.
+        let calls = db_stmt_calls(&body);
+        let bind = calls.iter().find(|(m, _)| m == "bind_int").expect("bind_int call");
+        assert_eq!(bind.1.len(), 3, "bind_int(stmt, idx, expr)");
+        assert!(
+            matches!(bind.1[1].node.as_ref(), ExprNode::Lit { value: Literal::Int { value: 1 } }),
+            "1-based bind index"
+        );
+        // And exactly one bind for one runtime value.
+        assert_eq!(calls.iter().filter(|(m, _)| m.starts_with("bind_")).count(), 1);
+    }
+
+    #[test]
+    fn param_off_keeps_inline_escape() {
+        // Same op, gate OFF → the pre-existing inline-escape emit: no
+        // `?`, no bind call (byte-identical to today).
+        let (schema, owner) = fixture_schema();
+        let sel = Select {
+            single_record: true,
+            table: TableRef(Symbol::from("articles")),
+            columns: ColumnSpec::All,
+            conditions: Some(Predicate::Eq(
+                id_col(),
+                Value::Runtime { expr: var_ref(&Symbol::from("id")), ty: ValueType::Int },
+            )),
+            orders: vec![],
+            limit: Some(LimitSpec(1)),
+            joins: vec![],
+            preloads: vec![],
+        };
+        let body = SqliteVisitor::default().visit(&ArelOp::Select(sel), &schema, &owner);
+
+        let sql = prepare_sql(&body);
+        assert!(!sql.contains('?'), "no placeholder when gate off; got:\n{sql}");
+        assert!(sql.contains("«expr»"), "expected inline escape value segment; got:\n{sql}");
+        assert!(
+            db_stmt_calls(&body).iter().all(|(m, _)| !m.starts_with("bind_")),
+            "no bind calls when gate off"
+        );
+        // Shape unchanged: 5-stmt Seq.
+        assert_eq!(seq_len(&body), 5);
+    }
+
+    #[test]
+    fn param_on_count_with_where_binds() {
+        let (schema, _) = fixture_schema();
+        let sel = Select {
+            single_record: false,
+            table: TableRef(Symbol::from("articles")),
+            columns: ColumnSpec::Count,
+            conditions: Some(Predicate::Eq(
+                id_col(),
+                Value::Runtime { expr: var_ref(&Symbol::from("id")), ty: ValueType::Int },
+            )),
+            orders: vec![],
+            limit: None,
+            joins: vec![],
+            preloads: vec![],
+        };
+        let body = SqliteVisitor { param_binds: true }.visit(
+            &ArelOp::Select(sel), &schema, &ClassId(Symbol::from("Article")),
+        );
+        let sql = prepare_sql(&body);
+        assert!(sql.contains("COUNT(*)") && sql.contains("WHERE id = ?"), "got:\n{sql}");
+        assert!(db_stmt_calls(&body).iter().any(|(m, _)| m == "bind_int"), "expected bind_int");
+    }
+
+    #[test]
+    fn param_on_string_value_binds_text() {
+        // A Str-typed runtime value picks `bind_text` (the monomorphic
+        // dispatch the ValueType tag already carries).
+        let (schema, _) = fixture_schema();
+        let sel = Select {
+            single_record: true,
+            table: TableRef(Symbol::from("articles")),
+            columns: ColumnSpec::Exists,
+            conditions: Some(Predicate::Eq(
+                ColRef { table: TableRef(Symbol::from("articles")), column: Symbol::from("title") },
+                Value::Runtime { expr: var_ref(&Symbol::from("title")), ty: ValueType::Str },
+            )),
+            orders: vec![],
+            limit: Some(LimitSpec(1)),
+            joins: vec![],
+            preloads: vec![],
+        };
+        let body = SqliteVisitor { param_binds: true }.visit(
+            &ArelOp::Select(sel), &schema, &ClassId(Symbol::from("Article")),
+        );
+        assert!(prepare_sql(&body).contains("WHERE title = ?"));
+        assert!(db_stmt_calls(&body).iter().any(|(m, _)| m == "bind_text"), "expected bind_text");
+    }
+    #[test]
+    fn param_binds_follow_placeholder_order_across_predicates() {
+        let (schema, owner) = fixture_schema();
+        let runtime = |column: &str, name: &str, ty| Predicate::Eq(
+            ColRef { table: TableRef(Symbol::from("articles")), column: Symbol::from(column) },
+            Value::Runtime { expr: var_ref(&Symbol::from(name)), ty },
+        );
+        let sel = Select {
+            table: TableRef(Symbol::from("articles")),
+            columns: ColumnSpec::Count,
+            conditions: Some(Predicate::And(
+                Box::new(runtime("id", "lookup_id", ValueType::Int)),
+                Box::new(Predicate::Or(
+                    Box::new(runtime("title", "lookup_title", ValueType::Str)),
+                    Box::new(runtime("published", "lookup_published", ValueType::Bool)),
+                )),
+            )),
+            single_record: false,
+            orders: vec![], limit: None, joins: vec![], preloads: vec![],
+        };
+        let body = SqliteVisitor { param_binds: true }.visit(&ArelOp::Select(sel), &schema, &owner);
+        assert_eq!(prepare_sql(&body),
+            "SELECT COUNT(*) FROM articles WHERE id = ? AND (title = ? OR published = ?)");
+        let calls = db_stmt_calls(&body);
+        let binds: Vec<_> = calls.iter().filter(|(m, _)| m.starts_with("bind_")).collect();
+        assert_eq!(binds.len(), 3);
+        for (index, ((method, args), (expected_method, expected_value))) in binds.iter().zip([
+            ("bind_int", "lookup_id"),
+            ("bind_text", "lookup_title"),
+            ("bind_bool", "lookup_published"),
+        ]).enumerate() {
+            assert_eq!(method, expected_method);
+            assert!(matches!(args[1].node.as_ref(),
+                ExprNode::Lit { value: Literal::Int { value } } if *value == index as i64 + 1));
+            assert!(matches!(args[2].node.as_ref(),
+                ExprNode::Var { name, .. } if name.as_str() == expected_value));
+        }
+        // All binds must execute directly after prepare, before any step.
+        let ExprNode::Seq { exprs } = body.node.as_ref() else { panic!("expected Seq") };
+        for expr in &exprs[1..=3] {
+            assert!(matches!(expr.node.as_ref(), ExprNode::Send { method, .. }
+                if method.as_str().starts_with("bind_")));
+        }
+    }
+
+}

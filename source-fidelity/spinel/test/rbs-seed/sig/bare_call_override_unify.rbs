@@ -1,0 +1,9 @@
+class Base
+  @snap: Hash[String, untyped]
+  def attributes: () -> Hash[String, untyped]
+  def snapshot: () -> void
+end
+
+class Post < Base
+  def attributes: () -> Hash[String, untyped]
+end

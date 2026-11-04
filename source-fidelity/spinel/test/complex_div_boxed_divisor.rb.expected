@@ -1,0 +1,9 @@
+boxed int zero: divided by 0
+(Infinity+Infinity*i)
+(-Infinity+Infinity*i)
+(10+20i)
+(10.5+20.5i)
+through a method: divided by 0
+(5+10i)
+(Infinity+Infinity*i)
+(10+20i)

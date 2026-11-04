@@ -1,0 +1,339 @@
+#!/usr/bin/env bash
+# scripts/campfire-compare — Rails campfire vs the emit, same rows, same
+# walk, diffed artifacts. The campfire half of what `scripts/compare`
+# does for the blog fixture, plus the piece no page compare can carry:
+# the TURBO-STREAM FRAMES that arrive over /cable.
+#
+# Both lanes are driven by the SAME `scripts/campfire-cable-drive.rb`
+# run — sign in through the real form, subscribe two sockets, post a
+# plain message and an HTML-bodied one — with `CABLE_WALK_DUMP` capturing
+# what each lane's wire carried: the room page, and both broadcast
+# frames. The walk's own probes must be green on BOTH lanes first
+# (behavioral equivalence, including on real Rails — which is also what
+# keeps the driver honest against ground truth); then the artifacts are
+# diffed after normalization.
+#
+# WHAT IS NORMALIZED, in two ranks:
+#
+#   * VOLATILE bytes any two runs disagree on — timestamps, CSRF tokens,
+#     signed blobs (avatar sgids, stream signatures), asset digests.
+#     Masked unconditionally.
+#   * KNOWN DIVERGENCES, each named in docs/pipeline/runtime.md and
+#     printed when applied, so the diff fails on anything NEW while the
+#     written-down gaps don't drown it. Retire each mask when its entry
+#     closes.
+#
+# EVERY artifact diff is a gate (exit non-zero on a mismatch): the two
+# broadcast frames and, since its triage closed (2026-09-01), the room
+# page — 100 seeded rich-text messages of rendering surface, held to
+# DOM-shaped equality against Rails with ONE ledgered forgiveness (the
+# fragment-cache CSRF entry in runtime.md). The report→ledger→promote
+# ladder remains the path for any NEW artifact this harness grows.
+#
+# Usage:  scripts/campfire-compare [options]
+#
+#   --reuse DIR   Skip transpiling; use an emit prepared earlier.
+#   --keep        Keep the emit + dumps and print their paths.
+#   --spinel      Drive the spinel BINARY as the emit lane (default: ruby).
+#                 A real gate since matz/spinel#4240 closed (fixed
+#                 c178fc15, the day it was filed): both frames
+#                 equivalent to Rails on the compiled binary. Needs
+#                 `spinel` >= that commit on PATH.
+#   --minor-gc    With --spinel: serve the binary under SPINEL_GC_MINOR=1,
+#                 spinel's generational collector (opt-in until it goes
+#                 default-on — matz/spinel#4260 asked for exactly this
+#                 leg, on every push, on our CI). Only the SERVED binary
+#                 sees the variable; the compiler builds without it, so
+#                 a compile-time fault cannot pass for a runtime one.
+#                 Either way the value is exported explicitly (0 or 1),
+#                 so an ambient setting cannot flip a lane. A divergence
+#                 that appears ONLY under this flag is the report matz
+#                 wants most: file it upstream with a reduction and say
+#                 minor-GC-only in the title.
+#   --verify-gen  With --spinel: serve under SPINEL_GC_VERIFY_GEN=1, which
+#                 implies the minor mark and re-marks the whole heap after
+#                 every minor cycle, so the RUNTIME names a young object
+#                 the write barrier failed to record (and the scan hook of
+#                 the old object holding it) instead of waiting for the
+#                 miss to reach the page. NOT the shipped mode: the check
+#                 keeps alive what the minor missed, so it hides the crash
+#                 it reports. A third leg beside --minor-gc, never a
+#                 replacement for it.
+#
+# EITHER WAY the emit's log is scanned for the runtime's own
+# `GC generational check` lines and the run fails on them, keeping the
+# dumps: that output goes to the binary's STDERR, which lands in
+# $DUMPS/emit-server.log, which used to be deleted on success and never
+# read. A reduction the collector wrote for us is the report
+# matz/spinel#4260 asked us to keep filing.
+#
+# Requires: the Rails oracle prepared at build/campfire-oracle
+# (scripts/campfire-oracle prepare), redis-server running (Action Cable's
+# adapter on the Rails side), cargo, ruby, and the puma / nio4r /
+# websocket-driver gems for the ruby lane (spinel + a C toolchain for
+# --spinel).
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+. "$REPO_ROOT/scripts/lib/spinel-link-path.sh"   # spinel_link_path: jemalloc's -L on a mac
+. "$REPO_ROOT/scripts/lib/roundhouse-bin.sh"     # ROUNDHOUSE_BIN or cargo run
+APP="$HOME/git/once-campfire"
+ORACLE="$REPO_ROOT/build/campfire-oracle"
+LANE=ruby
+MINOR_GC=0
+VERIFY_GEN=0
+OUT=""
+KEEP=0
+REUSE=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --reuse)  REUSE="$2"; shift 2 ;;
+        --keep)   KEEP=1; shift ;;
+        --spinel) LANE=spinel; shift ;;
+        --minor-gc) MINOR_GC=1; shift ;;
+        # VERIFY_GEN implies the minor mark in the runtime
+        # (lib/sp_gc.c's constructor sets sp_gc_minor_on), so this lane
+        # says so on its own banner rather than leaving it implied.
+        --verify-gen) VERIFY_GEN=1; MINOR_GC=1; shift ;;
+        -h|--help) sed -n '2,72p' "$0"; exit 0 ;;
+        *) APP="$1"; shift ;;
+    esac
+done
+
+step() { printf '\n\033[1;34m==>\033[0m %s\n' "$1"; }
+ok()   { printf '\033[1;32mok\033[0m  %s\n' "$1"; }
+fail() { printf '\033[1;31m%s\033[0m\n' "$1"; }
+die()  { fail "$1"; exit 1; }
+
+if [[ $MINOR_GC -eq 1 && "$LANE" != spinel ]]; then
+    die "--minor-gc needs --spinel: SPINEL_GC_MINOR is read by the compiled binary, nothing on the ruby lane"
+fi
+if [[ $VERIFY_GEN -eq 1 && "$LANE" != spinel ]]; then
+    die "--verify-gen needs --spinel: SPINEL_GC_VERIFY_GEN is read by the compiled binary, nothing on the ruby lane"
+fi
+
+if [[ "$LANE" == spinel ]]; then
+    # The emit names jemalloc and `spin` links it with no -L; on a mac that
+    # is not on clang's search path. See the helper for the whole story.
+    spinel_link_path
+fi
+
+ORACLE_PID=""
+EMIT_PID=""
+cleanup() {
+    [[ -n "$ORACLE_PID" ]] && kill "$ORACLE_PID" 2>/dev/null || true
+    [[ -n "$EMIT_PID" ]] && kill "$EMIT_PID" 2>/dev/null || true
+    wait 2>/dev/null || true
+    if [[ -n "$OUT" && $KEEP -eq 0 && -z "$REUSE" ]]; then rm -rf "$OUT"; fi
+}
+trap cleanup EXIT INT TERM
+
+# ── 0. preconditions ──────────────────────────────────────────────────
+[[ -f "$ORACLE/oracle.json" ]] \
+    || die "no oracle at $ORACLE — run scripts/campfire-oracle prepare first"
+ORACLE_SHA=$(ruby -rjson -e 'puts JSON.parse(File.read(ARGV[0]))["campfire_sha"]' "$ORACLE/oracle.json")
+APP_SHA=$(git -C "$APP" rev-parse HEAD 2>/dev/null || echo unknown)
+# A tarball checkout (CI fetches the pin without .git) answers
+# "unknown"; the caller pinned both sides there, so only a KNOWN
+# mismatch dies.
+if [[ "$ORACLE_SHA" != "unknown" && "$APP_SHA" != "unknown" && "$ORACLE_SHA" != "$APP_SHA" ]]; then
+    die "oracle is campfire $ORACLE_SHA but $APP is $APP_SHA — re-run scripts/campfire-oracle prepare"
+fi
+# redis-cli where it exists; a bare TCP probe where it doesn't (CI's
+# redis is a service container — port mapped, no client binary on the
+# runner).
+if command -v redis-cli >/dev/null 2>&1; then
+    redis-cli ping >/dev/null 2>&1 \
+        || die "redis is not running — the Rails lane's Action Cable adapter needs it"
+else
+    ruby -rsocket -e 'TCPSocket.new("127.0.0.1", 6379).close' 2>/dev/null \
+        || die "redis is not reachable on :6379 — the Rails lane's Action Cable adapter needs it"
+fi
+
+# ── 1. one pristine seed, staged into BOTH lanes ─────────────────────
+# The oracle's serve DB accumulates every walk's POSTs; equivalence
+# needs both lanes to start from the SAME rows every run. Snapshot the
+# seed on first use (prepare leaves the serve DB pristine), then restore
+# from the snapshot on every run.
+PRISTINE="$ORACLE/storage/db/seed-pristine.sqlite3"
+SERVE_DB="$ORACLE/storage/db/production.sqlite3"
+if [[ ! -f "$PRISTINE" ]]; then
+    step "snapshotting the pristine seed"
+    cp "$SERVE_DB" "$PRISTINE"
+fi
+cp "$PRISTINE" "$SERVE_DB"
+rm -f "$SERVE_DB-wal" "$SERVE_DB-shm"
+
+# ── 2. the emit ───────────────────────────────────────────────────────
+if [[ -n "$REUSE" ]]; then
+    OUT="$REUSE"
+    [[ -d "$OUT" ]] || die "no such emit: $OUT"
+    step "reusing emit at $OUT"
+else
+    OUT="$(mktemp -d -t roundhouse-campfire-compare.XXXXXX)"
+    step "transpiling $APP → $OUT (target: $LANE)"
+    rm -rf "$OUT"
+    roundhouse_run \
+        --target "$LANE" "$APP" -o "$OUT" --allow-unsupported 2>"$OUT.log" | tail -1
+fi
+
+if [[ "$LANE" == ruby && ! -f "$OUT/.job-hold-spliced" ]]; then
+    # Same splice, same reason as scripts/campfire-cable-walk: the ruby
+    # lane still runs perform_later inline, and the seeded rows reach
+    # the web-push job on every POST.
+    python3 - "$OUT/config.ru" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "Main.configure_default_adapter!"
+if "enqueue_without_running" not in s:
+    assert marker in s, f"{p} has no adapter marker to splice after"
+    s = s.replace(marker, marker + "\nActiveJob.enqueue_without_running", 1)
+    open(p, "w").write(s)
+PY
+    touch "$OUT/.job-hold-spliced"
+fi
+
+if [[ "$LANE" == spinel && ! -x "$OUT/build/blog" ]]; then
+    step "building the binary"
+    (cd "$OUT" && make build) >"$OUT/build.log" 2>&1 \
+        || { tail -20 "$OUT/build.log"; die "spinel build failed"; }
+fi
+
+step "staging the seeded rows into the emit"
+mkdir -p "$OUT/storage"
+cp "$PRISTINE" "$OUT/storage/development.sqlite3"
+rm -f "$OUT/storage/development.sqlite3-wal" "$OUT/storage/development.sqlite3-shm"
+
+# ── 3. boot both lanes ────────────────────────────────────────────────
+ORACLE_PORT=4180
+EMIT_PORT=4181
+DUMPS="$OUT-dumps"
+rm -rf "$DUMPS"; mkdir -p "$DUMPS"
+
+step "booting the Rails oracle on :$ORACLE_PORT"
+"$REPO_ROOT/scripts/campfire-oracle" serve --out "$ORACLE" --port "$ORACLE_PORT" \
+    > "$DUMPS/oracle-server.log" 2>&1 &
+ORACLE_PID=$!
+
+if [[ "$LANE" == spinel ]]; then
+    # SPINEL_GC_MINOR is exported explicitly on BOTH settings: the default
+    # lane's whole-heap mark is then an attestation, not an assumption
+    # about the caller's environment (scripts/lobsters-spinel-driver.rb
+    # learned this when the upstream default flipped under it).
+    step "booting the emit on :$EMIT_PORT (SPINEL_GC_MINOR=$MINOR_GC SPINEL_GC_VERIFY_GEN=$VERIFY_GEN)"
+    ( cd "$OUT" && BLOG_DB="$OUT/storage/development.sqlite3" PORT="$EMIT_PORT" \
+        SPINEL_GC_MINOR="$MINOR_GC" SPINEL_GC_VERIFY_GEN="$VERIFY_GEN" \
+        TEP_GC_STAT=1 exec ./build/blog ) > "$DUMPS/emit-server.log" 2>&1 &
+    EMIT_PID=$!
+else
+    step "booting the emit on :$EMIT_PORT"
+    ( cd "$OUT" && RAILS_ENV=development SECRET_KEY_BASE="$(ruby -e 'print "a" * 64')" \
+        exec ruby -S puma -p "$EMIT_PORT" config.ru ) > "$DUMPS/emit-server.log" 2>&1 &
+    EMIT_PID=$!
+fi
+
+wait_up() {
+    local port="$1" pid="$2" log="$3"
+    for _ in $(seq 1 60); do
+        curl -fso /dev/null "http://127.0.0.1:$port/" 2>/dev/null && return 0
+        # Puma answers the root with a redirect; -f rejects nothing there,
+        # but a connection refused keeps looping.
+        curl -so /dev/null "http://127.0.0.1:$port/" 2>/dev/null && return 0
+        kill -0 "$pid" 2>/dev/null || { tail -20 "$log"; return 1; }
+        sleep 1
+    done
+    tail -20 "$log"; return 1
+}
+wait_up "$ORACLE_PORT" "$ORACLE_PID" "$DUMPS/oracle-server.log" || die "the oracle never came up"
+wait_up "$EMIT_PORT" "$EMIT_PID" "$DUMPS/emit-server.log" || die "the emit never came up"
+
+# ── 4. one walk per lane, artifacts dumped ────────────────────────────
+drive() {
+    local name="$1" port="$2"
+    step "walking the $name lane"
+    CABLE_WALK_DUMP="$DUMPS/$name" \
+    CAMPFIRE_EMAIL=user1@example.com CAMPFIRE_PASSWORD=secret123456 \
+        ruby "$REPO_ROOT/scripts/campfire-cable-drive.rb" "http://127.0.0.1:$port" \
+        > "$DUMPS/$name-walk.log" 2>&1 \
+        || { tail -30 "$DUMPS/$name-walk.log"; die "the $name walk failed — equivalence starts at behavior"; }
+    ok "$name walk green"
+}
+drive rails "$ORACLE_PORT"
+drive emit "$EMIT_PORT"
+
+# ── 4b. the collector's own report ────────────────────────────────────
+# Under --verify-gen the runtime re-marks the whole heap after every
+# minor cycle and prints, to the binary's STDERR, every young object
+# that was reachable only through an old one the write barrier did not
+# record -- plus the scan hook of each old object holding one, which
+# names the type. That is the reduction matz/spinel#4260 asks us to keep
+# filing, written by the collector itself; before this it went to
+# emit-server.log and emit-server.log was deleted on success.
+#
+# The scan is unconditional. On the default and --minor-gc legs the
+# check is off and there is nothing to find, so it costs a grep and
+# cannot go stale by being forgotten on the leg that needs it.
+# The emit is stopped HERE rather than at EXIT, for two reasons: a
+# teardown collection is still a collection (its generational check
+# belongs in the scan below), and Tep.on_shutdown prints the collector's
+# attestation on its way out, which is no use in a log nobody reads
+# before deleting it.
+if [[ "$LANE" == spinel && -n "$EMIT_PID" ]]; then
+    step "stopping the emit and reading the collector's attestation"
+    kill "$EMIT_PID" 2>/dev/null || true
+    for _ in $(seq 1 15); do
+        kill -0 "$EMIT_PID" 2>/dev/null || break
+        sleep 1
+    done
+    kill -9 "$EMIT_PID" 2>/dev/null || true
+    EMIT_PID=""
+    if grep -q "^tep: GC.stat" "$DUMPS/emit-server.log"; then
+        grep "^tep: GC.stat" "$DUMPS/emit-server.log" | tail -1
+        # remembered_peak is the only line item that distinguishes a
+        # generational mark from a whole-heap one; a minor-gc leg that
+        # reports 0 collected nothing with a live remembered set, and
+        # its green says nothing about the barrier.
+        if [[ $MINOR_GC -eq 1 ]] && \
+           grep -q "^tep: GC.stat.*remembered_peak=0$" "$DUMPS/emit-server.log"; then
+            fail "remembered_peak=0 under SPINEL_GC_MINOR=1: this walk never took a"
+            fail "minor cycle with a live remembered set, so its green is not evidence"
+            echo "  dumps kept at $DUMPS"
+            die "the leg is not attesting what matz/spinel#4260 asked it to attest"
+        fi
+    else
+        fail "the emit printed no GC attestation (TEP_GC_STAT=1, Tep.on_shutdown)"
+        fail "-- it was killed before its shutdown hook ran, or the hook is gone"
+        echo "  dumps kept at $DUMPS"
+        die "a leg that cannot say what the collector did is not the leg #4260 asked for"
+    fi
+fi
+
+if [[ "$LANE" == spinel ]]; then
+    step "scanning the emit's log for the collector's generational check"
+    if grep -q "GC generational check" "$DUMPS/emit-server.log"; then
+        fail "the runtime's generational check FIRED -- a write barrier missed a store"
+        grep -E "GC generational check|holder scan=" "$DUMPS/emit-server.log" | head -40
+        echo
+        echo "  dumps kept at $DUMPS"
+        die "file this upstream with minor-GC-only in the title (matz/spinel#4260); \
+the holder scan= addresses above resolve with \`nm $OUT/build/blog\`"
+    fi
+    ok "no missed barrier reported by the runtime"
+fi
+
+# ── 5. normalize + diff ───────────────────────────────────────────────
+step "diffing the artifacts"
+set +e
+ruby "$REPO_ROOT/scripts/campfire-compare-diff.rb" "$DUMPS/rails" "$DUMPS/emit"
+STATUS=$?
+set -e
+
+if [[ $KEEP -eq 1 || $STATUS -ne 0 ]]; then
+    echo "  dumps kept at $DUMPS"
+else
+    rm -rf "$DUMPS"
+fi
+exit $STATUS

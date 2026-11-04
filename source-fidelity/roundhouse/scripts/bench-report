@@ -1,0 +1,1302 @@
+#!/usr/bin/env ruby
+# scripts/bench-report — render a bench summary.json to self-contained HTML.
+#
+# Usage:
+#   scripts/bench-report PATH/TO/summary.json [OUT.html]
+#
+# Defaults OUT to index.html alongside the input. Pure stdlib; inline
+# SVG charts; no JS, no CDN. Open the resulting file directly in a
+# browser, archive it, or serve it statically — the chart artifacts
+# outlive any chart library's CDN.
+
+require 'json'
+require 'time'
+
+input = ARGV[0] or abort "usage: scripts/bench-report PATH/TO/summary.json [OUT.html]"
+out   = ARGV[1] || File.join(File.dirname(File.expand_path(input)), 'index.html')
+
+cells = JSON.parse(File.read(input))
+
+# env.json is written by scripts/bench alongside summary.json. Optional:
+# reports for runs that predate it (or hand-assembled summaries) still
+# render, just without the provenance line and environment appendix.
+run_path = File.dirname(File.expand_path(input))
+env = begin
+  JSON.parse(File.read(File.join(run_path, 'env.json')))
+rescue Errno::ENOENT, JSON::ParserError
+  nil
+end
+
+# per-run.json is JSONL (one record per timed run) written alongside
+# summary.json — the only place the run-to-run spread survives the median
+# collapse. Optional, same as env.json: older runs render without the
+# stability section. Tolerate a partially-written / truncated tail line.
+per_run = begin
+  path = File.join(run_path, 'per-run.json')
+  if File.exist?(path)
+    File.readlines(path).filter_map do |line|
+      line = line.strip
+      JSON.parse(line) unless line.empty?
+    rescue JSON::ParserError
+      nil
+    end
+  end
+end
+
+# coldstart.json is JSONL, one record per boot — {target, rep, accept_ms,
+# page_ms, page_code} — written by scripts/bench-campfire. Optional like
+# every other sidecar: a run that measured no cold start renders without
+# the section rather than with an empty one.
+coldstart = begin
+  path = File.join(run_path, 'coldstart.json')
+  if File.exist?(path)
+    File.readlines(path).filter_map do |line|
+      line = line.strip
+      JSON.parse(line) unless line.empty?
+    rescue JSON::ParserError
+      nil
+    end
+  end
+end
+
+# sockets.json is a JSON ARRAY, one row per (lane, socket count), folded
+# together by bench-campfire from the two campfire-cable-sweep runs. The
+# WebSocket phase is a different workload on different cores from
+# everything else on the page, which is why it is a section of its own
+# and never a row in the HTTP tables.
+sockets = begin
+  path = File.join(run_path, 'sockets.json')
+  File.exist?(path) ? JSON.parse(File.read(path)) : nil
+rescue JSON::ParserError
+  nil
+end
+
+# skipped.json is JSONL too, one record per lane the harness asked for
+# and could not measure — {target, stage, reason, log_tail} — written by
+# scripts/bench since 2026-09-02. Its ABSENCE means a harness that
+# predates it; an empty file means nothing was skipped. Optional like the
+# others.
+skipped = begin
+  path = File.join(run_path, 'skipped.json')
+  if File.exist?(path)
+    File.readlines(path).filter_map do |line|
+      line = line.strip
+      JSON.parse(line) unless line.empty?
+    rescue JSON::ParserError
+      nil
+    end
+  end
+end
+
+# ── ordering / metadata ──────────────────────────────────────────────
+
+TARGET_ORDER = %w[rust crystal go csharp-aot kotlin swift csharp spinel spinel-1p spinel-fiber elixir typescript python tobi ruby-falcon ruby ruby-1p ruby-int jruby truffleruby rails rails-nocache rails-1p rails-int rails-jruby rails-truffleruby]
+ENDPOINT_ORDER = %w[
+  /articles /articles/1 /articles/new /articles.json /articles/1.json
+  /rooms/1 /rooms/1/messages /users/me/sidebar /searches?q=coffee
+]
+# Seed-resolved leftovers (`/rooms/N/messages?before=ID`,
+# `POST:/rooms/N/messages`) are not in the hint — their ids move with
+# the seed. `order_first` sorts those after the named rooms routes.
+
+# A lane the palette has never seen still needs a bar. Prefer its
+# family's colour, lightened so the pair is distinguishable side by side
+# (`rails-nocache` reads as a shade of `rails`, which is what it is);
+# fall back to neutral grey.
+def color_for(target)
+  return COLOR[target] if COLOR[target]
+  base = target.to_s.split('-').first
+  COLOR[base] ? lighten(COLOR[base], 0.45) : '#8a8a8a'
+end
+
+def lighten(hex, amount)
+  r, g, b = hex.delete('#').scan(/../).map { |h| h.to_i(16) }
+  format('#%02x%02x%02x', *[r, g, b].map { |c| (c + (255 - c) * amount).round })
+end
+
+# Brand-ish but muted; enough contrast in greyscale.
+COLOR = {
+  'rust'       => '#b7410e',
+  'crystal'    => '#1c1c1c',
+  'go'         => '#00add8',
+  'csharp-aot' => '#512bd4',
+  'kotlin'     => '#c711a8',
+  'swift'      => '#f05138',
+  'csharp'     => '#8a6fe0',
+  'spinel'     => '#7d4cdb',
+  'tobi'       => '#d4883a',
+  'spinel-1p'  => '#a98ae4',
+  'spinel-fiber' => '#b59ae8',
+  'elixir'     => '#4b275f',
+  'typescript' => '#3178c6',
+  'python'     => '#3776ab',
+  'ruby'       => '#cc342d',
+  'ruby-falcon' => '#a3241f',
+  'ruby-1p'    => '#e08079',
+  'ruby-int'   => '#e89c93',
+  'jruby'      => '#5382a1',
+  'truffleruby' => '#d35400',
+  'rails'      => '#666666',
+  'rails-1p'   => '#9a9a9a',
+  'rails-int'  => '#aaaaaa',
+  'rails-jruby' => '#46707f',
+  'rails-truffleruby' => '#8e5a3a',
+}
+
+GROUP_LABEL = {
+  'AOT'      => 'compiled (AOT)',
+  'JIT'      => 'JIT / interpreter',
+  'interp'   => 'interpreter, no JIT',
+  'baseline' => 'Rails baseline',
+}
+
+# ── index data ───────────────────────────────────────────────────────
+
+by = Hash.new { |h, k| h[k] = {} }
+cells.each { |c| by[c['endpoint']][c['target']] = c }
+
+# The ORDER lists are SORTING HINTS, not a guest list. They were
+# intersections once, and anything they did not name vanished from the
+# page without a word: campfire's `/rooms/1` is in no list, so `endpoints`
+# came out EMPTY and every lane read as "recorded no measurements" while
+# its numbers printed in the tables below — and `rails-nocache`, the lane
+# that makes campfire's comparison honest, was dropped from every chart,
+# leaving a page that said "Rails is 1.6x faster" by omission. What a
+# report renders is the data it was handed. The hint only orders it.
+# How a route reads on the page. campfire's per-route suite records the
+# lane-specific paths as placeholders ({avatar}, {css}) and writes as
+# `POST:<path>`; the record keeps those so cells line up across lanes.
+def ep_label(ep)
+  ep.sub(/\APOST:/, 'POST ').sub('{avatar}', ':avatar_token').sub(/\A\{css\}\z/, 'a stylesheet (/assets/*.css)')
+end
+
+# For a chart band rather than a heading: eight routes share 760px.
+def ep_short_label(ep)
+  return 'POST' if ep.start_with?('POST:')
+  return 'css' if ep == '{css}'
+  return 'avatar' if ep.include?('{avatar}')
+  ep.sub(%r{\A/rooms/[^/]+\z}, 'room').sub(%r{\A/rooms/[^/]+/messages.*}, 'messages')
+    .sub(%r{\A/users/me/sidebar\z}, 'sidebar').sub(%r{\A/searches.*}, 'search')
+end
+
+def order_first(values, hint)
+  known = hint & values
+  known + (values - known).sort
+end
+
+# A harness that names its endpoints (campfire's per-route suite) has
+# already put them in reading order; that order wins over the hint.
+endpoints = order_first(by.keys, Array(env&.dig('harness', 'endpoints')) | ENDPOINT_ORDER)
+targets   = order_first(cells.map { |c| c['target'] }.uniq, TARGET_ORDER)
+
+# A cell with a nil req_sec was never measured: wrk found nothing serving,
+# which is what a server that died mid-run leaves behind for every cell
+# after it — or it served ERRORS (the record then carries `non_2xx` and
+# skipped.json a reason), which wrk would otherwise have counted as
+# throughput: a Rails 500 page is cheap to serve. nil is NOT zero, and `.to_f` erases the difference — a dead
+# lane then draws a real-looking 0 bar, ranked last, indistinguishable
+# from a runtime that was measured and is simply slow. Everything below
+# reads metrics through `cell_metric`, which keeps the nil.
+def measured?(cell) ; cell && !cell['req_sec'].nil? ; end
+
+# THE FAIR MEMORY NUMBER. Summing RSS over a process tree counts every
+# shared page once per process, so a clustered lane reads high and a
+# single-process one does not — an error that runs one way. PSS divides
+# shared pages by their sharers; prefer it wherever the harness captured
+# it, and fall back to RSS for runs and platforms that have none.
+def mem_mb(cell)
+  return nil unless cell
+  cell['pss_mb'] || cell['rss_mb']
+end
+
+def mem_is_pss?(cells)
+  cells.any? { |c| c && c['pss_mb'] }
+end
+
+# Metric read that propagates "unmeasured". The req_sec nil is the
+# authority for the whole cell: an unmeasured cell's RSS is 0 only
+# because the sampler found no process to sample, and its rps_per_gb is
+# nil for the same reason. Also normalizes the pre-08-07 summary shape,
+# where those two arrived as literal zeros rather than nils.
+def cell_metric(cell, key)
+  return nil unless measured?(cell)
+  cell[key]
+end
+
+measured_targets = targets.select { |t| endpoints.any? { |ep| measured?(by[ep][t]) } }
+dead_targets     = targets - measured_targets
+
+
+# Per-target timed-run accounting, for the no-data banner. per-run.json is
+# the only artifact that distinguishes "never recorded a run" from
+# "recorded some runs and then stopped" — the second shape is a server
+# that died partway through its cells, and saying which one happened is
+# the difference between a bug report and a shrug.
+run_tally = Hash.new { |h, k| h[k] = { measured: 0, total: 0 } }
+(per_run || []).each do |row|
+  t = row['target'] or next
+  run_tally[t][:total] += 1
+  run_tally[t][:measured] += 1 unless row['req_sec'].nil?
+end
+
+# Lanes that warmed longer than the harness default (a floor per lane in
+# scripts/bench measure_one — the TruffleRuby cells). Each record carries
+# the warmup it got, so the page can say so instead of printing the
+# global default as if every cell had it.
+lane_warmups = {}
+(per_run || []).each do |row|
+  next unless row['target'] && row['warmup_sec']
+  (lane_warmups[row['target']] ||= []) << row['warmup_sec'].to_i
+end
+
+# What the harness actually ran, straight from its own record. Anything
+# the page states about the run has to come from here rather than from a
+# constant written when the blog bench was the only caller.
+# env.json is written by scripts/bench-env, but this renderer also has to
+# survive one that was hand-assembled or predates a field's current shape:
+# bench-campfire wrote `"host": "<uname>"` where the appendix expects a
+# map, and that one nested read aborted the ENTIRE report — a run's whole
+# page lost to a provenance field nobody reads first. A report degrades to
+# the fields it recognizes; it does not abort on the ones it doesn't.
+def env_dig(env, *keys)
+  keys.reduce(env) { |node, key| node.is_a?(Hash) ? node[key] : nil }
+end
+
+def env_map(env, key)
+  value = env_dig(env, key)
+  value.is_a?(Hash) ? value : {}
+end
+
+# What the run ASKED for, from env.json's harness snapshot. A lane that
+# fails to build never writes a cell, so it is in none of the lists above
+# — `targets` is what reached summary.json, and a page built only from
+# that reads eight lanes as the whole plan. On 2026-09-02 seventeen were
+# requested, eight measured, and the only trace of the other nine was one
+# appendix row. Everything that says how many lanes there are should say
+# how many were requested.
+requested_targets = Array(env_map(env, 'harness')['targets'])
+never_ran = requested_targets - targets - (per_run || []).map { |r| r['target'] }.uniq
+skipped_by = Hash.new { |h, k| h[k] = [] }
+(skipped || []).each { |s| skipped_by[s['target']] << s if s['target'] }
+
+concurrency = env_map(env, 'harness')['concurrency']
+benchmark   = env.is_a?(Hash) ? env['benchmark'] : nil
+
+run_dir   = File.basename(File.dirname(File.expand_path(input)))
+total     = cells.size
+runs      = cells.first['runs']
+
+# ── number formatting ────────────────────────────────────────────────
+
+def fmt_int(n)  ; n.to_i.to_s.reverse.scan(/\d{1,3}/).join(',').reverse ; end
+def fmt_dec(n, p = 1) ; format("%.#{p}f", n.to_f) ; end
+
+# ── env.json helpers ─────────────────────────────────────────────────
+
+def lscpu_field(env, name)
+  rows = env_dig(env, 'cpu', 'lscpu', 'lscpu')
+  return nil unless rows.is_a?(Array)
+  rows.find { |r| r.is_a?(Hash) && r['field'] == "#{name}:" }&.dig('data')
+end
+
+def kv_table(rows)
+  out = +"<table>\n<tbody>\n"
+  rows.each do |k, v|
+    next if v.nil? || v.to_s.empty?
+    out << "<tr><th>#{k}</th><td>#{v}</td></tr>\n"
+  end
+  out << "</tbody></table>\n"
+end
+
+# ── SVG primitives ───────────────────────────────────────────────────
+
+def svg_open(w, h)
+  %(<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 #{w} #{h}" ) +
+  %(width="#{w}" height="#{h}" font-family="-apple-system,system-ui,sans-serif" font-size="12">)
+end
+
+def svg_close ; '</svg>' ; end
+
+def t(x, y, s, anchor: 'start', size: 12, weight: nil, fill: '#222')
+  a = %(text-anchor="#{anchor}" font-size="#{size}" fill="#{fill}")
+  a << %( font-weight="#{weight}") if weight
+  %(<text x="#{x}" y="#{y}" #{a}>#{s}</text>)
+end
+
+def r(x, y, w, h, fill:, stroke: nil)
+  s = stroke ? %( stroke="#{stroke}") : ''
+  %(<rect x="#{x}" y="#{y}" width="#{w}" height="#{h}" fill="#{fill}"#{s}/>)
+end
+
+def l(x1, y1, x2, y2, stroke: '#ddd', sw: 1, dash: nil)
+  d = dash ? %( stroke-dasharray="#{dash}") : ''
+  %(<line x1="#{x1}" y1="#{y1}" x2="#{x2}" y2="#{y2}" stroke="#{stroke}" stroke-width="#{sw}"#{d}/>)
+end
+
+# ── log-scale horizontal bar chart (one per endpoint) ────────────────
+
+# The decade window FITS THE DATA at both ends. It used to be written in
+# at the call site, and a fixed window is invisible until numbers arrive
+# that do not live in it: campfire renders at TENS of req/sec against the
+# blog's tens of thousands, and every bar clamped to the 1px minimum below
+# — five lanes drawn exactly alike. It was not only the new benchmark. On
+# the PUBLISHED blog page, `rails-jruby` (744 req/sec/GB) and `rails`
+# (995) sat under a hardcoded 10^3 floor and had been drawing as 1-pixel
+# slivers, in the one chart whose whole point is that small working sets
+# rise.
+def hbar_log(rows, metric:, unit:)
+  values = rows.filter_map { |c| cell_metric(c, metric)&.to_f }.select(&:positive?)
+  min_decade = values.empty? ? 0 : Math.log10(values.min).floor
+  # A floor landing right on the smallest value draws it as a sliver: the
+  # bar measures the distance from the floor, and there is none. Drop a
+  # decade when the smallest value sits in the bottom fifth of its own,
+  # so the slowest lane is still legible as a bar rather than a line.
+  min_decade -= 1 if !values.empty? && Math.log10(values.min) - min_decade < 0.2
+  max_decade = [values.empty? ? 1 : Math.log10(values.max).ceil, min_decade + 1].max
+
+  width      = 760
+  left_pad   = 110
+  right_pad  = 100
+  plot_w     = width - left_pad - right_pad
+  row_h      = 22
+  gap        = 6
+  top        = 10
+  bottom     = 28
+  height     = top + (row_h + gap) * rows.size + bottom
+
+  buf = +svg_open(width, height)
+
+  # X-axis decade gridlines + labels
+  decades = (min_decade..max_decade).to_a
+  decades.each do |d|
+    x = left_pad + (d - min_decade).to_f / (max_decade - min_decade) * plot_w
+    buf << l(x, top, x, height - bottom, stroke: '#e5e5e5')
+    label = 10 ** d
+    buf << t(x, height - bottom + 14, fmt_int(label), anchor: 'middle', fill: '#666', size: 10)
+  end
+  buf << t(width - 4, height - bottom + 14, unit, anchor: 'end', fill: '#999', size: 10)
+
+  # Sort rows by metric desc for visual ranking; unmeasured rows sort to
+  # the bottom as a group rather than mixing in at the zero end, where
+  # they would read as the slowest measured cells.
+  ranked = rows.sort_by { |c| v = cell_metric(c, metric); [v ? 0 : 1, -v.to_f] }
+
+  ranked.each_with_index do |c, i|
+    y = top + i * (row_h + gap)
+    v = cell_metric(c, metric)
+
+    target = c['target']
+    buf << t(left_pad - 8, y + row_h * 0.7, target, anchor: 'end', weight: 'bold')
+
+    # No bar at all for an unmeasured cell. A zero-width bar would still
+    # read as a measurement of ~0; the words say what actually happened.
+    if v.nil?
+      why = c['non_2xx'].to_i > 0 ? 'no data — answered with errors' : 'no data — server not answering'
+      buf << t(left_pad, y + row_h * 0.7, why, fill: '#999')
+      next
+    end
+
+    lv = Math.log10([v.to_f, 1].max)
+    bar = ((lv - min_decade) / (max_decade - min_decade) * plot_w).round
+    bar = [bar, 1].max
+    buf << r(left_pad, y, bar, row_h, fill: color_for(target))
+    buf << t(left_pad + bar + 6, y + row_h * 0.7, fmt_int(v), fill: '#222')
+  end
+
+  buf << svg_close
+  buf
+end
+
+# ── grouped vertical bars (lowerer dividend, YJIT, multiplier) ───────
+
+def grouped_bars(groups, series:, max: nil, value_fmt: ->(v) { fmt_int(v) }, suffix: '', log: false)
+  # groups: [{label:, values: {series_key => value}}]
+  # log: decade axis, for groups spanning orders of magnitude (campfire's
+  # per-route suite runs from ~300 req/sec pages to ~30k /up, and on a
+  # linear axis the pages, the routes the dividend is about, were slivers).
+  width      = 760
+  left_pad   = 50
+  right_pad  = 20
+  plot_w     = width - left_pad - right_pad
+  bot_pad    = 60
+  top_pad    = 30
+  plot_h     = 240
+  height     = top_pad + plot_h + bot_pad
+
+  all_vals = groups.flat_map { |g| g[:values].values }.compact
+  max_v = max || ((all_vals.max || 0) * 1.15)
+  max_v = 1.0 if !max_v.is_a?(Numeric) || !max_v.finite? || max_v <= 0
+  if log
+    pos = all_vals.select { |v| v.to_f.positive? }
+    lo = pos.empty? ? 0 : Math.log10(pos.min).floor
+    lo -= 1 if !pos.empty? && Math.log10(pos.min) - lo < 0.2
+    hi = [pos.empty? ? 1 : Math.log10(pos.max * 1.15).ceil, lo + 1].max
+    scale = ->(v) { v.to_f <= 0 ? 0.0 : ((Math.log10(v) - lo) / (hi - lo)).clamp(0.0, 1.0) }
+  else
+    scale = ->(v) { v.to_f / max_v }
+  end
+  band  = plot_w.to_f / groups.size
+  bar_count = series.size
+  bar_w = [(band - 24) / bar_count, 80].min
+  inner_gap = 4
+
+  buf = +svg_open(width, height)
+
+  # Y-axis gridlines (nice round ticks at 5 levels)
+  ticks = if log
+            (lo..hi).map { |d| 10.0**d }
+          else
+            step = nice_step(max_v / 5.0)
+            (0..(max_v / step).ceil).map { |i| i * step }
+          end
+  ticks.each do |v|
+    y = top_pad + plot_h - scale.(v) * plot_h
+    buf << l(left_pad, y, width - right_pad, y, stroke: '#eee')
+    buf << t(left_pad - 6, y + 4, fmt_int(v), anchor: 'end', fill: '#888', size: 10)
+  end
+
+  groups.each_with_index do |g, gi|
+    cx = left_pad + band * gi + band / 2
+    series.each_with_index do |key, si|
+      v = g[:values][key].to_f
+      bx = cx - (bar_w * bar_count + inner_gap * (bar_count - 1)) / 2.0 + si * (bar_w + inner_gap)
+      bh = scale.(v) * plot_h
+      by = top_pad + plot_h - bh
+      buf << r(bx, by, bar_w, bh, fill: color_for(key))
+      buf << t(bx + bar_w / 2.0, by - 4, value_fmt.call(v) + suffix,
+               anchor: 'middle', fill: '#444', size: 10)
+    end
+    # Endpoint label
+    buf << t(cx, top_pad + plot_h + 16, g[:label],
+             anchor: 'middle', fill: '#333', size: 11)
+    # Multi-line second-row annotation
+    if g[:annotation]
+      buf << t(cx, top_pad + plot_h + 32, g[:annotation],
+               anchor: 'middle', fill: '#666', size: 11, weight: 'bold')
+    end
+  end
+
+  # Legend
+  legend_y = 16
+  legend_x = left_pad
+  series.each do |key|
+    buf << r(legend_x, legend_y - 10, 14, 12, fill: color_for(key))
+    buf << t(legend_x + 18, legend_y, key, fill: '#333')
+    legend_x += 110
+  end
+
+  buf << svg_close
+  buf
+end
+
+def nice_step(raw)
+  # Guard against degenerate input: an all-zero / empty series (e.g. a
+  # partial run that didn't measure a target this chart references)
+  # yields raw <= 0, and Math.log10(0) is -Infinity, which #floor
+  # rejects with FloatDomainError. Fall back to a step of 1.
+  return 1.0 unless raw.is_a?(Numeric) && raw.finite? && raw > 0
+  exp = Math.log10(raw).floor
+  base = 10 ** exp
+  frac = raw / base
+  step_frac = if frac < 1.5 then 1
+              elsif frac < 3 then 2
+              elsif frac < 7 then 5
+              else 10
+              end
+  step_frac * base
+end
+
+# ── HTML scaffold ────────────────────────────────────────────────────
+
+styles = <<~CSS
+  body { font-family: -apple-system, system-ui, sans-serif; color: #222;
+         max-width: 880px; margin: 2em auto; padding: 0 1em; line-height: 1.5; }
+  h1 { font-size: 1.6em; margin-bottom: 0.2em; }
+  h2 { font-size: 1.2em; margin-top: 2em; border-bottom: 1px solid #ddd;
+       padding-bottom: 0.2em; }
+  h3 { font-size: 1.0em; color: #555; margin: 1.4em 0 0.4em; }
+  .meta { color: #666; font-size: 0.9em; margin-bottom: 1em; }
+  .methodology { background: #f7f7f7; border-left: 3px solid #ccc;
+                 padding: 0.6em 1em; font-size: 0.92em; }
+  .methodology code { background: #ececec; padding: 0.05em 0.3em;
+                      border-radius: 3px; font-size: 0.9em; }
+  .caveat { color: #777; font-size: 0.9em; font-style: italic; }
+  table { border-collapse: collapse; font-size: 0.88em; margin: 0.4em 0; }
+  th, td { padding: 4px 10px; border-bottom: 1px solid #eee; }
+  th { text-align: left; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  details summary { cursor: pointer; color: #555; padding: 0.4em 0; }
+  .legend { font-size: 0.85em; color: #666; }
+  svg { display: block; margin: 0.4em auto; }
+CSS
+
+html = +"<!doctype html>\n<html lang=en>\n<head>\n<meta charset=utf-8>\n"
+html << "<title>Roundhouse bench#{benchmark ? " — #{benchmark}" : ''} — #{run_dir}</title>\n<style>#{styles}</style>\n</head>\n<body>\n"
+
+html << "<h1>Roundhouse benchmark results#{benchmark ? " — #{benchmark}" : ''}</h1>\n"
+provenance = ''
+if env
+  sha = env_dig(env, 'git', 'sha').to_s[0, 12]
+  provenance << " · captured #{env['captured_at']}" if env['captured_at']
+  provenance << %( · <code>#{sha}</code>) unless sha.empty?
+end
+lane_count = requested_targets.size > targets.size ? "#{targets.size} of #{requested_targets.size} requested" : targets.size.to_s
+html << %(<div class="meta">Run <code>#{run_dir}</code>#{provenance} · #{total} cells × #{runs} runs · #{endpoints.size} endpoints × #{lane_count} targets</div>\n)
+
+# Sibling artifacts published alongside this page (relative links, so
+# they work both served and opened from the run directory directly).
+artifacts = %w[env.json per-run.json skipped.json summary.json summary.md parity.txt]
+  .select { |f| File.exist?(File.join(run_path, f)) }
+unless artifacts.empty?
+  html << %(<div class="meta">Artifacts: #{artifacts.map { |f| %(<a href="#{f}"><code>#{f}</code></a>) }.join(' · ')}</div>\n)
+end
+
+# Keep the methodology prose generic — machine and harness specifics come
+# from env.json (with a bland fallback when it's absent); exact toolchain
+# versions live in the environment appendix at the bottom of the page.
+if env
+  clock   = env_map(env, 'clock')
+  ghz     = clock['max_khz'] ? fmt_dec(clock['max_khz'].to_i / 1_000_000.0, 1) + ' GHz' : nil
+  boost   = clock['boost'] == '0' ? '<strong>boost disabled</strong>' : 'boost enabled'
+  machine = [
+    lscpu_field(env, 'Model name'),
+    (lscpu_field(env, 'Core(s) per socket') && lscpu_field(env, 'CPU(s)') &&
+      "#{lscpu_field(env, 'Core(s) per socket')}c/#{lscpu_field(env, 'CPU(s)')}t"),
+    ghz, boost,
+    clock['governor'] ? "governor=#{clock['governor']}" : nil,
+  ].compact.join(', ')
+  machine << ", #{(env['memory_mb'].to_f / 1024).round} GB RAM" if env['memory_mb']
+  machine << ", #{env_dig(env, 'os', 'pretty_name')}" if env_dig(env, 'os', 'pretty_name')
+  h       = env_map(env, 'harness')
+  # Which harness ran, from its own recorded invocation — `scripts/bench`
+  # was written in here, and campfire's page credited its numbers to the
+  # blog harness that never touched them.
+  harness_name = h['command'].to_s.split.first
+  harness = "workers=#{Array(h['workers']).join('/')}#{concurrency ? ", c=#{concurrency}" : ''}, " \
+            "#{h['runs']}×#{h['duration_sec']}s runs per cell after #{h['warmup_sec']}s warmup"
+  longer = lane_warmups.map { |t, ws| [t, ws.max] }.select { |_, w| w > h['warmup_sec'].to_i }
+  harness << " (#{longer.map { |t, w| "<code>#{t}</code> #{w}s" }.join(', ')} — those lanes plateau later)" unless longer.empty?
+  appendix_ref = ' Full hardware, toolchain versions, and the exact invocation are in the <a href="#environment">environment appendix</a> below.'
+else
+  harness_name = 'scripts/bench'
+  # A run with no env.json recorded nothing about its clocks. The line
+  # used to assert the May 2026 pin (performance, boost off) here — a
+  # claim the box stopped satisfying on 06-11 when a reboot dropped the
+  # non-persistent cpupower setting; runs WITH env.json printed the true
+  # schedutil/boost-on the whole time. Say unrecorded, not a wish.
+  machine = 'Bare-metal Linux host; governor and boost state unrecorded (no env.json)'
+  harness = "workers=1, #{runs} runs per cell"
+  appendix_ref = ''
+end
+
+# A clause about managed heaps belongs on a page that measured one. The
+# blog bench always does; campfire runs five Ruby lanes and would have
+# published a paragraph about the JVM and .NET anyway.
+managed   = %w[jruby kotlin csharp csharp-aot rails-jruby truffleruby rails-truffleruby] & measured_targets
+# Name only the budgeted cells that are ON the page: a run without kotlin
+# or csharp must not describe their heap caps as if they were measured.
+jvm_cells = %w[jruby kotlin] & measured_targets
+net_cells = %w[csharp csharp-aot] & measured_targets
+tr_cells  = %w[truffleruby rails-truffleruby] & measured_targets
+code_list = ->(ts) { ts.map { |t| "<code>#{t}</code>" }.join(', ') }
+# A harness that records what each lane ACTUALLY got (campfire's
+# `heap=` shape line) names those budgets; the blog's fixed ones are
+# the fallback for a run that recorded none.
+shape_heap = ->(t) {
+  parts = env.is_a?(Hash) ? Array(env.dig('lane_shapes', t)) : []
+  parts.map { |l| l[/\Aheap=(.+)\z/, 1] }.compact.first
+}
+heap_list = ->(ts) { ts.map { |t| "<code>#{t}</code> #{shape_heap.(t)}" }.join(', ') }
+budget_clauses = []
+unless jvm_cells.empty?
+  budget_clauses << if jvm_cells.all? { |t| shape_heap.(t) }
+    "the JVM #{jvm_cells.size == 1 ? 'cell' : 'cells'} via <code>-Xmx=-Xms</code> (#{heap_list.(jvm_cells)})"
+  else
+    "the JVM #{jvm_cells.size == 1 ? 'cell' : 'cells'} (#{code_list.(jvm_cells)}) via <code>-Xmx512m=-Xms512m</code>"
+  end
+end
+budget_clauses << "the .NET #{net_cells.size == 1 ? 'cell' : 'cells'} (#{code_list.(net_cells)}) via the equivalent <code>DOTNET_GCHeapHardLimit</code> (512&nbsp;MB)" unless net_cells.empty?
+unless tr_cells.empty?
+  budget_clauses << if tr_cells.all? { |t| shape_heap.(t) }
+    "the TruffleRuby #{tr_cells.size == 1 ? 'cell' : 'cells'} via <code>--vm.Xmx</code> (#{heap_list.(tr_cells)})"
+  else
+    "the TruffleRuby #{tr_cells.size == 1 ? 'cell' : 'cells'} (#{code_list.(tr_cells)}) via <code>--vm.Xmx</code> — 512&nbsp;MB for the emitted tree, 1&nbsp;GB for stock Rails, which runs out of a 512&nbsp;MB heap under TruffleRuby within a minute of load"
+  end
+end
+heap_note = budget_clauses.empty? ? '' : " The managed-heap cells run under a fixed heap budget so their RSS is comparable to the other cells' working sets rather than the runtime's default share of host RAM: #{budget_clauses.join(', and ')}."
+
+# #16 is about the BLOG fixture specifically. Pointing campfire's readers
+# at it would be citing the wrong app's caveats at them.
+fixture_caveat = if benchmark.nil? || benchmark == 'blog'
+  %(<p class="caveat">These numbers measure one specific Rails reference app — not arbitrary Rails workloads. See <a href="https://github.com/rubys/roundhouse/issues/16">#16</a> for the fixture-fragility caveats.</p>)
+else
+  ''
+end
+
+# Whatever the harness itself insists on saying about its lanes. This is
+# how a benchmark whose LANES need explaining gets to explain them without
+# this renderer having to know which benchmark it is rendering: campfire's
+# `rails` and `rails-nocache` are not two configurations of one claim,
+# they are two different claims, and a page carrying one without the other
+# is the exact number the harness exists to prevent.
+harness_notes = Array(env.is_a?(Hash) ? env['notes'] : nil)
+  .map { |n| %(\n    <p class="caveat">#{n}</p>) }.join
+
+# Only point at the stability section when per-run.json is present to back
+# it (older runs render without that section, and the anchor with it).
+spread_ref = per_run && !per_run.empty? ? ' (the run-to-run spread is in the <a href="#stability">stability</a> section below)' : ''
+
+html << <<~METHOD
+  <div class="methodology">
+    <strong>Methodology.</strong> #{machine}. Toolchains pinned via <a href="https://mise.jdx.dev">mise</a>. Harness: <code>#{harness_name}</code> — #{harness}; the median of the #{runs} runs is reported#{spread_ref}. Quiet machine throughout.#{heap_note}#{appendix_ref}
+    #{fixture_caveat}#{harness_notes}
+    #{(measured_targets.include?('rails-jruby') ? %(<p class="caveat"><code>rails-jruby</code> is the stock-Rails-on-the-JVM baseline — the same blog, pinned to <strong>Rails 8.0</strong> (one minor behind the others' 8.1) on a <strong>prerelease</strong> AR-JDBC adapter (<code>activerecord-jdbcsqlite3-adapter 80.0.pre1</code>), the only combination that drives ActiveRecord on JRuby 10 today.</p>) : '')}
+    #{(measured_targets.include?('rails-truffleruby') && (benchmark.nil? || benchmark == 'blog') ? %(<p class="caveat"><code>rails-truffleruby</code> is the stock-Rails-on-TruffleRuby baseline — the <strong>same Rails 8.1 fixture</strong> the <code>rails</code> lane serves, since TruffleRuby compiles the <code>sqlite3</code> C extension and needs no JDBC adapter; <code>truffleruby</code> is the <code>ruby</code> lane's tree, unmodified, under the same interpreter. Both run the native standalone, single process, threads only (no <code>fork</code>).</p>) : '')}
+    #{(measured_targets.include?('spinel') ? %(<p class="caveat"><code>spinel</code> runs the <em>same</em> Roundhouse-emitted framework as the CRuby <code>ruby</code> cell, but compiled by <a href="https://github.com/matz/spinel">Spinel</a> behind its thread-per-connection server (a green thread per connection on the runtime's autodetected OS worker count) rather than CRuby + Puma — so the <code>ruby</code> → <code>spinel</code> gap is a runtime swap, not a framework or source change.</p>) : '')}
+    #{(measured_targets.include?('spinel-fiber') ? %(<p class="caveat"><code>spinel-fiber</code> is the <em>same spinel binary</em> started with <code>TEP_SERVER=fiber</code>: its previous fiber-per-connection server, one poll loop on one thread. Nothing else differs — same compiler, same emitted tree, same database and pool — so the <code>spinel</code> / <code>spinel-fiber</code> pair measures the scheduler design alone (<a href="https://github.com/matz/spinel/issues/4306">matz/spinel#4306</a>).</p>) : '')}
+  </div>
+METHOD
+
+# ── Banner: lanes that produced no numbers ───────────────────────────
+
+# Stated up here, above the first chart, rather than left for a reader to
+# infer from a missing bar. A lane can fail two ways and they mean
+# different things: never measured at all (never started, or died on its
+# first cell), versus measured some cells and then stopped — which is a
+# server that died partway through the run and took every later cell with
+# it. per-run.json is what tells them apart.
+partial = measured_targets.select do |t|
+  tally = run_tally[t]
+  tally[:total] > 0 && tally[:measured] < tally[:total]
+end
+
+# Three shapes, in the order a reader wants them: lanes that never reached
+# the run at all (failed to build, stage a DB, or start — skipped.json says
+# which stage and why), lanes that reached summary.json with no numbers,
+# and lanes that stopped partway. The first shape is the one this banner
+# could not see until 2026-09-02: it keyed off summary.json, and a lane
+# that fails to BUILD never writes a cell there.
+esc = ->(s) { s.to_s.gsub('&', '&amp;').gsub('<', '&lt;').gsub('>', '&gt;') }
+unless never_ran.empty? && dead_targets.empty? && partial.empty?
+  stage_word = { 'build' => 'failed to build', 'db' => 'failed to stage its database', 'start' => 'built but never came up' }
+  items = never_ran.map do |t|
+    recs = skipped_by[t]
+    if recs.empty?
+      why = skipped.nil? ? ' — this run predates <code>skipped.json</code>, so the reason is only in the harness\'s own log' :
+                           ' — the harness recorded no reason'
+      "<li><code>#{t}</code> was requested and never measured#{why}</li>"
+    else
+      recs.map do |r|
+        what = stage_word.fetch(r['stage'], "was lost at the #{esc.(r['stage'])} stage")
+        reason = r['reason'].to_s.strip
+        tail = Array(r['log_tail']).join("\n").strip
+        line = "<li><code>#{t}</code> #{what}"
+        line << ": <code>#{esc.(reason)}</code>" unless reason.empty?
+        line << %(<details><summary>last #{Array(r['log_tail']).size} lines of the #{esc.(r['stage'])} log</summary><pre style="white-space:pre-wrap;font-size:0.85em">#{esc.(tail)}</pre></details>) unless tail.empty?
+        line << '</li>'
+      end.join("\n")
+    end
+  end
+  items += (dead_targets + partial).map do |t|
+    tally = run_tally[t]
+    counted = tally[:total] > 0 ? " (#{tally[:measured]} of #{tally[:total]} timed runs recorded)" : ''
+    errored = skipped_by[t].any? { |r| r['stage'] == 'errors' }
+    verb = dead_targets.include?(t) ? 'recorded no measurements' :
+           errored ? 'answered some cells with errors' :
+           'stopped answering partway through its cells'
+    line = "<li><code>#{t}</code> #{verb}#{counted}"
+    # A lane whose SERVER died mid-run writes the exit status to
+    # skipped.json, and this is the branch that lane lands in — it has
+    # partial cells, so it is not `never_ran`. Reading skipped_by here is
+    # what stops the banner saying "stopped answering partway" while
+    # discarding the one fact worth having: SIGSEGV, SIGABRT and SIGKILL
+    # are three different bugs, and an intermittent crash cannot be chased
+    # without knowing which.
+    recs = skipped_by[t]
+    unless recs.empty?
+      reasons = recs.map { |r| r['reason'].to_s.strip }.reject(&:empty?).uniq
+      line << ": <code>#{esc.(reasons.join('; '))}</code>" unless reasons.empty?
+      tail = recs.flat_map { |r| Array(r['log_tail']) }.join("\n").strip
+      line << %(<details><summary>last lines of its log</summary><pre style="white-space:pre-wrap;font-size:0.85em">#{esc.(tail)}</pre></details>) unless tail.empty?
+    end
+    line << '</li>'
+  end
+  missing = never_ran.size + dead_targets.size
+  headline = if requested_targets.empty?
+    'Not every target produced numbers:'
+  else
+    "#{measured_targets.size} of #{requested_targets.size} requested targets produced numbers#{missing > 0 ? "; #{missing} did not" : ''}:"
+  end
+
+  html << <<~BANNER
+    <div class="methodology" style="border-left-color:#c0392b;background:#fdf3f2">
+      <strong>Incomplete run.</strong> #{headline}
+      <ul>
+      #{items.join("\n")}
+      </ul>
+      <p class="caveat">Every chart and table below is drawn from the targets that were measured; a target that failed to build is absent, not slow. Where a lane reached the run and then produced no numbers its cells are shown as <em>no data</em>, not as zero — an unmeasured cell means <code>wrk</code> found nothing serving, or found a server answering with errors (a cell with any non-2xx response is not a measurement of the endpoint — an error page is cheap to serve), which is a different claim from a runtime that was measured and is slow. Such lanes are left out of the derived charts (multipliers, RSS ranking) for the same reason.</p>
+    </div>
+  BANNER
+end
+
+# Sections are numbered as they are EMITTED, not as they are written: a
+# run that skips one (spinel-only skips the dividend; a benchmark with no
+# JSON endpoint skips the multiplier) would otherwise publish a page that
+# counts 1, 2, 4, 6 and reads as though pieces went missing in transit.
+section_no = 0
+h2 = lambda do |title|
+  section_no += 1
+  "<h2>#{section_no}. #{title}</h2>\n"
+end
+
+# ── Section: throughput per endpoint ─────────────────────────────────
+
+html << h2.('Throughput across targets')
+html << %(<p>Each endpoint is its own chart. Bars are log-scaled; raw req/sec is shown at the right.</p>\n)
+endpoints.each do |ep|
+  rows = targets.map { |t| by[ep][t] }.compact
+  html << "<h3>#{ep_label(ep)}</h3>\n"
+  html << hbar_log(rows, metric: 'req_sec', unit: 'req/sec')
+end
+
+# ── Section: lowerer dividend ────────────────────────────────────────
+
+# Cross-language comparison: only meaningful when both ruby and rails
+# were measured this run. Skip the whole section otherwise so a partial
+# run (e.g. spinel-only) still produces a report.
+if (%w[ruby rails] - measured_targets).empty?
+  html << h2.('Lowerer dividend (ruby vs rails)')
+  html << <<~P
+    <p>Same Ruby interpreter, same YJIT, same Puma — the only variable is whether the framework runtime is Rails or Roundhouse-emitted. The multiplier under each pair is the lift from the lowerer pipeline.#{endpoints.size > 4 ? ' Bars are log-scaled, so the multiplier, not bar height, is the ratio.' : ''}</p>
+  P
+
+  groups = endpoints.map do |ep|
+    ruby_v  = by[ep]['ruby']&.dig('req_sec').to_f
+    rails_v = by[ep]['rails']&.dig('req_sec').to_f
+    {
+      label:      endpoints.size > 4 ? ep_short_label(ep) : ep_label(ep),
+      annotation: rails_v > 0 ? "#{fmt_dec(ruby_v / rails_v, 1)}×" : '',
+      values:     { 'ruby' => ruby_v, 'rails' => rails_v },
+    }
+  end
+  html << grouped_bars(groups, series: %w[ruby rails], log: endpoints.size > 4)
+
+  # The same swap on each JIT runtime that ran both its cells, as the
+  # measured ratio. One sentence per runtime: the JRuby one says the
+  # emit is what HotSpot wanted (it rewards the emit more than Rails);
+  # the TruffleRuby one has read the other way since it was first
+  # measured (2026-09-18) — Graal's partial evaluation gets through
+  # Rails' metaprogramming on its own, so stock Rails gains MORE from
+  # the runtime swap than the emit does. The page states the ratio it
+  # measured either way; the interpretation belongs to the post.
+  #
+  # THE CRuby OPERANDS DEPEND ON THE PAGE. The blog's `ruby`/`rails` are
+  # one process each, so they are the swap's baseline as they stand.
+  # campfire's are eight-worker deployments, and its JVM-family lanes
+  # are one process (no fork), so the like-for-like baseline there is
+  # the one-process pair, `ruby-1p`/`rails-1p`. The sentence names the
+  # pair it used. The endpoint is the page's first, not `/articles`.
+  swap_ep = endpoints.first
+  cruby_emit, cruby_rails =
+    if benchmark == 'campfire' && (%w[ruby-1p rails-1p] - measured_targets).empty?
+      %w[ruby-1p rails-1p]
+    else
+      %w[ruby rails]
+    end
+  rb = by[swap_ep][cruby_emit]&.dig('req_sec').to_f
+  rl = by[swap_ep][cruby_rails]&.dig('req_sec').to_f
+  { 'jruby' => ['rails-jruby', 'on the JVM'], 'truffleruby' => ['rails-truffleruby', 'on TruffleRuby'] }.each do |emit_t, (rails_t, where)|
+    next unless ([emit_t, rails_t] - measured_targets).empty?
+    e = by[swap_ep][emit_t]&.dig('req_sec').to_f
+    r = by[swap_ep][rails_t]&.dig('req_sec').to_f
+    next unless e > 0 && r > 0 && rl > 0 && rb > 0
+    html << %(<p>The same comparison <em>#{where}</em>: emitted <code>#{emit_t}</code> beats stock <code>#{rails_t}</code> by <strong>#{fmt_dec(e / r, 1)}×</strong> on <code>#{swap_ep}</code>, against <strong>#{fmt_dec(rb / rl, 1)}×</strong> for <code>#{cruby_emit}</code> over <code>#{cruby_rails}</code> on CRuby — and the runtime swap alone is worth <strong>#{fmt_dec(r / rl, 1)}×</strong> to stock Rails, <strong>#{fmt_dec(e / rb, 1)}×</strong> to the emit.</p>\n)
+  end
+  # The JVM emit against the CRuby DEPLOYMENT, when the page has one:
+  # one process with the JVM's real threads against eight forked
+  # workers is the comparison a deployer would make.
+  if benchmark == 'campfire' && (%w[jruby ruby rails] - measured_targets).empty?
+    j = by[swap_ep]['jruby']&.dig('req_sec').to_f
+    rd = by[swap_ep]['ruby']&.dig('req_sec').to_f
+    rr = by[swap_ep]['rails']&.dig('req_sec').to_f
+    if j > 0 && rd > 0 && rr > 0
+      html << %(<p>Against the deployed shapes on <code>#{swap_ep}</code>: one <code>jruby</code> process is <strong>#{fmt_dec(j / rd, 2)}×</strong> the eight-worker <code>ruby</code> row and <strong>#{fmt_dec(j / rr, 1)}×</strong> the deployed <code>rails</code> row — and, unlike <code>ruby</code>, it is a shape campfire could run (one registry, one cache, one queue).</p>\n)
+    end
+  end
+end
+
+# ── Section: YJIT contribution ───────────────────────────────────────
+
+# Restrict to the JIT/interp PAIRS that were actually measured, and skip
+# the section unless at least one pair is complete. Half a pair is worse
+# than no section: campfire dropped its `-int` lanes on 2026-09-04 (they
+# measured within a percent of their YJIT siblings and cost a seventh of
+# the run), which left `ruby` and `rails` here on their own — a chart
+# captioned "how far YJIT moves each" with nothing for it to have moved
+# them from.
+yjit_series = %w[ruby rails].flat_map { |base|
+  pair = [base, "#{base}-int"]
+  (pair - measured_targets).empty? ? pair : []
+}
+unless yjit_series.empty?
+  html << h2.('YJIT contribution')
+  html << <<~P
+    <p>Each pair compares a cell with YJIT (<code>ruby</code>, <code>rails</code>) against its interpreter-only variant (<code>ruby-int</code>, <code>rails-int</code>). The bars show how far YJIT moves each.</p>
+  P
+
+  yjit_groups = endpoints.map do |ep|
+    {
+      label:  ep,
+      values: yjit_series.each_with_object({}) { |t, h| h[t] = by[ep][t]&.dig('req_sec').to_f },
+    }
+  end
+  html << grouped_bars(yjit_groups, series: yjit_series)
+end
+
+# ── Section: cost economics ──────────────────────────────────────────
+
+html << h2.('Cost economics (req/sec per GB of RSS)')
+html << <<~P
+  <p>Throughput normalized by memory footprint — req/sec divided by RSS in GB. This reorders the raw throughput charts above: targets with small working sets rise and high-RSS targets fall. Bars are log-scaled. How much the metric matters depends on the deployment shape — most on metered or serverless surfaces, least on bare metal with memory headroom.</p>
+P
+endpoints.each do |ep|
+  rows = targets.map { |t| by[ep][t] }.compact
+  html << "<h3>#{ep_label(ep)}</h3>\n"
+  html << hbar_log(rows, metric: 'rps_per_gb', unit: 'req/sec/GB')
+end
+
+# ── Section: HTML→JSON multiplier ────────────────────────────────────
+
+# Blog-fixture section: the multiplier is a claim about ONE pair of
+# endpoints, and a benchmark without them has nothing to say here.
+if by.key?('/articles') && by.key?('/articles.json')
+  html << h2.('HTML → JSON multiplier')
+  html << <<~P
+    <p>Per-target lift going from <code>/articles</code> (HTML) to <code>/articles.json</code> (JSON). The asymmetry isn't JSON-escape vs HTML-escape — both paths concatenate and escape strings. What JSON skips is the <em>layout chain</em> (csrf_meta_tag, importmap, asset-manifest scan, content_for slots) and the <em>per-row view helpers</em> (link_to, button_to, dom_id, tag.*) that the HTML index template invokes for every record. The chart below shows the multiplier per target.</p>
+  P
+
+  if measured_targets.include?('rails-jruby')
+    rjr_html = cell_metric(by['/articles']['rails-jruby'], 'req_sec').to_f
+    rjr_json = cell_metric(by['/articles.json']['rails-jruby'], 'req_sec').to_f
+    if rjr_html > 0 && rjr_json > 0 && rjr_json < rjr_html
+      html << %(<p><code>rails-jruby</code>'s multiplier falls below 1× (#{fmt_dec(rjr_json / rjr_html, 1)}×): its JSON endpoint measures slower than its HTML one.</p>\n)
+    end
+  end
+
+  # Collapse the JIT/non-JIT variants, compute each target's HTML→JSON
+  # multiplier, then rank by it (like the other bar charts) so the chart
+  # reads as an ordering rather than canonical target order.
+  mult_values = (measured_targets - %w[ruby-int rails-int]).each_with_object({}) do |t, h|
+    html_v = cell_metric(by['/articles'][t], 'req_sec').to_f
+    json_v = cell_metric(by['/articles.json'][t], 'req_sec').to_f
+    # Both ends must be measured — a lane that died between the HTML and
+    # JSON endpoints has no multiplier, and a 0× bar would invent one.
+    h[t] = (html_v > 0 && json_v > 0) ? (json_v / html_v) : nil
+  end
+  mult_values.reject! { |_, v| v.nil? }
+  mult_targets = mult_values.keys.sort_by { |t| -mult_values[t] }
+  # Single-group chart looks silly; redraw as per-target bars
+  html << <<~SVG
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 #{40 + 30 * mult_targets.size}" width="760">
+      #{mult_targets.each_with_index.map { |tgt, i|
+        v = mult_values[tgt]
+        bar_w = ((v / 6.0) * 540).round
+        y = 20 + i * 28
+        [
+          %(<text x="100" y="#{y + 14}" text-anchor="end" font-weight="bold" font-family="-apple-system,system-ui,sans-serif" font-size="12">#{tgt}</text>),
+          %(<rect x="110" y="#{y}" width="#{bar_w}" height="20" fill="#{color_for(tgt)}"/>),
+          %(<text x="#{110 + bar_w + 6}" y="#{y + 14}" font-family="-apple-system,system-ui,sans-serif" font-size="12">#{fmt_dec(v, 1)}×</text>)
+        ].join
+      }.join}
+      #{[1, 2, 3, 4, 5, 6].map { |d|
+        x = 110 + (d / 6.0) * 540
+        %(<line x1="#{x}" y1="10" x2="#{x}" y2="#{20 + 28 * mult_targets.size}" stroke="#e5e5e5"/>) +
+        %(<text x="#{x}" y="#{30 + 28 * mult_targets.size}" text-anchor="middle" font-size="10" fill="#888" font-family="-apple-system,system-ui,sans-serif">#{d}×</text>)
+      }.join}
+    </svg>
+  SVG
+end
+
+# ── Section: memory footprint ────────────────────────────────────────
+
+fair_mem = mem_is_pss?(cells)
+html << h2.("Memory footprint (#{fair_mem ? 'PSS' : 'RSS'})")
+rss_note = managed.empty? ? '' :
+  ' The field spans more than two orders of magnitude. The managed-heap cells (the JVM and .NET targets) run under a fixed heap budget rather than an organically-grown working set — see the note below the chart.'
+html << "<p>Max #{fair_mem ? 'PSS' : 'RSS'} observed across all endpoints, per target, sorted low to high.#{rss_note}</p>\n"
+if fair_mem
+  html << %(<p class="legend">PSS, not a sum of RSS: adding RSS across a process tree counts every shared page once per process, which reads high for a clustered lane and changes nothing for a single-process one. PSS divides each shared page among its sharers.</p>\n)
+end
+
+# Only lanes that measured: an unmeasured cell's RSS reads 0 because the
+# sampler had no process to sample, and a 0 MB bar would put a dead lane
+# at the top of a chart whose whole point is "lower is better".
+mem_rows = measured_targets.map do |tgt|
+  max_rss = endpoints.filter_map { |ep| mem_mb(by[ep][tgt])&.to_f }.max
+  { 'target' => tgt, 'rss_mb' => max_rss || 0.0 }
+end
+mem_rows.sort_by! { |r| r['rss_mb'] }
+
+mem_max = [mem_rows.map { |r| r['rss_mb'] }.max || 0.0, 1.0].max
+mem_svg_h = 30 + 28 * mem_rows.size
+html << svg_open(760, mem_svg_h)
+mem_rows.each_with_index do |row, i|
+  y = 10 + i * 28
+  v = row['rss_mb']
+  bar = (v / mem_max * 540).round
+  html << t(100, y + 14, row['target'], anchor: 'end', weight: 'bold')
+  html << r(110, y, bar, 20, fill: color_for(row['target']))
+  html << t(110 + bar + 6, y + 14, "#{fmt_int(v)} MB", fill: '#444')
+end
+html << svg_close
+if targets.include?('jruby') || targets.include?('truffleruby')
+  html << %(<p class="caveat">The JVM cells run under a fixed <code>-Xmx512m</code> heap (the TruffleRuby cells under <code>--vm.Xmx</code>: 512&nbsp;MB for the emit, 1&nbsp;GB for stock Rails), so the heap can't grab a host-dependent share of RAM; the rest is metaspace and code-cache, bounded by the app's class count rather than the box. Read the JVM bars as a pinned budget, not an organically-grown working set like the other cells.</p>\n)
+end
+if targets.include?('csharp') || targets.include?('csharp-aot')
+  html << %(<p class="caveat">The .NET cells are capped the same way — <code>DOTNET_GCHeapHardLimit</code> at 512&nbsp;MB, the <code>-Xmx</code> analog — so their RSS is a budget the GC collects within, not the host-proportional reservation Server GC takes by default. NativeAOT (<code>csharp-aot</code>) carries no JIT or warmup, so its working set is the leanest of the managed-heap cells.</p>\n)
+end
+
+# ── Section: latency ─────────────────────────────────────────────────
+
+# `c=64` used to be written into this heading as a constant. It was the
+# blog harness's value; campfire runs at 16, and the page said 64 anyway —
+# a wrong number stated as fact, in the one place a reader looks to know
+# what the latency means.
+at_c = concurrency ? " at c=#{concurrency}" : ''
+html << h2.("Latency (p50 / p99#{at_c})")
+html << "<p>Latencies are#{at_c.empty? ? '' : "#{at_c} concurrent connections"}; treat p50 as the median per-connection wait and p99 as the tail. Lanes are ordered by measured median p50 across endpoints, fastest first.</p>\n"
+
+# Order by latency (median p50 across endpoints, ascending) so the
+# table reads as a ranking like the sorted bar charts. Median is robust
+# to single-endpoint outliers.
+lat_order = targets.sort_by do |tgt|
+  ps = endpoints.map { |ep| by[ep][tgt]&.dig('p50_ms') }.compact.sort
+  ps.empty? ? Float::INFINITY : ps[ps.size / 2]
+end
+lat_pair = lambda do |c|
+  p50 = cell_metric(c, 'p50_ms')
+  p99 = cell_metric(c, 'p99_ms')
+  if p50 || p99
+    %(<td class="num">#{p50 ? fmt_dec(p50, 1) : '—'}</td><td class="num">#{p99 ? fmt_dec(p99, 1) : '—'}</td>)
+  else
+    "<td>—</td><td>—</td>"
+  end
+end
+# Many routes and few lanes (campfire's per-route suite) read better with
+# a row per route; the blog's five endpoints keep a row per target.
+if endpoints.size > lat_order.size
+  html << "<table>\n<thead><tr><th>route</th>"
+  lat_order.each { |tgt| html << "<th colspan=2>#{tgt}</th>" }
+  html << "</tr>\n<tr><th></th>"
+  lat_order.each { html << "<th>p50</th><th>p99</th>" }
+  html << "</tr></thead>\n<tbody>\n"
+  endpoints.each do |ep|
+    html << "<tr><td><code>#{ep_label(ep)}</code></td>"
+    lat_order.each { |tgt| html << lat_pair.(by[ep][tgt]) }
+    html << "</tr>\n"
+  end
+else
+  html << "<table>\n<thead><tr><th>target</th>"
+  endpoints.each { |ep| html << "<th colspan=2>#{ep_label(ep)}</th>" }
+  html << "</tr>\n<tr><th></th>"
+  endpoints.each { html << "<th>p50</th><th>p99</th>" }
+  html << "</tr></thead>\n<tbody>\n"
+  lat_order.each do |tgt|
+    html << "<tr><td><strong>#{tgt}</strong></td>"
+    endpoints.each { |ep| html << lat_pair.(by[ep][tgt]) }
+    html << "</tr>\n"
+  end
+end
+html << "</tbody></table>\n"
+html << %(<p class="legend">All values in milliseconds. Lower is better.</p>\n)
+
+# ── Section: cold start ──────────────────────────────────────────────
+#
+# First on campfire's own list of measures and, until 2026-09-04, on no
+# page here. Two numbers because for a chat app they are two questions:
+# when does the port answer, and when does a signed-in room page come
+# back. The second is the honest one — it contains the first render.
+if coldstart && !coldstart.empty?
+  def cs_median(xs)
+    xs = xs.compact.sort
+    return nil if xs.empty?
+    xs.size.odd? ? xs[xs.size / 2] : (xs[xs.size / 2 - 1] + xs[xs.size / 2]) / 2.0
+  end
+
+  cs_by = coldstart.group_by { |r| r['target'] }
+  cs_targets = order_first(cs_by.keys, TARGET_ORDER)
+  reps = cs_by.values.map(&:size).max
+
+  html << h2.('Cold start')
+  html << "<p>Time from <code>exec</code> to a server that answers, and to a signed-in <code>/rooms/1</code> that comes back 200. Median of #{reps} boots per lane, all on the shape named in the row. The room page is the number that matters: it contains the first render, and on a fragment-cached lane a restart keeps the Redis its own Procfile runs in a separate process, so this is a warm-cache restart rather than a cold deployment.</p>\n"
+  html << "<table>\n<thead><tr><th>target</th><th>answers (ms)</th><th>room page (ms)</th></tr></thead>\n<tbody>\n"
+  cs_targets.sort_by { |t| cs_median(cs_by[t].map { |r| r['page_ms'] }) || Float::INFINITY }.each do |tgt|
+    rows = cs_by[tgt]
+    acc = cs_median(rows.map { |r| r['accept_ms'] })
+    pg  = cs_median(rows.map { |r| r['page_ms'] })
+    bad = rows.count { |r| r['page_code'].to_s != '200' }
+    note = bad.zero? ? '' : %( <span class="caveat">(#{bad} boot#{bad == 1 ? '' : 's'} never rendered)</span>)
+    html << %(<tr><td><strong>#{tgt}</strong></td><td class="num">#{acc ? fmt_dec(acc, 0) : '—'}</td><td class="num">#{pg ? fmt_dec(pg, 0) : '—'}#{note}</td></tr>\n)
+  end
+  html << "</tbody></table>\n"
+  html << %(<p class="legend">Milliseconds. Lower is better. A deployed Rails lane boots a proxy, a Puma master and one worker per <code>(processor_count &times; 0.666).ceil</code>; the binary boots one process.</p>\n)
+end
+
+# ── Section: WebSocket connections ───────────────────────────────────
+#
+# "How many concurrent WebSocket connections a given box will hold" is
+# the measure campfire's own discussion calls the one that matters most.
+# It is a different workload on different cores from the HTTP rows above
+# — a pinned tier, one client driving both lanes — so it is a section of
+# its own and never a row in those tables.
+if sockets && !sockets.empty?
+  html << h2.('WebSocket connections')
+  tiers = sockets.map { |r| r['sockets'] }.compact.uniq.sort
+  html << "<p>Sockets held open, subscribed to a room, then idled and driven: each lane pinned to the same cores, one client, exact delivered/expected frame counts. The idle column is the cost of holding connections that are doing nothing, which is what a chat deployment does most of the time. <strong>Read the fan-out latency against the per-room column</strong> — one message costs one write per subscriber in its room, so a room of 200 and a room of 50 are different workloads at the same socket count.</p>\n"
+  html << "<table>\n<thead><tr><th>target</th><th>sockets</th><th>per room</th><th>connect storm</th><th>idle (cores)</th><th>#{sockets.any? { |r| r['pss_mb'] } ? 'PSS' : 'RSS'} (MB)</th><th>fan-out p50 / p99</th><th>delivering (cores)</th><th>frames</th></tr></thead>\n<tbody>\n"
+  tiers.each do |n|
+    order_first(sockets.select { |r| r['sockets'] == n }.map { |r| r['target'] }, TARGET_ORDER).each do |tgt|
+      r = sockets.find { |x| x['sockets'] == n && x['target'] == tgt } or next
+      frames = if r['delivered'] && r['expected']
+                 ok = r['delivered'] == r['expected']
+                 %(#{fmt_int(r['delivered'])}/#{fmt_int(r['expected'])}#{ok ? '' : ' <span class="caveat">short</span>'})
+               else '—' end
+      shape = r['shape'].to_s.strip
+      shape = shape.empty? ? '' : %(<br><span class="legend">#{shape.gsub('&', '&amp;').gsub('<', '&lt;').gsub('>', '&gt;')}</span>)
+      html << %(<tr><td><strong>#{tgt}</strong>#{shape}</td><td class="num">#{fmt_int(n)}</td>) +
+              %(<td class="num">#{r['subscribers_per_room'] || '—'}</td>) +
+              %(<td class="num">#{r['storm_s'] ? "#{fmt_dec(r['storm_s'], 1)} s" : '—'}</td>) +
+              %(<td class="num">#{r['idle_cores'] ? fmt_dec(r['idle_cores'], 3) : '—'}</td>) +
+              %(<td class="num">#{r['pss_mb'] || r['rss_mb'] || '—'}</td>) +
+              %(<td class="num">#{r['frame_p50_ms'] ? "#{fmt_dec(r['frame_p50_ms'], 0)} / #{fmt_dec(r['frame_p99_ms'], 0)} ms" : '—'}</td>) +
+              %(<td class="num">#{r['chat_cores'] ? fmt_dec(r['chat_cores'], 3) : '—'}</td>) +
+              %(<td class="num">#{frames}</td></tr>\n)
+    end
+  end
+  html << "</tbody></table>\n"
+  # The client is single-threaded, and above a few thousand sockets a
+  # shared heartbeat hands it every ping at once. Saying so beside the
+  # tail is the difference between a measurement and a claim.
+  worst = sockets.map { |r| r['driver_max_pass_ms'] }.compact.max
+  if worst && worst > 20
+    html << %(<p class="caveat">The driver is one thread reading every socket; its longest single reading pass in this run was #{fmt_dec(worst, 0)}&nbsp;ms. A fan-out p99 near that number is the client's backlog rather than the server's fan-out.</p>\n)
+  end
+  html << %(<p class="legend">Memory is PSS where the lane is multi-process, RSS otherwise. Lower is better in every column except frames, which must be exact.</p>\n)
+end
+
+# ── Section: what each lane rendered (parity.txt) ────────────────────
+
+# A throughput number for a page that is not the same page is not a
+# comparison. The harness captures one authenticated GET per lane per
+# endpoint before any load and writes the tally here; without it a reader
+# has to take on faith that the lanes were answering with the same
+# document. Optional, and TSV so any harness can leave one:
+#   <lane>\t<endpoint>\tstatus=<n>\ttags=<n>\tbytes=<n>
+parity_rows = begin
+  File.readlines(File.join(run_path, 'parity.txt'), chomp: true).reject(&:empty?)
+rescue Errno::ENOENT
+  []
+end
+
+unless parity_rows.empty?
+  html << h2.('What each lane rendered')
+  html << "<p>One authenticated GET per lane per endpoint, captured before any load. Equal tag counts are what makes the throughput numbers above a comparison rather than two measurements.</p>\n"
+  html << "<table>\n<thead><tr><th>lane</th><th>endpoint</th><th>status</th><th>tags</th><th>bytes</th></tr></thead>\n<tbody>\n"
+  parity_rows.each do |line|
+    lane, ep, status, tags, bytes = line.split("\t").map { |f| f.to_s.sub(/\A[a-z_]+=/, '') }
+    html << %(<tr><td>#{lane}</td><td><code>#{ep_label(ep)}</code></td>) +
+            %(<td class="num">#{status}</td><td class="num">#{fmt_int(tags.to_i)}</td>) +
+            %(<td class="num">#{fmt_int(bytes.to_i)}</td></tr>\n)
+  end
+  html << "</tbody></table>\n"
+end
+
+# ── Section: run-to-run stability (from per-run.json) ────────────────
+
+# The summary collapses each cell to its median run; per-run.json is the
+# only artifact that keeps the individual runs, so the spread lives here.
+# Fully data-driven (no hand-tuned numbers) so it can't go stale: the
+# headline CV, the outlier threshold, and the cold-first-run count are all
+# computed from the records read above. Skipped entirely when per-run.json
+# is absent (older runs) or yields no usable rows.
+if per_run && !per_run.empty?
+  # Group by cell; keep each run's req/sec ordered by its run index so the
+  # per-run columns line up regardless of file order.
+  series = Hash.new { |h, k| h[k] = [] }
+  per_run.each do |row|
+    next unless row['target'] && row['endpoint'] && row['req_sec']
+    series[[row['target'], row['endpoint']]] << [row['run'].to_i, row['req_sec'].to_f]
+  end
+
+  stats = series.filter_map do |(tgt, ep), pairs|
+    vs = pairs.sort_by(&:first).map(&:last)
+    next if vs.empty?
+    mean = vs.sum / vs.size
+    sd   = Math.sqrt(vs.map { |v| (v - mean)**2 }.sum / vs.size)
+    cv   = mean > 0 ? sd / mean * 100 : 0.0
+    { target: tgt, endpoint: ep, runs: vs, cv: cv }
+  end
+
+  unless stats.empty?
+    cvs        = stats.map { |s| s[:cv] }.sort
+    median_cv  = cvs[cvs.size / 2]
+    runs_each  = series.values.map(&:size).max
+    threshold  = 3.0
+    warmup     = env&.dig('harness', 'warmup_sec')
+
+    html << %(<h2 id="stability">Run-to-run stability</h2>\n)
+    html << <<~P
+      <p>Each cell is timed #{runs_each} times and the charts above report the median run. This section reads <code>per-run.json</code> directly to show how far the individual runs strayed from it. Across all #{stats.size} cells the median run-to-run coefficient of variation in req/sec is <strong>#{fmt_dec(median_cv, 2)}%</strong> — the timed runs of a given cell agree to a fraction of a percent, so the reported medians aren't masking noise.</p>
+    P
+
+    noisy = stats.select { |s| s[:cv] >= threshold }.sort_by { |s| -s[:cv] }
+    if noisy.empty?
+      html << %(<p>No cell varies by more than #{fmt_dec(threshold, 0)}% across its runs.</p>\n)
+    else
+      cold_first = noisy.count { |s| s[:runs].size > 1 && s[:runs].first == s[:runs].min }
+      warm_note  = if cold_first > 0
+        warmup_txt = warmup ? "fixed #{warmup}s warmup" : 'fixed warmup window'
+        "; in #{cold_first} of them the first timed run is the slowest, consistent with residual warmup the #{warmup_txt} doesn't fully absorb"
+      else
+        ''
+      end
+      html << %(<p>The #{noisy.size} cell#{noisy.size == 1 ? '' : 's'} that vary by more than #{fmt_dec(threshold, 0)}% are concentrated in the lowest-throughput cells, where a small absolute swing is a larger fraction of the rate#{warm_note}:</p>\n)
+      html << "<table>\n<thead><tr><th>target</th><th>endpoint</th>"
+      (1..runs_each).each { |i| html << "<th>run #{i}</th>" }
+      html << "<th>CV</th></tr></thead>\n<tbody>\n"
+      noisy.each do |s|
+        html << "<tr><td><strong>#{s[:target]}</strong></td><td>#{s[:endpoint]}</td>"
+        runs_each.times { |i| html << %(<td class="num">#{s[:runs][i] ? fmt_int(s[:runs][i]) : '-'}</td>) }
+        html << %(<td class="num">#{fmt_dec(s[:cv], 1)}%</td></tr>\n)
+      end
+      html << "</tbody></table>\n"
+      html << %(<p class="legend">req/sec per timed run; CV = standard deviation ÷ mean.</p>\n)
+    end
+  end
+end
+
+# ── Section: raw data table ──────────────────────────────────────────
+
+html << "<details>\n<summary>Raw cell data (#{cells.size} rows)</summary>\n"
+html << "<table>\n<thead><tr><th>target</th><th>endpoint</th><th>req/sec</th><th>p50 (ms)</th><th>p99 (ms)</th><th>#{mem_is_pss?(cells) ? 'PSS' : 'RSS'} (MB)</th><th>req/sec/GB</th></tr></thead>\n<tbody>\n"
+cells.sort_by { |c| [TARGET_ORDER.index(c['target']) || 99, ENDPOINT_ORDER.index(c['endpoint']) || 99] }.each do |c|
+  html << "<tr>"
+  html << "<td>#{c['target']}</td>"
+  html << "<td>#{c['endpoint']}</td>"
+  req = cell_metric(c, 'req_sec')
+  html << %(<td class="num">#{req ? fmt_int(req) : '—'}</td>)
+  %w[p50_ms p99_ms].each do |k|
+    v = cell_metric(c, k)
+    html << %(<td class="num">#{v ? fmt_dec(v, 2) : '—'}</td>)
+  end
+  mem = mem_mb(c)
+  html << %(<td class="num">#{mem ? fmt_int(mem) : '—'}</td>)
+  v = cell_metric(c, 'rps_per_gb')
+  html << %(<td class="num">#{v ? fmt_int(v) : '—'}</td>)
+  html << "</tr>\n"
+end
+html << "</tbody></table>\n</details>\n"
+
+# ── Section: environment appendix ────────────────────────────────────
+
+if env
+  html << %(<details id="environment">\n<summary>Environment#{env['captured_at'] ? " (captured #{env['captured_at']})" : ''}</summary>\n)
+
+  clock = env_map(env, 'clock')
+  html << "<h3>Host</h3>\n"
+  html << kv_table([
+    ['hostname', env_dig(env, 'host', 'hostname')],
+    ['OS',       env_dig(env, 'os', 'pretty_name')],
+    ['kernel',   env_dig(env, 'host', 'uname') || (env['host'] if env['host'].is_a?(String))],
+    ['board',    [env_dig(env, 'cpu', 'board_vendor'), env_dig(env, 'cpu', 'board_name')].compact.reject(&:empty?).join(' ')],
+    ['CPU',      lscpu_field(env, 'Model name')],
+    ['topology', lscpu_field(env, 'CPU(s)') && "#{lscpu_field(env, 'Core(s) per socket')} cores / #{lscpu_field(env, 'CPU(s)')} threads"],
+    ['clock',    clock['governor'] && "governor=#{clock['governor']}, boost #{clock['boost'] == '0' ? 'disabled' : 'enabled'}, #{(clock['max_khz'].to_i / 1000)} MHz max"],
+    ['memory',   env['memory_mb'] && "#{fmt_int(env['memory_mb'])} MB"],
+  ])
+
+  # The application under test, when the harness knows one. A generic
+  # machine capture cannot: campfire's Gemfile tracks rails/rails main, so
+  # naming "Rails 8.2" is not a pin — the framework is identified only by
+  # the lockfile's git revision, and the app only by its own SHA.
+  oracle  = env_map(env, 'oracle')
+  # The app server is part of what was measured, and a harness whose lanes
+  # resolve it separately has to say so — otherwise the only place the two
+  # versions appear is a server log nobody opens.
+  servers = env_map(env, 'servers')
+  unless oracle.empty? && servers.empty?
+    seed = oracle['seed'].is_a?(Hash) ? oracle['seed'] : {}
+    rails = [oracle['rails_version'],
+             oracle['rails_revision'] && "(#{oracle['rails_revision'].to_s[0, 12]})"].compact.join(' ')
+    app_sha = oracle['app_sha'] || oracle['campfire_sha']
+    html << "<h3>Application under test</h3>\n"
+    html << kv_table([
+      ['app',      env['benchmark']],
+      ['revision', app_sha && "<code>#{app_sha.to_s[0, 12]}</code>"],
+      ['Rails',    rails],
+      ['Ruby',     oracle['ruby_version']],
+      ['served',   oracle['serve_env']],
+      ['seed',     seed.empty? ? nil : "#{seed['users']} users, #{seed['rooms']} rooms, " \
+                                       "#{seed['messages_per_room']} messages/room"],
+      *servers.map { |label, version| ["app server (#{label})", version] },
+    ])
+  end
+
+  # What each lane ACTUALLY ran, as the harness recorded it at boot —
+  # not what it was asked to run. Outside the toolchain block on purpose:
+  # a run with no toolchain capture still has lanes.
+  shapes = env['lane_shapes']
+  if shapes.is_a?(Hash) && !shapes.empty?
+    html << "<h3>What each lane actually ran</h3>\n"
+    html << "<p class=\"legend\">Recorded at boot, not copied from intent: a lane that asked for jemalloc and did not get one says so here.</p>\n"
+    html << kv_table(shapes.sort.map { |lane, parts| [lane, "<code>#{parts.join('</code>, <code>')}</code>"] })
+  end
+
+  toolchains = env_map(env, 'toolchains')
+  unless toolchains.empty?
+    html << "<h3>Toolchains</h3>\n"
+    html << kv_table(toolchains.sort.map { |name, ver| [name, "<code>#{ver}</code>"] })
+  end
+
+  h = env_map(env, 'harness')
+  requested  = Array(h['targets'])
+  unmeasured = requested - measured_targets
+  html << "<h3>Harness</h3>\n"
+  html << kv_table([
+    ['command',     h['command'] && "<code>#{h['command']}</code>"],
+    ['workers',     Array(h['workers']).join(', ')],
+    ['concurrency', h['concurrency']],
+    ['runs',        h['runs'] && "#{h['runs']} × #{h['duration_sec']}s after #{h['warmup_sec']}s warmup"],
+    ['wrk threads', h['wrk_threads']],
+    ['endpoints',   Array(h['endpoints']).map { |e| "<code>#{e}</code>" }.join(' ')],
+    ['targets',     requested.join(', ')],
+    ['not measured', unmeasured.empty? ? nil : "#{unmeasured.join(', ')} (requested but produced no measurements)"],
+  ])
+
+  g = env_map(env, 'git')
+  unless g.empty?
+    html << "<h3>Source</h3>\n"
+    html << kv_table([
+      ['commit',  g['sha'] && "<code>#{g['sha']}</code>#{g['dirty'] ? ' (dirty)' : ''}"],
+      ['branch',  g['branch']],
+      ['subject', g['subject']],
+    ])
+  end
+
+  c = env_map(env, 'conditions')
+  unless c.empty?
+    html << "<h3>Conditions at start</h3>\n"
+    html << kv_table([
+      ['load average', Array(c['loadavg_1_5_15']).join(' / ')],
+      ['uptime',       c['uptime']],
+    ])
+  end
+
+  html << "</details>\n"
+end
+
+html << %(<hr><p class="meta">Generated #{Time.now.utc.iso8601} from <code>#{File.basename(input)}</code>.</p>\n)
+html << "</body>\n</html>\n"
+
+File.write(out, html)
+$stderr.puts "wrote #{out} (#{html.bytesize} bytes)"

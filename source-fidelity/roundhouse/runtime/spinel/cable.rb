@@ -1,0 +1,822 @@
+# frozen_string_literal: true
+# Cable — Action Cable (actioncable-v1-json) WebSocket endpoint for the
+# spinel target, built on the Tep::WebSocket codec + Tep::Broadcast fan-out
+# under Tep::Server::Threaded.
+#
+# This is the spinel-subset sibling of the CRuby overlay's
+# `ruby_overlay/cable.rb` (which rides Puma's rack-hijack +
+# websocket-driver gem). Both satisfy the same surface — Turbo's
+# `<turbo-cable-stream-source>` opens a WebSocket to `/cable`, and
+# `Broadcasts.set_transport(...)` fans model after-commit fragments out
+# to subscribers in real time — but this one uses no gems: the
+# connection is a green thread that parks between frames, the
+# Tep::WebSocket codec frames the traffic, and Tep::Broadcast does the
+# per-connection fan-out.
+#
+# Protocol implemented (Action Cable v1 JSON):
+#   - Server -> client {"type":"welcome"} on open
+#   - Server -> client {"type":"ping","message":<unix-ts>} every 3s
+#     (ONE heartbeat thread for the process, walking a registry of open
+#     connections -- Action Cable's shape, and see `Cable.register` for
+#     why it is not a thread per connection; Turbo reconnects without it)
+#   - Client -> server {"command":"subscribe","identifier":"<json>"}
+#     where the identifier JSON carries
+#     {"channel":"Turbo::StreamsChannel","signed_stream_name":"<sig>"}
+#   - Server -> client {"identifier":"<json>","type":"confirm_subscription"}
+#   - Server -> client {"identifier":"<json>","message":"<turbo-stream>"}
+#     when Broadcasts.record fires on a subscribed stream
+#
+# Single-worker only (WORKERS=1): subscriptions + the broadcast log
+# live per-process, so cross-worker fan-out would need the (dropped) PG
+# backend. The model after-commit hook and the WebSocket connections
+# run in the same worker, so in-process delivery reaches every client.
+module Cable
+  # The stream-topic -> identifier-JSON map lives on Tep::APP
+  # (Tep::APP.cable_identifiers), not a Cable constant: spinel types a
+  # Tep.str_hash ivar as StrStrHash but mistypes a module-level
+  # constant initialised the same way as int. The identifier is echoed
+  # verbatim in confirm_subscription + every broadcast message so Turbo
+  # routes the frame to the right stream-source.
+
+  PING_INTERVAL = 3   # seconds — matches Action Cable's default
+
+  # How many pieces one interval's beats are sent in. See `beat_cycle`:
+  # every connection is still pinged once per interval, but N frames do
+  # not leave together.
+  BEAT_SLICES = 10
+
+  # THE APP'S OWN `ApplicationCable::Connection`, built against the
+  # handshake's cookie jar — or an anonymous one when the app declares
+  # no connection class. The factory itself lives in
+  # `runtime/action_cable.rb` (`ActionCable::Connection.build`, a
+  # generated arm) beside the class it builds, because the test harness
+  # builds the same object: a `Connection::TestCase` runs the app's
+  # `connect` against a jar it seeded, and one factory per tree is what
+  # keeps the connection slot one class per tree (below).
+  #
+  # ONE RETURN TYPE PER TREE, which is why `WsMessage#initialize` builds
+  # its placeholder through here too rather than naming the base class
+  # directly: two spellings would make the handler's connection slot
+  # poly for no gain: a base class is a union point, and a slot with
+  # two spellings in it is one the emitter can no longer monomorphize.
+  def self.build_connection(cookies)
+    ActionCable::Connection.build(cookies)
+  end
+
+  # Resolve the handshake's identity by running the APP's own `connect`.
+  #
+  # WHY THE APP'S CODE AND NOT A COOKIE LOOKUP HERE: `connect` is where
+  # an app decides who is on the other end, and every app decides it
+  # differently. campfire's reads `cookies.signed[:session_token]` and
+  # loads a `Session`; reimplementing that here would hardcode one app's
+  # authentication into the runtime and diverge the moment the app
+  # changed it. The runtime's job is to hand `connect` a real signed
+  # cookie jar and to honour its verdict — and the jar is the SAME
+  # `ActionController::CookieJar` over the SAME `req.cookies` that
+  # `Main.dispatch` builds for a controller, because a WebSocket upgrade
+  # IS an ordinary HTTP GET and carries the same `Cookie:` header.
+  #
+  # Returns nil when the app refused. The caller answers that with a
+  # status, which is only possible because identity resolves BEFORE
+  # `res.start_websocket` — a socket already handed to the recv loop
+  # could be closed but not given a reason.
+  #
+  # No DB lease is taken here: `connect` loads a `Session`, and
+  # `Tep::App#dispatch`'s `Db.with_connection` already wraps the whole
+  # dispatch, cable branch included.
+  def self.identify(req)
+    conn = Cable.build_connection(ActionController::CookieJar.new(req.cookies))
+    refused = false
+    begin
+      conn.connect
+    rescue ActionCable::Connection::Authorization::UnauthorizedError
+      # A refusal is an ORDINARY OUTCOME of `connect`, not a crash, and
+      # the rescue is narrowed to exactly the error
+      # `reject_unauthorized_connection` raises so that a channel that
+      # genuinely broke still reaches the caller as an error.
+      refused = true
+    end
+    if refused
+      return nil
+    end
+    conn
+  end
+
+  # THE CHANNEL A SUBSCRIBE FRAME NAMES — `ActionCable::Channel.build`,
+  # the generated arm-per-channel factory in `runtime/action_cable.rb`,
+  # which the test harness shares (`Channel::TestCase#subscribe` builds
+  # the channel the same way, with no socket). nil for a name nothing
+  # defined; `subscribe` answers that with `reject_subscription`, which
+  # is what Action Cable's client expects and what stops it waiting
+  # forever for a confirmation.
+  def self.build_channel(name, connection, identifier)
+    ActionCable::Channel.build(name, connection, identifier)
+  end
+
+  # Route one subscribe frame to the channel it NAMES, run the app's own
+  # `subscribed`, and register whatever streams it asked for.
+  #
+  # THIS IS WHERE AUTHORIZATION HAPPENS, and the reason item 4 is a
+  # dispatch rather than a guard bolted onto the old path: campfire
+  # prepends `RoomStreamsAreAuthorized` onto `Turbo::StreamsChannel`,
+  # and a prepended module only runs if something calls the method it
+  # wraps. The frame used to be decoded here and subscribed directly,
+  # so `subscribed` never ran and the guard sat in the tree unreached —
+  # whoever could spell a stream name got its fan-out.
+  #
+  # THE CHANNEL DECIDES THE STREAMS, not this method. `subscribed` calls
+  # `stream_from`/`stream_for`, which record on the channel; the loop
+  # below registers what it recorded. A channel that authorizes and then
+  # subscribes to nothing is confirmed with zero streams, which is what
+  # Rails does — the confirmation says "your subscription exists", not
+  # "you will receive something".
+  #
+  # A REJECTION IS A FRAME, not a silence. Action Cable's client keys
+  # its subscription table on the identifier and retries a subscription
+  # it never heard back about, so a dropped frame is a reconnect loop.
+  def self.subscribe(ws, connection, identifier, holder)
+    name = ActionCable::Channel::Parameters.read(identifier, "channel")
+    if name.length == 0
+      return Cable.reject(ws, identifier)
+    end
+    channel = Cable.build_channel(name, connection, identifier)
+    if channel.nil?
+      return Cable.reject(ws, identifier)
+    end
+    # A RAISE IS AN OUTCOME, NOT AN ESCAPE, and on this lane that is
+    # load-bearing rather than tidy: tep has no per-request rescue, so
+    # an unhandled error inside `subscribed` ends the PROCESS — every
+    # other connection with it. `Array#second` reaching the binary
+    # un-lowered took the server down on the first cable subscribe.
+    # The client is told the subscription was rejected; stderr is the
+    # only place the reason can exist, and a subscription that silently
+    # stops working is the bug that costs an afternoon. The overlay's
+    # `Cable::Dispatch.subscribe` reports the same event the same way.
+    begin
+      channel.subscribed
+      # AFTER `subscribed` AND BEFORE the rejection check, which is
+      # Rails' order: the callback's own `unless: :subscription_rejected?`
+      # guard is what skips it for a refused subscription, and a channel
+      # that declared `on_subscribe` WITHOUT that guard means it to run
+      # either way. campfire's `PresenceChannel` writes its `memberships`
+      # row here — the whole reason a connect storm costs a database.
+      channel.after_subscribe
+    rescue StandardError => e
+      warn "[cable] " + name + "#subscribed raised: " + e.message
+      return Cable.reject(ws, identifier)
+    end
+    if channel.subscription_rejected?
+      return Cable.reject(ws, identifier)
+    end
+    channel.streams.each do |stream|
+      Tep::APP.cable_lock.synchronize do
+        Tep::APP.cable_identifiers[stream] = identifier
+      end
+      Tep::Broadcast.subscribe_ws(stream, ws)
+    end
+    # REMEMBERED, and only once the subscription is confirmed. The
+    # unsubscribe callbacks are the other half of a connect storm —
+    # campfire's `on_unsubscribe :absent` is the `memberships` UPDATE
+    # that takes a user back out of the room — and they need a channel
+    # object that outlives the frame that built it. A rejected or
+    # crashed subscribe returns above and is never held.
+    holder.remember(channel)
+    ws.text("{\"identifier\":" + JSON.generate(identifier) +
+            ",\"type\":\"confirm_subscription\"}")
+    0
+  end
+
+  def self.reject(ws, identifier)
+    ws.text("{\"identifier\":" + JSON.generate(identifier) +
+            ",\"type\":\"reject_subscription\"}")
+    0
+  end
+
+  # Handle one inbound WebSocket frame: `subscribe` and `message` are
+  # acted on; pings and unsubscribes are ignored (teardown drops fds,
+  # and `Broadcast.unsubscribe_fd` runs on close).
+  #
+  # `connection` is the identified connection this socket was upgraded
+  # with — #71 item 3 — and it is passed through to the channel so the
+  # app's `subscribed` can read `current_user`. That is the hop item 4
+  # adds: identity existed and nothing consulted it.
+  def self.handle_message(ws, connection, data, holder)
+    frame = ActionCable::Channel::Parameters.object(data)
+    if frame.nil?
+      return 0
+    end
+    command = frame["command"].to_s
+    identifier = frame["identifier"].to_s
+    if identifier.length == 0
+      return 0
+    end
+    if command == "subscribe"
+      return Cable.subscribe(ws, connection, identifier, holder)
+    end
+    if command == "message"
+      return Cable.perform(identifier, frame["data"].to_s, holder)
+    end
+    0
+  end
+
+  # A `message` frame - the client's `subscription.perform(action, data)`,
+  # #71 item 6. It goes to the channel this socket SUBSCRIBED under that
+  # identifier, the same object `subscribed` ran on, so whatever state
+  # `subscribed` left in its ivars is there for the action.
+  #
+  # IN FRAME ORDER: this runs on the connection's own green thread, one
+  # frame after another, so two actions from one client never overtake
+  # each other (a terminal's keystrokes stay in the order typed).
+  #
+  # `data` is decoded with its JSON types kept, as Rails decodes it. An
+  # identifier this socket holds no subscription for is logged and
+  # dropped, as Rails logs "Unable to find subscription"; so is a `data`
+  # that is not a JSON object. A raise inside the action is reported and
+  # contained: an unhandled error here would end the process, every
+  # other connection with it.
+  def self.perform(identifier, data_json, holder)
+    channel = holder.channel_for(identifier)
+    if channel.nil?
+      warn "[cable] Unable to find subscription with identifier: " + identifier
+      return 0
+    end
+    data = ActionCable::Channel::Parameters.object(data_json)
+    if data.nil?
+      warn "[cable] Unable to process a message whose data is not a JSON object"
+      return 0
+    end
+    begin
+      channel.perform_action(data)
+    rescue StandardError => e
+      warn "[cable] " + channel.class.to_s + "#perform_action raised: " + e.message
+    end
+    0
+  end
+
+  # ONE HEARTBEAT THREAD FOR THE PROCESS, not one per connection, and
+  # the difference is most of our idle cost. A per-connection ping
+  # thread sleeps PING_INTERVAL and wakes on its own phase; connections
+  # arrive over minutes in a real deployment, so the phases spread out
+  # and the scheduler's monitor turns once per beat -- 333 turns a
+  # second at 1,000 sockets, each one a poll over every parked thread.
+  # A shared beat is one turn per interval no matter how many sockets
+  # are held. Measured on the standalone matz and I traded on
+  # matz/spinel#4317: 0.375 cores staggered per-connection against
+  # 0.010 shared, at 1,000 connections. It is also Action Cable's own
+  # shape, which is what the comparison lane runs.
+  #
+  # THE REGISTRY IS DRIVERS, NOT FDS, for the reason Broadcast's is: an
+  # fd number belongs to the next accept the moment its owner closes
+  # it, and a heartbeat that wrote to the number would put a ping frame
+  # in front of a stranger's 101. `Driver#write_frame` refuses once the
+  # connection has retired it, and retirement happens before the close.
+  def self.register(ws)
+    start = false
+    Tep::APP.cable_conns_lock.synchronize do
+      Tep::APP.cable_conns.push(ws)
+      if Tep::APP.cable_heartbeat == 0
+        Tep::APP.cable_heartbeat = 1
+        start = true
+      end
+    end
+    # Outside the lock: nothing else should wait on the registry while a
+    # thread is being born. The flag is already set, so a second opener
+    # racing here cannot start a second beat.
+    if start
+      Cable.spawn_heartbeat
+    end
+    # This process's Redis subscription, when broadcasts go through Redis.
+    RedisCable.ensure_subscriber
+    0
+  end
+
+  # Drop a connection from the heartbeat's registry. Called from the
+  # on-close handler, BEFORE the fd is closed, while its number still
+  # names only this connection -- the same contract, and the same
+  # back-to-front delete, as `Tep::Broadcast.unsubscribe_fd`.
+  def self.unregister(ws)
+    fd = ws.fd
+    dropped = 0
+    Tep::APP.cable_conns_lock.synchronize do
+      conns = Tep::APP.cable_conns
+      i = conns.length - 1
+      while i >= 0
+        if conns[i].fd == fd
+          conns.delete_at(i)
+          dropped += 1
+        end
+        i -= 1
+      end
+    end
+    dropped
+  end
+
+  def self.spawn_heartbeat
+    Thread.new do
+      Cable.heartbeat_loop
+    end
+    0
+  end
+
+  # Beat forever. The thread outlives the last connection and beats over
+  # an empty registry rather than exiting: a beat costs one wake every
+  # three seconds, and a heartbeat that stops has to be restarted by
+  # whoever opens the next socket, under the same lock, which is a race
+  # for nothing.
+  def self.heartbeat_loop
+    while true
+      Cable.beat_cycle
+    end
+    0
+  end
+
+  # ONE INTERVAL'S BEATS, SPREAD ACROSS IT. Every connection is still
+  # pinged exactly once per PING_INTERVAL; what changes is that the
+  # frames leave in BEAT_SLICES pieces instead of all at once.
+  #
+  # WHY, measured. A single burst of N pings costs the server one long
+  # run of writes every interval, and it costs anything reading many of
+  # those sockets a backlog: on the 5,000-socket sweep cell the driver's
+  # longest single reading pass went from 101 ms with a thread per
+  # connection to 791 ms with one unsliced beat, and about two thirds of
+  # the fan-out p99 that grew alongside it (367 -> 1401 ms) is that
+  # backlog rather than the server. Ten slices divide the burst by ten
+  # and cost ten monitor wakes per interval instead of one — against the
+  # 333 a second a thread per connection costs at 1,000 sockets, which is
+  # the whole reason the beat was shared.
+  #
+  # A connection that arrives mid-cycle is picked up by the next one, at
+  # most one interval later, which is well inside the client's timeout.
+  def self.beat_cycle
+    live = Cable.registry_snapshot
+    n = live.length
+    if n == 0
+      Cable.beat_pause(PING_INTERVAL.to_f)
+      return 0
+    end
+    per = (n + BEAT_SLICES - 1) / BEAT_SLICES
+    pause = PING_INTERVAL.to_f / BEAT_SLICES.to_f
+    i = 0
+    slice = 0
+    while slice < BEAT_SLICES
+      Cable.beat_pause(pause)
+      stop = i + per
+      if stop > n
+        stop = n
+      end
+      # A timestamp per slice, not per cycle: the frame says when it was
+      # sent, and the slices are up to an interval apart.
+      payload = Cable.ping_payload
+      while i < stop
+        live[i].text(payload)
+        i += 1
+      end
+      slice += 1
+    end
+    Cable.app_beats
+    n
+  end
+
+  # Rails' heartbeat calls every connection's `beat`; campfire's override
+  # looks its session up again now and then and closes once it is gone.
+  # After the cycle's pings, under a database lease (the override reads
+  # the database). An app error is the app's: logged, and the beat goes
+  # on to the next connection.
+  def self.app_beats
+    registry = @beats
+    return 0 if registry.nil?
+    handlers = registry.snapshot
+    i = 0
+    while i < handlers.length
+      handler = handlers[i]
+      i += 1
+      begin
+        Db.with_connection do
+          handler.connection.beat
+          true
+        end
+      rescue StandardError => e
+        $stderr.puts "[cable] beat: " + e.message
+      end
+    end
+    0
+  end
+
+  # The sleep between slices, as its own method so a test can run a whole
+  # cycle without waiting an interval for it. Nothing else should call it.
+  def self.beat_pause(seconds)
+    sleep(seconds)
+    0
+  end
+
+  def self.ping_payload
+    "{\"type\":\"ping\",\"message\":" + Time.now.to_i.to_s + "}"
+  end
+
+  # The registry, copied out under its lock. The writes then happen
+  # outside it -- `Tep::Broadcast.publish_local_only`'s rule, and for the
+  # same reason: a write can park, and nothing else may wait on the
+  # registry while it does.
+  def self.registry_snapshot
+    live = [Tep::WebSocket::Driver.new(-1)]
+    live.pop
+    Tep::APP.cable_conns_lock.synchronize do
+      conns = Tep::APP.cable_conns
+      i = 0
+      while i < conns.length
+        live.push(conns[i])
+        i += 1
+      end
+    end
+    live
+  end
+
+  # One unsliced pass over the registry: every open connection gets a
+  # frame now. `beat_cycle` is what the heartbeat thread runs; this is
+  # the whole-registry write it is built out of, kept whole because a
+  # test can read it and because a slice of one is this.
+  #
+  # A slow client can park this thread inside its write, which is the
+  # cost of sharing the beat; Action Cable's timer shares the same
+  # exposure, and a client that cannot absorb 40 bytes in three seconds
+  # is gone anyway. The timestamp is read once per pass rather than once
+  # per connection.
+  def self.beat
+    payload = Cable.ping_payload
+    live = Cable.registry_snapshot
+    i = 0
+    while i < live.length
+      live[i].text(payload)
+      i += 1
+    end
+    live.length
+  end
+
+  # on_open handler: greet + join the heartbeat's registry.
+  class WsOpen < Tep::WebSocket::Handler
+    attr_accessor :ws
+
+    def initialize
+      super
+      @ws = Tep::WebSocket::Driver.new(0)
+    end
+
+    def handle_event(evt)
+      @ws.text("{\"type\":\"welcome\"}")
+      Cable.register(@ws)
+      0
+    end
+  end
+
+  # on_message handler: subscribe dispatch.
+  #
+  # THE PER-CONNECTION OBJECT ON THIS LANE. The overlay has one because
+  # nio4r hands it a connection; tep hands out an fd and two handler
+  # objects — and `Cable.upgrade` builds a FRESH `WsMessage` per
+  # upgrade, so the handler instance already IS per-connection. It only
+  # lacked identity. Nothing new has to be given a lifecycle: the driver
+  # holds the handler (`set_on_message`), so the handler lives exactly
+  # as long as the connection and dies with it —
+  # `Tep::WebSocket::Connection.dispatch_close` runs `h_close` and then
+  # `Tep::Broadcast.unsubscribe_fd(driver.fd)`, and the driver goes.
+  class WsMessage < Tep::WebSocket::Handler
+    attr_accessor :ws, :connection
+
+    def initialize
+      super
+      @ws = Tep::WebSocket::Driver.new(0)
+      # An anonymous placeholder so the slot has a type before
+      # `upgrade` assigns the identified connection. Built through
+      # `Cable.build_connection` rather than by naming
+      # `ActionCable::Connection::Base` directly so the slot holds ONE
+      # class per tree — see that method's note.
+      @connection = Cable.build_connection(
+        ActionController::CookieJar.new(Tep.str_hash))
+      @channels = []
+    end
+
+    # UNDER A LEASE. The socket's recv loop runs after the upgrade
+    # response, outside the request's `Db.with_connection`, and a
+    # subscribe reads the database (`RoomStreamsAreAuthorized` asks who
+    # belongs to the room). Without a lease the read fell back to the
+    # pool's first connection -- which another thread may hold, and a
+    # sqlite connection and its statement cache are one thread's at a
+    # time. The first two sockets to subscribe at once took the binary
+    # down inside sqlite's parser.
+    def handle_event(evt)
+      Db.with_connection do
+        Cable.handle_message(@ws, @connection, evt.data, self)
+      end
+      0
+    end
+
+    # THE SUBSCRIPTIONS THIS SOCKET HOLDS, so the unsubscribe callbacks
+    # have somewhere to run. `Cable.subscribe` pushes a channel here only
+    # after it has confirmed it; `WsClose` walks the list once, on the
+    # connection's own thread, inside a lease.
+    #
+    # ONE ARRAY ON THE HANDLER rather than a module-level fd map: the
+    # handler already IS the per-connection object (`Cable.upgrade`
+    # builds a fresh one per upgrade and the driver holds it), so the
+    # list dies with the connection and no lock is needed — nothing else
+    # can reach it.
+    def remember(channel)
+      @channels << channel
+      0
+    end
+
+    def channels
+      @channels
+    end
+
+    # The confirmed subscription this socket holds under `identifier`, or
+    # nil. Compared as the client sent it: Action Cable's client replays
+    # an identifier byte for byte in every frame it sends for that
+    # subscription.
+    def channel_for(identifier)
+      @channels.each do |channel|
+        if channel.identifier == identifier
+          return channel
+        end
+      end
+      nil
+    end
+
+    # Rails runs `unsubscribed` and the `after_unsubscribe` chain when a
+    # subscription goes away, including when the socket simply closes.
+    #
+    # BEST EFFORT, one channel at a time: a teardown callback that raises
+    # must not stop the rest of the teardown, and there is nobody left to
+    # tell. Same posture as the overlay's `Cable::Dispatch.unsubscribe`.
+    def unsubscribe_all
+      @channels.each do |channel|
+        begin
+          channel.unsubscribed
+          channel.after_unsubscribe
+        rescue StandardError => e
+          warn "[cable] unsubscribe raised: " + e.message
+        end
+      end
+      @channels = []
+      0
+    end
+  end
+
+  # on_close handler: run the app's unsubscribe callbacks.
+  #
+  # A THIRD HANDLER rather than a branch in `WsMessage`, because tep
+  # dispatches close to `driver.h_close` and the message handler is not
+  # it. It holds the message handler — the object that owns the channel
+  # list — which is also what makes the pair one lifetime: `upgrade`
+  # builds both and hands the same `WsMessage` to this one.
+  #
+  # UNDER A LEASE, for the reason `WsMessage#handle_event` is: the
+  # callbacks write (`membership.disconnected` is an UPDATE), and this
+  # runs on the connection's recv thread outside any request.
+  class WsClose < Tep::WebSocket::Handler
+    attr_accessor :msg
+
+    def initialize
+      super
+      @msg = Cable::WsMessage.new
+    end
+
+    def handle_event(evt)
+      Cable.unregister(@msg.ws)
+      Cable.beats.remove(@msg)
+      Db.with_connection do
+        @msg.unsubscribe_all
+      end
+      0
+    end
+  end
+
+  # Perform the `/cable` upgrade from inside Main.dispatch. Mirrors the
+  # manual shape bin/tep's translator lowers a `websocket` block into:
+  # validate the handshake, build one Driver shared by both event
+  # handlers, and flip res.start_websocket so Tep::Server::Threaded
+  # writes the 101 and runs the recv loop. Returns true if it handled
+  # an upgrade (caller returns early), false if the request wasn't a
+  # valid WS upgrade.
+  def self.upgrade(req, res)
+    hs = Tep::WebSocket::Handshake.check(req)
+    if !hs.valid
+      res.status = 400
+      res.body = "invalid websocket upgrade"
+      return true
+    end
+
+    # THE ORIGIN FIRST, as Action Cable orders it
+    # (runtime/request_forgery_protection.rb): a handshake from another
+    # site is refused with Rails' own 404 before the app's `connect`
+    # runs, and the CRuby overlay's config.ru answers it the same way.
+    unless ActionController::RequestForgeryProtection.cable_origin_allowed?(
+        req.req_headers.fetch("origin", ""),
+        ActionController::RequestForgeryProtection.host_origin_for(
+          req.req_headers.fetch("host", ""), "",
+          req.req_headers.fetch("x-forwarded-proto", ""), ""))
+      res.status = 404
+      res.body = "Page not found"
+      return true
+    end
+
+    # IDENTITY RESOLVES BEFORE THE SOCKET IS TAKEN OVER. `res.status`
+    # below is only answerable while this is still an ordinary HTTP
+    # response; once `res.start_websocket` runs, Tep::Server::Threaded
+    # has written the 101 and a refusal could only be a silent close.
+    # 401 rather than a quiet welcome, and 401 rather than Rails' 404,
+    # because it is what the CRuby overlay's config.ru already answers —
+    # the two lanes have to refuse the same way to be comparable.
+    conn = Cable.identify(req)
+    if conn.nil?
+      res.status = 401
+      res.body = "unauthorized"
+      return true
+    end
+
+    drv = Tep::WebSocket::Driver.new(0)
+    # Echo the Action Cable subprotocol. The browser's ActionCable client
+    # opens with `Sec-WebSocket-Protocol: actioncable-v1-json` and, per its
+    # isProtocolSupported() check, IGNORES every frame (welcome,
+    # confirm_subscription, and all broadcasts) unless the server echoes a
+    # supported subprotocol in the 101 — so without this the
+    # `<turbo-cable-stream-source>` never flips to `connected` and no live
+    # updates arrive. Select it only when offered (a raw ws client that
+    # offers none leaves it "" and the header is omitted, per RFC 6455).
+    hs.protocols.each do |proto|
+      if proto == "actioncable-v1-json"
+        drv.set_subprotocol("actioncable-v1-json")
+      end
+    end
+
+    cb_open = Cable::WsOpen.new
+    cb_open.ws = drv
+    cb_open.req = req
+    drv.set_on_open(cb_open)
+
+    cb_msg = Cable::WsMessage.new
+    cb_msg.ws = drv
+    cb_msg.req = req
+    cb_msg.connection = conn
+    drv.set_on_message(cb_msg)
+    # `close(reason:)` closes this socket, and the heartbeat calls the
+    # connection's `beat` (`Cable.app_beats`).
+    sock = Cable::Socket.new
+    sock.ws = drv
+    conn.transport = sock
+    Cable.beats.add(cb_msg)
+
+    cb_close = Cable::WsClose.new
+    cb_close.msg = cb_msg
+    drv.set_on_close(cb_close)
+
+    res.start_websocket(hs.accept_key, drv)
+    true
+  end
+
+  # Publish an already-composed Action Cable `message` VALUE to every
+  # WebSocket fd subscribed to `stream`.
+  #
+  # `message_json` is JSON TEXT and is spliced UNQUOTED, which is the
+  # whole reason this is separate from `Transport#broadcast` below: that
+  # one ships a turbo-stream fragment, an HTML String, and quotes it.
+  # Action Cable's `message` field carries the VALUE, so a raw publish of
+  # `{roomId: 1}` has to arrive as a JSON OBJECT — quoting it would ship
+  # `"message":"{\"roomId\":1}"`, valid JSON in the wrong shape, and
+  # wrong in the silent way because only the browser notices.
+  #
+  # `publish_local` returns without publishing when no subscriber here
+  # has named the stream; `Transport#broadcast` comes through it too.
+  # The identifier JSON a subscriber sent for `stream`, or "" when none
+  # has. Read under the map's lock: subscribes on other connections
+  # write it concurrently.
+  def self.identifier_for(stream)
+    id = ""
+    Tep::APP.cable_lock.synchronize do
+      id = Tep::APP.cable_identifiers[stream]
+    end
+    id
+  end
+
+  # Under config/cable.yml's `adapter: redis` (runtime/redis_cable.rb)
+  # every message goes through Redis, and comes back to this process's
+  # sockets, and every other process's, through `deliver_json`.
+  def self.publish_raw(stream, message_json)
+    if RedisCable.enabled?
+      RedisCable.publish(stream, message_json)
+    else
+      Cable.publish_local(stream, message_json)
+    end
+    nil
+  end
+
+  # A message from Redis for this process's sockets.
+  def self.deliver_json(stream, message_json)
+    Cable.publish_local(stream, message_json)
+  end
+
+  def self.publish_local(stream, message_json)
+    id = Cable.identifier_for(stream)
+    if id.length == 0
+      return nil
+    end
+    envelope = "{\"identifier\":" + JSON.generate(id) +
+               ",\"message\":" + message_json + "}"
+    Tep::Broadcast.publish(stream, envelope)
+    nil
+  end
+
+  # Rails' connection `socket` over the driver, the two calls
+  # `ActionCable::Connection::Base` hands it: `close` tells the client
+  # why and whether to come back and closes (the client's close reply
+  # runs the driver's ordinary teardown), and `perform_work` runs inline
+  # under the heartbeat's database lease.
+  class Socket
+    attr_accessor :ws
+
+    def transmit(data)
+      @ws.text(ActionCable.payload_json(data))
+      nil
+    end
+
+    def close_with_reason(reason, reconnect)
+      drv = @ws
+      drv.text(ActionCable.disconnect_json(reason, reconnect))
+      drv.close(1000, "")
+      nil
+    end
+
+    def perform_work(receiver)
+      receiver.call
+      nil
+    end
+  end
+
+  # Broadcasts transport: Broadcasts.record calls broadcast(stream,
+  # fragment) on every after-commit hook. Wrap the fragment in the
+  # Action Cable message envelope (echoing the subscriber's identifier)
+  # and publish to every WS fd subscribed to the stream.
+  class Transport
+    def broadcast(stream, fragment)
+      # The fragment as Rails writes it: ActiveSupport::JSON escapes `<`,
+      # `>` and `&` inside strings (`\u003cturbo-stream ...`), which plain
+      # JSON.generate does not. Same text as the overlay's `Registry.deliver`.
+      Cable.publish_raw(stream, JsonBuilder.escape_html_entities(JSON.generate(fragment)))
+      nil
+    end
+  end
+
+  # The connections the heartbeat calls `beat` on, beside the drivers it
+  # pings: one `WsMessage` per socket, which holds the app's connection.
+  # Under the drivers' registry lock.
+  class BeatRegistry
+    def initialize
+      @handlers = [Cable::WsMessage.new]
+      @handlers.pop
+    end
+
+    def add(handler)
+      Tep::APP.cable_conns_lock.synchronize do
+        @handlers.push(handler)
+      end
+      nil
+    end
+
+    def remove(handler)
+      Tep::APP.cable_conns_lock.synchronize do
+        i = @handlers.length - 1
+        while i >= 0
+          @handlers.delete_at(i) if @handlers[i].equal?(handler)
+          i -= 1
+        end
+      end
+      nil
+    end
+
+    def snapshot
+      out = [Cable::WsMessage.new]
+      out.pop
+      Tep::APP.cable_conns_lock.synchronize do
+        @handlers.each { |h| out.push(h) }
+      end
+      out
+    end
+  end
+
+  # Made on the first upgrade, not as this file loads: its seed is a
+  # `WsMessage`, whose own seed is a cookie jar.
+  @beats = nil
+
+  # Under the registry lock: two upgrades on two request threads would
+  # otherwise each make one, and the loser's connections would never beat.
+  def self.beats
+    registry = @beats
+    return registry unless registry.nil?
+    Tep::APP.cable_conns_lock.synchronize do
+      if @beats.nil?
+        @beats = BeatRegistry.new
+      end
+    end
+    @beats
+  end
+end

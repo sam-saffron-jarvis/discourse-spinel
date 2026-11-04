@@ -1,0 +1,14 @@
+held_all=true
+all=true
+any=true
+none=false
+one=false
+mix_all=false
+mix_any=true
+mix_none=true
+one_j=true
+all_k_j=true
+chain_all=true
+str_all=true
+int_all=true
+count=0

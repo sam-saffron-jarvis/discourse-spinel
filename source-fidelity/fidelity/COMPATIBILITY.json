@@ -1,0 +1,48 @@
+{
+  "ticket": "018-source-fidelity-ar",
+  "status": "repository verify passes isolated original-scope F1 proof; coordinator acceptance separate; NOT TopicQuery or /latest",
+  "executable_inputs": [
+    {"source": "app/models/topic.rb:371", "contract": "original listable_topics lambda body"},
+    {"source": "app/models/topic.rb:375", "contract": "original visible lambda body"},
+    {"source": "app/models/topic.rb:249", "contract": "original belongs_to category declaration"},
+    {"source": "app/models/concerns/trashable.rb:7", "contract": "original included default_scope predicate"},
+    {"source": "lib/archetype.rb:21-23", "contract": "original private_message method"}
+  ],
+  "reusable_changes": [
+    {"owner": "roundhouse/src/project.rs", "gap": "Spinel output ignored PostgreSQL adapter", "fix": "existing shared PG runtime, native driver, PG dialect, signatures, pg0.2.0 package; native generated test helper explicitly refuses unimplemented PG isolation", "tests": ["postgresql_spinel_target tree/refusal and native SELECT-only execution"]},
+    {"owner": "roundhouse/src/lower/model_to_library/adapter_emit/mod.rs", "gap": "non-null Float passed to String escape primitive", "fix": "typed semantic to_s in shared storage lowering", "tests": ["float_write_serialization emitted/native SQLite memory insert/update/reload"]},
+    {"owner": "roundhouse/runtime/spinel/db_pg.rb + db_pg.rbs", "gap": "PGOPTIONS alone does not protect spinel-pg's new/reopened pooled sessions", "fix": "DATABASE_READONLY=1 shared per-physical-connection policy, before use; connection discarded on setup failure", "tests": ["postgresql_spinel_target native/CRuby two pool paths plus reconnect read-only assertions", "spinel_pg_db RBS completeness"]}
+  ],
+  "verified_contract": [
+    "Identical lowered Ruby on native/CRuby except platform pg_driver.rb, compared with actual full original Discourse/Rails8.1.4 oracle",
+    "Five nonempty live rows and category identity/name",
+    "Integer/String/Boolean/nullable Float/text/integer/Time values; NULL fidelity and microsecond timestamp normalization",
+    "Ten labelled SELECT-only derived cases; original scopes retain ids101,105,108,109,110 and exclude private_message, false/NULL visible, NULL archetype and deleted rows",
+    "NULL and dangling category FKs preload loaded nil without repeat queries",
+    "Composition0, live materialization2, repeat0, fixture materialization2, fixture repeat0 queries",
+    "Limit fork immutability; hostile quote/question-mark/backslash binding and explicit NULL bind",
+    "RecordNotFound, ArgumentError and actual invalid-SELECT StatementInvalid; no empty-success fallback",
+    "Actual wrong-scope native query is rejected against real oracle; comparator also rejects boolean-to-integer mutation",
+    "Native ELF directly connects to task PG with one execve and no runtime Ruby/Rails process"
+  ],
+  "oracle_isolation": {
+    "authorization": "../run/ORACLE_SANDBOX_AUTHORIZATION.json, Nov3",
+    "fixture": "Owned short-lived Valkey, dynamically unused127.0.0.1 port !=5499/6399; PING/INFO PID and runtime config attestation; persistence off",
+    "guards": "All Redis config/connect/dispatch paths must target owned endpoint; pipelines included; shared6399, unknown TCP/Unix endpoints rejected before boot. Oracle PG constructors/aliases/startup options/prepared SQL/session overrides guarded, actual target/read-only checked. Native/compat physical pool/reopen readonly policy is shared runtime",
+    "effects": "Actual unchanged cache DEL and Logster HSET/RPUSH/etc pipelines execute on fixture; successful replies and original call stacks retained privately, not stubbed",
+    "profiling": "MiniProfiler remains enabled; direct safety wrappers preserve later alias-based original hooks, covered by regression and actual hook source metadata",
+    "readonly_internal_helper": "Original boot libvips version check may use only its proven original private worker child/socket for the read-only version operation; tracked and cleaned, no shared socket allowed",
+    "cleanup": "Owned child handles only; success/error/interrupt cleanup tests and per-run stopped evidence required before verifier success"
+  },
+  "remaining_closure": [
+    "Native program is an explicitly isolated declaration projection, not full Topic/Category/Trashable callback/plugin/model boot",
+    "Only observed fields are compared; all111 physical columns get type/null metadata, but defaults and Category ignored_columns are not a complete native contract",
+    "No native generated PG test-helper schema isolation; helper fails rather than risk shared DB DDL",
+    "Relation hash predicates retain existing PG quoting/inlining; not new true server-bound Relation predicates (Db dollar-parameter binds already exist)",
+    "Native compilation uses emitted RBS; no Spinel change or unseeded receiver-dispatch support claim",
+    "TopicQuery initialize/default_results/latest_results/create_list, Guardian, settings, applicable plugin callbacks/modifiers, TopicList and original serializer/controller/document remain to execute"
+  ],
+  "transformation_policy": "No original source/method body edits and no unsupported-Ruby application-body rewrite. Position-preserving Prism projections feed existing static scope/Concern/schema/association DSL expansion. Each run records full hashes, original spans, emitted markers and generated method locations; actual Rails/compat/native live and negative comparisons evidence the selected semantics, not full-model equivalence.",
+  "next_original_query_step": "Grow original TopicQuery#default_results at lib/topic_query.rb:821 from original Guardian.filter_allowed_categories(Topic.unscoped.listable_topics, category_id_column: categories.id) merged into category-preloaded Topic. Preserve real settings and applicable hooks or report exact barriers. Then original latest_results:629 and create_list:576 lead to list_latest:305-307. Do not replace these bodies or resume manual plugin endpoints.",
+  "historical_safety_disclosure": "Nov2 two early exploratory Rails boots lacked Valkey guards and could perform startup cache writes; not accepted isolated evidence. That blocked handoff/history is preserved. Nov3 uses only the owned writable fixture and read-only task PG; no shared cache rollback/reset, source/settings change or service restart."
+}

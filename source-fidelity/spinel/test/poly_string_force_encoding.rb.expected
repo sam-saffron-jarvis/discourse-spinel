@@ -1,0 +1,8 @@
+<b>café</b>
+<b>café</b>
+12
+"ASCII-8BIT"
+"<b>café</b>"
+"ASCII-8BIT"
+undefined method 'force_encoding' for nil
+undefined method 'b' for nil

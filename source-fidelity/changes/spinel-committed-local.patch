@@ -1,0 +1,1363 @@
+diff --git a/docs/limitations.md b/docs/limitations.md
+index 5c48dd135..4720eacfd 100644
+--- a/docs/limitations.md
++++ b/docs/limitations.md
+@@ -93,6 +93,7 @@ registry, or stack reification -- none of which exist in a flat compiled binary.
+ | An ivar write in an Object or Kernel method with boxed `self` | uses the existing reflective setter; refused if a possible receiver has no writable slot, or a possible receiver has no writable slot; the setter carries the String itself | ordinary user-class slots are registered by the existing boxed-receiver analysis, including a class that starts with no ivars; its indexed call sites bound the receiver layouts, while calls it cannot follow remain conservative; an unused setter adds no instance slots; no write is silently dropped |
+ | `defined?(@x)` in an Object or Kernel method whose receiver is boxed | refused when the existing layout facts cannot track whether a possible receiver's slot has been assigned | an initialized slot, a slot whose value distinguishes unset, or a slot with an explicit presence bit is supported; a slot introduced by a root setter keeps its presence bit even if an unrelated class writes an ivar of the same name; mixed ordinary/reflective nil writes to related layouts can leave presence untracked |
+ | General reflection (`methods`, `instance_variables`) and `instance_variable_get` / `instance_variable_set` / `instance_variable_defined?` with a **non-literal** name | a non-literal `instance_variable_get` or `instance_variable_set` on a user-class instance (typed, boxed, an exception, main) dispatches by name over the ivars its class declares, each as its literal form does: a read boxes the field and a write stores into it, after the analysis joined the written value's type into every field the write can reach (a field that may take a value of another type widens to a box). A name the class does not declare lives in a table keyed by the object, where the rest of the reflection finds it as CRuby does: `instance_variable_get` (literal or computed), `instance_variable_defined?` (literal or computed), `instance_variables` (after the declared names), the default `inspect`, `dup`, `clone` and `remove_instance_variable`. A name without `@` raises NameError, a frozen receiver (a Data, an immediate) FrozenError. Refused when a boxed receiver may be an instance of a class that defines its own `instance_variable_get` / `instance_variable_set`, and for a computed write on a by-value object | user-class ivars are C struct offsets; a literal name resolves to the known offset, a computed one to a switch over the class's names, and the table takes the rest. Builtin reflective paths and ordinary ivar access in Object methods keep working. `instance_variables` can list the declared fields. A **literal** `instance_variable_get(:@x)` / `instance_variable_set(:@x, v)` *is* supported, like `send(:literal)` below. `methods` and `public_methods` (no argument, or `true`) on nil, true, false, an Integer, a Float, a Symbol, a String, an Array, a Hash, a Range, a Regexp, a Rational, a Proc, a Time or an `Object.new` list CRuby's names for its class, with the methods the program's reopenings of the class and its ancestors add; those are listed from the start of the run, before the reopening has run. On a boxed value of another builtin class (Complex, MatchData, ...) they raise NotImplementedError. |
++| Computed `klass.instance_variable_get(name)` / `instance_variable_set(name, value)` on an explicit Class-valued receiver | non-NUL ASCII identifiers absent from the receiver's statically laid-out class slots use the existing real class-keyed ivar table; inherited calls and captured Class receivers keep distinct receiver storage, nil/false/Symbol values and setter results | A computed name that overlaps a statically typed slot, or a non-ASCII identifier, raises explicit NotImplementedError instead of shadowing the slot or claiming Ruby's encoding semantics. Possible source class-method overrides on an unknown Class receiver are refused at compile time; a statically bound source override still runs normally. Bare implicit class-method calls are not admitted by this explicit-receiver arm. |
+ | User-defined `#hash` / `#eql?` for hash *keys* | not dispatched (identity probe) | the hash machinery can't call back into a user method per key |
+ | A method that **uses its block** (`yield` or `block.call`) **and recurses into itself** (`def rec(n, &b); ...; rec(n-1, &b); yield n; end`) | compile error (loud, was a hang / undefined-symbol) | a block-using method is inlined at each call site (there is no standalone function that takes the block), so a self-call inlines its own body unboundedly -- the runtime base case is invisible at compile time. Recursion *through a yielded block* (`with_state { with_state { } }`, finite source nesting) does work |
+ | `Monitor#class` | reports `Thread::Mutex` | a Monitor IS a mutex here, with reentrancy switched on per object, and the class name for a `TY_MUTEX` value is decided at compile time from the type rather than read off the object. `#synchronize` (including reentrant use), `#try_enter` and mutual exclusion across threads all behave as CRuby's do; only the name differs. The `MonitorMixin` module is modelled for an includer (`synchronize`, `mon_*`, `new_cond` and its `wait` / `wait_while` / `wait_until` / `signal` / `broadcast`). `Monitor#mon_owned?` and `Monitor#new_cond` also work on a statically typed Monitor; a condition variable retains its monitor and restores its reentrant lock depth after a wait. |
+@@ -188,6 +189,24 @@ See [require.md](require.md) for which stdlib needs which `require`.
+ | Mixed / non-UTF-8 encodings | UTF-8 / ASCII-8BIT only. `IO#set_encoding` picks between the two (US-ASCII counts as UTF-8) for what a read with no length and `getc` answer; a third encoding, an internal encoding that would convert reads, or `BOM\|` raises `NotImplementedError` at run time, and options (`invalid: :replace`, ...) are refused. `String#encode` / `encode!` convert between UTF-8, ASCII-8BIT and US-ASCII with `invalid:`, `undef:` and `replace:` as CRuby's; with another encoding they answer ASCII text unchanged where both encodings hold it as ASCII (and an empty String as empty) and raise `NotImplementedError` otherwise, as they do for non-ASCII text from US-ASCII to itself without `invalid: :replace`, and a call that names `xml:`, `fallback:` or a newline option, or computes an option's key, is refused (a `**` hash holding one of those options raises `NotImplementedError`). `encode!` that replaces characters works on a variable or a String shared by reference, where it reaches every name for the String, and raises `NotImplementedError` elsewhere; `s = s.encode(...)` works everywhere | one internal representation; transcoding tables are out of scope |
+ | Embedded `NUL` in general binary strings | `char *` boundary assumption | most string ops are NUL-terminated at the C boundary |
+ 
++A nullable Symbol-keyed Hash read raises `NoMethodError` for a nil receiver,
++including a reflective class-storage read through a stored closure. A missing
++key in an actual Hash still follows its default/default-proc; unset object
++instance variables continue to answer nil through their separate storage API.
++
++A program-defined Class/Module held in a typed Class parameter supports
++`respond_to?(runtime_name, include_private)` using its singleton methods,
++aliases/accessors, inherited visibility and Class/Module's core method surface.
++The operands run once in source order. This arm declines user `respond_to?`
++overrides, undef tables and core Object/Class/Module reopenings rather than bypassing them;
++core, name-backed, singleton-class and nullable Class values remain explicitly
++unsupported by this runtime-name arm. This is reflection support, not runtime
++method installation or a claim that every reported core method is callable.
++
++`send`/`__send__` retain their visibility bypass when a boxed receiver contains
++a Class value, including private lifecycle callbacks. `public_send` and ordinary
++explicit calls still reject non-public class methods.
++
+ `send`/`public_send`/`__send__` with a **non-literal** name (`send(meth)`) is
+ partially supported: an explicit-receiver send lowers to a static dispatch over
+ the method names that appear as symbol/string **literals** anywhere in the
+diff --git a/lib/spinel_rt.h b/lib/spinel_rt.h
+index 3d6a7ff4b..b9e4cf453 100644
+--- a/lib/spinel_rt.h
++++ b/lib/spinel_rt.h
+@@ -10630,7 +10630,7 @@ static void sp_SymPolyHash_grow(sp_SymPolyHash*h){ sp_gc_wb((void*)h);sp_int oc=
+    threshold and cost optcarrot ~35% fps (same lesson as the string-hash cache:
+    hot-path inline branches regress; SP_NOINLINE the cold side). */
+ static SP_NOINLINE sp_RbVal sp_SymPolyHash_miss(sp_SymPolyHash*h,sp_sym k){if(h->dproc)return h->dproc(h,k,h->dproc_self);return h->default_v;}
+-static sp_RbVal sp_SymPolyHash_get(sp_SymPolyHash*h,sp_sym k){if(!h)return sp_box_nil();sp_int idx=(sp_int)(((sp_int)k)&h->mask);while(h->keys[idx]>=0){if(h->keys[idx]==k)return h->vals[idx];idx=(idx+1)&h->mask;}return sp_SymPolyHash_miss(h,k);}
++static sp_RbVal sp_SymPolyHash_get(sp_SymPolyHash*h,sp_sym k){if (SP_UNLIKELY(!h)) sp_nil_recv("[]");sp_int idx=(sp_int)(((sp_int)k)&h->mask);while(h->keys[idx]>=0){if(h->keys[idx]==k)return h->vals[idx];idx=(idx+1)&h->mask;}return sp_SymPolyHash_miss(h,k);}
+ static void sp_SymPolyHash_set(sp_SymPolyHash*h,sp_sym k,sp_RbVal v){sp_gc_wb((void*)h); if(h->len*2>=h->cap)sp_SymPolyHash_grow(h);sp_int idx=(sp_int)(((sp_int)k)&h->mask);while(h->keys[idx]>=0){if(h->keys[idx]==k){h->vals[idx]=v;return;}idx=(idx+1)&h->mask;}h->keys[idx]=k;h->vals[idx]=v;h->order[h->len]=k;h->len++;}
+ static sp_bool sp_SymPolyHash_has_key(sp_SymPolyHash*h,sp_sym k){sp_int idx=(sp_int)(((sp_int)k)&h->mask);while(h->keys[idx]>=0){if(h->keys[idx]==k)return TRUE;idx=(idx+1)&h->mask;}return FALSE;}
+ static sp_int sp_SymPolyHash_length(sp_SymPolyHash*h){return h->len;}
+diff --git a/src/analyze.c b/src/analyze.c
+index 80206852a..db95e6720 100644
+--- a/src/analyze.c
++++ b/src/analyze.c
+@@ -7443,6 +7443,52 @@ static const char *seed_type_of_param(const Scope *s, const char *list, int slot
+   return buf;
+ }
+ 
++/* A class object and its instances can use the same Ruby ivar spelling.
++   Their physical stores are distinct, but ClassInfo's representation slot is
++   shared. A container return pin must not pin the other home's scalar store. */
++static int seed_ivar_home(Compiler *c, int id, int cid) {
++  Scope *s = comp_scope_of(c, id);
++  if (s && s->class_id == cid) {
++    if (s->is_cmethod) return 2;
++    if (!s->is_proc_form && s->def_node >= 0) return 1;
++  }
++  if ((!s || s->class_id < 0) && c->node_cbody && id < c->node_cap && c->node_cbody[id] == cid) return 2;
++  return 0;
++}
++static int seed_ivar_mixed_homes(Compiler *c, Scope *s, const char *name) {
++  const NodeTable *nt = c->nt;
++  int other = s->is_cmethod ? 1 : 2;
++  for (int id = 0; id < nt->count; id++) {
++    NodeKind k = nt_kind(nt, id);
++    if (k != NK_InstanceVariableReadNode && k != NK_InstanceVariableWriteNode &&
++        k != NK_InstanceVariableOrWriteNode && k != NK_InstanceVariableAndWriteNode &&
++        k != NK_InstanceVariableOperatorWriteNode) continue;
++    const char *nm = nt_str(nt, id, "name");
++    if (nm && sp_streq(nm, name) && seed_ivar_home(c, id, s->class_id) == other) return 1;
++  }
++  return 0;
++}
++static void seed_home_empty_literals(Compiler *c, Scope *s, const char *name, TyKind want) {
++  const NodeTable *nt = c->nt;
++  int home = s->is_cmethod ? 2 : 1;
++  for (int id = 0; id < nt->count; id++) {
++    NodeKind k = nt_kind(nt, id);
++    if (k != NK_InstanceVariableWriteNode && k != NK_InstanceVariableOrWriteNode) continue;
++    const char *nm = nt_str(nt, id, "name");
++    if (!nm || !sp_streq(nm, name) || seed_ivar_home(c, id, s->class_id) != home) continue;
++    int v = nt_ref(nt, id, "value"), n = -1;
++    if (v < 0 || v >= c->node_cap) continue;
++    if (ty_is_hash(want) && nt_kind(nt, v) == NK_HashNode && c->hash_want) {
++      nt_arr(nt, v, "elements", &n);
++      if (n == 0) comp_set_hash_want(c, v, want);
++    }
++    else if (ty_is_array(want) && nt_kind(nt, v) == NK_ArrayNode && c->arr_want) {
++      nt_arr(nt, v, "elements", &n);
++      if (n == 0) comp_set_arr_want(c, v, want);
++    }
++  }
++}
++
+ /* Pin scope `s`'s return and each named parameter to its seeded type. ptypes
+    is a comma-separated list: a plain field is aligned with the parameter
+    index (empty fields preserved so a skipped middle param doesn't shift the
+@@ -7484,9 +7530,18 @@ static void seed_method(Compiler *c, Scope *s, const char *ret_tok, char *ptypes
+             if (!inline_pin_agrees(c, NULL, s->class_id, ivn, ret_tok, NULL, where, from_rbs)) return;
+             ClassInfo *ci = &c->classes[s->class_id];
+             int idx = comp_ivar_intern(ci, ivn);
+-            ivar_set_type(ci, idx, rt);
+-            class_pin_ivar(ci, ivn);
+-            if (!from_rbs) inline_pin_record(NULL, s->class_id, ivn, ret_tok, NULL, where, head);
++            if (seed_ivar_mixed_homes(c, s, ivn)) {
++              /* Keep the shared descriptor boxed, but preserve the exact
++                 payload layout of empty literals in the seeded reader's
++                 own home. The return seed remains authoritative. */
++              ivar_set_type(ci, idx, TY_POLY);
++              seed_home_empty_literals(c, s, ivn, rt);
++            }
++            else {
++              ivar_set_type(ci, idx, rt);
++              class_pin_ivar(ci, ivn);
++              if (!from_rbs) inline_pin_record(NULL, s->class_id, ivn, ret_tok, NULL, where, head);
++            }
+           }
+         }
+       }
+@@ -35190,8 +35245,35 @@ static void check_seed_contradictions(Compiler *c) {
+   char _sn1[192], _sn2[192];
+   SeedIvarReport *reported = NULL;
+   int nreported = 0;
++  /* Mixed-home readers retain their logical backing-slot contract even
++     though the shared representation descriptor must stay boxed. */
++  typedef struct { Scope *scope; const char *name; TyKind type; } HomePin;
++  HomePin *home_pins = NULL;
++  int nhome_pins = 0;
++  for (int si = 0; si < c->nscopes; si++) {
++    Scope *s = &c->scopes[si];
++    if (s->ret_rbs_cont_nil || s->class_id < 0 || s->body < 0) continue;
++    TyKind contract = s->ret_rbs_seeded ? s->ret :
++      s->ret_rbs_cont == RBS_CONT_HASH ? TY_POLY_POLY_HASH :
++      s->ret_rbs_cont == RBS_CONT_ARRAY ? TY_POLY_ARRAY : TY_UNKNOWN;
++    if (!(ty_is_hash(contract) || ty_is_array(contract))) continue;
++    int effective = s->is_cmethod ? comp_cmethod_in_chain(c, s->class_id, s->name, NULL)
++                                  : comp_method_in_chain(c, s->class_id, s->name, NULL);
++    if (effective >= 0 && effective != si) continue;
++    int bn = 0; const int *bb = nt_arr(nt, s->body, "body", &bn);
++    if (!bb || bn <= 0) continue;
++    int last = bb[bn - 1];
++    NodeKind k = nt_kind(nt, last);
++    if (k != NK_InstanceVariableReadNode && k != NK_InstanceVariableOrWriteNode) continue;
++    const char *name = nt_str(nt, last, "name");
++    if (!name || !seed_ivar_mixed_homes(c, s, name)) continue;
++    home_pins = realloc(home_pins, sizeof *home_pins * (size_t)(nhome_pins + 1));
++    home_pins[nhome_pins++] = (HomePin){ s, name, contract };
++  }
+   for (int id = 0; id < nt->count; id++) {
+-    if (nt_kind(nt, id) != NK_InstanceVariableWriteNode) continue;
++    NodeKind wk = nt_kind(nt, id);
++    if (wk != NK_InstanceVariableWriteNode && wk != NK_InstanceVariableOrWriteNode &&
++        wk != NK_InstanceVariableAndWriteNode) continue;
+     const char *nm = nt_str(nt, id, "name");
+     int v = nt_ref(nt, id, "value");
+     if (!nm || v < 0) continue;
+@@ -35199,10 +35281,21 @@ static void check_seed_contradictions(Compiler *c) {
+     int cid = sc ? sc->class_id : -1;
+     if (cid < 0) continue;
+     ClassInfo *ci = &c->classes[cid];
+-    if (!class_ivar_pinned(ci, nm)) continue;
++    Scope *home_reader = NULL;
++    TyKind home_contract = TY_UNKNOWN;
++    for (int hi = 0; hi < nhome_pins; hi++) {
++      Scope *hs = home_pins[hi].scope;
++      if (hs->class_id == cid && sp_streq(home_pins[hi].name, nm) &&
++          seed_ivar_home(c, id, cid) == (hs->is_cmethod ? 2 : 1)) {
++        home_reader = hs;
++        home_contract = home_pins[hi].type;
++        break;
++      }
++    }
++    if (!home_reader && (!class_ivar_pinned(ci, nm) || wk != NK_InstanceVariableWriteNode)) continue;
+     int iv = comp_ivar_index(ci, nm);
+     if (iv < 0) continue;
+-    TyKind slot = ci->ivar_types[iv];
++    TyKind slot = home_reader ? home_contract : ci->ivar_types[iv];
+     /* `@a = @b = nil` assigns @a the nil at the bottom of the chain, not
+        @b's slot type: the write's value is what was written */
+     for (int d = 0; d < 32; d++) {
+@@ -35224,13 +35317,15 @@ static void check_seed_contradictions(Compiler *c) {
+         (val == TY_STR_ARRAY))
+       continue;
+     if (slot == TY_STR_POLY_HASH && val == TY_STR_STR_HASH) continue;
+-    if (!seed_contradicts(c, slot, val, 0)) continue;
++    /* A home contract checks the returned Ruby container, not a typed
++       physical slot: its boxed store can hold any array representation. */
++    if (!seed_contradicts(c, slot, val, home_reader != NULL)) continue;
+     int ln  = (int)nt_int(nt, id, "node_line", 0);
+     int fid = (int)nt_int(nt, id, "node_file", 0);
+     const char *file = nt_file_path(nt, fid);
+     if (!file || !*file) file = nt->source_file;
+     if (!file || !*file) file = "source.rb";
+-    const char *by = inline_pin_at_ivar(cid, nm);
++    const char *by = home_reader ? inline_pin_at_method(home_reader, -1) : inline_pin_at_ivar(cid, nm);
+     /* A write in a mixed-in module's method is cloned into each includer's
+        copy, and the clone carries the annotation, so one assignment in the
+        source can contradict the pin twice: it is reported once. */
+@@ -35263,6 +35358,7 @@ static void check_seed_contradictions(Compiler *c) {
+     if (!collect_mode()) exit(1);
+     g_seed_bad = 1;
+   }
++  free(home_pins);
+   free(reported);
+   /* The same contradiction on a RETURN. A seeded return is trusted, so the
+      emitted function carries the pinned C type and the body's value is placed
+diff --git a/src/analyze_desugar.c b/src/analyze_desugar.c
+index 84f03aa95..96e3e3dbc 100644
+--- a/src/analyze_desugar.c
++++ b/src/analyze_desugar.c
+@@ -4391,11 +4391,13 @@ int send_family_program_owns(Compiler *c, const char *name) {
+   for (int k = 0; k < c->nclasses; k++) {
+     int mi = comp_method_in_class(c, k, name);
+     if (mi >= 0 && !send_def_just_supers(c, mi)) return 1;
++    mi = comp_cmethod_in_class(c, k, name);
++    if (mi >= 0 && !send_def_just_supers(c, mi)) return 1;
+   }
+   return 0;
+ }
+ 
+-static int send_family_user_answers(Compiler *c, int id, int recv, const char *name) {
++int send_family_user_answers(Compiler *c, int id, int recv, const char *name) {
+   int own = send_family_program_owns(c, name);
+   if (own != 1) return own == 2;
+   if (recv < 0 || nt_kind(c->nt, recv) == NK_SelfNode) {
+diff --git a/src/analyze_infer.c b/src/analyze_infer.c
+index 5b15d1cb3..efb75ea07 100644
+--- a/src/analyze_infer.c
++++ b/src/analyze_infer.c
+@@ -6015,6 +6015,17 @@ static int infer_class_module_call(Compiler *c, int id, const NodeTable *nt, con
+       int ncc = 0; comp_cmethod_candidates(c, name, &ncc);
+       if (ncc == 0) { *out = TY_POLY; return 1; }
+     }
++    /* A computed class-object ivar lives in the existing class-keyed
++       builtin map. Declared static slots retain an explicit runtime boundary
++       in codegen: this does not widen unrelated instance layouts. */
++    if (is_ivar_access(name) && argc == (is_ivar_set(name) ? 2 : 1) &&
++        nt_ref(nt, id, "block") < 0 &&
++        nt_kind(nt, argv[0]) != NK_SymbolNode && nt_kind(nt, argv[0]) != NK_StringNode &&
++        class_recv_user_cmethod(c, id, recv, name) < 0 && !comp_object_defines(c, name)) {
++      int nc = 0;
++      if (class_recv_static_ci(c, recv) < 0) comp_cmethod_candidates(c, name, &nc);
++      if (!nc) { *out = TY_POLY; return 1; }
++    }
+     if (argc == 0 && sp_streq(name, "nil?")) { *out = TY_BOOL; return 1; }
+     if (argc == 0 && sp_streq(name, "singleton_class?")) { *out = TY_BOOL; return 1; }
+     if (argc == 0 && sp_streq(name, "singleton_class") && nt_ref(nt, id, "block") < 0) { *out = TY_CLASS; return 1; }
+diff --git a/src/analyze_internal.h b/src/analyze_internal.h
+index b418d5de3..d18940fcd 100644
+--- a/src/analyze_internal.h
++++ b/src/analyze_internal.h
+@@ -952,6 +952,7 @@ int desugar_env_enum(Compiler *c);
+ int desugar_dir_surface(Compiler *c);
+ int local_write_binds_value(NodeKind k);
+ int desugar_enumerable_chain(Compiler *c);
++int send_family_user_answers(Compiler *c, int id, int recv, const char *name);
+ int desugar_implicit_send(Compiler *c);
+ int desugar_public_send_recv(Compiler *c);
+ int type_block_rest_params(Compiler *c);
+diff --git a/src/analyze_scope.c b/src/analyze_scope.c
+index 8740334a1..c9581aab5 100644
+--- a/src/analyze_scope.c
++++ b/src/analyze_scope.c
+@@ -6584,6 +6584,12 @@ static void check_builtin_subclasses(Compiler *c) {
+     const int *av = args >= 0 ? nt_arr(nt, args, "arguments", &ac) : NULL;
+     if (!av || ac != 1) continue;
+     const char *par = builtin_value_superclass(c, av[0]);
++    /* This is a call, not a class declaration: CP_REFUSE already diagnoses
++       Class.new(parent) during emission. Under deferred refusals leave it
++       there, inside the statement's recovery point, so an unused method or
++       untaken branch does not stop the build. ClassNode refusals above must
++       remain unconditional: their layout cannot be deferred. */
++    if (defer_refusals_at(c, id)) continue;
+     if (is_embedding_builtin(par)) {
+       /* no class of the program's own stands for a class made by the call */
+       char msg[300];
+@@ -8424,6 +8430,21 @@ static int cm_call_on_self(const NodeTable *nt, int id) {
+   return r < 0 || nt_kind(nt, r) == NK_SelfNode;
+ }
+ 
++/* These specialization walks run before literal public_send is retargeted.
++   Its target is a self-call too; otherwise an inherited wrapper can keep the
++   defining class's @ivar even though the nested reader was copied correctly.
++   Reuse desugaring's user-override check rather than treating an app's own
++   send-family method as the builtin. */
++static const char *cm_self_call_name(Compiler *c, int id) {
++  const char *nm = nt_str(c->nt, id, "name");
++  if (nm && (sp_streq(nm, "send") || sp_streq(nm, "__send__") || sp_streq(nm, "public_send")) &&
++      !send_family_user_answers(c, id, nt_ref(c->nt, id, "receiver"), nm)) {
++    const char *target = method_sym_arg(c, id);
++    if (target) return target;
++  }
++  return nm;
++}
++
+ /* Does the inherited cls method `mi` (defined on def_cls), run as a class method
+    of `ci`, reach a bare cmethod call that resolves to a DIFFERENT method for ci
+    -- directly, or TRANSITIVELY through a non-overriding intermediate cmethod?
+@@ -8496,7 +8517,7 @@ static int cmethod_reaches_class_ivar_walk(Compiler *c, int mi, int def_cls, uns
+   for (int id = sn_next(c, mi, -1); id >= 0; id = sn_next(c, mi, id)) {
+     if (nt_kind(nt, id) != NK_CallNode) continue;
+     if (!cm_call_on_self(nt, id)) continue;
+-    const char *nm = nt_str(nt, id, "name");
++    const char *nm = cm_self_call_name(c, id);
+     if (!nm || sp_streq(nm, "new")) continue;
+     /* a `class << self` accessor's @ivar is per class too (`self.x = v`) */
+     if (def_cls >= 0 && def_cls < c->nclasses) {
+@@ -8650,7 +8671,7 @@ static void specialize_cmethod_for(Compiler *c, int mi, int def_cls, int ci, int
+     NodeKind k = nt_kind(nt, id);
+     if (k != NK_CallNode) continue;
+     if (!cm_call_on_self(nt, id)) continue;
+-    const char *nm = nt_str(nt, id, "name");
++    const char *nm = cm_self_call_name(c, id);
+     if (!nm || sp_streq(nm, "new")) continue;
+     int sub_def = -1;
+     int sub_mi = call_target(c, id, ci, nm, CT_CMETHOD, &sub_def);
+@@ -8734,6 +8755,8 @@ static const char *cls_call_name(Compiler *c, int id) {
+   const char *nm = nt_str(c->nt, id, "name");
+   int named = nm && (sp_streq(nm, "method") || sp_streq(nm, "send") || sp_streq(nm, "__send__") ||
+                      sp_streq(nm, "public_send"));
++  if (named && !sp_streq(nm, "method") &&
++      send_family_user_answers(c, id, nt_ref(c->nt, id, "receiver"), nm)) return nm;
+   const char *sym = named ? method_sym_arg(c, id) : NULL;
+   return sym ? sym : nm;
+ }
+@@ -11182,6 +11205,14 @@ static int infer_ivar_set_call(Compiler *c, int id, NilWrites *writes) {
+       else if (san == 2 && sav && !(a0ty && (sp_streq(a0ty, "SymbolNode") || sp_streq(a0ty, "StringNode")))) {
+         int ivrecv = nt_ref(nt, id, "receiver");
+         TyKind rt = ivrecv >= 0 ? comp_ntype(c, ivrecv) : TY_UNKNOWN;
++        /* A Class object's computed namespace is not an instance field of
++           that class. Demand the real class-keyed map without widening all
++           its unrelated typed slots; static-name overlap is refused at run
++           time by the computed Class emitter. */
++        if (rt == TY_CLASS) {
++          if (!c->bivar_table) { c->bivar_table = 1; changed = 1; }
++          return changed;
++        }
+         int self_recv = ivrecv < 0 || (nt_kind(nt, ivrecv) == NK_SelfNode && rt != TY_POLY);
+         int scid = -1;
+         if (self_recv) {
+diff --git a/src/call_plan.c b/src/call_plan.c
+index 988abd525..34d44e16c 100644
+--- a/src/call_plan.c
++++ b/src/call_plan.c
+@@ -2201,6 +2201,11 @@ static int cplan_computed_ivar_get(Compiler *c, int id, const char *name) {
+   if (ac != (set ? 2 : 1) || nt_kind(nt, av[0]) == NK_SymbolNode || nt_kind(nt, av[0]) == NK_StringNode) return 0;
+   int recv = nt_ref(nt, id, "receiver");
+   TyKind rt = recv >= 0 ? comp_ntype(c, recv) : TY_UNKNOWN;
++  if (rt == TY_CLASS && class_recv_static_ci(c, recv) < 0) {
++    int nc = 0;
++    comp_cmethod_candidates(c, name, &nc);
++    if (nc) return 2;  /* Class builtin fallback beside a source override */
++  }
+   if (rt != TY_POLY && rt != TY_EXCEPTION) return 0;
+   for (int k = 0; k < c->nclasses; k++)
+     if (c->classes[k].instantiated && !is_builtin_reopen(c->classes[k].name) &&
+@@ -2444,7 +2449,10 @@ static const char *feature_limit(Compiler *c, int id, int *stop, int *lx, char *
+   if (nt_int(nt, id, "define_method_name", 0) && cplan_reachable(c, id))
+     return "Module#define_method with a non-literal name is not supported; "
+            "use a literal Symbol or String (see docs/limitations.md)";
+-  if (cplan_computed_ivar_get(c, id, name))
++  int ivr = cplan_computed_ivar_get(c, id, name);
++  if (ivr == 2)
++    return "computed Class ivar access with a possible source class-method override is not supported";
++  if (ivr)
+     return sp_streq(name, "instance_variable_set")
+       ? "Object#instance_variable_set with a non-literal name on a receiver that may be an instance "
+         "of a class defining its own instance_variable_set is not supported (see docs/limitations.md)"
+@@ -3897,7 +3905,11 @@ int cplan_has_method_missing(Compiler *c, int id, int ci, int cmethod) {
+    its visibility. Explicit self may call private methods too.
+    The class-body self stamp identifies the caller of a protected call. */
+ int cplan_cmethod_visible(Compiler *c, int id, int ci, const char *name) {
+-  if (nt_ignore_visibility(c->nt, id)) return 1;
++  /* A literal send/__send__ keeps its visibility bypass when a boxed
++     receiver turns out to hold a Class. public_send's stamp wins. */
++  if (!nt_str(c->nt, id, "vis_enforce") &&
++      (nt_ignore_visibility(c->nt, id) || nt_str(c->nt, id, "send_blind") ||
++       nt_int(c->nt, id, "dyn_arm", 0))) return 1;
+   int owner = -1;
+   int vis = comp_cmethod_vis_declared(c, ci, name, &owner);
+   if (vis == SP_VIS_PROTECTED && !nt_str(c->nt, id, "vis_enforce")) {
+diff --git a/src/codegen_call_class.c b/src/codegen_call_class.c
+index 5fa0efae4..88bea8de5 100644
+--- a/src/codegen_call_class.c
++++ b/src/codegen_call_class.c
+@@ -452,6 +452,94 @@ static int obj_defines_own(Compiler *c, int recv, const char *name) {
+   return ty_is_object(t) && comp_method_in_chain(c, ty_object_class(t), name, NULL) >= 0;
+ }
+ 
++/* A runtime Class-valued parameter is not an instance of the class it
++   names. Query its singleton method table, retaining inherited visibility,
++   then Class/Module's core surface. No source-name literal domain is needed.
++   Overrides and core/name-backed/singleton-class receivers stay outside this
++   arm rather than silently borrowing another Class's table. */
++static int emit_class_runtime_respond_to(Compiler *c, int id, Buf *b,
++                                         int recv, int argc, const int *argv) {
++  if (argc > 2 || nt_ref(c->nt, id, "block") >= 0) return 0;
++  for (int k = 0; k < c->nclasses; k++) {
++    const char *cn = c->classes[k].name;
++    if (c->classes[k].nundefs || comp_cmethod_in_chain(c, k, "respond_to?", NULL) >= 0 ||
++        ((sp_streq(cn, "Class") || sp_streq(cn, "Module") || is_object_root(cn)) &&
++         comp_method_in_class(c, k, "respond_to?") >= 0)) return 0;
++  }
++  /* Core reopenings can add instance methods to every Class object.
++     They need ordinary dispatch, not a table that ignores the reopening. */
++  for (int i = 0; i < c->nscopes; i++) {
++    Scope *scope = &c->scopes[i];
++    if (scope->is_cmethod || scope->class_id < 0) continue;
++    const char *cn = c->classes[scope->class_id].name;
++    if (sp_streq(cn, "Class") || sp_streq(cn, "Module") || is_object_root(cn)) return 0;
++  }
++  int cap = c->nscopes + (int)(sizeof(core_cls_methods) / sizeof(core_cls_methods[0])) - 1;
++  const char **names = malloc(sizeof(char *) * (size_t)cap);
++  int nn = 0;
++  for (int i = 0; i < cap; i++) {
++    if (i < c->nscopes && !c->scopes[i].is_cmethod) continue;
++    if (i >= c->nscopes) {
++      const char *cn = core_cls_methods[i - c->nscopes].cls;
++      if (!sp_streq(cn, "Class") && !sp_streq(cn, "Module") && !is_object_root(cn)) continue;
++    }
++    const char *nm = i < c->nscopes ? c->scopes[i].name : core_cls_methods[i - c->nscopes].m;
++    if (!nm || name_is_synth_method(c, nm)) continue;
++    int duplicate = 0;
++    for (int j = 0; j < nn && !duplicate; j++) duplicate = sp_streq(names[j], nm);
++    if (!duplicate) names[nn++] = nm;
++  }
++  int tv = ++g_tmp, boxed = repr_of(c, id).kind == RK_BOXED;
++  if (boxed) buf_puts(b, "sp_box_bool(");
++  buf_printf(b, "({ sp_RbVal _t%d = ", tv); emit_boxed(c, recv, b);
++  buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d); sp_RbVal _v%d = ", tv, tv);
++  emit_boxed(c, argv[0], b);
++  buf_printf(b, "; SP_GC_ROOT_RBVAL(_v%d); const char *_n%d = sp_poly_to_name(_v%d); sp_bool _a%d = ", tv, tv, tv, tv);
++  if (argc >= 2) emit_cond(c, argv[1], b); else buf_puts(b, "0");
++  buf_printf(b, "; if (_t%d.tag != SP_TAG_CLASS) sp_raise_cls(\"NotImplementedError\", \"spinel: nullable runtime Class reflection is not modeled\"); sp_bool _r%d = 0; switch (_t%d.cls_id) {", tv, tv, tv);
++  for (int k = 0; k < c->nclasses; k++) {
++    if (c->classes[k].is_builtin_const) {
++      buf_printf(b, "case %d: sp_raise_cls(\"NotImplementedError\", \"spinel: runtime-name reflection of a reopened core Class is not modeled\"); break;", k);
++      continue;
++    }
++    Buf pub = {0}, priv = {0};
++    /* Candidate names include private methods and aliases too. The chain
++       lookup, not their presence on some unrelated class, decides ownership. */
++    for (int i = 0; i < nn; i++) {
++      const char *nm = names[i];
++      int mi = comp_cmethod_in_chain(c, k, nm, NULL), at = -1;
++      int vis = comp_cmethod_vis_declared(c, k, nm, &at);
++      int cv = core_method_vis(comp_class_is_module(c, &c->classes[k]) ? "Module" : "Class", nm, 1);
++      if (mi < 0 && !cv) continue;
++      if (mi < 0 && at < 0) vis = cv == 1 ? SP_VIS_PUBLIC : cv == 2 ? SP_VIS_PROTECTED : SP_VIS_PRIVATE;
++      Buf *out = vis == SP_VIS_PUBLIC ? &pub : &priv;
++      buf_puts(out, "\""); emit_c_escaped(out, nm); buf_puts(out, "\", ");
++    }
++    for (int p = k; p >= 0; p = c->classes[p].parent) {
++      ClassInfo *cl = &c->classes[p];
++      for (int i = 0; i < cl->naliases + cl->nsg_readers + cl->nsg_writers; i++) {
++        char writer[256];
++        const char *nm;
++        if (i < cl->naliases) {
++          if (!cl->alias_sg || !cl->alias_sg[i]) continue;
++          nm = cl->alias_new[i];
++        } else if (i < cl->naliases + cl->nsg_readers) nm = cl->sg_readers[i - cl->naliases];
++        else { snprintf(writer, sizeof writer, "%s=", cl->sg_writers[i - cl->naliases - cl->nsg_readers]); nm = writer; }
++        Buf *out = comp_cmethod_vis_declared(c, k, nm, NULL) == SP_VIS_PUBLIC ? &pub : &priv;
++        buf_puts(out, "\""); emit_c_escaped(out, nm); buf_puts(out, "\", ");
++      }
++    }
++    buf_printf(b, "case %d: _r%d = sp_str_in_list(_n%d, (const char *const[]){%sNULL}) || (_a%d && sp_str_in_list(_n%d, (const char *const[]){%sNULL})); break;",
++               k, tv, tv, pub.p ? pub.p : "", tv, tv, priv.p ? priv.p : "");
++    free(pub.p); free(priv.p);
++  }
++  buf_puts(b, "default: sp_raise_cls(\"NotImplementedError\", \"spinel: runtime-name respond_to? of a core or singleton Class value is not modeled\"); }");
++  buf_printf(b, " _r%d; })", tv);
++  if (boxed) buf_puts(b, ")");
++  free(names);
++  return 1;
++}
++
+ /* respond_to?, method_defined? and its kin, const_set / const_get / const_defined? */
+ int emit_call_reflection_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv, TyKind rt) {
+   if (sp_streq(name, "respond_to?") && argc >= 1 && !respond_to_user_defined(c, id, recv)) {
+@@ -691,6 +779,9 @@ int emit_call_reflection_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
+         }
+       }
+     }
++    else if (recv >= 0 && rt == TY_CLASS && nt_kind(nt, argv[0]) != NK_SplatNode) {
++      if (emit_class_runtime_respond_to(c, id, b, recv, argc, argv)) return 1;
++    }
+     else if (recv >= 0 && rt != TY_CLASS && nt_kind(nt, argv[0]) != NK_SplatNode &&
+              respond_to_runtime_reaches(c, rt)) {
+       emit_respond_to_runtime_name(c, id, b, recv, argc, argv);
+diff --git a/src/codegen_call_kernel.c b/src/codegen_call_kernel.c
+index a29f69cd6..be045e967 100644
+--- a/src/codegen_call_kernel.c
++++ b/src/codegen_call_kernel.c
+@@ -186,18 +186,24 @@ int emit_call_kernel_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
+   if (recv < 0 && argc == 0 &&
+       (is_current_method(name))) {
+     Scope *s = comp_scope_of(c, id);
+-    /* __callee__ names the ALIAS the call spelled, which only the call site
+-       knows: an alias shares the definition's one function. The prologue took
+-       the channel; fall back to the definition's name when nothing wrote it
+-       (a direct call, or a path with no write). __method__ always answers the
+-       definition's name (#3729). */
++    /* An alias normally shares the definition's one function, so its call
++       site supplies the spelled name. A captured earlier definition may
++       instead own a function under the alias name. __method__ always keeps
++       the original definition's name (#3729). */
+     /* (a method a prepend or an extend moved behind another of its name
+        runs under a shadow name, `__prep 0 go`: the name as written) */
+     /* (and one an alias captured ahead of a redefinition runs under the
+        alias, alias_capture_earlier_def: the name its def has) */
+     const char *mn = s ? comp_scope_def_name(c, s) : NULL;
+-    if (mn && mn[0] && sp_streq(name, "__callee__"))
+-      buf_printf(b, "(_sp_cal ? sp_sym_intern(_sp_cal) : (sp_sym)%d)", comp_sym_intern(c, mn));
++    if (mn && mn[0] && sp_streq(name, "__callee__")) {
++      /* Capturing an earlier definition can give it its own function under
++         the alias's public name. A direct call to that function writes no
++         called-name channel: its fallback is that alias, not the original
++         def's name. Do not expose hidden/version/proc-form scope names. */
++      const char *called = s ? comp_scope_user_name(s) : NULL;
++      if (!called || s->shadow != SHADOW_NONE || strchr(called, '#')) called = mn;
++      buf_printf(b, "(_sp_cal ? sp_sym_intern(_sp_cal) : (sp_sym)%d)", comp_sym_intern(c, called));
++    }
+     else if (mn && mn[0]) buf_printf(b, "(sp_sym)%d", comp_sym_intern(c, mn));
+     else buf_puts(b, "sp_box_nil()");
+     return 1;
+diff --git a/src/codegen_call_recv.c b/src/codegen_call_recv.c
+index 382728e10..f20fd015d 100644
+--- a/src/codegen_call_recv.c
++++ b/src/codegen_call_recv.c
+@@ -17574,7 +17574,59 @@ static void emit_poly_ivar_set_computed(Compiler *c, int id, int recv, TyKind rt
+   emit_ivar_reflect_answer(c, id, ivn, b);
+ }
+ 
++/* A computed name on an explicit Class value uses the actual class-keyed
++   ivar table, not an instance layout or a captured/root class snapshot.
++   Existing statically laid-out class slots are deliberately NOT shadowed by
++   this map: without a closed namespace write proof their ABI cannot hold any
++   value, so crossing that boundary raises explicitly rather than diverging. */
++static int emit_class_computed_ivar_call(Compiler *c, int id, Buf *b, const NodeTable *nt,
++                                       const char *name, int recv, int argc, const int *argv, TyKind rt) {
++  if (recv < 0 || rt != TY_CLASS || !is_ivar_access(name) ||
++      argc != (is_ivar_set(name) ? 2 : 1) || nt_ref(nt, id, "block") >= 0 ||
++      nt_kind(nt, argv[0]) == NK_SymbolNode || nt_kind(nt, argv[0]) == NK_StringNode ||
++      (comp_ntype(c, argv[0]) != TY_STRING && comp_ntype(c, argv[0]) != TY_SYMBOL) ||
++      class_recv_user_cmethod(c, id, recv, name) >= 0 || comp_object_defines(c, name)) return 0;
++  int nc = 0;
++  if (class_recv_static_ci(c, recv) < 0) comp_cmethod_candidates(c, name, &nc);
++  if (nc) unsupported(c, id, "computed Class ivar access with a possible source class-method override");
++  int tv = ++g_tmp;
++  char syv[32], val[32];
++  snprintf(syv, sizeof syv, "_sy%d", tv);
++  snprintf(val, sizeof val, "_ivs%d", tv);
++  buf_puts(b, "({ ");
++  tv = hold_operand(c, recv, TY_POLY, 1, tv, 1, " ", b);
++  buf_printf(b, "sp_sym %s = ", syv); emit_ivar_name_sym(c, argv[0], b); buf_puts(b, "; ");
++  if (is_ivar_set(name)) { buf_printf(b, "sp_RbVal %s = ", val); emit_boxed(c, argv[1], b); buf_puts(b, "; "); }
++  emit_ivar_name_check(syv, b);
++  /* The first arm's namespace is ASCII. Do not silently accept malformed
++     names or pretend this implements Ruby's encoding-dependent identifiers. */
++  buf_printf(b, "{ const unsigned char *_n = (const unsigned char *)sp_sym_to_s(%s); "
++                "int _ok = (_n[0] == '@' && (_n[1] == '_' || (_n[1] >= 'a' && _n[1] <= 'z') || (_n[1] >= 'A' && _n[1] <= 'Z'))); "
++                "for (int _i = 1; _n[_i]; _i++) { "
++                "if (_n[_i] >= 128) sp_raise_cls(\"NotImplementedError\", \"non-ASCII computed Class ivar name\"); "
++                "if (!((_n[_i] >= 'a' && _n[_i] <= 'z') || (_n[_i] >= 'A' && _n[_i] <= 'Z') || (_n[_i] >= '0' && _n[_i] <= '9') || _n[_i] == '_')) _ok = 0; } "
++                "if (!_ok) sp_raise_cls(\"NameError\", \"invalid computed Class instance variable name\"); } ", syv);
++  for (int k = 0; k < c->nclasses; k++) {
++    ClassInfo *ci = &c->classes[k];
++    for (int j = 0; j < ci->nivars; j++) {
++      char slot[300]; TyKind t;
++      if (!class_ivar_slot(c, k, ci->ivars[j], slot, sizeof slot, &t)) continue;
++      buf_printf(b, "if (_t%d.cls_id == %d && %s == sp_sym_intern(\"%s\")) "
++                    "sp_raise_cls(\"NotImplementedError\", \"computed Class ivar overlaps a statically typed slot\"); ", tv, k, syv, ci->ivars[j]);
++    }
++  }
++  if (is_ivar_set(name)) {
++    buf_printf(b, "sp_bivar_set(_t%d, %s, %s); ", tv, syv, val);
++    emit_ivar_reflect_answer(c, id, val, b);
++  } else {
++    buf_printf(b, "sp_RbVal %s = sp_bivar_get(_t%d, %s); ", val, tv, syv);
++    emit_ivar_reflect_answer(c, id, val, b);
++  }
++  return 1;
++}
++
+ static int emit_poly_ivar_call(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv, TyKind rt, int *out) {
++  if (emit_class_computed_ivar_call(c, id, b, nt, name, recv, argc, argv, rt)) { *out = 1; return 1; }
+   /* an exception class of the program's that defines the method answers it */
+   if (rt == TY_EXCEPTION && exc_class_defines(c, name)) return 0;
+   /* instance_variable_get with a computed name on a POLY receiver: the
+diff --git a/src/codegen_stmt.c b/src/codegen_stmt.c
+index e7e9634d3..6042d7753 100644
+--- a/src/codegen_stmt.c
++++ b/src/codegen_stmt.c
+@@ -8642,7 +8642,10 @@ static int emit_pm_cond_value(Compiler *c, int pat, int t, TyKind pt, int subj,
+            (validated to succeed above) */
+         int vtmp = ++g_tmp;
+         emit_indent(hs, hi);
+-        buf_puts(hs, "{ ");
++        /* A failed nil/key check must not fetch: Hash#[] can raise on nil
++           or run a default proc for a missing key, even though this arm
++           has already failed. Keep recursive helper emission guarded too. */
++        buf_printf(hs, "if (_t%d) { ", hcond);
+         emit_ctype(c, hvt, hs);
+         buf_printf(hs, " _t%d = sp_%sHash_get(_t%d, ", vtmp, hn, t);
+         emit_hash_key(c, key, ty_hash_key(pt), hs); buf_puts(hs, "); ");
+@@ -8656,7 +8659,7 @@ static int emit_pm_cond_value(Compiler *c, int pat, int t, TyKind pt, int subj,
+       if (hvt == TY_POLY) {
+         int vtmp = ++g_tmp;
+         emit_indent(hs, hi);
+-        buf_printf(hs, "{ sp_RbVal _t%d = sp_%sHash_get(_t%d, ", vtmp, hn, t);
++        buf_printf(hs, "if (_t%d) { sp_RbVal _t%d = sp_%sHash_get(_t%d, ", hcond, vtmp, hn, t);
+         emit_hash_key(c, key, ty_hash_key(pt), hs); buf_puts(hs, "); ");
+         char vn[24]; snprintf(vn, sizeof vn, "_t%d", vtmp);
+         Buf cw; memset(&cw, 0, sizeof cw);
+@@ -9912,15 +9915,18 @@ static void emit_case_match_in(Compiler *c, int id, Buf *b, int indent, int tail
+               nt_kind(nt, vchk) != NK_ImplicitNode) {
+             int vtmp = ++g_tmp;
+             emit_indent(b, indent + 1);
++            buf_printf(b, "if (_t%d) {\n", hcond);
++            emit_indent(b, indent + 2);
+             emit_ctype(c, hvt, b);
+             buf_printf(b, " _t%d = sp_%sHash_get(_t%d, ", vtmp, hn, arm_t);
+             emit_hash_key(c, key, ty_hash_key(arm_pt), b); buf_puts(b, ");\n");
+             Buf vcb = {NULL, 0, 0};
+             int hv = emit_pm_cond(c, vchk, vtmp, hvt, &vcb);
+             if (!hv) unsupported(c, vchk, "hash-pattern value sub-form");
+-            emit_indent(b, indent + 1);
++            emit_indent(b, indent + 2);
+             buf_printf(b, "_t%d = _t%d && (%s);\n", hcond, hcond,
+                        vcb.p ? vcb.p : "1");
++            emit_indent(b, indent + 1); buf_puts(b, "}\n");
+             free(vcb.p);
+           }
+         }
+diff --git a/test/alias_captured_callee_identity.rb b/test/alias_captured_callee_identity.rb
+new file mode 100644
+index 000000000..37f23d33f
+--- /dev/null
++++ b/test/alias_captured_callee_identity.rb
+@@ -0,0 +1,33 @@
++# A captured earlier definition has its own function under the alias name.
++# __method__ keeps the def name; __callee__ must not fall back to it when a
++# direct singleton/instance call needs no called-name channel.
++class CapturedCallee
++  def self.value(arg = nil)
++    [__method__, __callee__, arg]
++  end
++  class << self
++    alias_method :raw, :value
++  end
++  def self.value(arg = nil)
++    :replacement
++  end
++  def self.argument
++    __callee__
++  end
++
++  def item
++    [__method__, __callee__]
++  end
++  alias saved_item item
++  def item
++    :new_item
++  end
++end
++class CapturedCalleeChild < CapturedCallee
++end
++p CapturedCallee.raw
++p CapturedCallee.raw(CapturedCallee.argument)
++p CapturedCallee.value
++p CapturedCalleeChild.raw
++p CapturedCallee.new.saved_item
++p CapturedCallee.new.item
+diff --git a/test/alias_captured_callee_identity.rb.expected b/test/alias_captured_callee_identity.rb.expected
+new file mode 100644
+index 000000000..5c0ecce08
+--- /dev/null
++++ b/test/alias_captured_callee_identity.rb.expected
+@@ -0,0 +1,6 @@
++[:value, :raw, nil]
++[:value, :raw, :argument]
++:replacement
++[:value, :raw, nil]
++[:item, :saved_item]
++:new_item
+diff --git a/test/boxed_class_send_visibility.rb b/test/boxed_class_send_visibility.rb
+new file mode 100644
+index 000000000..cda30541e
+--- /dev/null
++++ b/test/boxed_class_send_visibility.rb
+@@ -0,0 +1,23 @@
++# A Class held boxed must keep send/__send__ visibility bypass, while
++# public_send and ordinary explicit receivers still reject private targets.
++class BoxedClassVisibility
++  def self.hidden(value)
++    value
++  end
++  private_class_method :hidden
++end
++receiver = [BoxedClassVisibility, "not a class"][ARGV.length]
++p receiver.send(:hidden, :send)
++p receiver.__send__(:hidden, :__send__)
++begin
++  receiver.public_send(:hidden, :wrong)
++  raise "public_send bypassed private class visibility"
++rescue NoMethodError
++  puts "public_send rejected"
++end
++begin
++  receiver.hidden(:wrong)
++  raise "direct call bypassed private class visibility"
++rescue NoMethodError
++  puts "direct call rejected"
++end
+diff --git a/test/boxed_class_send_visibility.rb.expected b/test/boxed_class_send_visibility.rb.expected
+new file mode 100644
+index 000000000..95774463c
+--- /dev/null
++++ b/test/boxed_class_send_visibility.rb.expected
+@@ -0,0 +1,4 @@
++:send
++:__send__
++public_send rejected
++direct call rejected
+diff --git a/test/class_value_runtime_respond_to.rb b/test/class_value_runtime_respond_to.rb
+new file mode 100644
+index 000000000..27f82782b
+--- /dev/null
++++ b/test/class_value_runtime_respond_to.rb
+@@ -0,0 +1,49 @@
++# Runtime Class parameters query their singleton table, not their instances.
++class RuntimeQueryOwner
++  def self.answer; 17; end
++  def self.hidden; 19; end
++  private_class_method :hidden
++  class << self
++    alias old_answer answer
++    attr_accessor :level
++  end
++end
++class RuntimeQueryChild < RuntimeQueryOwner
++  private_class_method :answer
++end
++module RuntimeQueryModule
++  def self.answer; 23; end
++end
++class RuntimeQueryProbe
++  @effects = []
++  def self.receiver
++    @effects << :receiver
++    RuntimeQueryOwner
++  end
++  def self.name(value)
++    @effects << :name
++    value.to_sym
++  end
++  def self.flag(value)
++    @effects << :flag
++    value
++  end
++  def self.query(receiver, name, include_private)
++    receiver.respond_to?(name, include_private)
++  end
++  def self.exercise
++    %w[answer hidden old_answer level level= name inherited new absent].each do |name|
++      puts name
++      puts query(RuntimeQueryOwner, name.to_sym, false)
++      puts query(RuntimeQueryOwner, name.to_sym, true)
++      puts query(RuntimeQueryChild, name.to_sym, false)
++      puts query(RuntimeQueryChild, name.to_sym, true)
++      puts query(RuntimeQueryModule, name.to_sym, false)
++      puts query(RuntimeQueryModule, name.to_sym, true)
++    end
++    raise "query result" if query(receiver, self.name("absent"), flag(false))
++    raise "operand evaluation" unless @effects == [:receiver, :name, :flag]
++    puts "runtime Class query PASS"
++  end
++end
++RuntimeQueryProbe.exercise
+diff --git a/test/class_value_runtime_respond_to.rb.expected b/test/class_value_runtime_respond_to.rb.expected
+new file mode 100644
+index 000000000..298ff76d2
+--- /dev/null
++++ b/test/class_value_runtime_respond_to.rb.expected
+@@ -0,0 +1,64 @@
++answer
++true
++true
++false
++true
++true
++true
++hidden
++false
++true
++false
++true
++false
++false
++old_answer
++true
++true
++true
++true
++false
++false
++level
++true
++true
++true
++true
++false
++false
++level=
++true
++true
++true
++true
++false
++false
++name
++true
++true
++true
++true
++true
++true
++inherited
++false
++true
++false
++true
++false
++false
++new
++true
++true
++true
++true
++false
++false
++absent
++false
++false
++false
++false
++false
++false
++runtime Class query PASS
+diff --git a/test/collect/refusals.expected b/test/collect/refusals.expected
+index d23d16b7a..6d01b81f7 100644
+--- a/test/collect/refusals.expected
++++ b/test/collect/refusals.expected
+@@ -538,6 +538,12 @@ spinel: 1 refusal, nothing written
+ == test/reject/complex_bignum_component.rb [promote] rc=1
+ spinel: test/reject/complex_bignum_component.rb:7: a Complex component given an Integer past 64 bits, which no conversion keeps in its sp_float slot
+ spinel: 1 refusal, nothing written
++== test/reject/computed_class_ivar_possible_override.rb [default] rc=1
++spinel: test/reject/computed_class_ivar_possible_override.rb:9: computed Class ivar access with a possible source class-method override is not supported
++spinel: 1 refusal, nothing written
++== test/reject/computed_class_ivar_possible_override.rb [promote] rc=1
++spinel: test/reject/computed_class_ivar_possible_override.rb:9: computed Class ivar access with a possible source class-method override is not supported
++spinel: 1 refusal, nothing written
+ == test/reject/computed_ivar_set_poly_user_method.rb [default] rc=1
+ spinel: test/reject/computed_ivar_set_poly_user_method.rb:13: Object#instance_variable_set with a non-literal name on a receiver that may be an instance of a class defining its own instance_variable_set is not supported (see docs/limitations.md)
+ spinel: 1 refusal, nothing written
+diff --git a/test/computed_class_ivar_cache.rb b/test/computed_class_ivar_cache.rb
+new file mode 100644
+index 000000000..c9f463eff
+--- /dev/null
++++ b/test/computed_class_ivar_cache.rb
+@@ -0,0 +1,27 @@
++class NativeComputedClassCache
++  def self.write(key, value)
++    self.instance_variable_set("@#{key}_cache", value)
++  end
++  def self.read(key)
++    self.instance_variable_get("@#{key}_cache")
++  end
++end
++class NativeComputedChildCache < NativeComputedClassCache
++end
++key = "dynamic" + "_field"
++p NativeComputedClassCache.read(key)
++p NativeComputedClassCache.write(key, false)
++p NativeComputedClassCache.read(key)
++p NativeComputedChildCache.read(key)
++p NativeComputedChildCache.write(key, 29)
++p NativeComputedChildCache.read(key)
++p NativeComputedClassCache.read(key)
++p NativeComputedClassCache.write(key, :missing)
++p NativeComputedClassCache.read(key)
++# Captured runtime Class receiver, not a root constant or instance self.
++reader = ->(owner, name) { owner.instance_variable_get("@#{name}_cache") }
++p reader.call(NativeComputedClassCache, key)
++p reader.call(NativeComputedChildCache, key)
++# A nil is really stored/unset, not confused with a cached false.
++p NativeComputedClassCache.write(key, nil)
++p NativeComputedClassCache.read(key)
+diff --git a/test/computed_class_ivar_cache.rb.expected b/test/computed_class_ivar_cache.rb.expected
+new file mode 100644
+index 000000000..71c869ce0
+--- /dev/null
++++ b/test/computed_class_ivar_cache.rb.expected
+@@ -0,0 +1,13 @@
++nil
++false
++false
++nil
++29
++29
++false
++:missing
++:missing
++:missing
++29
++nil
++nil
+diff --git a/test/computed_class_ivar_source_override.rb b/test/computed_class_ivar_source_override.rb
+new file mode 100644
+index 000000000..2c7229730
+--- /dev/null
++++ b/test/computed_class_ivar_source_override.rb
+@@ -0,0 +1,7 @@
++class ComputedClassIvarSourceOverride
++  def self.instance_variable_get(name) = 31
++  def self.instance_variable_set(name, value) = value + 1
++end
++name = "@" + "original"
++p ComputedClassIvarSourceOverride.instance_variable_get(name)
++p ComputedClassIvarSourceOverride.instance_variable_set(name, 17)
+diff --git a/test/computed_class_ivar_source_override.rb.expected b/test/computed_class_ivar_source_override.rb.expected
+new file mode 100644
+index 000000000..bd73370c5
+--- /dev/null
++++ b/test/computed_class_ivar_source_override.rb.expected
+@@ -0,0 +1,2 @@
++31
++18
+diff --git a/test/computed_class_ivar_static_boundary.rb b/test/computed_class_ivar_static_boundary.rb
+new file mode 100644
+index 000000000..d01e01b14
+--- /dev/null
++++ b/test/computed_class_ivar_static_boundary.rb
+@@ -0,0 +1,20 @@
++# spinel: not-cruby -- the computed Class map must not shadow a typed static slot.
++class StaticClassIvarBoundary
++  @fixed = 17
++  def self.fixed = @fixed
++end
++name = "@" + "fixed"
++begin
++  StaticClassIvarBoundary.instance_variable_set(name, false)
++  raise "static slot overwritten"
++rescue NotImplementedError
++  puts "static Class slot refused"
++end
++p StaticClassIvarBoundary.fixed
++unicode = "@" + "é"
++begin
++  StaticClassIvarBoundary.instance_variable_set(unicode, 1)
++  raise "Unicode boundary bypassed"
++rescue NotImplementedError
++  puts "encoding boundary refused"
++end
+diff --git a/test/computed_class_ivar_static_boundary.rb.expected b/test/computed_class_ivar_static_boundary.rb.expected
+new file mode 100644
+index 000000000..d0bf1a0a2
+--- /dev/null
++++ b/test/computed_class_ivar_static_boundary.rb.expected
+@@ -0,0 +1,3 @@
++static Class slot refused
++17
++encoding boundary refused
+diff --git a/test/deferred_builtin_class_new.sh b/test/deferred_builtin_class_new.sh
+new file mode 100644
+index 000000000..a7f1be7b4
+--- /dev/null
++++ b/test/deferred_builtin_class_new.sh
+@@ -0,0 +1,48 @@
++#!/bin/sh
++# Calls can defer their Class.new(parent) refusal; class layouts cannot.
++set -eu
++SPINEL=${SPINEL:-bin/spinel}
++scratch=$(mktemp -d "${TMPDIR:-build}/deferred-builtin-class-new.XXXXXX")
++trap 'rm -rf "$scratch"' EXIT HUP INT TERM
++cat > "$scratch/call.rb" <<'RUBY'
++def unused
++  Class.new(Array)
++end
++def factory(run)
++  if run
++    Class.new(String)
++  else
++    "untaken"
++  end
++end
++puts factory(false)
++begin
++  factory(true)
++rescue NotImplementedError => e
++  puts e.message.include?("Class.new(parent)")
++end
++puts "after"
++RUBY
++if "$SPINEL" "$scratch/call.rb" -c -o "$scratch/strict.c" > "$scratch/strict.log" 2>&1; then
++  echo 'deferred-builtin-class-new: FAIL (strict call accepted)' >&2
++  exit 1
++fi
++grep -q 'Class.new.*not supported' "$scratch/strict.log"
++printf 'untaken\ntrue\nafter\n' > "$scratch/expected"
++for mode in flag pragma; do
++  if [ "$mode" = flag ]; then
++    "$SPINEL" --defer-refusals "$scratch/call.rb" -o "$scratch/call" > "$scratch/$mode.log" 2>&1
++  else
++    { echo '# spinel: defer-refusals'; cat "$scratch/call.rb"; } > "$scratch/pragma.rb"
++    "$SPINEL" "$scratch/pragma.rb" -o "$scratch/call" > "$scratch/$mode.log" 2>&1
++  fi
++  "$scratch/call" > "$scratch/out"
++  cmp "$scratch/expected" "$scratch/out"
++done
++printf 'class Layout < OpenStruct; end\n' > "$scratch/layout.rb"
++if "$SPINEL" --defer-refusals "$scratch/layout.rb" -c -o "$scratch/layout.c" > "$scratch/layout.log" 2>&1; then
++  echo 'deferred-builtin-class-new: FAIL (unsupported layout accepted)' >&2
++  exit 1
++fi
++grep -q 'class Layout < OpenStruct' "$scratch/layout.log"
++echo 'deferred-builtin-class-new: pass'
+diff --git a/test/hash_pattern_guarded_fetch.rb b/test/hash_pattern_guarded_fetch.rb
+new file mode 100644
+index 000000000..27051f0ea
+--- /dev/null
++++ b/test/hash_pattern_guarded_fetch.rb
+@@ -0,0 +1,46 @@
++# spinel: gc-stress
++# A failed typed hash pattern must not fetch from nil or a missing key.
++class NullablePatternTable
++  def initialize
++    @table = nil
++  end
++  def set(value)
++    @table = {key: value}
++  end
++  def literal
++    case @table
++    in {key: 7} then :seven
++    in nil then :nil
++    else :other
++    end
++  end
++  def typed
++    case @table
++    in {key: Integer} then :integer
++    in nil then :nil
++    else :other
++    end
++  end
++  def alternative
++    case @table
++    in {key: 7} | {missing: Integer} then :match
++    in nil then :nil
++    else :other
++    end
++  end
++  def expression
++    @table in {key: Integer}
++  end
++  def missing_default
++    @table = Hash.new { raise "pattern fetched a missing key" }
++    @table[:key] = "other"
++  end
++end
++table = NullablePatternTable.new
++p [table.literal, table.typed, table.alternative, table.expression]
++table.set(7)
++p [table.literal, table.typed, table.alternative, table.expression]
++table.set("other")
++p [table.literal, table.typed, table.alternative, table.expression]
++table.missing_default
++p [table.literal, table.typed, table.alternative, table.expression]
+diff --git a/test/hash_pattern_guarded_fetch.rb.expected b/test/hash_pattern_guarded_fetch.rb.expected
+new file mode 100644
+index 000000000..584080a92
+--- /dev/null
++++ b/test/hash_pattern_guarded_fetch.rb.expected
+@@ -0,0 +1,4 @@
++[:nil, :nil, :nil, false]
++[:seven, :integer, :match, true]
++[:other, :other, :other, false]
++[:other, :other, :other, false]
+diff --git a/test/inherited_cmethod_literal_send_state.rb b/test/inherited_cmethod_literal_send_state.rb
+new file mode 100644
+index 000000000..3e8ea03b1
+--- /dev/null
++++ b/test/inherited_cmethod_literal_send_state.rb
+@@ -0,0 +1,55 @@
++# Literal reflective self-calls participate in inherited class-method
++# specialization before public_send is desugared. Each class owns its @cache.
++class ReflectiveReader
++  def self.raw
++    @cache || (@cache = [-1, 2, 3])
++  end
++  def self.items
++    public_send(:raw).select { |value| value > 0 }
++  end
++  def self.explicit_items
++    self.public_send("raw").select { |value| value > 0 }
++  end
++end
++class ChildReflectiveReader < ReflectiveReader; end
++ReflectiveReader.raw << 4
++ChildReflectiveReader.raw << 5
++p [ReflectiveReader.items, ChildReflectiveReader.items]
++p [ReflectiveReader.explicit_items, ChildReflectiveReader.explicit_items]
++
++# The source reader may be an alias of an earlier method version.
++class AliasReflectiveReader
++  def self.items
++    @cache || (@cache = [1])
++  end
++  class << self
++    alias_method :raw, :items
++  end
++  def self.items
++    public_send(:raw).select { |value| value > 0 }
++  end
++end
++class ChildAliasReflectiveReader < AliasReflectiveReader; end
++AliasReflectiveReader.raw << 2
++ChildAliasReflectiveReader.raw << 3
++p [AliasReflectiveReader.items, ChildAliasReflectiveReader.items]
++
++# An app's own public_send is not the builtin reflective call. Its own
++# stateful implementation, not the unused literal target, needs specialization.
++class CustomReflectiveReader
++  def self.public_send(name)
++    @calls || (@calls = [])
++    @calls << name
++    @calls
++  end
++  def self.target
++    :unused
++  end
++  def self.call
++    public_send(:target)
++  end
++end
++class ChildCustomReflectiveReader < CustomReflectiveReader; end
++p CustomReflectiveReader.call
++p ChildCustomReflectiveReader.call
++p CustomReflectiveReader.call
+diff --git a/test/inherited_cmethod_literal_send_state.rb.expected b/test/inherited_cmethod_literal_send_state.rb.expected
+new file mode 100644
+index 000000000..6c05c3c65
+--- /dev/null
++++ b/test/inherited_cmethod_literal_send_state.rb.expected
+@@ -0,0 +1,6 @@
++[[2, 3, 4], [2, 3, 5]]
++[[2, 3, 4], [2, 3, 5]]
++[[1, 2], [1, 3]]
++[:target]
++[:target]
++[:target, :target]
+diff --git a/test/rbs-seed/memo_civ_instance_same_name.expected b/test/rbs-seed/memo_civ_instance_same_name.expected
+new file mode 100644
+index 000000000..f9a088e6f
+--- /dev/null
++++ b/test/rbs-seed/memo_civ_instance_same_name.expected
+@@ -0,0 +1,7 @@
++41
++true
++"class value"
++41
++true
++"CLASS ITEM"
++"instance marker"
+diff --git a/test/rbs-seed/memo_civ_instance_same_name.rb b/test/rbs-seed/memo_civ_instance_same_name.rb
+new file mode 100644
+index 000000000..858e6f72b
+--- /dev/null
++++ b/test/rbs-seed/memo_civ_instance_same_name.rb
+@@ -0,0 +1,44 @@
++# spinel: rbs-seed-run
++# Class and instance state share a spelling, not a Ruby object or value.
++class MixedMemoOwner
++  def initialize
++    @table = 41
++  end
++  def marker
++    @table
++  end
++  def self.table
++    @table ||= {}
++  end
++  def self.populate
++    @table = {}
++    @table["key"] = "class value"
++  end
++end
++value = MixedMemoOwner.new
++p value.marker
++p MixedMemoOwner.table.empty?
++MixedMemoOwner.populate
++p MixedMemoOwner.table["key"]
++p value.marker
++
++class MixedArrayOwner
++  def initialize
++    @items = "instance marker"
++  end
++  def marker
++    @items
++  end
++  def self.items
++    @items ||= []
++  end
++  def self.populate
++    @items = []
++    @items << "class item"
++  end
++end
++item = MixedArrayOwner.new
++p MixedArrayOwner.items.empty?
++MixedArrayOwner.populate
++p MixedArrayOwner.items[0].upcase
++p item.marker
+diff --git a/test/rbs-seed/memo_civ_mixed_bad_writer.rb b/test/rbs-seed/memo_civ_mixed_bad_writer.rb
+new file mode 100644
+index 000000000..156f1f6e8
+--- /dev/null
++++ b/test/rbs-seed/memo_civ_mixed_bad_writer.rb
+@@ -0,0 +1,19 @@
++# spinel: rbs-seed-contradicted-return
++# Boxing separate homes must not discard the class reader's Hash contract.
++class MixedBadWriter
++  def initialize
++    @table = 41
++  end
++  def marker
++    @table
++  end
++  def self.table
++    @table ||= {}
++  end
++  def self.poison
++    @table = 81
++  end
++end
++p MixedBadWriter.new.marker
++MixedBadWriter.poison
++p MixedBadWriter.table
+diff --git a/test/rbs-seed/sig/memo_civ_instance_same_name.rbs b/test/rbs-seed/sig/memo_civ_instance_same_name.rbs
+new file mode 100644
+index 000000000..6dc3f9c99
+--- /dev/null
++++ b/test/rbs-seed/sig/memo_civ_instance_same_name.rbs
+@@ -0,0 +1,13 @@
++class MixedMemoOwner
++  def initialize: () -> void
++  def marker: () -> Integer
++  def self.table: () -> Hash[String, String]
++  def self.populate: () -> String
++end
++
++class MixedArrayOwner
++  def initialize: () -> void
++  def marker: () -> String
++  def self.items: () -> Array[String]
++  def self.populate: () -> Array[String]
++end
+diff --git a/test/rbs-seed/sig/memo_civ_mixed_bad_writer.rbs b/test/rbs-seed/sig/memo_civ_mixed_bad_writer.rbs
+new file mode 100644
+index 000000000..45ae117fb
+--- /dev/null
++++ b/test/rbs-seed/sig/memo_civ_mixed_bad_writer.rbs
+@@ -0,0 +1,5 @@
++class MixedBadWriter
++  def marker: () -> Integer
++  def self.table: () -> Hash[String, String]
++  def self.poison: () -> Integer
++end
+diff --git a/test/rbs-seed/sig/stored_proc_nil_class_hash.rbs b/test/rbs-seed/sig/stored_proc_nil_class_hash.rbs
+new file mode 100644
+index 000000000..7389a8904
+--- /dev/null
++++ b/test/rbs-seed/sig/stored_proc_nil_class_hash.rbs
+@@ -0,0 +1,8 @@
++class NullableStoredOwner
++ def self.seed: (Hash[Symbol, Integer] values) -> Hash[Symbol, Integer]
++end
++class NullableStoredBody
++ @body: ^(singleton(::NullableStoredOwner)) -> Integer?
++ def initialize: (^(singleton(::NullableStoredOwner)) -> Integer? body) -> void
++ def invoke: (singleton(::NullableStoredOwner) receiver) -> Integer?
++end
+diff --git a/test/rbs-seed/stored_proc_nil_class_hash.expected b/test/rbs-seed/stored_proc_nil_class_hash.expected
+new file mode 100644
+index 000000000..9837de6ec
+--- /dev/null
++++ b/test/rbs-seed/stored_proc_nil_class_hash.expected
+@@ -0,0 +1,2 @@
++stored nil receiver
++17
+diff --git a/test/rbs-seed/stored_proc_nil_class_hash.rb b/test/rbs-seed/stored_proc_nil_class_hash.rb
+new file mode 100644
+index 000000000..908d4f70c
+--- /dev/null
++++ b/test/rbs-seed/stored_proc_nil_class_hash.rb
+@@ -0,0 +1,24 @@
++class NullableStoredOwner
++  def self.seed(values)
++    @values = values
++  end
++end
++class NullableStoredChild < NullableStoredOwner
++end
++class NullableStoredBody
++  def initialize(body)
++    @body = body
++  end
++  def invoke(receiver)
++    @body.call(receiver)
++  end
++end
++NullableStoredOwner.seed({value: 17})
++key = :value
++stored = NullableStoredBody.new(->(receiver) { receiver.instance_variable_get(:@values)[key] })
++begin
++  puts stored.invoke(NullableStoredChild).inspect
++rescue NoMethodError
++  puts 'stored nil receiver'
++end
++puts stored.invoke(NullableStoredOwner).inspect
+diff --git a/test/reject/computed_class_ivar_possible_override.rb b/test/reject/computed_class_ivar_possible_override.rb
+new file mode 100644
+index 000000000..c13371270
+--- /dev/null
++++ b/test/reject/computed_class_ivar_possible_override.rb
+@@ -0,0 +1,13 @@
++class PlainClassIvarReceiver
++end
++class OwnClassIvarReceiver
++  def self.instance_variable_get(name)
++    31
++  end
++end
++def read_unknown_class(owner, name)
++  owner.instance_variable_get(name)
++end
++name = "@" + "field"
++p read_unknown_class(PlainClassIvarReceiver, name)
++p read_unknown_class(OwnClassIvarReceiver, name)

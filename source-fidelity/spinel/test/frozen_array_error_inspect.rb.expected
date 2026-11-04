@@ -1,0 +1,5 @@
+can't modify frozen Array: [true, false, true]
+can't modify frozen Array: [1, 2]
+can't modify frozen Array: [1, "a"]
+can't modify frozen Array: ["x", "y"]
+true

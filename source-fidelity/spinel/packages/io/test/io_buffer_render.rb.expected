@@ -1,0 +1,31 @@
+== hexdump/inspect ==
+#<IO::Buffer 0xX+16 INTERNAL>
+0xX  48 65 6c 6c 6f 20 57 6f 72 6c 64 21 00 00 00 00 Hello World!....
+#<IO::Buffer 0xX+16 INTERNAL>
+hexdump: => "0x00000000  48 65 6c 6c 6f 20 57 6f 72 6c 64 21 00 00 00 00 Hello World!...."
+hexdump o,l: => "0x00000002  6c 6c 6f 20                                     llo "
+hexdump w: => "0x00000000  48 65 6c 6c Hell\n0x00000004  6f 20 57 6f o Wo"
+hexdump w1: => "0x00000000  48 H\n0x00000001  65 e\n0x00000002  6c l"
+w0: ArgumentError: Width must be at least 1!
+neg: ArgumentError: Offset can't be negative!
+null: => nil
+null inspect: => "#<IO::Buffer 0xX+0 NULL>"
+empty for: => "#<IO::Buffer 0xX+0 EXTERNAL READONLY SLICE>"
+#<IO::Buffer 0xX+300 INTERNAL>
+0xX  5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a ZZZZZZZZZZZZZZZZ
+0xX  5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a ZZZZZZZZZZZZZZZZ
+0xX  5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a ZZZZZZZZZZZZZZZZ
+0xX  5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a ZZZZZZZZZZZZZZZZ
+0xX  5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a ZZZZZZZZZZZZZZZZ
+0xX  5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a ZZZZZZZZZZZZZZZZ
+0xX  5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a ZZZZZZZZZZZZZZZZ
+0xX  5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a ZZZZZZZZZZZZZZZZ
+0xX  5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a ZZZZZZZZZZZZZZZZ
+0xX  5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a ZZZZZZZZZZZZZZZZ
+0xX  5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a ZZZZZZZZZZZZZZZZ
+0xX  5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a ZZZZZZZZZZZZZZZZ
+0xX  5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a ZZZZZZZZZZZZZZZZ
+0xX  5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a ZZZZZZZZZZZZZZZZ
+0xX  5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a ZZZZZZZZZZZZZZZZ
+0xX  5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a ZZZZZZZZZZZZZZZZ
+(and 44 more bytes not printed)

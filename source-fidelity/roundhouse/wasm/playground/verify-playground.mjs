@@ -1,0 +1,415 @@
+// Phase 1 smoke check: drive the playground in a real browser engine
+// (Playwright/chromium) and assert the full edit -> transpile -> render loop,
+// editor-widget agnostic (via window.__playground, so it passes whether Monaco
+// or the textarea fallback is active).
+//
+// Asserts:
+//   1. boots + first transpile renders a positive, stable set of TS files.
+//   2. editing app/models/article.rb (a validation the transpiler reflects:
+//      length minimum 10 -> 999) re-transpiles and the emitted model TS
+//      changes to match.
+//   3. switching target re-transpiles every backend with no error.
+//   4. diagnostics overlay: real-blog's baseline is 0 errors + only the
+//      jbuilder gradual_untyped warnings (the API-contract seam), and a
+//      type-error edit (`title + 1`) surfaces an incompatible_binop error
+//      rendered as a Monaco squiggle.
+//   5. inferred-type hovers: `title` in the edited method types as String, and
+//      the result carries many inferred types.
+//
+// (Note: a plain `def foo` method is NOT carried into the model emit today —
+// the transpiler reflects recognized Rails DSL like `validates`, not arbitrary
+// methods — so the edit assertion uses a validation, which IS reflected.)
+//
+// Serve the PARENT (wasm/) as the web root, since the page now imports the
+// shared ../lib/ modules (rung D Phase 4):
+//   python3 -m http.server 8099    # run from wasm/
+//   node verify-playground.mjs     # (run from wasm/playground/)
+
+import { createRequire } from "node:module";
+import "../verify-stack.mjs";
+// Borrow Playwright from the browser_smoke harness (repo-relative, so it
+// resolves on any checkout / CI runner — not just a local macOS path).
+const require = createRequire(new URL("../../tests/browser_smoke/", import.meta.url).pathname);
+const { chromium } = require("playwright");
+
+const PAGE_URL = "http://localhost:8099/playground/index.html";
+const MODEL = "app/models/article.rb";
+
+const browser = await chromium.launch();
+const page = await browser.newPage();
+const logs = [];
+page.on("console", (m) => logs.push(`[${m.type()}] ${m.text()}`));
+page.on("pageerror", (e) => logs.push(`[pageerror] ${e.message}`));
+
+let failed = false;
+const fail = (msg) => { console.error(`FAIL: ${msg}`); failed = true; };
+
+// A FAILURE THAT PRODUCES NO SIGNAL OF ITS OWN READS AS A MYSTERY.
+// This script is top-level-await ESM, so an unexpected throw — the page
+// dying under a `page.evaluate`, say — surfaces as an uncaught
+// exception and exits BEFORE the console tail at the bottom of this
+// file is ever printed. CI hit exactly that on 2026-08-26 and reported
+// only `page.evaluate: Execution context was destroyed, most likely
+// because of a navigation` with nothing about what the page was doing;
+// nothing here navigates (the deep-link sync is `history.replaceState`,
+// playground.js:276), so the interesting evidence was the part that
+// went unprinted. Dump what we collected, then exit non-zero.
+//
+// `crash` is listened for for the same reason: Playwright reports a
+// dead renderer as a destroyed context at whatever call was in flight,
+// which names the symptom and not the cause.
+page.on("crash", () => logs.push("[crash] the page's renderer process died (OOM?)"));
+const bail = (label) => (err) => {
+  console.error(`\n=== ${label} — last 30 page log lines ===`);
+  logs.slice(-30).forEach((l) => console.error(l));
+  console.error(`\n=== ${label} ===`);
+  console.error(err);
+  process.exit(1);
+};
+process.on("uncaughtException", bail("uncaught exception"));
+process.on("unhandledRejection", bail("unhandled rejection"));
+
+await page.goto(PAGE_URL, { waitUntil: "load" });
+await page.waitForSelector("#status.ok", { timeout: 30000 });
+await page.waitForFunction(() => window.__playground && window.__playground.ready, { timeout: 30000 });
+
+// Boot defaults: ruby is the initial target, and the dropdown is alphabetical.
+console.log("=== boot defaults ===");
+const defaultTarget = await page.evaluate(() => document.getElementById("target").value);
+const optionOrder = await page.evaluate(() =>
+  [...document.querySelectorAll("#target option")].map((o) => o.value));
+console.log("default target:", defaultTarget, "| options:", optionOrder.join(", "));
+if (defaultTarget !== "ruby") fail(`expected default target ruby, got ${defaultTarget}`);
+if (optionOrder.join() !== [...optionOrder].sort().join())
+  fail(`target options not alphabetical: ${optionOrder.join(", ")}`);
+for (const t of ["kotlin", "swift", "ruby", "roda"])
+  if (!optionOrder.includes(t)) fail(`missing newly-wired target ${t}`);
+const rubyBoot = await page.evaluate(() => window.__playground.output());
+if (rubyBoot.error) fail(`ruby default transpile errored: ${rubyBoot.error}`);
+if (!rubyBoot.files?.some((f) => f.path.endsWith(".rb"))) fail("ruby default emitted no .rb files");
+
+// roda: the Rails -> Roda + Sequel source conversion (issue #67). The
+// converted app.rb carries the re-nested routing tree; the views
+// translate from app.sources (no filesystem in wasm — the regression
+// this guards).
+console.log("\n=== roda conversion ===");
+await page.evaluate(() => window.__playground.setTarget("roda"));
+const roda = await page.evaluate(() => window.__playground.output());
+if (roda.error) fail(`roda conversion errored: ${roda.error}`);
+const rodaApp = roda.files?.find((f) => f.path === "app.rb");
+if (!rodaApp?.content?.includes("class App < Roda")) fail("roda conversion emitted no Roda app class");
+if (!rodaApp?.content?.includes('r.on "articles"')) fail("roda conversion missing the routing tree");
+const rodaIndex = roda.files?.find((f) => f.path === "views/articles/index.erb");
+if (!rodaIndex?.content?.includes("part(")) fail("roda conversion missing translated views (app.sources plumbing)");
+console.log(`roda: ${roda.files.length} files, app.rb + translated views present`);
+
+// futamura: the app's own tree, still on Rails. The blog has no static
+// query chain, so its output is the identity; an edit that adds one gets
+// spliced (Futamura.records) and defined in the generated initializer.
+console.log("\n=== futamura specialization ===");
+await page.evaluate(() => window.__playground.setTarget("futamura"));
+const ctrlPath = "app/controllers/articles_controller.rb";
+const ctrlSrc = await page.evaluate((p) => window.__playground.source(p), ctrlPath);
+const futId = await page.evaluate(() => window.__playground.output());
+if (futId.error) fail(`futamura errored: ${futId.error}`);
+if (futId.files?.find((f) => f.path === ctrlPath)?.content !== ctrlSrc)
+  fail("futamura changed the blog's controller with no static chain to specialize");
+const ctrlEdit = ctrlSrc.replace(/^  def show$/m, "  def show\n    @latest = Article.where(title: params[:title]).first");
+if (ctrlEdit === ctrlSrc) fail("could not find `def show` in the blog controller");
+await page.evaluate(([p, s]) => window.__playground.editFile(p, s), [ctrlPath, ctrlEdit]);
+const fut = await page.evaluate(() => window.__playground.output());
+if (fut.error) fail(`futamura errored after the edit: ${fut.error}`);
+if (!fut.files?.find((f) => f.path === ctrlPath)?.content?.includes("Futamura.records("))
+  fail("futamura did not splice the added where(...).first chain");
+if (!fut.files?.find((f) => f.path === "config/initializers/futamura.rb")?.content?.includes("Futamura.define("))
+  fail("futamura emitted no initializer define for the spliced site");
+console.log(`futamura: identity on the blog, ${fut.files.length} files with one site spliced`);
+await page.evaluate(([p, s]) => window.__playground.editFile(p, s), [ctrlPath, ctrlSrc]);
+await page.evaluate(() => window.__playground.setTarget("ruby"));
+
+// Switch to typescript for the TS-shaped assertions that follow.
+await page.evaluate(() => window.__playground.setTarget("typescript"));
+
+const editorKind = await page.evaluate(() => window.__playground.editorKind);
+const initial = await page.evaluate(() => window.__playground.output());
+console.log("\n=== boot ===");
+console.log("editor:", editorKind);
+console.log("target: typescript");
+console.log("files:", initial.files?.length, "| sources:", await page.evaluate(() => window.__playground.sourceCount()));
+
+if (initial.error) fail(`initial transpile errored: ${initial.error}`);
+if (!(initial.files?.length > 0)) fail(`expected >0 TS files, got ${initial.files?.length}`);
+
+const modelPath = (o) => o.files.find((f) => f.path === "app/models/article.ts");
+const before = modelPath(initial);
+if (!before) fail("no emitted app/models/article.ts in initial output");
+
+// --- edit: change a validation the transpiler reflects, expect output to move
+const edited = await page.evaluate(async (p) => {
+  const orig = window.__playground.source(p);
+  const next = orig.replace("length: { minimum: 10 }", "length: { minimum: 999 }");
+  if (next === orig) return { error: "edit precondition failed: validation string not found in source" };
+  await window.__playground.editFile(p, next);
+  return window.__playground.output();
+}, MODEL);
+
+console.log("\n=== after edit (validation minimum 10 -> 999) ===");
+if (edited.error) {
+  fail(`transpile errored after edit: ${edited.error}`);
+} else {
+  const after = modelPath(edited);
+  const changed = before && after && after.content !== before.content;
+  const reflects = after && /999/.test(after.content);
+  console.log("model file:", after?.path, "| len", before?.content.length, "->", after?.content.length);
+  console.log("reflects 999:", reflects, "| content changed:", changed);
+  if (!changed) fail("emitted model TS did not change after editing the source");
+  if (!reflects) fail("emitted model TS does not reflect the changed validation");
+}
+
+// --- target sweep: every backend re-transpiles cleanly ----------------------
+console.log("\n=== target sweep (live re-transpile) ===");
+for (const t of ["typescript", "go", "rust", "python", "elixir", "crystal", "kotlin", "swift", "csharp", "ruby"]) {
+  const out = await page.evaluate(async (target) => {
+    await window.__playground.setTarget(target);
+    return window.__playground.output();
+  }, t);
+  const count = out.files?.length ?? 0;
+  const err = out.error || count < 1;
+  console.log(`${t}: ${out.error ? `ERROR — ${out.error}` : `${count} files`}`);
+  if (err) fail(`${t} produced no output`);
+}
+
+// --- diagnostics overlay: baseline is clean + edit introduces an error ------
+console.log("\n=== diagnostics (inference overlay) ===");
+await page.evaluate(() => window.__playground.setTarget("typescript"));
+const baseDiag = await page.evaluate(() => window.__playground.diagnostics());
+console.log("baseline:", baseDiag.length,
+  baseDiag.length ? "— " + [...new Set(baseDiag.map((d) => d.code))].join(", ") : "(clean)");
+// real-blog's honest baseline: zero errors, and the only warnings are the
+// jbuilder views' gradual_untyped escapes (the intentionally-dynamic JSON
+// response shape — the API-contract seam, not noise). Anything error-severity
+// or any other warning code appearing here is a regression. The live
+// diagnostics pipeline is exercised by the `title + 1` error edit below.
+const baseErrors = baseDiag.filter((d) => d.severity === "error");
+const baseOther = baseDiag.filter((d) => d.code !== "gradual_untyped");
+if (baseErrors.length)
+  fail(`expected 0 baseline errors, got ${baseErrors.length}: ${[...new Set(baseErrors.map((d) => d.code))].join(", ")}`);
+if (baseOther.length)
+  fail(`expected only gradual_untyped baseline warnings, got: ${[...new Set(baseOther.map((d) => d.code))].join(", ")}`);
+
+const errDiag = await page.evaluate(async (p) => {
+  const orig = window.__playground.source(p);
+  const next = orig.replace("class Article < ApplicationRecord\n",
+    "class Article < ApplicationRecord\n  def bad\n    title + 1\n  end\n\n");
+  await window.__playground.editFile(p, next);
+  return window.__playground.diagnostics();
+}, MODEL);
+const typeErr = errDiag.find((d) =>
+  d.severity === "error" && d.code === "incompatible_binop" && d.path === MODEL);
+console.log("after `title + 1` edit:", errDiag.length,
+  "| incompatible_binop error:", typeErr ? `@${typeErr.start_line}:${typeErr.start_col}` : "MISSING");
+if (!typeErr) fail("expected an incompatible_binop error after the type-error edit");
+
+// confirm the squiggle actually rendered in Monaco (not just plumbed as data)
+const errorMarkers = await page.evaluate(() => {
+  if (!window.monaco) return -1; // textarea fallback — no markers
+  return window.monaco.editor.getModelMarkers({ owner: "roundhouse" })
+    .filter((m) => m.severity === window.monaco.MarkerSeverity.Error).length;
+});
+console.log("monaco error markers on open file:", errorMarkers < 0 ? "(textarea fallback)" : errorMarkers);
+if (errorMarkers === 0) fail("expected an error squiggle rendered in Monaco");
+
+// --- inferred-type hovers: `title` in the edited method types as String? ----
+console.log("\n=== inferred-type hovers ===");
+const titleType = await page.evaluate(() => window.__playground.typeAt(3, 6));
+const typeCount = await page.evaluate(() => window.__playground.types().length);
+console.log("type at article.rb:3:6 (`title`):", titleType, "| total inferred types:", typeCount);
+// Nullable column (`articles.title` carries no `null: false`), so the
+// hover reports the slot type — nil until something sets it.
+if (titleType !== "String?") fail(`expected String? at the \`title\` position, got ${titleType}`);
+if (typeCount < 100) fail(`expected many inferred types, got ${typeCount}`);
+
+// --- typed completion: `article.` offers columns/associations with types ----
+// Answers from the snapshot the last transpile stashed; the probe text is the
+// live-buffer contract (one keystroke ahead of the analysis).
+console.log("\n=== typed completion ===");
+const completion = await page.evaluate(() => {
+  window.__playground.selectSource("app/controllers/articles_controller.rb");
+  const orig = window.__playground.source("app/controllers/articles_controller.rb");
+  const text = orig.replace("  def show\n", "  def show\n    @article.\n");
+  const idx = text.indexOf("    @article.") + "    @article.".length;
+  const line = text.slice(0, idx).split("\n").length - 1;
+  const character = idx - text.lastIndexOf("\n", idx - 1) - 1;
+  return window.__playground.complete(text, line, character);
+});
+const compByLabel = Object.fromEntries((completion || []).map((c) => [c.label, c.detail]));
+console.log(`completion @article.: ${(completion || []).length} items;`,
+  "title:", compByLabel.title, "| comments:", compByLabel.comments);
+// `articles.title` has no `null: false`, so a read can be nil — the
+// completion detail reports the slot type it actually reads.
+if (compByLabel.title !== "String?") fail(`expected title → String?, got ${compByLabel.title}`);
+if (compByLabel.comments !== "Array[Comment]")
+  fail(`expected comments → Array[Comment], got ${compByLabel.comments}`);
+
+// --- source -> output follow: selecting a source shows its emitted file ------
+// Heuristic name match (no `source` field on EmittedFile yet): basename, then
+// tighten by parent dir until unique. Covers the TS exact-path case and rust's
+// app/ -> src/ prefix divergence.
+console.log("\n=== source → output follow ===");
+await page.evaluate(() => window.__playground.setTarget("typescript"));
+await page.evaluate(() => window.__playground.selectSource("app/models/article.rb"));
+const tsModelOut = await page.evaluate(() => window.__playground.displayedOutput());
+console.log("ts: select app/models/article.rb ->", tsModelOut);
+if (tsModelOut !== "app/models/article.ts") fail(`expected app/models/article.ts, got ${tsModelOut}`);
+
+await page.evaluate(() => window.__playground.selectSource("app/views/articles/index.html.erb"));
+const tsViewOut = await page.evaluate(() => window.__playground.displayedOutput());
+console.log("ts: select app/views/articles/index.html.erb ->", tsViewOut);
+if (tsViewOut !== "app/views/articles/index.ts") fail(`expected app/views/articles/index.ts, got ${tsViewOut}`);
+
+// rust relocates app/ -> src/; the suffix-walk should still map controllers.
+await page.evaluate(() => window.__playground.setTarget("rust"));
+await page.evaluate(() => window.__playground.selectSource("app/controllers/application_controller.rb"));
+const rsCtrlOut = await page.evaluate(() => window.__playground.displayedOutput());
+console.log("rust: select app/controllers/application_controller.rb ->", rsCtrlOut);
+if (!/controllers\/application_controller\.rs$/.test(rsCtrlOut || ""))
+  fail(`expected a rust controllers/application_controller.rs, got ${rsCtrlOut}`);
+
+// ruby: source .rb and output .rb share a name, and an .rbs sidecar sits beside
+// it — the sidecar exclusion must keep the follow landing on the .rb (not no-op).
+await page.evaluate(() => window.__playground.setTarget("ruby"));
+await page.evaluate(() => window.__playground.selectSource("app/models/article.rb"));
+const rbOut = await page.evaluate(() => window.__playground.displayedOutput());
+console.log("ruby: select app/models/article.rb ->", rbOut);
+if (rbOut !== "app/models/article.rb") fail(`expected app/models/article.rb, got ${rbOut}`);
+
+await page.evaluate(async () => { await window.__playground.setTarget("typescript"); window.__playground.selectSource("app/models/article.rb"); });
+await page.screenshot({ path: "playground.png" });
+
+// --- app picker (only when a manifest ships >1 app) -------------------------
+// Switching apps re-seeds srcMap and re-transpiles. blog is clean; lobsters
+// runs the full transpile partially and surfaces the honest diagnostics
+// ledger (its ingest is accepted where Mastodon's strict-mode gaps are not,
+// which is why the playground offers lobsters but not Mastodon). Skipped for
+// a single-app (no apps.json) deployment.
+const appNames = await page.evaluate(() => window.__playground.apps().map((a) => a.name));
+// roda-blog: the Roda + Sequel exemplar (issue #67), the picker's second
+// CLEAN app — a different source framework transpiling through the roda
+// front-end with zero diagnostics.
+if (appNames.includes("roda")) {
+  console.log("\n=== roda-blog (Roda + Sequel front-end) ===");
+  await page.evaluate(() => window.__playground.setApp("roda"));
+  await page.waitForFunction(() => window.__playground.source("app.rb") != null, { timeout: 60000 });
+  await page.waitForFunction(() => {
+    const out = window.__playground.output();
+    return out && (out.files || out.error);
+  }, { timeout: 60000 });
+  const roda = await page.evaluate(() => {
+    const out = window.__playground.output();
+    return { sources: window.__playground.sourceCount(), emitted: (out.files || []).length, error: out.error || null, diags: (out.diagnostics || []).length };
+  });
+  console.log(`roda-blog: ${roda.sources} sources -> ${roda.emitted} emitted, ${roda.diags} diagnostics`);
+  if (roda.error) fail(`roda-blog transpile errored: ${roda.error}`);
+  if (!(roda.sources >= 15 && roda.emitted >= 15)) fail(`roda-blog re-seed/transpile too small: ${roda.sources}/${roda.emitted}`);
+  if (roda.diags !== 0) fail(`roda-blog should transpile clean, got ${roda.diags} diagnostics`);
+  await page.evaluate(() => window.__playground.setApp("blog"));
+  await page.waitForFunction(() => window.__playground.source("app/models/article.rb") != null, { timeout: 60000 });
+}
+if (appNames.length >= 2 && appNames.includes("lobsters")) {
+  console.log("\n=== app picker ===");
+  await page.evaluate(() => window.__playground.setApp("lobsters"));
+  await page.waitForFunction(() => window.__playground.source("app/models/story.rb") != null, { timeout: 60000 });
+  const lob = await page.evaluate(() => {
+    const out = window.__playground.output();
+    return { sources: window.__playground.sourceCount(), emitted: (out.files || []).length, error: out.error || null, diags: (out.diagnostics || []).length };
+  });
+  console.log(`lobsters: ${lob.sources} sources -> ${lob.emitted} emitted, ${lob.diags} diagnostics`);
+  if (lob.error) fail(`lobsters transpile errored: ${lob.error}`);
+  if (!(lob.sources > 30 && lob.emitted > 30)) fail(`lobsters re-seed/transpile too small: ${lob.sources}/${lob.emitted}`);
+  if (!(lob.diags > 100)) fail(`lobsters diagnostics ledger unexpectedly sparse: ${lob.diags}`);
+  // campfire (ONCE Campfire, MIT): the write+push app — Action Cable channels,
+  // model-side broadcast_*_to, turbo_stream views. Same partial-transpile
+  // contract as lobsters: it emits, and the unmodeled constructs land in the
+  // ledger rather than aborting.
+  if (appNames.includes("campfire")) {
+    await page.evaluate(() => window.__playground.setApp("campfire"));
+    await page.waitForFunction(() => window.__playground.source("app/models/message.rb") != null, { timeout: 60000 });
+    await page.waitForFunction(() => {
+      const out = window.__playground.output();
+      return out && (out.files || out.error);
+    }, { timeout: 60000 });
+    const cf = await page.evaluate(() => {
+      const out = window.__playground.output();
+      return { sources: window.__playground.sourceCount(), emitted: (out.files || []).length, error: out.error || null, diags: (out.diagnostics || []).length };
+    });
+    console.log(`campfire: ${cf.sources} sources -> ${cf.emitted} emitted, ${cf.diags} diagnostics`);
+    if (cf.error) fail(`campfire transpile errored: ${cf.error}`);
+    if (!(cf.sources > 100 && cf.emitted > 100)) fail(`campfire re-seed/transpile too small: ${cf.sources}/${cf.emitted}`);
+    if (!(cf.diags > 100)) fail(`campfire diagnostics ledger unexpectedly sparse: ${cf.diags}`);
+  }
+  // Mastodon is the off-thread stress case: a multi-second transpile that only
+  // works because the wasm runs in the worker (the main thread would freeze
+  // otherwise). Assert the UI stays responsive WHILE it runs, then that partial
+  // output + gap-note diagnostics land.
+  if (appNames.includes("mastodon")) {
+    const started = Date.now();
+    const done = page.evaluate(() => window.__playground.setApp("mastodon"));
+    let worst = 0;
+    while (Date.now() - started < 2500) {
+      const t0 = Date.now();
+      await page.evaluate(() => performance.now()); // must return promptly if the main thread is free
+      worst = Math.max(worst, Date.now() - t0);
+    }
+    if (worst >= 750) fail(`main thread blocked during mastodon transpile: worst round-trip ${worst}ms`);
+    await done;
+    const mast = await page.evaluate(() => {
+      const out = window.__playground.output();
+      return { files: (out.files || []).length, error: out.error || null,
+        notes: (out.diagnostics || []).filter((d) => d.severity === "info").length };
+    });
+    console.log(`mastodon: ${mast.files} files, ${mast.notes} gap-notes, worst UI round-trip ${worst}ms during transpile`);
+    if (mast.error) fail(`mastodon transpile errored: ${mast.error}`);
+    if (!(mast.files > 100)) fail(`mastodon emitted too little: ${mast.files} files`);
+    // Measured 59 on 2026-10-03 after ordinary Rails calls stopped being
+    // recorded as ingest gaps. The floor only proves the ledger still
+    // lands; it is not a target to grow.
+    if (!(mast.notes >= 59)) fail(`mastodon gap-note ledger unexpectedly sparse: ${mast.notes}`);
+  }
+
+  // Deep-link: switching via the picker syncs ?app= into the address bar, and
+  // a fresh load with ?app= boots straight into that app (falls back on junk).
+  await page.evaluate(() => window.__playground.setApp("lobsters"));
+  if (!/[?&]app=lobsters/.test(page.url())) fail(`picker switch did not sync URL: ${page.url()}`);
+  await page.goto(PAGE_URL + "?app=lobsters", { waitUntil: "load" });
+  await page.waitForFunction(() => window.__playground?.ready, { timeout: 30000 });
+  const booted = await page.evaluate(() => document.getElementById("app").value);
+  if (booted !== "lobsters") fail(`?app=lobsters did not boot lobsters, got ${booted}`);
+  console.log("deep-link: ?app= boots the named app + picker syncs the URL");
+
+  await page.goto(PAGE_URL + "?app=nope", { waitUntil: "load" });
+  await page.waitForFunction(() => window.__playground?.ready, { timeout: 30000 });
+  await page.evaluate(() => window.__playground.setApp("blog"));
+  await page.waitForFunction(() => window.__playground.source("app/models/article.rb") != null, { timeout: 30000 });
+  const backErrs = await page.evaluate(() => (window.__playground.output().diagnostics || []).filter((d) => d.severity === "error").length);
+  if (backErrs !== 0) fail(`round-trip back to blog not clean: ${backErrs} errors`);
+  console.log("app switch: lobsters · mastodon · blog verified");
+}
+
+// Monaco's Monarch tokenizer occasionally logs "trying to pop an empty stack"
+// when a model is disposed mid-background-tokenization (both views swap a fresh
+// model per file — the documented workaround — but the async transpile timing
+// can still race the tokenizer). It's a Monaco-internal, cosmetic warning with
+// no functional effect (every assertion above passes through it), so it joins
+// the Monaco/loader noise already filtered here.
+const noise = /monaco|web worker|cdn\.jsdelivr|loader\.js|pop an empty stack/i;
+const realErrors = logs.filter((l) => /pageerror|\[error\]/.test(l) && !noise.test(l));
+if (realErrors.length) {
+  console.log("\n=== console errors ===");
+  realErrors.forEach((l) => console.log(l));
+  fail(`${realErrors.length} console/page error(s)`);
+}
+
+await browser.close();
+
+if (failed) process.exit(1);
+console.log("\nOK: edit -> transpile -> render loop + diagnostics overlay + inferred-type hovers verified in a real browser tab.");

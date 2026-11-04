@@ -1,0 +1,17 @@
+Vehicle wheels 4
+"Vehicle-v"
+"<Vehicle>"
+[:v, :v]
+Car doors 2
+"Car-c"
+"<Car>"
+Boat hull 1
+[:wheels, :engine]
+[:doors]
+[:hull]
+true
+[:hull, :sail]
+"Car-x"
+"<Boat>"
+"plane"
+[:c, :c]

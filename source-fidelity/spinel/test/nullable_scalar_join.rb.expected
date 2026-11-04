@@ -1,0 +1,47 @@
+3
+xy
+nil
+9
+7
+nil
+1.5
+nil
+10
+10
+nil
+8
+nil
+true
+true
+[1, nil]
+[10, nil, 30]
+nil
+10
+nil
+1
+nil
+nil
+3
+#<data Pt v=nil>
+2
+nil
+nil
+2.5
+nil
+2.5
+"var"
+true
+1
+3
+nil
+7
+nil
+1
+true
+AE: comparison of Ver with Ver failed
+9
+true
+false
+NME: undefined method 'scan' for nil
+2
+"none"

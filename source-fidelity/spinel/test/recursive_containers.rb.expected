@@ -1,0 +1,81 @@
+[[...]]
+[[[...]]]
+[[[...]]]
+"[[...]]"
+"[[...]]"
+[...]
+[[...]]
+[1, [...]]
+[[[...]]]
+[[[...]]]
+[[...]]
+{h: {...}}
+"{h: {...}}"
+[[:h, {h: {...}}]]
+[:h, {h: {...}}]
+{a: {h: {...}}}
+{{...} => 1}
+[:a, [[...]]]
+[true, true, true, true, true]
+[0, -1, 0]
+1
+true
+true
+[true, false, false, false]
+"tried to flatten recursive array"
+"tried to flatten recursive array"
+[1, true]
+"tried to flatten recursive array"
+[[[...]]]
+[[[...]]]
+[[[...]]]
+"recursive array join"
+"recursive array join"
+"recursive array join"
+#<struct S a=#<struct S:...>>
+[#<struct S a=#<struct S:...>>]
+{a: #<struct S a=#<struct S:...>>}
+{#<struct S a=#<struct S:...>> => 1}
+{a: #<struct S a=#<struct S:...>>}
+[#<struct S a=#<struct S:...>>]
+[true, true, true]
+[false, true, true]
+#<struct S2 a=#<struct S2:...>, b=nil>
+#<struct S2 a=#<struct S2 a=#<struct S2:...>, b=3>, b=2>
+#<data D x=[#<data D:...>]>
+"#<Node:0xX @kids=[#<Node:0xX @kids=[], @parent=#<Node:0xX ...>>], @parent=nil>"
+"[B, [[...]]]"
+"boom"
+"[1, [2]]"
+"[[...]]"
+"{h: {...}}"
+"[[...]]"
+"[[...]]"
+"[C, [...]]"
+1
+[4000, false]
+[true, true]
+"[1, J]"
+7
+"[1, J]"
+"[[...]]"
+"[1, J]"
+"[1, J]"
+true
+11
+"[1, J]"
+"[[...]]"
+"recursive array join"
+true
+1
+true
+5
+[false, true, true]
+[Integer, false]
+[1207, true]
+[true, true, true, 0]
+[false, false, -1]
+[2002, true]
+true
+"tried to flatten recursive array"
+[true, true, 4200]

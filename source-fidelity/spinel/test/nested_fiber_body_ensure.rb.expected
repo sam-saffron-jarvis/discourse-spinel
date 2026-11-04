@@ -1,0 +1,11 @@
+ok
+outer returned outer_value
+["inner body", "inner ensure", "inner returned inner_value", "outer ensure"]
+g ensure
+f got g
+f ensure
+:f
+t ensure
+caught boom
+l ensure
+:l

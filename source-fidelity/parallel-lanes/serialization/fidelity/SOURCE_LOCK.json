@@ -1,0 +1,206 @@
+{
+  "discourse_revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+  "scope": "Original Discourse sources, byte-identical. Compiler lowering may transform unsupported Ruby with evidence; no hand-written replacement application queries.",
+  "files": [
+    {
+      "path": "app/models/topic.rb",
+      "sha256": "8202e548cd9ce289b61aca469449e282ce061b411a9b0551c0f1cd3b82455952"
+    },
+    {
+      "path": "lib/topic_query.rb",
+      "sha256": "9066840709436451bd392921f1dfaeed121ce0024e63916bb0e388145f8762dc"
+    },
+    {
+      "path": "app/models/category.rb",
+      "sha256": "7a0b2299f9dfee07ae74f346723e695182fe888963c3b1939ee4fcbc95b5f011"
+    },
+    {
+      "path": "app/models/concerns/trashable.rb",
+      "sha256": "14363cac2b95190f6f143ef943eb4a6564883851aade706f469b020388b1c347"
+    },
+    {
+      "path": "lib/archetype.rb",
+      "sha256": "c3c10927b5fa53645e5799fd8543585ce024447050dcc3eb88c9fbf473de62ae"
+    },
+    {
+      "path": "lib/guardian.rb",
+      "sha256": "d14e82df366bb63d2d2a34add5ae9417dc17ff0d1ad91f991c0582134489645c"
+    },
+    {
+      "path": "lib/guardian/topic_guardian.rb",
+      "sha256": "9c647803cbd137df5f18080fe0659447789ea264308df4e3d2aa7ca8a1152cae"
+    },
+    {
+      "path": "lib/guardian/category_guardian.rb",
+      "sha256": "f7e3d398829c8eebcd8c55da94deaa153e51e4c8497cb144fbd723fa365dee29"
+    },
+    {
+      "path": "app/models/user.rb",
+      "sha256": "36d66d4c6fce6b245c505771f5136e65b08c14e964b7665381721fd4a84c9fe2"
+    },
+    {
+      "path": "app/models/group.rb",
+      "sha256": "4f53a5cfc4e861a7a1ac2d9c6cf131987cdd4e45694b523c551128faef79d91f"
+    },
+    {
+      "path": "app/models/category_group.rb",
+      "sha256": "0e45f4045627a8f14710111007b09da35a7bd2ff27b4fc4fc4108705929d821a"
+    },
+    {
+      "path": "app/models/site_setting.rb",
+      "sha256": "a44e4bf6277b8693ae59f63dcabca0b4fbf474f3a80e6a10f6ef6db682d86986"
+    },
+    {
+      "path": "lib/site_setting_extension.rb",
+      "sha256": "7f4e727c17ef9a4da8254e5ee70ea272dd886dbf88b0936a4ee37f435b6aaeab"
+    },
+    {
+      "path": "lib/site_settings/db_provider.rb",
+      "sha256": "a3e2227d477e40fb5279166b9d29423a4d5d7f204ee1584a9150c0d083d9a376"
+    },
+    {
+      "path": "config/site_settings.yml",
+      "sha256": "f5d22ff1dc5e7afc1d5c136d0160c12443639a1df792ed43553460252db1e3d1"
+    },
+    {
+      "path": "lib/site_settings/yaml_loader.rb",
+      "sha256": "e07ac87a3006f3dd8c7cb7c3c233bbe3f9166e626648d64f10b58baa35d224e6"
+    },
+    {
+      "path": "lib/site_settings/defaults_provider.rb",
+      "sha256": "0e944183b86420fe65370d6d5e8ee7b92217e0d2837422d605f26cd7ab0c867b"
+    },
+    {
+      "path": "lib/site_settings/type_supervisor.rb",
+      "sha256": "2ebb80ee39cd416f1fddd506976ab67aaab91d8617a3c8d430add8a48d1833eb"
+    },
+    {
+      "path": "app/models/site.rb",
+      "sha256": "77e404c42b30329ce3c05f06e46110afaddf4380062b3f8670298c7bbb08d427"
+    },
+    {
+      "path": "app/models/theme.rb",
+      "sha256": "6240fae13333496c437cd47a2fd9c2d7f6e849bf595829b5d31e99942165d80c"
+    },
+    {
+      "path": "lib/cache.rb",
+      "sha256": "9a4f21da0222d90c779054ce3cb494560c107958922d158ed6ce50902d97e386"
+    },
+    {
+      "path": "lib/discourse_redis.rb",
+      "sha256": "3af7b8284dfdf82bf81c3a86cfca6f3fae5c7e991b626871a7a613eba81e5394"
+    },
+    {
+      "path": "lib/discourse_plugin_registry.rb",
+      "sha256": "b68c7be036d6c722ce70dc1920b9059bfd537b463144a01a79c1e7c16c3c9c29"
+    },
+    {
+      "path": "lib/plugin.rb",
+      "sha256": "5c751877a6354d7fefcc7e92a99cbd38bf70dcda38e819977d81a848669a70f6"
+    },
+    {
+      "path": "lib/plugin/instance.rb",
+      "sha256": "61fecfea0649aaa2fe6e8ebf67960d268b711e3578419eec855a29473b6ff8ee"
+    },
+    {
+      "path": "app/models/global_setting.rb",
+      "sha256": "7540311b8504a318131a2e33f8d0c888faffd586e5aa4964982003c939c66d40"
+    },
+    {
+      "path": "lib/global_path.rb",
+      "sha256": "fa83d6a96eb095d413dc409dce3d5626274ab3c4cdb7d9d8b0ac2dd544129a9d"
+    },
+    {
+      "path": "app/models/concerns/has_sanitizable_fields.rb",
+      "sha256": "91b3cf55c2790795755c81417cb99aa21b9f36bd82a05c841cc6544da1ab3246"
+    },
+    {
+      "path": "lib/site_settings/deprecated_settings.rb",
+      "sha256": "e6479fac6aaf01b4e8c7bced36a117185110a1fb13995472358deba089d5f029"
+    },
+    {
+      "path": "lib/enum.rb",
+      "sha256": "b879a803f904df73e9d7abbb1b15ebc7dca3828d5daa5434502e40d04a6f3f99"
+    },
+    {
+      "path": "lib/site_settings/hidden_provider.rb",
+      "sha256": "450e4f3bdcbf7f36e8c097d1fc6188b8588970571ebb0f19e9a7b3237cb9e213"
+    },
+    {
+      "path": "lib/site_settings/dependency_graph.rb",
+      "sha256": "0550791a432a2e0fb8c20919735f4a228fdc3d8b7d7795eedee9de11a01e50cb"
+    },
+    {
+      "path": "lib/site_settings/label_formatter.rb",
+      "sha256": "5f5acce3ae886a08cd86510c4ac9cd63359ded80306c052cf755804404b718b0"
+    },
+    {
+      "path": "config/application.rb",
+      "sha256": "789086c01435a0fc91651bf3ad098e10e5f8bea96fd84569e91e2b7f38db1d58"
+    },
+    {
+      "path": "config/initializers/005-site_settings.rb",
+      "sha256": "e3163d369f05406d80be74620d6a54d3623bcb182c1c8748d4b7ee20e0b3bc4a"
+    },
+    {
+      "path": "config/discourse_defaults.conf",
+      "sha256": "ffc088046d70a1a0fa7bea1b6f1458ea7a45e689614faadb5ad508cf50a002c6"
+    },
+    {
+      "path": "lib/upcoming_changes.rb",
+      "sha256": "adb01f9d8b3d1e0bc49e1df7fe13834eb9375dd4c2c9788751d1547c61bec4f1"
+    },
+    {
+      "path": "lib/discourse.rb",
+      "sha256": "1330fdf219417287e80958fae9e90e9a15eff984d298e1203f301ff25f0e6aba"
+    },
+    {
+      "path": "app/models/theme_site_setting.rb",
+      "sha256": "a6a81a19afed775b3043cd75bb067c6d4277440891bcc1e695ad486c999abeef"
+    },
+    {
+      "path": "lib/plugin/metadata.rb",
+      "sha256": "228176118ba67f34b6c76715b2d944fcec3bbfc260d6d063db502470d1612f41"
+    },
+    {
+      "path": "config/official_plugins.json",
+      "sha256": "17333326631618d7260445d80de70fae67cf71da078fcc683e12fb7f2bb316c5"
+    },
+    {
+      "path": "app/controllers/application_controller.rb",
+      "sha256": "793f89f85258089376c4e09da54030919afa29fc7b2cb3fad0109a3637ae012f"
+    },
+    {
+      "path": "app/controllers/list_controller.rb",
+      "sha256": "dbced8e36813d9d6221cb6316b48e1e3eb4ad70ecdec58f319f9569ba5f9edc0"
+    },
+    {
+      "path": "app/models/topic_list.rb",
+      "sha256": "5247ac80e9469741140f8d93e8cf2be750dc04b9af9907e6973780ab1c534e58"
+    },
+    {
+      "path": "app/serializers/topic_list_item_serializer.rb",
+      "sha256": "33a5cbc233e0f4c4b0457f7d99f288f12dd7a97719f457ea5a90623eb4795812"
+    },
+    {
+      "path": "app/serializers/topic_list_serializer.rb",
+      "sha256": "c3d062421d91095c0f378de047693de500192ca3dc4b3f94a4f8b6a764f4cbc4"
+    },
+    {
+      "path": "lib/application_layout_preloader.rb",
+      "sha256": "d1527e34b8ed09cbbe2b1e9fc5f2f472bf58d26e4036ff8611e531099c86335d"
+    },
+    {
+      "path": "lib/topic_list_responder.rb",
+      "sha256": "aa029946c01a1cd803504af21e9960f2d259482f67656b4a6d151da3e985704b"
+    },
+    {
+      "path": "lib/topic_query_params.rb",
+      "sha256": "930fdf22110573de49155ffcc53f944d7615edb4cc4b8165702e6e8f0cc2ebdd"
+    },
+    {
+      "path": "Gemfile.lock",
+      "sha256": "ada2da879a32de7000c2bd43954514dc900e4b71c463d86533b105017bdeaba8"
+    }
+  ]
+}

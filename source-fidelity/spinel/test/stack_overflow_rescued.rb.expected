@@ -1,0 +1,12 @@
+rescued: SystemStackError
+again 0
+again 1
+again 2
+mutual: rescued
+1000
+[2, 4, 6]
+bare rescue passed it through
+10000
+479001600
+10000
+10000

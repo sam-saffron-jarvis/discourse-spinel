@@ -1,0 +1,3 @@
+body
+throw: UncaughtThrowError
+escaped proc: LocalJumpError: unexpected return

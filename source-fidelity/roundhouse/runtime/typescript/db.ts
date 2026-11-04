@@ -1,0 +1,308 @@
+// Primitive Db surface — TypeScript / Node / better-sqlite3 implementation.
+//
+// Mirrors `runtime/spinel/db.rb`'s contract verbatim: the lowerer emits
+// per-model `_adapter_*` methods that compose SQL strings and dispatch
+// against this surface. Sibling shims (cruby/sqlite-gem under spinel,
+// libsql for async-target, postgres/etc.) implement the same module
+// name; per-database SQL dialect differences live in a separate dialect
+// helper consulted at SQL composition time. See
+// project_level_3_adapter_emit.md and project_arel_compile_time_first.md.
+//
+// API (every Db shim must satisfy this):
+//
+//   Db.configure(path)         — open a database (":memory:" for tests)
+//   Db.close()                 — close the database
+//   Db.exec(sql)               — run DDL / INSERT / UPDATE / DELETE
+//   Db.prepare(sql)            — prepare a SELECT, returns stmt handle
+//   Db.step?(stmt)             — advance, returns true if a row arrived
+//   Db.column_int(stmt, i)     — read int column at zero-based index
+//   Db.column_text(stmt, i)    — read text column at zero-based index
+//   Db.finalize(stmt)          — release the prepared stmt
+//   Db.last_insert_rowid()     — id of the last INSERTed row
+//   Db.changes()               — affected-row count of the last statement
+//   Db.escape_string(s)        — SQL-quote a string value
+//   Db.escape_int(n)           — render an integer for SQL inlining
+//
+// Stmt handles are opaque integers indexing into a per-process table
+// that caches each prepared statement's iterator + most recently
+// stepped row. The cache lets `column_int` / `column_text` pick fields
+// by index without re-stepping.
+//
+// Per-shape question-mark methods (`step?`) emit as
+// `["step?"]` in TypeScript since Ruby permits `?` in method names but
+// JS does not. Lowered call sites use the same bracket form, so the
+// shim exposes them under their original names via the bracket-export
+// shape below.
+
+import Database from "better-sqlite3";
+
+type StmtEntry = {
+  iterator: IterableIterator<unknown[]>;
+  current: unknown[] | undefined;
+};
+
+let _db: Database.Database | null = null;
+const _statements: Map<number, StmtEntry> = new Map();
+// Prepared-statement cache (roundhouse#12). better-sqlite3 compiles SQL on
+// every Database#prepare and does not cache, so the blog's fixed query set
+// was re-parsed each request. Cache the compiled Statement keyed by SQL.
+// better-sqlite3 is single-connection + synchronous, so one module-level
+// map suffices — no per-connection partitioning. The cache is cleared on
+// every db swap (configure/install/close) since a Statement is bound to
+// the Database it was prepared on. Inlined literals make id-bearing
+// queries key per-id; _STMT_CACHE_CAP bounds growth (over-cap statements
+// are transient). Placeholder binding (the planned follow-on) makes the
+// key the static query shape.
+const _stmtCache: Map<string, Database.Statement> = new Map();
+const _STMT_CACHE_CAP = 128;
+let _nextId = 0;
+let _lastRunResult: { lastInsertRowid: number | bigint; changes: number } | null = null;
+
+function db(): Database.Database {
+  if (_db === null) throw new Error("Db not configured — call Db.configure(path) first");
+  return _db;
+}
+
+function configure(path: string): void {
+  _db = new Database(path);
+  _stmtCache.clear();
+}
+
+// Adopt an already-opened Database. Lets the test runtime share one
+// in-memory connection between the legacy juntos `installDb(db)` path
+// and this Level-3 Db primitive surface — without this, Level-3
+// reads would miss anything written by legacy AR helpers (and vice
+// versa) because each call would have opened a separate `:memory:`
+// DB. The setup.ts emitter calls both `installDb(db)` and
+// `Db.install(db)` so both paths see the same rows.
+function install(adopted: Database.Database): void {
+  _db = adopted;
+  _stmtCache.clear();
+}
+
+function close(): void {
+  if (_db !== null) {
+    _stmtCache.clear();
+    _db.close();
+    _db = null;
+  }
+}
+
+// Run any one-shot SQL: DDL, INSERT, UPDATE, DELETE. better-sqlite3's
+// `Database#exec` runs multi-statement SQL but doesn't expose
+// last_insert_rowid; for the AR contract we route everything through
+// prepare+run so `last_insert_rowid` after an INSERT gives the right
+// value. DDL (CREATE TABLE etc.) tolerates this routing fine.
+function exec(sql: string): void {
+  const stmt = db().prepare(sql);
+  _lastRunResult = stmt.run();
+}
+
+function prepare(sql: string): number {
+  // `.raw(true)` switches Statement.iterate() to yield arrays instead
+  // of objects. Index-based column reads (column_int, column_text)
+  // line up with this array form. Reuse the cached compiled Statement
+  // when present (roundhouse#12) — the parse is skipped; `.iterate()`
+  // starts a fresh run each call.
+  let stmt = _stmtCache.get(sql);
+  if (stmt === undefined) {
+    stmt = db().prepare(sql).raw(true);
+    if (_stmtCache.size < _STMT_CACHE_CAP) _stmtCache.set(sql, stmt);
+  }
+  let iterator: IterableIterator<unknown[]>;
+  try {
+    iterator = stmt.iterate() as IterableIterator<unknown[]>;
+  } catch {
+    // A cached Statement left "busy" by an abandoned prior iterator
+    // (e.g. a handler that raised before finalize) can't be re-iterated.
+    // Drop it and prepare a fresh one so this request still succeeds —
+    // self-healing rather than poisoning the query for good.
+    _stmtCache.delete(sql);
+    stmt = db().prepare(sql).raw(true);
+    if (_stmtCache.size < _STMT_CACHE_CAP) _stmtCache.set(sql, stmt);
+    iterator = stmt.iterate() as IterableIterator<unknown[]>;
+  }
+  _nextId += 1;
+  _statements.set(_nextId, { iterator, current: undefined });
+  return _nextId;
+}
+
+function stepQ(stmtId: number): boolean {
+  const entry = _statements.get(stmtId);
+  if (entry === undefined) throw new Error(`Db: unknown stmt id ${stmtId}`);
+  const result = entry.iterator.next();
+  if (result.done) {
+    entry.current = undefined;
+    return false;
+  }
+  entry.current = result.value;
+  return true;
+}
+
+function columnInt(stmtId: number, i: number): number {
+  const entry = _statements.get(stmtId);
+  if (entry === undefined || entry.current === undefined) {
+    throw new Error(`Db: column_int called on stmt ${stmtId} with no current row`);
+  }
+  const v = entry.current[i];
+  if (v === null || v === undefined) return 0;
+  return typeof v === "number" ? Math.trunc(v) : Number(v) | 0;
+}
+
+function columnText(stmtId: number, i: number): string {
+  const entry = _statements.get(stmtId);
+  if (entry === undefined || entry.current === undefined) {
+    throw new Error(`Db: column_text called on stmt ${stmtId} with no current row`);
+  }
+  const v = entry.current[i];
+  if (v === null || v === undefined) return "";
+  return String(v);
+}
+
+// Drain any unread rows so better-sqlite3 releases the underlying
+// statement cleanly; iterators that haven't been exhausted leave
+// statements in a "busy" state across Database#close.
+function finalize(stmtId: number): void {
+  const entry = _statements.get(stmtId);
+  if (entry === undefined) return;
+  try {
+    while (!entry.iterator.next().done) { /* drain */ }
+  } catch {
+    /* iterator already exhausted or errored — nothing to release */
+  }
+  _statements.delete(stmtId);
+}
+
+function lastInsertRowid(): number {
+  if (_lastRunResult === null) return 0;
+  const v = _lastRunResult.lastInsertRowid;
+  return typeof v === "bigint" ? Number(v) : v;
+}
+
+function changes(): number {
+  return _lastRunResult?.changes ?? 0;
+}
+
+function escapeString(s: unknown): string {
+  return "'" + String(s ?? "").replace(/'/g, "''") + "'";
+}
+
+function escapeInt(n: unknown): string {
+  // Truncate-to-int matches Ruby's `n.to_i.to_s` semantic in
+  // `runtime/spinel/db.rb`. Non-numeric input parses to 0 (Ruby
+  // semantics: "abc".to_i == 0). A non-finite *number* has no Integer
+  // (Ruby's `Float::NAN.to_i` raises): it is NULL, which no `id = `
+  // matches, so a `find(NaN)` (a blank or non-numeric request id) finds
+  // nothing rather than row 0.
+  if (typeof n === "number") return Number.isFinite(n) ? String(Math.trunc(n)) : "NULL";
+  const parsed = Number(n);
+  return Number.isFinite(parsed) ? String(Math.trunc(parsed)) : "0";
+}
+
+function escapeIntList(ids: unknown[]): string {
+  // Render an integer list for `IN (...)` eager-load batches (issue
+  // #27). Empty list → "NULL" so `IN (NULL)` is valid SQL matching no
+  // rows (an empty `IN ()` is a syntax error).
+  if (ids.length === 0) return "NULL";
+  return ids.map((n) => escapeInt(n)).join(", ");
+}
+
+function escapeBool(b: unknown): string {
+  // SQLite stores booleans as 0/1 integers — mirror the Ruby/Crystal
+  // sibling shims. Truthiness check accepts Ruby's `truthy` interp.
+  return b ? "1" : "0";
+}
+
+function columnBool(stmtId: number, idx: number): boolean {
+  return columnInt(stmtId, idx) !== 0;
+}
+
+// Nullable-column reads. A column the schema declares nullable holds
+// NULL until something sets it, and NULL is not the type's zero: ""
+// in a nullable UNIQUE column collides row-to-row, and 0 in a nullable
+// fk makes `where(fk: nil)` match nothing. The lowerer emits these for
+// those columns; the non-`_opt` readers above stay as they are for
+// NOT NULL columns.
+function columnValueOrNull(stmtId: number, i: number, caller: string): unknown {
+  const entry = _statements.get(stmtId);
+  if (entry === undefined || entry.current === undefined) {
+    throw new Error(`Db: ${caller} called on stmt ${stmtId} with no current row`);
+  }
+  const v = entry.current[i];
+  return v === null || v === undefined ? null : v;
+}
+
+function columnIntOpt(stmtId: number, i: number): number | null {
+  const v = columnValueOrNull(stmtId, i, "column_int_opt");
+  if (v === null) return null;
+  return typeof v === "number" ? Math.trunc(v) : Number(v) | 0;
+}
+
+function columnFloatOpt(stmtId: number, i: number): number | null {
+  const v = columnValueOrNull(stmtId, i, "column_float_opt");
+  return v === null ? null : Number(v);
+}
+
+function columnTextOpt(stmtId: number, i: number): string | null {
+  const v = columnValueOrNull(stmtId, i, "column_text_opt");
+  return v === null ? null : String(v);
+}
+
+function columnBoolOpt(stmtId: number, i: number): boolean | null {
+  const v = columnIntOpt(stmtId, i);
+  return v === null ? null : v !== 0;
+}
+
+// Nullable-column writes: nil renders the SQL keyword NULL rather than
+// `''` / `0`, so a nullable column round-trips as null.
+function escapeStringOpt(s: unknown): string {
+  return s === null || s === undefined ? "NULL" : escapeString(s);
+}
+
+function escapeIntOpt(n: unknown): string {
+  return n === null || n === undefined ? "NULL" : escapeInt(n);
+}
+
+function escapeFloatOpt(f: unknown): string {
+  if (f === null || f === undefined) return "NULL";
+  const parsed = typeof f === "number" ? f : Number(f);
+  return Number.isFinite(parsed) ? String(parsed) : "0.0";
+}
+
+function escapeBoolOpt(b: unknown): string {
+  return b === null || b === undefined ? "NULL" : escapeBool(b);
+}
+
+// Method names match the TypeScript emitter's Ruby→TS rename rule
+// (see `src/emit/typescript/naming.rs::ts_method_name`): Ruby's `?`
+// suffix becomes an `is_` prefix at the call site, so `Db.step?(stmt)`
+// emits as `Db.is_step(stmt)` and the export is named accordingly.
+// All other names preserve their snake_case shape verbatim.
+export const Db = {
+  configure,
+  install,
+  close,
+  exec,
+  prepare,
+  is_step: stepQ,
+  column_int: columnInt,
+  column_text: columnText,
+  column_bool: columnBool,
+  column_int_opt: columnIntOpt,
+  column_float_opt: columnFloatOpt,
+  column_text_opt: columnTextOpt,
+  column_bool_opt: columnBoolOpt,
+  finalize,
+  last_insert_rowid: lastInsertRowid,
+  changes,
+  escape_string: escapeString,
+  escape_int: escapeInt,
+  escape_int_list: escapeIntList,
+  escape_bool: escapeBool,
+  escape_string_opt: escapeStringOpt,
+  escape_int_opt: escapeIntOpt,
+  escape_float_opt: escapeFloatOpt,
+  escape_bool_opt: escapeBoolOpt,
+};
+
+export type DbModule = typeof Db;

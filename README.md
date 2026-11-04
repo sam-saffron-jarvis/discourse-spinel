@@ -1,4 +1,26 @@
-# Discourse on Spinel — experimental native read-only extraction
+# Discourse on Spinel — work in progress
+
+**Latest source checkpoint: [the original-source fidelity effort](source-fidelity/README.md), captured November4,2026.** It includes the current Roundhouse and Spinel source trees, fidelity probes, active uncommitted source work and preserved unintegrated lanes.
+
+**The original native `/latest` page is not complete.** Read [current status and limitations](source-fidelity/STATUS.md) before interpreting tests or trying the code. The working adapted backend below is an older strategy, not proof of the newer original-source goal.
+
+### Current source entry points
+
+| Area | Browse |
+|---|---|
+| Current implementation and component pins | [source-fidelity](source-fidelity/README.md) |
+| Current proof versus remaining gaps | [status](source-fidelity/STATUS.md) |
+| Original application source locks/probes | [fidelity](source-fidelity/fidelity/) |
+| Rails compatibility/compiler source | [Roundhouse](source-fidelity/roundhouse/) |
+| Native compiler source | [Spinel](source-fidelity/spinel/) |
+| Local committed/uncommitted deltas | [changes](source-fidelity/changes/) |
+| Separate helper work not yet integrated | [parallel lanes](source-fidelity/parallel-lanes/) |
+
+No database, credentials, raw captures, generated assets or binaries are published. This is a source snapshot, not a release or new deployment. Component licenses remain intact.
+
+---
+
+## Legacy adapted backend — November 2 checkpoint
 
 A public source-browsing checkpoint of the bottom-up Discourse/Spinel experiment.
 **This is not the entire Rails application compiled unchanged, a drop-in

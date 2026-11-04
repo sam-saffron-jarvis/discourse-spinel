@@ -1,0 +1,205 @@
+//! Prism parse wrapper that routes syntax errors into a diagnostic sink.
+//!
+//! `ruby_prism::parse` is error-recovering: on a syntax error it still
+//! returns a (partial) AST via `node()`, and every per-file ingester
+//! walks that tree regardless. Historically the `errors()` list was
+//! dropped on the floor, so a genuine syntax error in app source
+//! vanished silently and resurfaced — if at all — as a confusing
+//! downstream `Unsupported` gap on a node Prism never actually built.
+//!
+//! [`parse`] is a drop-in replacement for `ruby_prism::parse` that, in
+//! addition to returning the same [`ParseResult`], converts each Prism
+//! error into a [`Diagnostic`] (kind [`crate::diagnostic::DiagnosticKind::Parse`])
+//! carrying a real [`Span`] and pushes it into a thread-local sink. The
+//! `ParseResult` is returned unchanged, so callers keep walking the
+//! recovered AST exactly as before — reporting is purely additive.
+//!
+//! The lifecycle mirrors the emit diagnostic sink ([`crate::emit::diagnostics`])
+//! and the [`sources`] registry: [`scope`] installs a fresh buffer for
+//! the duration of one whole-app ingest (saving/restoring any outer
+//! buffer so scopes nest), runs the closure, and returns the collected
+//! diagnostics alongside its result. Outside any scope [`push`] is a
+//! no-op — standalone unit-test ingests (`ingest_ruby_program` called
+//! directly) parse without collecting, same as before.
+//!
+//! The span's [`crate::span::FileId`] comes from the [`sources`] registry,
+//! which every per-file ingester populates (via `sources::register`)
+//! immediately before calling `parse`, so the file is already registered
+//! by the time the wrapper looks it up. Call sites with no registered
+//! path resolve to the synthetic `FileId(0)` and render message-only —
+//! the same graceful fallback the rest of the diagnostics use.
+
+use std::cell::RefCell;
+
+use ruby_prism::ParseResult;
+
+use crate::diagnostic::Diagnostic;
+use crate::span::Span;
+
+use super::sources;
+
+thread_local! {
+    /// Active parse-diagnostic buffer. `None` when no [`scope`] is
+    /// installed (pushes drop); `Some` for the duration of a scope.
+    static PARSE_DIAGS: RefCell<Option<Vec<Diagnostic>>> = const { RefCell::new(None) };
+}
+
+/// Run `f` with a fresh parse-diagnostic buffer installed, returning its
+/// result paired with every parse diagnostic recorded during the call.
+/// Any outer buffer is saved and restored, so scopes nest and run in
+/// sequence without leaking diagnostics into one another.
+pub fn scope<T>(f: impl FnOnce() -> T) -> (T, Vec<Diagnostic>) {
+    let prev = PARSE_DIAGS.with(|c| c.borrow_mut().replace(Vec::new()));
+    let result = f();
+    let mut collected = PARSE_DIAGS.with(|c| {
+        std::mem::replace(&mut *c.borrow_mut(), prev).unwrap_or_default()
+    });
+    // A file can be parsed more than once — a classification pre-pass
+    // before it is registered, then the real ingest — so the same
+    // syntax error arrives message-only and then located. Keep the
+    // located copy.
+    let unlocated = |d: &Diagnostic| d.span.file.0 == 0;
+    let located: crate::det::HashSet<String> = collected
+        .iter()
+        .filter(|d| !unlocated(d))
+        .map(|d| d.message.clone())
+        .collect();
+    collected.retain(|d| !unlocated(d) || !located.contains(&d.message));
+    (result, collected)
+}
+
+/// How many diagnostics the active buffer holds, for `rewind`.
+pub(crate) fn mark() -> Option<usize> {
+    PARSE_DIAGS.with(|c| c.borrow().as_ref().map(Vec::len))
+}
+
+/// Forget what was pushed since `mark`: an ingest pass that is run again.
+pub(crate) fn rewind(mark: Option<usize>) {
+    if let Some(length) = mark {
+        PARSE_DIAGS.with(|c| c.borrow_mut().as_mut().map(|buf| buf.truncate(length)));
+    }
+}
+
+/// Push a diagnostic into the active buffer. A no-op outside a
+/// [`scope`]. The buffer is the ingest phase's diagnostic channel: syntax
+/// errors, and the warnings ingest itself raises (the initializer ledger).
+pub(super) fn push(d: Diagnostic) {
+    PARSE_DIAGS.with(|c| {
+        if let Some(buf) = c.borrow_mut().as_mut() {
+            buf.push(d);
+        }
+    });
+}
+
+/// Retain parse metadata without reporting context-only syntax errors.
+/// Compiled ERB and typed runtime sources keep their own diagnostic policy.
+///
+/// **Ingest policy:** production ingest call sites that need
+/// [`sources::line_at_parse`] / parse-line tables must go through
+/// [`parse`] or [`parse_silent`] (both call [`sources::register_parse_result`]).
+/// Raw `ruby_prism::parse` is for unit probes and non-ingest callers that
+/// never ask the parse-line registry.
+pub(crate) fn parse_silent(source: &[u8]) -> ParseResult<'_> {
+    let result = ruby_prism::parse(source);
+    sources::register_parse_result(&result);
+    result
+}
+
+/// Drop-in replacement for [`ruby_prism::parse`]: parse `source` and, for
+/// every syntax error Prism reports, record a [`Diagnostic`] against
+/// `file` before returning the (error-recovered) [`ParseResult`]
+/// unchanged. `file` is the source path used to resolve each
+/// diagnostic's [`Span`] against the [`sources`] registry; pass `""`
+/// (or any unregistered path) to get a message-only diagnostic.
+///
+/// Prefer this (or [`parse_silent`]) over raw `ruby_prism::parse` inside
+/// `src/ingest/` so Prism `line_offsets` reach the sources registry.
+pub fn parse<'pr>(source: &'pr [u8], file: &str) -> ParseResult<'pr> {
+    let result = parse_silent(source);
+    let errors = result.errors();
+    // Peek before resolving the file id so the registry lookup is
+    // skipped on the common (no-error) path.
+    let mut errors = errors.peekable();
+    if errors.peek().is_some() {
+        let file_id = sources::file_id(file);
+        for err in errors {
+            let loc = err.location();
+            let (start, end) = super::prism_api::span_offsets(&loc);
+            let span = Span {
+                file: file_id,
+                start,
+                end,
+            };
+            push(Diagnostic::parse(
+                span,
+                super::prism_api::diagnostic_message(&err),
+            ));
+        }
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::diagnostic::DiagnosticKind;
+
+    #[test]
+    fn clean_source_records_nothing() {
+        let (result, diags) = scope(|| parse(b"x = 1\n", "a.rb"));
+        assert_eq!(result.errors().count(), 0);
+        assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn syntax_error_is_recorded_as_a_parse_diagnostic() {
+        // Register the file so the span resolves to a real id.
+        sources::reset();
+        sources::register("broken.rb", "def\n");
+        let (result, diags) = scope(|| parse(b"def\n", "broken.rb"));
+        // Prism still hands back a (partial) AST — callers keep walking.
+        assert!(result.node().as_program_node().is_some());
+        // And the dropped error is now a collected Parse diagnostic.
+        assert!(!diags.is_empty());
+        assert!(matches!(diags[0].kind, DiagnosticKind::Parse { .. }));
+        assert_eq!(diags[0].code(), "parse");
+        assert!(!diags[0].span.is_synthetic());
+        sources::reset();
+    }
+
+    #[test]
+    fn silent_program_ingest_reserves_enclosing_block_parameters() {
+        use crate::expr::{ExprNode, LValue};
+        sources::reset();
+        let source = "[41].map do |__mw_24|\n  a, *b, c = [11, 22, 33]\n  [a, b, c, __mw_24]\nend";
+        let (expr, diags) = scope(|| {
+            let expr = super::super::expr::ingest_ruby_program(source, "compiled.erb").unwrap();
+            // Context-only errors must remain silent in compiled snippets.
+            super::super::expr::ingest_ruby_program("yield", "layout.erb").unwrap();
+            expr
+        });
+        assert!(diags.is_empty());
+        let ExprNode::Send { block: Some(block), .. } = &*expr.node else { panic!("missing map block") };
+        let ExprNode::Lambda { extra_params, params, body, .. } = &*block.node else { panic!("missing lambda") };
+        if !extra_params.is_empty() {
+            panic!("missing lambda")
+        }
+        assert_eq!(params[0].as_str(), "__mw_24");
+        let ExprNode::Seq { exprs } = &*body.node else { panic!("missing block body") };
+        let ExprNode::Seq { exprs } = &*exprs[0].node else { panic!("missing multi-write") };
+        let ExprNode::Assign { target: LValue::Var { name, .. }, .. } = &*exprs[0].node else {
+            panic!("missing temporary");
+        };
+        assert_eq!(exprs[0].span.start, 24, "control must collide with the unsuffixed stem");
+        assert_ne!(name.as_str(), "__mw_24");
+        sources::drain();
+    }
+
+    #[test]
+    fn push_outside_scope_is_a_noop() {
+        // Must not panic and must not retain anything for the next scope.
+        let _ = parse(b"def\n", "");
+        let (_, diags) = scope(|| ());
+        assert!(diags.is_empty());
+    }
+}

@@ -1,0 +1,590 @@
+#!/usr/bin/env bash
+# scripts/compare — end-to-end cross-rendering compare.
+#
+# One command drives the whole loop: regenerate the target,
+# prepare the DB, boot Rails + the target server, run
+# roundhouse-compare, and clean up on exit (even on failure or
+# SIGINT). Exit code matches the compare tool's — 0 on all-match,
+# non-zero on any divergence.
+#
+# Usage:  scripts/compare [options] TARGET
+#
+#   TARGET ∈ { typescript | ts | rust | rs | python | py | go | crystal | cr | elixir | ex | ruby | rb | spinel | sp }
+#     (others are emitted but no live server runtime yet; extend
+#     as targets grow.)
+#
+#   The `ruby` target produces Ruby-shape output runnable under stock
+#   CRuby/MRI. The `spinel` target compiles the same lowered emit
+#   through the spinel AOT compiler to a native binary served over
+#   Tep::Server (FFI HTTP/1.1). Requires `spinel` on PATH.
+#
+# Options:
+#   --path PATH           URL path to compare (repeatable). Default:
+#                         / /articles /articles/1 /articles/new
+#                         /articles/1/edit  (plus /articles.json
+#                         and /articles/1.json for targets that
+#                         strip the .json suffix before routing —
+#                         currently ruby + typescript + crystal +
+#                         go + rust)
+#   --rails-port N        Port for Rails (default 4000)
+#   --target-port N       Port for target (default 3000)
+#   --keep                Don't tear down servers or wipe the
+#                         target build dir (debug inspection)
+#   --verbose             Pass --verbose through to compare tool
+#                         (full body diff on failure)
+#   --skip-emit           Reuse existing target build (faster
+#                         re-runs on the same target)
+#
+# Environment: Rails gems must be installed (handled by
+# `bin/rh fixture`); Ruby/Node/Rust toolchains must be available
+# per target.
+
+set -euo pipefail
+
+# -------- arg parsing --------
+
+TARGET=""
+PATHS=()
+RAILS_PORT=4000
+TARGET_PORT=3000
+KEEP=0
+VERBOSE=0
+SKIP_EMIT=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --path)
+            PATHS+=("$2")
+            shift 2
+            ;;
+        --rails-port)
+            RAILS_PORT="$2"
+            shift 2
+            ;;
+        --target-port)
+            TARGET_PORT="$2"
+            shift 2
+            ;;
+        --keep)
+            KEEP=1
+            shift
+            ;;
+        --verbose)
+            VERBOSE=1
+            shift
+            ;;
+        --skip-emit)
+            SKIP_EMIT=1
+            shift
+            ;;
+        -h|--help)
+            sed -n '2,/^$/p' "$0" | sed 's/^# \?//'
+            exit 0
+            ;;
+        -*)
+            echo "unknown flag: $1" >&2
+            exit 2
+            ;;
+        *)
+            if [[ -z "$TARGET" ]]; then
+                TARGET="$1"
+            else
+                echo "unexpected positional arg: $1" >&2
+                exit 2
+            fi
+            shift
+            ;;
+    esac
+done
+
+if [[ -z "$TARGET" ]]; then
+    echo "usage: scripts/compare [options] TARGET" >&2
+    exit 2
+fi
+
+# Normalize + validate target.
+case "$TARGET" in
+    typescript|ts) TARGET=typescript ;;
+    rust|rs)       TARGET=rust ;;
+    python|py)     TARGET=python ;;
+    go)            TARGET=go ;;
+    crystal|cr)    TARGET=crystal ;;
+    elixir|ex)     TARGET=elixir ;;
+    ruby|rb)       TARGET=ruby ;;
+    jruby|jr)      TARGET=jruby ;;
+    spinel|sp)     TARGET=spinel ;;
+    kotlin|kt)     TARGET=kotlin ;;
+    swift|sw)      TARGET=swift ;;
+    csharp|cs)     TARGET=csharp ;;
+    *)
+        echo "unsupported target: $TARGET (want typescript, rust, python, go, crystal, elixir, ruby, jruby, kotlin, swift, csharp, or spinel)" >&2
+        exit 2
+        ;;
+esac
+
+# The V2.* overlay (models+views+controllers+dispatch/main/
+# server) is the DEFAULT elixir target as of Phase D. The compiler emits
+# it unconditionally; this flag only selects which entry point the run
+# step boots — `Main.run` by default, or the legacy `App.Main.run`
+# under `ROUNDHOUSE_ELIXIR_V1=1` (retained as a fallback until the v1 app
+# shell is deleted).
+ELIXIR_V1="${ROUNDHOUSE_ELIXIR_V1:-0}"
+
+if [[ ${#PATHS[@]} -eq 0 ]]; then
+    PATHS=(/ /articles /articles/1 /articles/new /articles/1/edit)
+    # JSON paths exercise the jbuilder lowerer end-to-end. The
+    # comparator detects `.json` suffix and switches to structural
+    # JSON compare (parsed-value, datetime fractional seconds
+    # canonicalized) — see tools/compare/src/json_diff.rs. Gated
+    # per-target: only targets whose server entry point strips the
+    # `.json` suffix before routing and dispatches on
+    # `controller.request_format` are exercised. A target without that
+    # glue would 404/500 on the JSON paths (see
+    # runtime/typescript/server.ts:206-217, runtime/python/server.py:95-102,
+    # and runtime/spinel/scaffold/main.rb:82-93 for the pattern).
+    case "$TARGET" in
+        ruby|jruby|spinel|typescript|crystal|go|rust|kotlin|swift|csharp|python)
+            PATHS+=(/articles.json /articles/1.json)
+            ;;
+        elixir)
+            # The v2 overlay's server (default) strips `.json` → `:json`
+            # format and dispatches on `record.request_format` into the
+            # `*_json` jbuilder views; the legacy v1 server doesn't strip
+            # it. So exercise JSON unless the v1 fallback is selected.
+            [[ "$ELIXIR_V1" == 1 ]] || PATHS+=(/articles.json /articles/1.json)
+            ;;
+    esac
+fi
+
+# -------- paths --------
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+. "$REPO_ROOT/scripts/lib/spinel-link-path.sh"   # spinel_link_path: jemalloc's -L on a mac
+FIXTURE="$REPO_ROOT/fixtures/real-blog"
+COMPARE_BIN="$REPO_ROOT/tools/compare/target/release/roundhouse-compare"
+LOG_DIR="$(mktemp -d -t roundhouse-compare-logs.XXXXXX)"
+RAILS_LOG="$LOG_DIR/rails.log"
+TARGET_LOG="$LOG_DIR/target.log"
+
+# Target-specific paths.
+case "$TARGET" in
+    typescript)
+        BUILD_DIR="/tmp/rh-ts-pass2"
+        DB_DEST="$BUILD_DIR/storage/development.sqlite3"
+        ;;
+    rust)
+        BUILD_DIR="/tmp/rh-rs-pass2"
+        DB_DEST="$BUILD_DIR/storage/development.sqlite3"
+        ;;
+    python)
+        BUILD_DIR="/tmp/rh-py-pass2"
+        DB_DEST="$BUILD_DIR/storage/development.sqlite3"
+        ;;
+    go)
+        BUILD_DIR="/tmp/rh-go-pass2"
+        DB_DEST="$BUILD_DIR/storage/development.sqlite3"
+        ;;
+    crystal)
+        BUILD_DIR="/tmp/rh-cr-pass2"
+        DB_DEST="$BUILD_DIR/storage/development.sqlite3"
+        ;;
+    kotlin)
+        BUILD_DIR="/tmp/rh-kt-pass2"
+        DB_DEST="$BUILD_DIR/storage/development.sqlite3"
+        ;;
+    swift)
+        BUILD_DIR="/tmp/rh-swift-pass2"
+        DB_DEST="$BUILD_DIR/storage/development.sqlite3"
+        ;;
+    csharp)
+        BUILD_DIR="/tmp/rh-cs-pass2"
+        DB_DEST="$BUILD_DIR/storage/development.sqlite3"
+        ;;
+    elixir)
+        BUILD_DIR="/tmp/rh-ex-pass2"
+        DB_DEST="$BUILD_DIR/storage/development.sqlite3"
+        ;;
+    ruby)
+        # Ruby reuses the demo's transpile output (`bin/rh transpile
+        # ruby`), which lives under build/transpiled-blog-ruby/. The
+        # dev server reads BLOG_DB; the staged DB lands at the Rails-
+        # traditional storage/development.sqlite3 inside that tree.
+        BUILD_DIR="$REPO_ROOT/build/transpiled-blog-ruby"
+        DB_DEST="$BUILD_DIR/storage/development.sqlite3"
+        ;;
+    jruby)
+        # JRuby reuses `bin/rh transpile jruby` — byte-identical emit to
+        # the ruby tree but with the JDBC db backend. Same DB layout
+        # (BLOG_DB → storage/development.sqlite3) inside its own build dir.
+        BUILD_DIR="$REPO_ROOT/build/transpiled-blog-jruby"
+        DB_DEST="$BUILD_DIR/storage/development.sqlite3"
+        ;;
+    spinel)
+        # Spinel uses `bin/rh transpile spinel`, which mirrors the
+        # ruby path but compiles main.rb to a native binary. The
+        # AOT-compiled binary reads BLOG_DB and serves over Tep::Server
+        # on $PORT; same DB layout as the ruby target.
+        BUILD_DIR="$REPO_ROOT/build/transpiled-blog-spinel"
+        DB_DEST="$BUILD_DIR/storage/development.sqlite3"
+        ;;
+esac
+
+# -------- helpers --------
+
+step() {
+    printf '\033[36m→\033[0m %s\n' "$*"
+}
+
+ok() {
+    printf '\033[32m✓\033[0m %s\n' "$*"
+}
+
+fail() {
+    printf '\033[31m✗\033[0m %s\n' "$*" >&2
+}
+
+wait_for_port() {
+    local url="$1"
+    local label="$2"
+    # Optional readiness budget (seconds); defaults to 30. JRuby needs
+    # more — JVM boot + JRuby startup is slower than an MRI boot.
+    local budget="${3:-30}"
+    local deadline=$(( $(date +%s) + budget ))
+    while (( $(date +%s) < deadline )); do
+        if curl --silent --fail --output /dev/null "$url" 2>/dev/null; then
+            return 0
+        fi
+        sleep 0.3
+    done
+    fail "$label did not come up within ${budget}s ($url)"
+    return 1
+}
+
+RAILS_PID=""
+TARGET_PID=""
+
+# Kill the entire process tree under a given PID. Bash's `&`
+# reports the subshell PID but `rails server` / `npm start` fork
+# children (Puma workers, tsx loader) that don't receive signals
+# sent to the subshell. `pkill -P` targets direct children; we
+# recurse so Rails' Puma grandchildren get hit too.
+kill_tree() {
+    local pid="$1"
+    [[ -z "$pid" ]] && return
+    # Collect children before we kill the root — they'd be
+    # reparented to init otherwise.
+    local children
+    children="$(pgrep -P "$pid" 2>/dev/null || true)"
+    kill "$pid" 2>/dev/null || true
+    for child in $children; do
+        kill_tree "$child"
+    done
+}
+
+cleanup() {
+    local code=$?
+    if (( KEEP == 0 )); then
+        kill_tree "$RAILS_PID"
+        kill_tree "$TARGET_PID"
+        # Give the OS a beat to release listener sockets so back-to-
+        # back runs don't trip EADDRINUSE.
+        sleep 0.3
+        wait 2>/dev/null || true
+    else
+        echo
+        step "--keep: servers still running"
+        [[ -n "$RAILS_PID"  ]] && echo "  rails  PID=$RAILS_PID  port=$RAILS_PORT"
+        [[ -n "$TARGET_PID" ]] && echo "  target PID=$TARGET_PID port=$TARGET_PORT"
+        echo "  logs $LOG_DIR"
+    fi
+    exit "$code"
+}
+trap cleanup EXIT INT TERM
+
+# -------- 1. fixture --------
+
+if [[ ! -f "$FIXTURE/storage/development.sqlite3" ]]; then
+    step "regenerating fixtures/real-blog (bin/rh fixture)"
+    (cd "$REPO_ROOT" && bin/rh fixture >/dev/null)
+fi
+ok "fixture ready ($FIXTURE)"
+
+# -------- 2. compare tool --------
+
+# Always invoke Cargo so a restored rust-cache binary cannot skip a
+# source rebuild (the executable-exists check is not a freshness check).
+step "building roundhouse-compare"
+(cd "$REPO_ROOT/tools/compare" && cargo build --release --quiet)
+ok "compare tool ready"
+
+# -------- 3. regenerate target --------
+
+if (( SKIP_EMIT == 0 )); then
+    step "regenerating target ($TARGET) → $BUILD_DIR"
+    case "$TARGET" in
+        ruby)
+            # Ruby uses `bin/rh transpile ruby` (roundhouse compiler +
+            # scaffold overlay + DB seed), which is the same path the
+            # demo uses. `transpile` always rebuilds from scratch — no
+            # stamp tracking needed.
+            (cd "$REPO_ROOT" && bin/rh transpile ruby >/dev/null)
+            ;;
+        jruby)
+            # Same path as ruby but `bin/rh transpile jruby` — swaps in
+            # the JDBC db backend (runtime/db.rb = db_jruby.rb).
+            (cd "$REPO_ROOT" && bin/rh transpile jruby >/dev/null)
+            ;;
+        spinel)
+            # Spinel mirrors the ruby path but uses `bin/rh transpile
+            # spinel`. The Tep transport rides spinel's auto-linked
+            # sp_net, so there's no C shim to vendor or precompile.
+            (cd "$REPO_ROOT" && bin/rh transpile spinel >/dev/null)
+            ;;
+        *)
+            # emit_preview writes the target's emitted tree to its
+            # per-target /tmp/rh-*-pass2 dir. For go that includes the
+            # v2 overlay (always on); the build step below builds the
+            # v2 binary from cmd/v2/.
+            (cd "$REPO_ROOT" && cargo build --quiet --bin emit_preview)
+            (cd "$REPO_ROOT" && "$REPO_ROOT/target/debug/emit_preview" --target "$TARGET" "$FIXTURE" >/dev/null)
+            ;;
+    esac
+fi
+ok "target emit at $BUILD_DIR"
+
+# -------- 4. build target --------
+
+case "$TARGET" in
+    typescript)
+        if [[ ! -d "$BUILD_DIR/node_modules" ]] || (( SKIP_EMIT == 0 )); then
+            step "installing npm deps"
+            (cd "$BUILD_DIR" && npm install --silent --no-audit --no-fund)
+        fi
+        ;;
+    rust)
+        step "building rust target (release)"
+        (cd "$BUILD_DIR" && cargo build --release --quiet)
+        ;;
+    python)
+        # aiohttp lives in a uv-managed venv declared by the
+        # emitted pyproject.toml. Wipe pycache so emitter-side
+        # changes don't get masked by stale bytecode, sync the
+        # venv (fast on warm caches), and validate imports before
+        # the compare run so startup failures don't masquerade as
+        # HTTP-level diffs.
+        step "refreshing python pycache + syncing uv venv"
+        (cd "$BUILD_DIR" && find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null; uv sync --quiet && uv run python3 -c "import app, app.server, app.v2.dispatch")
+        ;;
+    go)
+        # Phase 6 step 2 (2026-05-24): build from cmd/v2/ unconditionally.
+        # The v2 strangler-fig path is now the default; the legacy main.go
+        # at the build dir root is being retired in Phase 6 step 3.
+        step "building go target"
+        (cd "$BUILD_DIR" && go mod tidy && mkdir -p .bin && go build -o .bin/server ./cmd/v2/)
+        ;;
+    crystal)
+        step "building crystal target (release)"
+        (cd "$BUILD_DIR" && mkdir -p .bin && shards install --quiet && crystal build --release --no-debug src/main.cr -o .bin/server)
+        ;;
+    kotlin)
+        # Gradle installDist produces a self-contained launcher at
+        # build/install/<rootProject.name>/bin/<name>, started below.
+        # JAVA_HOME pins the JDK (non-interactive shells otherwise resolve
+        # an older `java` via PATH); jvmTarget is 17 (Javalin's floor).
+        step "building kotlin target (gradle installDist)"
+        (cd "$BUILD_DIR" && JAVA_HOME="${KOTLIN_JAVA_HOME:-${JAVA_HOME:-/opt/homebrew/opt/openjdk}}" PATH="${KOTLIN_JAVA_HOME:-${JAVA_HOME:-/opt/homebrew/opt/openjdk}}/bin:$PATH" gradle installDist --console=plain -q)
+        ;;
+    swift)
+        # Debug is the same check as tests/swift_toolchain.rs and the
+        # published README (`swift build`): type-check, link, boot. Release
+        # WMO was ~150s of compare-extra (swift) with no extra verification.
+        step "building swift target (swift build)"
+        (cd "$BUILD_DIR" && swift build -Xswiftc -gnone 2>&1 | tail -2)
+        ;;
+    csharp)
+        # `dotnet build -c Release` → bin/Release/net10.0/roundhouse-app.dll,
+        # run directly below. Restores NuGet packages on first build.
+        step "building csharp target (dotnet build -c Release)"
+        (cd "$BUILD_DIR" && dotnet build -c Release -nologo -v q)
+        ;;
+    elixir)
+        step "building elixir target"
+        (cd "$BUILD_DIR" && mix deps.get && MIX_ENV=prod mix compile)
+        ;;
+    ruby)
+        # Tailwind + turbo.min.js. The inner Makefile (copied from
+        # runtime/spinel/scaffold/Makefile by ruby-transpile) handles
+        # both: tailwindcss CLI for app.css, gem-dir copy for turbo JS.
+        step "building ruby assets (tailwind + turbo.min.js)"
+        (cd "$BUILD_DIR" && BUNDLE_GEMFILE="$REPO_ROOT/runtime/spinel/scaffold/Gemfile" make assets >/dev/null)
+        ;;
+    jruby)
+        # Resolve the JRuby runtime bundle (jdbc-sqlite3 + JRuby builds of
+        # puma/rack) into the tree. Assets are intentionally NOT built
+        # here: the emitted HTML is byte-identical to the ruby target
+        # (whose asset parity compare-ruby already gates), and the DOM
+        # diff compares the asset <link>/<script> tags, not the files they
+        # reference — so a missing static/assets dir doesn't change the
+        # /articles DOM. Keeping it out lets compare-jruby run JRuby-only
+        # (no node/tailwind toolchain needed in that CI job).
+        step "installing jruby bundle"
+        (cd "$BUILD_DIR" && BUNDLE_GEMFILE="$BUILD_DIR/Gemfile" jruby -S bundle install >/dev/null)
+        ;;
+    spinel)
+        # Assets (same scaffold Makefile as ruby) + AOT-compile main.rb.
+        # `make build` invokes `spinel main.rb -o build/blog`; sphttp.o
+        # and the @TEP_SPHTTP_O@ substitution were already done in the
+        # spinel-transpile step above.
+        step "building spinel assets (tailwind + turbo.min.js)"
+        (cd "$BUILD_DIR" && BUNDLE_GEMFILE="$REPO_ROOT/runtime/spinel/scaffold/Gemfile" make assets >/dev/null)
+        step "AOT-compiling main.rb → build/blog (spinel)"
+        spinel_link_path
+        (cd "$BUILD_DIR" && make build >/dev/null)
+        ;;
+esac
+ok "target built"
+
+# -------- 5. stage DB --------
+
+step "staging seeded DB → $DB_DEST"
+mkdir -p "$(dirname "$DB_DEST")"
+rm -f "$DB_DEST" "$DB_DEST-wal" "$DB_DEST-shm"
+# `.backup` is a quiescent copy — reads through Rails' WAL so the
+# target starts from the same snapshot a query against the live
+# Rails DB would see.
+sqlite3 "$FIXTURE/storage/development.sqlite3" ".backup $DB_DEST"
+ok "DB staged ($(sqlite3 "$DB_DEST" 'SELECT COUNT(*) FROM articles') articles)"
+
+# -------- 6. start Rails --------
+
+step "starting Rails on :$RAILS_PORT"
+(cd "$FIXTURE" && bin/rails server -p "$RAILS_PORT" -e development >"$RAILS_LOG" 2>&1) &
+RAILS_PID=$!
+wait_for_port "http://localhost:$RAILS_PORT/articles" "rails" || {
+    echo "--- rails log ---" >&2
+    tail -20 "$RAILS_LOG" >&2
+    exit 1
+}
+ok "rails up"
+
+# -------- 7. start target / build cmd --------
+
+# TARGET_CMD is the CGI shell-out hatch for targets without a live
+# server — historically used by the ruby target after dev_server.rb
+# was retired and before ruby_overlay added a Rack adapter, and
+# reserved for future targets that ship CGI-only. All current
+# targets boot HTTP servers, so this stays empty in the default path.
+TARGET_CMD=""
+
+if [[ -z "$TARGET_CMD" ]]; then
+    step "starting $TARGET on :$TARGET_PORT"
+    case "$TARGET" in
+        python)
+            (cd "$BUILD_DIR" && PORT="$TARGET_PORT" uv run python3 -m app >"$TARGET_LOG" 2>&1) &
+            TARGET_PID=$!
+            ;;
+        go)
+            (cd "$BUILD_DIR" && PORT="$TARGET_PORT" ./.bin/server >"$TARGET_LOG" 2>&1) &
+            TARGET_PID=$!
+            ;;
+        crystal)
+            (cd "$BUILD_DIR" && PORT="$TARGET_PORT" ./.bin/server >"$TARGET_LOG" 2>&1) &
+            TARGET_PID=$!
+            ;;
+        kotlin)
+            # The installDist launcher reads BLOG_DB + PORT (Main.kt). JAVA_HOME
+            # pins the JDK for the bundled `java` invocation.
+            (cd "$BUILD_DIR" && JAVA_HOME="${KOTLIN_JAVA_HOME:-${JAVA_HOME:-/opt/homebrew/opt/openjdk}}" BLOG_DB="$DB_DEST" PORT="$TARGET_PORT" ./build/install/roundhouse-app/bin/roundhouse-app >"$TARGET_LOG" 2>&1) &
+            TARGET_PID=$!
+            ;;
+        swift)
+            # The debug binary reads BLOG_DB + PORT (main.swift).
+            (cd "$BUILD_DIR" && BLOG_DB="$DB_DEST" PORT="$TARGET_PORT" ./.build/debug/App >"$TARGET_LOG" 2>&1) &
+            TARGET_PID=$!
+            ;;
+        csharp)
+            # Run the built DLL directly (reads BLOG_DB + PORT in Program.cs/
+            # Server.cs / Db.cs). `dotnet <dll>` avoids a `dotnet run` rebuild.
+            (cd "$BUILD_DIR" && BLOG_DB="$DB_DEST" PORT="$TARGET_PORT" dotnet bin/Release/net10.0/roundhouse-app.dll >"$TARGET_LOG" 2>&1) &
+            TARGET_PID=$!
+            ;;
+        elixir)
+            # v2 overlay (default) boots Main.run (Plug/Cowboy → v2
+            # stack); legacy v1 boots App.Main.run under ROUNDHOUSE_ELIXIR_V1.
+            EX_ENTRY='Main.run'
+            [[ "$ELIXIR_V1" == 1 ]] && EX_ENTRY='App.Main.run'
+            (cd "$BUILD_DIR" && PORT="$TARGET_PORT" MIX_ENV=prod mix run --no-halt -e "$EX_ENTRY" >"$TARGET_LOG" 2>&1) &
+            TARGET_PID=$!
+            ;;
+        ruby)
+            # Puma reads config.ru + config/puma.rb from the emit tree
+            # (both supplied by ruby_overlay). BLOG_DB points at the
+            # staged seeded SQLite; BUNDLE_GEMFILE points at the
+            # scaffold's Gemfile so CI's bundler-cache is reused.
+            (cd "$BUILD_DIR" && BLOG_DB="$DB_DEST" BUNDLE_GEMFILE="$REPO_ROOT/runtime/spinel/scaffold/Gemfile" PORT="$TARGET_PORT" bundle exec puma -C config/puma.rb >"$TARGET_LOG" 2>&1) &
+            TARGET_PID=$!
+            ;;
+        jruby)
+            # Same as ruby but on the JVM via jruby. Single-process
+            # (WEB_CONCURRENCY=0 — Puma cluster mode forks, unsupported on
+            # the JVM); its own tree Gemfile drives the JRuby bundle. Heap
+            # pinned to 512 MB to match the bench harness (-Xmx==-Xms).
+            (cd "$BUILD_DIR" && BLOG_DB="$DB_DEST" BUNDLE_GEMFILE="$BUILD_DIR/Gemfile" WEB_CONCURRENCY=0 PORT="$TARGET_PORT" JRUBY_OPTS="-J-Xmx512m -J-Xms512m" jruby -S bundle exec puma -C config/puma.rb >"$TARGET_LOG" 2>&1) &
+            TARGET_PID=$!
+            ;;
+        typescript)
+            (cd "$BUILD_DIR" && PORT="$TARGET_PORT" npm start >"$TARGET_LOG" 2>&1) &
+            TARGET_PID=$!
+            ;;
+        rust)
+            (cd "$BUILD_DIR" && PORT="$TARGET_PORT" ./target/release/app >"$TARGET_LOG" 2>&1) &
+            TARGET_PID=$!
+            ;;
+        spinel)
+            (cd "$BUILD_DIR" && BLOG_DB="$DB_DEST" PORT="$TARGET_PORT" ./build/blog >"$TARGET_LOG" 2>&1) &
+            TARGET_PID=$!
+            ;;
+    esac
+    target_ready_budget=30
+    [[ "$TARGET" == jruby ]] && target_ready_budget=90
+    wait_for_port "http://localhost:$TARGET_PORT/articles" "$TARGET" "$target_ready_budget" || {
+        echo "--- $TARGET log ---" >&2
+        tail -20 "$TARGET_LOG" >&2
+        exit 1
+    }
+    ok "$TARGET up"
+else
+    ok "$TARGET cmd-mode (no server boot)"
+fi
+
+# -------- 8. run compare --------
+
+echo
+if [[ -n "$TARGET_CMD" ]]; then
+    step "compare (reference=http://localhost:$RAILS_PORT target=cmd)"
+else
+    step "compare (reference=http://localhost:$RAILS_PORT target=http://localhost:$TARGET_PORT)"
+fi
+echo
+
+compare_args=(
+    --reference "http://localhost:$RAILS_PORT"
+)
+if [[ -n "$TARGET_CMD" ]]; then
+    compare_args+=(--target-cmd "$TARGET_CMD")
+else
+    compare_args+=(--target "http://localhost:$TARGET_PORT")
+fi
+for p in "${PATHS[@]}"; do
+    compare_args+=(--path "$p")
+done
+if (( VERBOSE == 1 )); then
+    compare_args+=(--verbose)
+fi
+
+set +e
+"$COMPARE_BIN" "${compare_args[@]}"
+compare_exit=$?
+set -e
+
+exit "$compare_exit"

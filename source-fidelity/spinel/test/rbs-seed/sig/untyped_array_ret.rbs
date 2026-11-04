@@ -1,0 +1,3 @@
+class Rel
+  def to_a: () -> Array[untyped]
+end

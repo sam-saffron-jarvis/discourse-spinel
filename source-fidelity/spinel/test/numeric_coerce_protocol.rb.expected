@@ -1,0 +1,67 @@
+7.0
+-3.0
+10.0
+0.4
+2.0
+32.0
+[TypeError, "coerce must return [x, y]"]
+"money+"
+"money+"
+[ArgumentError, "comparison of String with Money failed"]
+[ArgumentError, "comparison of String with Money failed"]
+[ArgumentError, "comparison of String with Money failed"]
+true
+false
+Wrap(12+4i)
+[NoMethodError, "undefined method '%' for an instance of Complex"]
+[NoMethodError, "undefined method 'div' for an instance of Complex"]
+[NoMethodError, "undefined method 'remainder' for an instance of Complex"]
+[TypeError, "Inert can't be coerced into Complex"]
+false
+false
+true
+true
+1
+false
+true
+true
+false
+true
+0
+2.0
+2.0
+0.4
+0.4
+[0, 2.0]
+0
+2.0
+0.4
+[0, 2.0]
+7.0
+-3.0
+10.0
+0.4
+2.0
+3.5
+false
+1.0e+20
+7.0
+false
+0
+7.0
+false
+0
+10
+true
+false
+[TypeError, "coerce must return [x, y]"]
+320.0
+40
+true
+[12, 35, [1, 2], true]
+0
+3333333333333333333333333
+[3333333333333333333333333, 1]
+0
+0
+true

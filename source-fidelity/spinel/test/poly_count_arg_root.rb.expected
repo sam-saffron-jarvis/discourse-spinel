@@ -1,0 +1,12 @@
+count=1
+index=6
+all=false
+any=true
+none=false
+one=true
+count_chain=1
+one_arg=true
+count_arg=1
+any_arg=false
+count_both=1
+any_range=true

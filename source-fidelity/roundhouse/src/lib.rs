@@ -1,0 +1,116 @@
+//! Roundhouse — Rails is the specification, deployment is a build flag.
+//!
+//! Defines the Roundhouse intermediate representation: a typed, effect-tracked,
+//! serializable core with a Rails dialect layered on top. The IR is the
+//! deliverable; ingesters produce it, emitters consume it.
+
+pub mod adapter;
+pub mod analyze;
+pub mod app;
+pub mod builder;
+pub mod bytecode;
+pub mod catalog;
+/// Machine-readable `roundhouse check` inventory + ranked hotspot report.
+pub mod check_report;
+pub mod diagnostic;
+pub mod database;
+pub mod dialect;
+pub mod det;
+/// Shared parent/include ordering for library classes that share a file.
+pub mod library_class_order;
+pub mod effect;
+pub mod entry_routes;
+pub mod construction_contexts;
+pub mod emit;
+pub mod erb;
+pub mod expr;
+/// Project extensions: gem and DSL facts an app lists in `roundhouse.yml`
+/// and keeps in its own tree, carried on [`App::extensions`].
+pub mod extensions;
+pub mod facades;
+/// The generated Rails fixtures (`fixtures/real-blog`, `fixtures/store`)
+/// the test suites read, resolved with the generating command in the
+/// panic when one is absent.
+pub mod fixtures;
+/// The app's gem census: `Gemfile.lock` parsed and each direct
+/// dependency classified (framework / stdlib / modeled / infrastructure /
+/// unknown). Shared by every analysis skin; the unknown list feeds
+/// [`analyze::attribution`].
+pub mod gem_boundary;
+pub mod gems;
+pub mod haml;
+pub mod slim;
+pub mod ide;
+pub mod i18n;
+pub mod ident;
+pub mod ingest;
+pub mod lower;
+/// The `roundhouse` subcommands (`check`, `lsp`, `mcp`) and the alias
+/// bins that delegate to them. Host-only (stdio, real directories).
+#[cfg(not(target_arch = "wasm32"))]
+pub mod cli;
+/// The user guide (`docs/guide/*.md`) rendered for the Pages site.
+/// Host-only, like `project`.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod guide;
+/// Standalone read-only LSP server over the [`ide`] query layer. Host-only
+/// (uses stdio + the synchronous `lsp-server` transport); excluded from the
+/// wasm build.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod lsp;
+/// MCP server exposing the [`ide`] query layer + lowering gaps as agent
+/// tools. Host-only (stdio JSON-RPC); excluded from the wasm build.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod mcp;
+pub mod naming;
+pub mod par;
+pub mod profile;
+/// Target identity and the policies lowering reads (`param_binds_enabled`,
+/// `has_runtime_relation`). Compiled for wasm: `project` is host-only, but
+/// `lower` and `emit::ruby` still name a [`build_target::BuildTarget`].
+pub mod build_target;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod project;
+/// Embedded Ruby sources for constant lookup on all targets, plus the
+/// full Ruby and Spinel emit trees on native targets.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod runtime_files;
+#[cfg(target_arch = "wasm32")]
+pub(crate) mod runtime_files;
+/// The thread budget every CLI runs the pipeline on. Host-only: wasm has
+/// no threads and its stack is fixed at link time.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod stack;
+pub mod rbs;
+pub mod runtime_loader;
+pub mod runtime_src;
+pub mod session;
+pub mod timings;
+pub mod treeshake;
+pub(crate) mod source_gem_shake;
+pub mod version;
+pub mod schema;
+pub mod span;
+pub mod ty;
+pub mod vfs;
+
+pub use adapter::{ArMethodKind, DatabaseAdapter, SqliteAdapter, SqliteAsyncAdapter};
+pub use app::{App, ControllerResolution, ResolvedFilter};
+pub use profile::{Database, DeploymentProfile, HttpShim, ProfileError, Target};
+pub use dialect::{
+    Action, Association, Callback, CallbackHook, Comment, Controller, ControllerBodyItem,
+    Dependent, Filter, FilterKind, HttpMethod, LayoutDecl, MethodDef, MethodReceiver, Model,
+    ModelBodyItem,
+    InclusionRange, RenderTarget, ResourceScope, Route, RouteSpec, RouteTable, Scope, Validation,
+    ValidationRule,
+    View,
+};
+pub use effect::{Effect, EffectSet};
+pub use expr::{Arm, BlockStyle, Expr, ExprNode, LValue, Literal, Pattern};
+pub use ident::{ClassId, EffectVar, Symbol, TableRef, TyVar, VarId};
+pub use ide::{Position, Reference, TypeAt};
+pub use schema::{Column, ColumnType, ForeignKey, Index, ReferentialAction, Schema, Table};
+pub use span::{FileId, Span};
+pub use ty::{Param, ParamKind, Row, Ty};
+
+pub mod shared;

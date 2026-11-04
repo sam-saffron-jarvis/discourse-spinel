@@ -1,0 +1,15 @@
+big/1: bignum too big to convert into 'long'
+big/3: bignum too big to convert into 'long'
+big/box: bignum too big to convert into 'long'
+negbig: bignum too big to convert into 'long'
+big1arg: bignum too big to convert into 'long'
+1/big: bignum too big to convert into 'long'
+(1180591620717411303424/1)
+(1180591620717411303424/3)
+(5/2)
+(5/1)
+(5/4)
+(3/2)
+(5/2)
+(5/2)
+(3/8)

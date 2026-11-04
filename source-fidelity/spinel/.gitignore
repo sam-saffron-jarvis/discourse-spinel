@@ -1,0 +1,56 @@
+*~
+*.swp
+*.swo
+.DS_Store
+*.o
+
+# Build artifacts
+/build/
+/bin/
+/vendor/
+/lib/regexp/libspre.a
+lib/spinel_rt_responds_generated.h
+lib/libspinel_rt.a
+lib/libspinel_cext_rt.a
+lib/libspinel_cext_rec.a
+lib/libspinel_rt_mt.a
+lib/libspinel_rt_nogc.a
+lib/libspinel_rt_mt_nogc.a
+lib/libspinel_rt_mt_tsan.a
+lib/wasm32-wasi/
+lib/libspbi.a
+packages/*/build/
+# Dev convenience symlink to bin/spinel (created by `make`)
+/spinel
+
+# Temp / profiling output
+/tmp/
+/perf.data
+/perf.data.old
+
+# Local config and machine-local Makefile overrides
+.claude/
+/CLAUDE.md
+CLAUDE.local.md
+.agents/
+/AGENTS.md
+AGENTS.local.md
+AGENTS.override.md
+/local.mk
+/config.mk
+
+# Analyze-only emit artifacts (--emit-types / --emit-symbol-map, and the
+# symbol map --profile writes beside the binary).
+# Not *.rbs: test/rbs/ and test/rbs-seed/ carry tracked .rbs fixtures.
+*.types.json
+*.symbols.json
+
+# Downloaded gems
+*.gem
+.sccache/
+lib/win32/*.a
+
+/lib/libspinel_cext_rt_mt.a
+# a bundled extension's declarations, written by `make` beside its package
+packages/racc/racc/cparse.rb
+packages/sqlite3/sqlite3/sqlite3_native.rb

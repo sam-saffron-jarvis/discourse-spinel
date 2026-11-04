@@ -1,0 +1,3 @@
+class SeedOrwMem
+  def poke: (Integer, Integer) -> void
+end

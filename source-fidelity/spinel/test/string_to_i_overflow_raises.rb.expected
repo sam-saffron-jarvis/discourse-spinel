@@ -1,0 +1,6 @@
+to_i raised RangeError
+to_i(16) raised RangeError
+Integer raised RangeError
+42
+255
+-1000

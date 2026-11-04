@@ -1,0 +1,37 @@
+== cmp ==
+eq: => true
+ne size: => false
+ne bytes: => false
+neq op: => true
+cmp: => [-1, 0, 1]
+prefix: => [-1, 1]
+empty: => -1
+eq string: TypeError: wrong argument type String (expected IO::Buffer)
+cmp nil: TypeError: wrong argument type nil (expected IO::Buffer)
+== for/string ==
+for flags: => "#<IO::Buffer 0xX+2 EXTERNAL READONLY SLICE>"
+for empty: => [0, false, "#<IO::Buffer 0xX+0 EXTERNAL READONLY SLICE>"]
+for ro: IO::Buffer::AccessError: Buffer is not writable!
+for resize: IO::Buffer::AccessError: Cannot resize external buffer!
+for dup write: => "HELLO"
+for bytes: => [65, 0, 66]
+string: => "HELLO"
+string enc: => [0, 0]
+string ret: => "\x00\x00\x00"
+size_of: => [1, 8, 5]
+size_of bad: ArgumentError: Invalid type name!
+== bitwise ==
+and: => [3, 48, 34]
+and flags: => "#<IO::Buffer 0xX+3 INTERNAL>"
+or: => [63, 243, 187]
+xor: => [60, 195, 153]
+not: => [240, 15, 85]
+mismatch: => [51]
+and!: => [true, [51, 51, 51]]
+or!: => [51, 51, 51]
+xor!: => [204, 51, 204]
+not!: => [240]
+and! ro: IO::Buffer::AccessError: Buffer is not writable!
+and! smaller: => [1, 1, 1, 1]
+null and: => "#<IO::Buffer 0xX+0 NULL>"
+null not: => "#<IO::Buffer 0xX+0 NULL>"

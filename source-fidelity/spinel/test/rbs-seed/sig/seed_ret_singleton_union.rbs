@@ -1,0 +1,5 @@
+class SgSearch
+  def initialize: (Symbol what) -> void
+  def searched_model: () -> (singleton(SgStory) | singleton(SgComment))
+  def one: () -> singleton(SgStory)
+end

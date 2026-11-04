@@ -1,0 +1,1026 @@
+//! Cross-cutting Prism AST helpers used by every ingest submodule.
+//!
+//! Everything here is an `Option<T>` / `Vec<T>` leaf helper — no
+//! `IngestResult`, no recursion into domain-specific structures.
+//! Functions that fail at the recognizer level (and need to surface
+//! `IngestError`) live in their domain module, not here.
+
+use ruby_prism::Node;
+
+use crate::Symbol;
+use crate::dialect::Comment;
+use crate::expr::ArrayStyle;
+use crate::span::Span;
+
+use super::prism_api::PrismLocation;
+// ---- Leaf literal extractors -------------------------------------------
+
+/// The span of a `def`'s name token (`show` in `def show`, `title=` in
+/// `def title=(v)`), resolved against the sources registry — the one
+/// position a method header has, since the body's spans start at its
+/// first statement.
+pub(super) fn def_name_span(def: &ruby_prism::DefNode<'_>, file: &str) -> crate::span::Span {
+    let (start, end) = super::prism_api::span_offsets(&def.name_loc());
+    crate::span::Span {
+        file: super::sources::file_id(file),
+        start,
+        end,
+    }
+}
+
+/// Span of an arbitrary Prism node in `file`.
+pub(super) fn node_span(node: &Node<'_>, file: &str) -> crate::span::Span {
+    let (start, end) = super::prism_api::span_offsets(&node.location());
+    crate::span::Span {
+        file: super::sources::file_id(file),
+        start,
+        end,
+    }
+}
+
+pub(super) fn constant_id_str<'a>(id: &ruby_prism::ConstantId<'a>) -> &'a str {
+    std::str::from_utf8(id.as_slice()).expect("prism constant id is UTF-8")
+}
+
+pub(super) fn string_value(node: &Node<'_>) -> Option<String> {
+    let s = node.as_string_node()?;
+    Some(String::from_utf8_lossy(s.unescaped()).into_owned())
+}
+
+pub(super) fn symbol_value(node: &Node<'_>) -> Option<String> {
+    let s = node.as_symbol_node()?;
+    Some(String::from_utf8_lossy(s.unescaped()).into_owned())
+}
+
+/// A symbol OR a string literal, for the DSL slots Rails normalizes
+/// with `to_sym` (`resources "tours"`, `only: %w[index show]`, `as:`,
+/// `controller:`, `param:`). Both spellings appear in real route
+/// files; accepting only the symbol dropped the whole resource for
+/// one and silently widened `only:` to all seven actions for the
+/// other (#85).
+pub(super) fn symbol_or_string_value(node: &Node<'_>) -> Option<String> {
+    symbol_value(node).or_else(|| string_value(node))
+}
+
+pub(super) fn bool_value(node: &Node<'_>) -> Option<bool> {
+    if node.as_true_node().is_some() {
+        Some(true)
+    } else if node.as_false_node().is_some() {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+pub(super) fn integer_value(node: &Node<'_>) -> Option<i64> {
+    integer_i64(&node.as_integer_node()?.value())
+}
+
+/// The seconds an `ActiveSupport::Duration` literal stands for: an Integer
+/// literal times a unit (`1.week`, `2.months`), bare or with `.seconds`
+/// (`1.week.seconds`, itself a Duration of the same length). Rails 8.1.4's
+/// fixed lengths: a month is 2629746 seconds (a year / 12) and a year
+/// 31556952 (365.2425 days). A Duration equals its Integer seconds, both
+/// ways, so a list of them answers `include?` as the Integer list does.
+pub(super) fn duration_seconds(node: &Node<'_>) -> Option<i64> {
+    let call = node.as_call_node()?;
+    if call.arguments().is_some() || call.block().is_some() {
+        return None;
+    }
+    let receiver = call.receiver()?;
+    let unit: i64 = match constant_id_str(&call.name()) {
+        // `1.week.seconds`: the Duration's own `.seconds` is the same length.
+        "seconds" if receiver.as_call_node().is_some() => return duration_seconds(&receiver),
+        "second" | "seconds" => 1,
+        "minute" | "minutes" => 60,
+        "hour" | "hours" => 3_600,
+        "day" | "days" => 86_400,
+        "week" | "weeks" => 604_800,
+        "fortnight" | "fortnights" => 1_209_600,
+        "month" | "months" => 2_629_746,
+        "year" | "years" => 31_556_952,
+        _ => return None,
+    };
+    integer_value(&receiver)?.checked_mul(unit)
+}
+
+/// A non-interpolated `/pattern/flags` literal's pattern (prism's
+/// UNESCAPED bytes — the regex engine's view, same as
+/// `dialect::Literal::Regex`) and its flags, in canonical `imxoesun`
+/// order (matching Ruby's own `Regexp#to_s`). `None` for anything but
+/// a plain regex literal node — an interpolated regex
+/// (`InterpolatedRegularExpressionNode`) has no single pattern string
+/// and is each caller's own concern.
+pub(super) fn regexp_literal_flags(node: &Node<'_>) -> Option<(String, String)> {
+    let r = node.as_regular_expression_node()?;
+    let mut flags = String::new();
+    if r.is_ignore_case() {
+        flags.push('i');
+    }
+    if r.is_multi_line() {
+        flags.push('m');
+    }
+    if r.is_extended() {
+        flags.push('x');
+    }
+    if r.is_once() {
+        flags.push('o');
+    }
+    if r.is_euc_jp() {
+        flags.push('e');
+    }
+    if r.is_windows_31j() {
+        flags.push('s');
+    }
+    if r.is_utf_8() {
+        flags.push('u');
+    }
+    if r.is_ascii_8bit() {
+        flags.push('n');
+    }
+    let pattern = String::from_utf8_lossy(r.unescaped()).into_owned();
+    Some((pattern, flags))
+}
+
+/// An integer literal's value as `i64`.
+///
+/// **prism only offers `TryInto<i32>`**, and every literal in ingest
+/// used to go through it. `Literal::Int` has always been `i64`, so the
+/// narrow hop was pure loss — and it was SILENT: campfire's
+/// `RestrictedHTTP::PrivateNetworkGuard#embedded_ipv4` writes
+/// `ipaddr.to_i & 0xffffffff` and we emitted `ipaddr.to_i & 0`, a mask
+/// that keeps nothing. Anything above 2^31-1 (a byte size, a
+/// milliseconds timestamp, a bitmask, a snowflake id) became zero and
+/// nothing said so.
+///
+/// Built from `to_u32_digits`, which is the only full-width view prism
+/// exposes: little-endian `u32` limbs plus a sign. Four limbs are
+/// accumulated in `i128` — more than an `i64` can hold, deliberately,
+/// so the range check happens once at the end rather than as an
+/// overflow midway. `None` for a value no `i64` can hold; the caller
+/// reports it rather than inventing one.
+pub(super) fn integer_i64(value: &ruby_prism::Integer<'_>) -> Option<i64> {
+    let (negative, digits) = value.to_u32_digits();
+    let mut acc: i128 = 0;
+    for (idx, limb) in digits.iter().enumerate() {
+        if idx >= 4 {
+            if *limb != 0 {
+                return None;
+            }
+            continue;
+        }
+        acc |= i128::from(*limb) << (32 * idx);
+    }
+    i64::try_from(if negative { -acc } else { acc }).ok()
+}
+
+// ---- Class / constant-path navigators ----------------------------------
+
+pub(super) fn find_first_class<'pr>(node: &Node<'pr>) -> Option<ruby_prism::ClassNode<'pr>> {
+    if let Some(c) = node.as_class_node() {
+        return Some(c);
+    }
+    if let Some(p) = node.as_program_node() {
+        return find_first_class(&p.statements().as_node());
+    }
+    if let Some(s) = node.as_statements_node() {
+        for stmt in s.body().iter() {
+            if let Some(found) = find_first_class(&stmt) {
+                return Some(found);
+            }
+        }
+    }
+    if let Some(m) = node.as_module_node() {
+        if let Some(body) = m.body() {
+            return find_first_class(&body);
+        }
+    }
+    None
+}
+
+/// Collect every `class` declaration reachable from `node`, paired
+/// with its enclosing module path (as written in the source).
+/// `module ActiveRecord; class Base` produces `(["ActiveRecord"],
+/// ClassNode<Base>)` so callers can build the fully-qualified
+/// `ClassId("ActiveRecord::Base")`. Top-level classes have an empty
+/// enclosing path. Source-order preserved. Used by the library-
+/// shape ingest path where one file can declare multiple classes
+/// (e.g. `runtime/active_record/errors.rb`).
+pub(super) fn find_all_classes_with_scope<'pr>(
+    node: &Node<'pr>,
+) -> Vec<(Vec<String>, ruby_prism::ClassNode<'pr>)> {
+    find_all_classes_with_nesting(node)
+        .into_iter()
+        .map(|(scope, _, c)| (scope, c))
+        .collect()
+}
+
+/// The class a file declares, past namespace wrappers. A file such as
+/// `module Catalog; class Item; class Detail < ApplicationRecord …
+/// end; end; end` reopens `Item` only to nest the model. Taking the first
+/// class read it as a reopening of `Item` and left
+/// `Catalog::Item::Detail` a plain nested class with no table. A
+/// class with no superclass whose body holds nothing but class and module
+/// declarations is such a wrapper; its first nested class is meant.
+pub(super) fn primary_class_with_scope<'pr>(
+    node: &Node<'pr>,
+) -> Option<(Vec<String>, ruby_prism::ClassNode<'pr>)> {
+    let mut classes = find_all_classes_with_scope(node).into_iter();
+    let mut primary = classes.next()?;
+    while is_namespace_wrapper(&primary.1) {
+        let inside = primary.1.location();
+        match classes.next() {
+            Some(next)
+                if next.1.location().start_offset() < inside.end_offset() =>
+            {
+                primary = next
+            }
+            _ => break,
+        }
+    }
+    Some(primary)
+}
+
+fn is_namespace_wrapper(class: &ruby_prism::ClassNode<'_>) -> bool {
+    if class.superclass().is_some() {
+        return false;
+    }
+    let Some(body) = class.body() else { return false };
+    let stmts = flatten_statements(body);
+    stmts.iter().any(|stmt| stmt.as_class_node().is_some())
+        && stmts.iter().all(|stmt| stmt.as_class_node().is_some() || stmt.as_module_node().is_some())
+}
+
+/// `find_all_classes_with_scope`, plus each class's lexical nesting at
+/// its `class` keyword — what `Module.nesting` reports there: the
+/// qualified names of the enclosing `module`/`class` bodies, innermost
+/// first. It differs from the scope wherever a compact path is
+/// written. `module A::B; class X` has nesting `["A::B"]` (not `A`),
+/// and a top-level `class A::X` has none at all: the `A::` prefix
+/// names the class but puts nothing in Ruby's lexical search path.
+pub(super) fn find_all_classes_with_nesting<'pr>(
+    node: &Node<'pr>,
+) -> Vec<(Vec<String>, Vec<String>, ruby_prism::ClassNode<'pr>)> {
+    let mut out = Vec::new();
+    collect_classes(node, &[], &[], &mut |scope, nesting, c| {
+        out.push((scope.to_vec(), nesting.to_vec(), c));
+    });
+    out
+}
+
+/// The nesting inside a body whose qualified path is `inner`.
+fn push_nesting(inner: &[String], nesting: &[String]) -> Vec<String> {
+    std::iter::once(inner.join("::")).chain(nesting.iter().cloned()).collect()
+}
+
+fn collect_classes<'pr, F: FnMut(&[String], &[String], ruby_prism::ClassNode<'pr>)>(
+    node: &Node<'pr>,
+    scope: &[String],
+    nesting: &[String],
+    out: &mut F,
+) {
+    if let Some(c) = node.as_class_node() {
+        // Save body before moving `c` into the callback; body() borrows
+        // `c` but the returned Node is tied to the tree's lifetime, so
+        // it outlives the move.
+        let body = c.body();
+        // Compute the inner scope BEFORE moving `c` — scope for
+        // nested classes/modules inside `c`'s body should include
+        // `c`'s own name (the bare segment as written in source).
+        let mut inner = scope.to_vec();
+        if let Some(name_path) = class_name_path(&c) {
+            inner.extend(name_path);
+        }
+        out(scope, nesting, c);
+        if let Some(b) = body {
+            collect_classes(&b, &inner, &push_nesting(&inner, nesting), out);
+        }
+        return;
+    }
+    if let Some(p) = node.as_program_node() {
+        collect_classes(&p.statements().as_node(), scope, nesting, out);
+        return;
+    }
+    if let Some(s) = node.as_statements_node() {
+        for stmt in s.body().iter() {
+            collect_classes(&stmt, scope, nesting, out);
+        }
+        return;
+    }
+    if let Some(body) = hoisted_singleton_body(node) {
+        collect_classes(&body, scope, nesting, out);
+        return;
+    }
+    if let Some(decl) = self_guarded_body(node, Some(scope)) {
+        collect_classes(&decl, scope, nesting, out);
+        return;
+    }
+    if let Some(m) = node.as_module_node() {
+        // Push the module's name onto the scope before descending —
+        // bare class declarations inside qualify with the module
+        // path.
+        let mut inner = scope.to_vec();
+        if let Some(name_path) = module_name_path(&m) {
+            inner.extend(name_path);
+        }
+        if let Some(body) = m.body() {
+            collect_classes(&body, &inner, &push_nesting(&inner, nesting), out);
+        }
+    }
+}
+
+pub(super) fn class_name_path(class: &ruby_prism::ClassNode<'_>) -> Option<Vec<String>> {
+    let cp = class.constant_path();
+    constant_path_segments_strs(&cp)
+}
+
+/// Collect every `module` declaration reachable from `node` that has
+/// at least one direct `def` in its body. Modules with only nested
+/// classes/modules (pure namespace wrappers like `module ActiveRecord`
+/// in errors.rb) are skipped — their nested decls are already picked
+/// up via the recursive walk into class/module bodies.
+///
+/// Each module is paired with its enclosing-scope path (as written
+/// in the source) so callers can build the fully-qualified ClassId.
+/// Used by the library-shape ingest path to lower modules-as-
+/// namespaces (e.g. `module Inflector with def self.pluralize`) into
+/// LibraryClass with no parent. Mixin semantics (modules whose
+/// instance methods are `include`d into classes) are not handled
+/// here — they need a separate lowering when the include site is
+/// known.
+pub(super) fn find_all_modules_with_scope<'pr>(
+    node: &Node<'pr>,
+) -> Vec<(Vec<String>, ruby_prism::ModuleNode<'pr>)> {
+    find_all_module_declarations_with_scope(node)
+        .into_iter()
+        .filter(|(_, module)| module_has_direct_def(module))
+        .collect()
+}
+
+/// Every source module declaration, including effect-only reopenings that
+/// do not produce library IR but can change a Concern's framework identity.
+pub(super) fn find_all_module_declarations_with_scope<'pr>(
+    node: &Node<'pr>,
+) -> Vec<(Vec<String>, ruby_prism::ModuleNode<'pr>)> {
+    let mut out = Vec::new();
+    collect_modules(node, &[], &mut |scope, m| {
+        out.push((scope.to_vec(), m));
+    });
+    out
+}
+
+fn collect_modules<'pr, F: FnMut(&[String], ruby_prism::ModuleNode<'pr>)>(
+    node: &Node<'pr>,
+    scope: &[String],
+    out: &mut F,
+) {
+    if let Some(m) = node.as_module_node() {
+        let body = m.body();
+        // Compute inner scope before moving `m`.
+        let mut inner = scope.to_vec();
+        if let Some(name_path) = module_name_path(&m) {
+            inner.extend(name_path);
+        }
+        out(scope, m);
+        if let Some(b) = body {
+            collect_modules(&b, &inner, out);
+        }
+        return;
+    }
+    if let Some(c) = node.as_class_node() {
+        let mut inner = scope.to_vec();
+        if let Some(name_path) = class_name_path(&c) {
+            inner.extend(name_path);
+        }
+        if let Some(body) = c.body() {
+            collect_modules(&body, &inner, out);
+        }
+        return;
+    }
+    if let Some(p) = node.as_program_node() {
+        collect_modules(&p.statements().as_node(), scope, out);
+        return;
+    }
+    if let Some(s) = node.as_statements_node() {
+        for stmt in s.body().iter() {
+            collect_modules(&stmt, scope, out);
+        }
+        return;
+    }
+    if let Some(body) = hoisted_singleton_body(node) {
+        collect_modules(&body, scope, out);
+        return;
+    }
+    if let Some(decl) = self_guarded_body(node, Some(scope)) {
+        collect_modules(&decl, scope, out);
+    }
+}
+
+/// The body of a `class << self` inside a class or module. Ruby puts
+/// the classes and modules declared there on the singleton class
+/// (a namespace keeps helper modules there and its class methods read
+/// them bare). Like the constants such a body writes, they are hoisted
+/// into the enclosing scope. This is a deliberate widening: natively
+/// `Outer::Helper` raises NameError from outside (the constant lives on
+/// the singleton class), while the hoisted declaration is reachable by
+/// that name. Programs that run natively read it bare from the singleton
+/// body, which still works. [`hoisted_name_collision`] refuses the one
+/// case where hoisting would change which declaration a bare read finds.
+fn hoisted_singleton_body<'pr>(node: &Node<'pr>) -> Option<Node<'pr>> {
+    let sc = node.as_singleton_class_node()?;
+    sc.expression().as_self_node()?;
+    sc.body()
+}
+
+/// The first name that both a `class << self` body in `statements` and
+/// the enclosing body itself declare as a class, module or constant.
+/// Natively the two are different constants (one on the singleton class,
+/// one on the namespace); hoisting merges them, and a bare read in the
+/// singleton body would find the wrong one. The caller refuses.
+pub(super) fn hoisted_name_collision(statements: &[Node<'_>]) -> Option<String> {
+    let declared = |node: &Node<'_>| -> Option<String> {
+        if let Some(c) = node.as_class_node() {
+            return class_name_path(&c).map(|p| p.join("::"));
+        }
+        if let Some(m) = node.as_module_node() {
+            return module_name_path(&m).map(|p| p.join("::"));
+        }
+        node.as_constant_write_node().map(|w| constant_id_str(&w.name()).to_string())
+    };
+    let outer: Vec<String> = statements.iter().filter_map(|s| declared(s)).collect();
+    for stmt in statements {
+        let Some(body) = hoisted_singleton_body(stmt) else { continue };
+        for inner in flatten_statements(body) {
+            if inner.as_constant_write_node().is_some() {
+                continue;
+            }
+            if let Some(name) = declared(&inner).filter(|n| outer.contains(n)) {
+                return Some(name);
+            }
+        }
+    }
+    None
+}
+
+fn module_has_direct_def(m: &ruby_prism::ModuleNode<'_>) -> bool {
+    body_has_direct_method_decl(m.body())
+        || body_has_included_block(m.body())
+        || body_has_constant_decl(m.body())
+        || body_has_route_helpers_include(m.body())
+        || body_runs_module_code(m.body())
+        || body_includes_into_constant(m.body())
+}
+
+/// A namespace whose body includes one constant into another:
+/// activemerchant's `module Billing` ends `Compatibility::Model.include
+/// Rails::Model`. Ruby runs it as the body loads, so the module surfaces
+/// for the call to have a body to be carried from
+/// (`external_include`).
+fn body_includes_into_constant(body: Option<Node<'_>>) -> bool {
+    let Some(body) = body else { return false };
+    flatten_statements(body).iter().any(|stmt| {
+        stmt.as_call_node().is_some_and(|call| {
+            constant_id_str(&call.name()) == "include"
+                && call.block().is_none()
+                && call.receiver().is_some_and(|r| constant_path_segments_strs(&r).is_some())
+                && call.arguments().is_some_and(|a| {
+                    let args: Vec<_> = a.arguments().iter().collect();
+                    args.len() == 1 && constant_path_segments_strs(&args[0]).is_some()
+                })
+        })
+    })
+}
+
+/// A module whose body runs one of Ruby's own `Module` methods on itself
+/// (`freeze`, `self.freeze`, `module_eval <<~RUBY … RUBY`): the module
+/// exists, and the Ruby family runs the statement as it loads
+/// (`body_statements`).
+fn body_runs_module_code(body: Option<Node<'_>>) -> bool {
+    let Some(body) = body else { return false };
+    flatten_statements(body).iter().any(|stmt| {
+        stmt.as_call_node().is_some_and(|call| {
+            call.receiver().is_none_or(|r| r.as_self_node().is_some())
+                && matches!(
+                    constant_id_str(&call.name()),
+                    "freeze" | "class_eval" | "module_eval" | "class_exec" | "module_exec"
+                )
+        })
+    })
+}
+
+/// A module whose whole content is the route-helper mixin — core's
+/// `UrlHelpers`, `class << self` around `self.include(Rails.application.
+/// routes.url_helpers)` — is the app's handle on the route table.
+/// Callers reach it as `UrlHelpers.<route>_url`, so it must surface for
+/// the include marker to reach the analyzer and give it the helper set.
+fn body_has_route_helpers_include(body: Option<Node<'_>>) -> bool {
+    let Some(body) = body else { return false };
+    flatten_statements(body).iter().any(|stmt| {
+        if let Some(sc) = stmt.as_singleton_class_node() {
+            return body_has_route_helpers_include(sc.body());
+        }
+        let Some(call) = stmt.as_call_node() else { return false };
+        constant_id_str(&call.name()) == "include"
+            && call.receiver().is_none_or(|r| r.as_self_node().is_some())
+            && call
+                .arguments()
+                .is_some_and(|a| a.arguments().iter().any(|arg| is_rails_url_helpers_chain(&arg)))
+    })
+}
+
+/// Match the `Rails.application.routes.url_helpers` receiver chain (a
+/// nested CallNode ladder rooted at the `Rails` constant).
+pub(super) fn is_rails_url_helpers_chain(node: &ruby_prism::Node<'_>) -> bool {
+    let mut expected = ["url_helpers", "routes", "application"].iter();
+    let mut cur = match node.as_call_node() {
+        Some(c) => c,
+        None => return false,
+    };
+    loop {
+        let Some(want) = expected.next() else { return false };
+        if cur.name().as_slice() != want.as_bytes() {
+            return false;
+        }
+        match cur.receiver() {
+            Some(r) => {
+                if let Some(cr) = r.as_constant_read_node() {
+                    return expected.next().is_none()
+                        && cr.name().as_slice() == b"Rails";
+                }
+                match r.as_call_node() {
+                    Some(next) => cur = next,
+                    None => return false,
+                }
+            }
+            None => return false,
+        }
+    }
+}
+
+/// A module whose only content is a CONSTANT is still app state the
+/// rest of the app reads, and surfacing is what gets it emitted at all.
+/// campfire's `EmojiHelper` is exactly this — one `REACTIONS` hash, the
+/// reaction picker every message row renders — and dropping the module
+/// took the constant with it, so `messages/_actions` raised
+/// `uninitialized constant EmojiHelper` on the page that lists
+/// messages.
+fn body_has_constant_decl(body: Option<Node<'_>>) -> bool {
+    let Some(body) = body else { return false };
+    flatten_statements(body).iter().any(|stmt| {
+        stmt.as_constant_write_node().is_some() || stmt.as_constant_path_write_node().is_some()
+    })
+}
+
+/// An `included do … end` block marks an ActiveSupport::Concern whose
+/// whole value may be the DSL it injects into includers (Mastodon's
+/// `Paginable`: one scope, zero defs). Such a module must surface even
+/// with no direct methods, so the concern capture (filters, model DSL)
+/// has a module to key on.
+fn body_has_included_block(body: Option<Node<'_>>) -> bool {
+    let Some(body) = body else { return false };
+    for stmt in flatten_statements(body) {
+        if let Some(call) = stmt.as_call_node() {
+            if call.receiver().is_none()
+                && constant_id_str(&call.name()) == "included"
+                && call.block().is_some_and(|b| b.as_block_node().is_some())
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Whether the body has anything that lowers to a method on the
+/// enclosing scope: a direct `def`, an `attr_*` call, or a
+/// `class << self` block whose body contains the same. Used to decide
+/// whether a module is worth surfacing as a `LibraryClass`.
+fn body_has_direct_method_decl(body: Option<Node<'_>>) -> bool {
+    let Some(body) = body else { return false };
+    for stmt in flatten_statements(body) {
+        if super::visibility::definition(&stmt).is_some() {
+            return true;
+        }
+        // `if ready; def hidden; end; end` is a declaration this walk
+        // cannot keep. Surface the module so the refusal is reported
+        // instead of the file vanishing.
+        if (stmt.as_if_node().is_some() || stmt.as_unless_node().is_some())
+            && super::visibility::Visibility::hides_declaration(&stmt)
+        {
+            return true;
+        }
+        if let Some(call) = stmt.as_call_node() {
+            if call.receiver().is_none() {
+                let kw = constant_id_str(&call.name());
+                // Not only `attr_*`: a module whose only content is `mattr_accessor` / `thread_mattr_accessor` is state the app reads.
+                if matches!(kw, "attr_reader" | "attr_writer" | "attr_accessor")
+                    || ["cattr_", "mattr_", "thread_mattr_", "thread_cattr_"].iter().any(|p| {
+                        kw.strip_prefix(p).is_some_and(|rest| matches!(rest, "reader" | "writer" | "accessor"))
+                    })
+                {
+                    return true;
+                }
+                // ActiveSupport::Concern's `class_methods do … end`: its
+                // defs become class methods of every includer. A concern
+                // whose *only* defs live in that block (Mastodon's
+                // Account::FinderConcern) is very much worth surfacing.
+                if kw == "class_methods" {
+                    if let Some(block) = call.block().and_then(|b| b.as_block_node()) {
+                        if body_has_direct_method_decl(block.body()) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(sc) = stmt.as_singleton_class_node() {
+            if body_has_direct_method_decl(sc.body()) {
+                return true;
+            }
+        }
+        // The other Concern spelling: `module ClassMethods … end`.
+        // `walk_decl_body` folds its defs onto THIS module as class
+        // methods, so a concern whose only content is that module
+        // (campfire's Opengraph::Metadata::Fetching) still declares
+        // methods — and skipping it would drop them entirely, since the
+        // nested module is deliberately not surfaced on its own.
+        if let Some(m) = stmt.as_module_node() {
+            if module_name_path(&m).as_deref() == Some(&["ClassMethods".to_string()])
+                && body_has_direct_method_decl(m.body())
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+pub(super) fn module_name_path(m: &ruby_prism::ModuleNode<'_>) -> Option<Vec<String>> {
+    let cp = m.constant_path();
+    constant_path_segments_strs(&cp)
+}
+
+pub(super) fn constant_path_of(node: &Node<'_>) -> Option<Vec<String>> {
+    constant_path_segments_strs(node)
+}
+
+pub(super) fn constant_path_segments_strs(node: &Node<'_>) -> Option<Vec<String>> {
+    if let Some(c) = node.as_constant_read_node() {
+        return Some(vec![constant_id_str(&c.name()).to_string()]);
+    }
+    if let Some(p) = node.as_constant_path_node() {
+        let mut out = p
+            .parent()
+            .and_then(|n| constant_path_segments_strs(&n))
+            .unwrap_or_default();
+        if let Some(id) = p.name() {
+            out.push(constant_id_str(&id).to_string());
+        }
+        return Some(out);
+    }
+    None
+}
+
+/// Whether a value sits anywhere under this constant path
+/// (`self.class::KINDS`, `self.class::NAMES::LABEL`): the path is then a
+/// lookup through that value. `constant_path_segments_strs` keeps the
+/// constant names alone, for the declaration sites that check their own
+/// literal spelling (`alba::literal_constant`).
+pub(super) fn constant_path_has_value_parent(p: &ruby_prism::ConstantPathNode<'_>) -> bool {
+    match p.parent() {
+        None => false,
+        Some(parent) => match parent.as_constant_path_node() {
+            Some(inner) => constant_path_has_value_parent(&inner),
+            None => parent.as_constant_read_node().is_none(),
+        },
+    }
+}
+
+pub(super) fn constant_path_segments(p: &ruby_prism::ConstantPathNode<'_>) -> Vec<Symbol> {
+    constant_path_segments_strs(&p.as_node())
+        .unwrap_or_default()
+        .into_iter()
+        .map(Symbol::from)
+        .collect()
+}
+
+/// The leading `::` belongs to the innermost path node in `::A::B`.
+pub(super) fn constant_path_is_rooted(p: &ruby_prism::ConstantPathNode<'_>) -> bool {
+    match p.parent() {
+        None => true,
+        Some(parent) => parent.as_constant_path_node().is_some_and(|p| constant_path_is_rooted(&p)),
+    }
+}
+
+// ---- Tree walkers ------------------------------------------------------
+
+pub(super) fn flatten_statements<'pr>(node: Node<'pr>) -> Vec<Node<'pr>> {
+    if let Some(s) = node.as_statements_node() {
+        s.body().iter().flat_map(|stmt| match self_guarded_body(&stmt, None) {
+            Some(body) => vec![body],
+            None => vec![stmt],
+        }).collect()
+    } else {
+        vec![node]
+    }
+}
+
+// Only a reload guard around its own declaration: any other guard, or an `else`, takes the branch what else loaded decides.
+pub(super) fn self_guarded_body<'pr>(node: &Node<'pr>, scope: Option<&[String]>) -> Option<Node<'pr>> {
+    let unless = node.as_unless_node()?;
+    if unless.else_clause().is_some() {
+        return None;
+    }
+    let guarded = constant_path_of(&unless.predicate().as_defined_node()?.value())?;
+    let mut body = unless.statements()?.body().iter();
+    let decl = body.next()?;
+    if body.next().is_some() {
+        return None;
+    }
+    let declared = if let Some(m) = decl.as_module_node() {
+        module_name_path(&m)?
+    } else if let Some(c) = decl.as_class_node() {
+        class_name_path(&c)?
+    } else {
+        return None;
+    };
+    (guarded == declared || scope.is_some_and(|scope| guarded.iter().eq(scope.iter().chain(&declared)))).then_some(decl)
+}
+
+pub(super) fn find_call_named<'pr>(
+    node: &Node<'pr>,
+    name: &str,
+) -> Option<ruby_prism::CallNode<'pr>> {
+    if let Some(c) = node.as_call_node() {
+        if constant_id_str(&c.name()) == name {
+            return Some(c);
+        }
+        if let Some(recv) = c.receiver() {
+            if let Some(found) = find_call_named(&recv, name) {
+                return Some(found);
+            }
+        }
+        if let Some(args) = c.arguments() {
+            for arg in args.arguments().iter() {
+                if let Some(f) = find_call_named(&arg, name) {
+                    return Some(f);
+                }
+            }
+        }
+        if let Some(block_node) = c.block() {
+            if let Some(f) = find_call_named(&block_node, name) {
+                return Some(f);
+            }
+        }
+        return None;
+    }
+    if let Some(p) = node.as_program_node() {
+        return find_call_named(&p.statements().as_node(), name);
+    }
+    if let Some(s) = node.as_statements_node() {
+        for stmt in s.body().iter() {
+            if let Some(f) = find_call_named(&stmt, name) {
+                return Some(f);
+            }
+        }
+    }
+    if let Some(b) = node.as_block_node() {
+        if let Some(body) = b.body() {
+            return find_call_named(&body, name);
+        }
+    }
+    None
+}
+
+pub(super) fn walk_calls<'pr, F: FnMut(&ruby_prism::CallNode<'pr>)>(node: &Node<'pr>, f: &mut F) {
+    if let Some(c) = node.as_call_node() {
+        f(&c);
+        if let Some(recv) = c.receiver() {
+            walk_calls(&recv, f);
+        }
+        if let Some(args) = c.arguments() {
+            for arg in args.arguments().iter() {
+                walk_calls(&arg, f);
+            }
+        }
+        if let Some(block_node) = c.block() {
+            walk_calls(&block_node, f);
+        }
+        return;
+    }
+    if let Some(p) = node.as_program_node() {
+        walk_calls(&p.statements().as_node(), f);
+        return;
+    }
+    if let Some(s) = node.as_statements_node() {
+        for stmt in s.body().iter() {
+            walk_calls(&stmt, f);
+        }
+        return;
+    }
+    if let Some(b) = node.as_block_node() {
+        if let Some(body) = b.body() {
+            walk_calls(&body, f);
+        }
+    }
+}
+
+// ---- Symbol-list parsing (shared by controller filters + routes) ------
+
+/// Accepts both `%i[a b]` and `%w[a b]` (and `:a` / `"a"`): every
+/// slot this feeds — `only:`/`except:` on a filter or a resource —
+/// is one Rails `to_sym`s, and both spellings appear in real apps.
+/// Matching only symbols returned an EMPTY list for `%w[index show]`,
+/// which the resource expander reads as "no restriction" and turned
+/// a two-action resource into seven routes (#85).
+pub(super) fn symbol_list_value(node: &Node<'_>) -> Vec<Symbol> {
+    if let Some(arr) = node.as_array_node() {
+        return arr
+            .elements()
+            .iter()
+            .filter_map(|n| symbol_or_string_value(&n))
+            .map(|s| Symbol::from(s.as_str()))
+            .collect();
+    }
+    if let Some(s) = symbol_or_string_value(node) {
+        return vec![Symbol::from(s.as_str())];
+    }
+    vec![]
+}
+
+/// Surface form of a symbol list (`[:a, :b]` or `%i[a b]`). For a bare
+/// symbol arg (`before_action :foo, only: :show`) we default to Brackets
+/// since no array syntax was used — emit falls back on the flat form.
+pub(super) fn symbol_list_style(node: &Node<'_>) -> ArrayStyle {
+    if let Some(arr) = node.as_array_node() {
+        return array_style_from(&arr);
+    }
+    ArrayStyle::default()
+}
+
+/// Detect the surface form of an array literal from its opening token:
+/// `%i[` → PercentI, `%w[` → PercentW, else Brackets (with padding
+/// detected from the gap between opener and first element).
+pub(super) fn array_style_from(arr: &ruby_prism::ArrayNode<'_>) -> ArrayStyle {
+    let Some(loc) = arr.opening_loc() else { return ArrayStyle::Brackets };
+    let bytes = loc.as_slice();
+    if bytes.starts_with(b"%i") || bytes.starts_with(b"%I") {
+        return ArrayStyle::PercentI;
+    }
+    if bytes.starts_with(b"%w") || bytes.starts_with(b"%W") {
+        return ArrayStyle::PercentW;
+    }
+    // Bare brackets — padded `[ x, y ]` vs tight `[x, y]`. Detected by
+    // comparing the opening's end-offset to the first element's start.
+    // An empty array (`[]`) has no first element; default to tight
+    // brackets since padding is only visually meaningful with content.
+    if let Some(first) = arr.elements().iter().next() {
+        let opener_end = loc.end_offset();
+        let first_start = first.location().start_offset();
+        if first_start > opener_end {
+            return ArrayStyle::BracketsSpaced;
+        }
+    }
+    ArrayStyle::Brackets
+}
+
+// ---- Comment / blank-line helpers (model + controller class bodies) ---
+
+/// Collect Prism's inline comments into `(start_offset, text)` pairs.
+/// Comments are returned in source order, which matches the order we
+/// want to drain them during body ingest. The offset is used for
+/// association; the resulting `Comment`'s span stays synthetic for
+/// now — real span propagation is a separate effort and including
+/// real offsets here would break IR round-trip (positions differ
+/// between the original source and the emitter's scratch output).
+pub(super) fn collect_comments(result: &ruby_prism::ParseResult<'_>) -> Vec<(usize, Comment)> {
+    use ruby_prism::CommentType;
+    result
+        .comments()
+        .filter(|c| c.type_() == CommentType::InlineComment)
+        .map(|c| {
+            let loc = c.location();
+            let text = String::from_utf8_lossy(loc.as_slice())
+                .trim_end()
+                .to_string();
+            (
+                loc.start_offset(),
+                Comment { text, span: Span::synthetic() },
+            )
+        })
+        .collect()
+}
+
+/// Pull every comment whose start is before `offset` off the front of
+/// `comments`. Returned in source order so emit produces them in the
+/// same sequence they appeared.
+pub(super) fn drain_comments_before(
+    comments: &mut Vec<(usize, Comment)>,
+    offset: usize,
+) -> Vec<Comment> {
+    let mut out = Vec::new();
+    while let Some((start, _)) = comments.first() {
+        if *start >= offset {
+            break;
+        }
+        out.push(comments.remove(0).1);
+    }
+    out
+}
+
+/// Is there a blank line in `source[from..to]` — i.e., at least two
+/// newlines separated only by whitespace? A single `\n` separates
+/// consecutive non-blank lines; `\n<whitespace>\n` means the line
+/// between them was blank.
+pub(super) fn source_has_blank_line(source: &[u8], from: usize, to: usize) -> bool {
+    if from >= to || to > source.len() {
+        return false;
+    }
+    slice_has_blank_line(source, from, to)
+}
+
+/// Same check, scoped to an already-sliced byte range (e.g., a Prism
+/// `Location::as_slice()`). Kept separate from `source_has_blank_line`
+/// because callers that work from a sub-slice don't need the outer
+/// bounds check.
+pub(super) fn slice_has_blank_line(bytes: &[u8], from: usize, to: usize) -> bool {
+    if from >= to || to > bytes.len() {
+        return false;
+    }
+    let slice = &bytes[from..to];
+    let mut saw_newline = false;
+    for &b in slice {
+        match b {
+            b'\n' => {
+                if saw_newline {
+                    return true;
+                }
+                saw_newline = true;
+            }
+            b' ' | b'\t' | b'\r' => {}
+            _ => saw_newline = false,
+        }
+    }
+    false
+}
+
+/// `ActionView::Helpers::*` (SanitizeHelper, NumberHelper) in an
+/// include list, or `ActiveSupport::NumberHelper`, which gives the same
+/// number helpers. No target ships the namespace, so the `include` is an
+/// `uninitialized constant` at class-definition time — before any
+/// request, which means it takes the whole tree's boot with it, not one
+/// route. It contributes nothing either way: every member the app calls
+/// through it is qualified to `ActionView::ViewHelpers.<name>` at emit
+/// (`emit::ruby::library::is_framework_view_helper`).
+///
+/// `ActionView::RecordIdentifier` is the same story for `dom_id` /
+/// `dom_class`: models, presenters and broadcasters mix it in to name a
+/// DOM node, and the calls resolve to the one shared
+/// `ActionView::ViewHelpers.dom_id` / `dom_class` views already use.
+///
+/// Called from BOTH homes that build an include list —
+/// `analyze::model_includes` for models, `ingest::library_class`'s decl
+/// walk for everything else — because the same source line means the
+/// same thing in either.
+pub(crate) fn is_view_helper_marker_include(path: &[&str]) -> bool {
+    matches!(
+        path,
+        ["ActionView", "Helpers", ..] | ["ActionView", "RecordIdentifier"] | ["ActiveSupport", "NumberHelper"]
+    )
+}
+
+/// `ActiveModel::*` (Validations / Conversion / AttributeMethods /
+/// Model) in a MODEL's include list. Same "no target ships the
+/// namespace" argument as above, and here the replacement is already in
+/// hand by the time the list is built: a superclass-less model
+/// including them is lowered to a tableless model whose `valid?` /
+/// `errors` / `validate` surface is synthesized as real methods.
+///
+/// MODELS ONLY, deliberately. A library class gets the same three
+/// methods from `lower::active_model_model`, which runs long after
+/// ingest and READS the include to decide whether to — so dropping it
+/// at ingest would delete the pass's own input and leave the class with
+/// no constructor.
+pub(crate) fn is_active_model_marker_include(path: &[&str]) -> bool {
+    matches!(path, ["ActiveModel", ..])
+}
+
+/// `ActiveSupport::Concern` in an include list, written as `include`
+/// where the idiom is `extend`. On Rails, including (rather than
+/// extending) `Concern` is a harmless slip: `Module#include` runs
+/// `ActiveSupport::Concern`'s own `append_features`/`included`/
+/// `class_methods` defs as unused INSTANCE methods of the includer,
+/// since nothing ever calls them that way, and the module otherwise
+/// stays a plain module with its own methods untouched. No target
+/// ships `ActiveSupport::Concern`, so recording the include would make
+/// it an unresolved external class the Ruby emit cannot load; dropping
+/// it here is exactly as sound as Rails' own behavior, and cheaper than
+/// giving the misuse a diagnostic location it does not need.
+///
+/// Called from the library-class decl walk only: a module written this
+/// way is a library class (a mailer concern, in the wild), never a
+/// model — models record their includes separately in
+/// `analyze::body_includes`.
+pub(crate) fn is_concern_marker_include(path: &[&str]) -> bool {
+    matches!(path, ["ActiveSupport", "Concern"])
+}

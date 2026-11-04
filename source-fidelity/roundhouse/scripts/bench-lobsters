@@ -1,0 +1,1571 @@
+#!/usr/bin/env bash
+# scripts/bench-lobsters — the lobsters benchmark orchestrator.
+#
+# The lobsters counterpart of scripts/bench: where that measures blog
+# throughput per target, this measures the ruby-bench lobsters benchmark
+# (frozen 114-visit sequence, in-memory, in-process, single-threaded)
+# across runtime × JIT lanes, plus route parity per emit lane.
+#
+# Usage:  scripts/bench-lobsters [options] [LANE...]
+#
+#   LANE            lane list — the nightly form. One run dir, one subdir
+#                   per lane, one aggregated matrix.json (what
+#                   scripts/lobsters-report renders). Lane vocabulary
+#                   matches scripts/bench:
+#                     rails       real Rails, YJIT        [needs the bundle]
+#                     rails-int   real Rails, no JIT      [needs the bundle]
+#                     ruby        roundhouse emit, YJIT
+#                     ruby-int    roundhouse emit, no JIT
+#                   and, off by default (see below):
+#                     rails-jruby real Rails on JRuby, from a patched
+#                                 sibling fixture (see prep_rails_jruby_
+#                                 fixture) — list it AFTER jruby, whose
+#                                 emit tree it borrows the markly shim from
+#                     jruby       roundhouse emit, JRuby/JVM
+#                     spinel      roundhouse emit, AOT-compiled
+#
+#                   RETIRED, and accepted as no-ops so a stale caller still
+#                   produces a run: spinel-gc, spinel-ballast,
+#                   spinel-gc-ballast. Those were the heap-sensitivity cells
+#                   — the same binary crossed over GC configuration
+#                   (SPINEL_GC_MINOR) and a retained-heap ballast — and they
+#                   existed to make the case that spinel's whole-heap mark
+#                   charged this workload for a live set it never touched.
+#                   matz/spinel@d3b1400d (2026-08-12) made the generational
+#                   mark the DEFAULT, which is the case being won: the
+#                   `spinel` lane now IS the generational one, there is no
+#                   second configuration to publish beside it, and a ballast
+#                   cell would only measure a knob nobody ships. The escape
+#                   hatch (SPINEL_GC_MINOR=0) stays a spinel-side debugging
+#                   tool, not a published row.
+#                   The futamura lane's tree serves the GET actions the
+#                   analysis clears from the lowered app (whole-route
+#                   replacement), which needs Ruby 4.1 with RUBY_BOX=1:
+#                   set FUTAMURA_RUBY to that Ruby's bin directory. Unset,
+#                   the lane runs with whole-route off on the PATH Ruby.
+#                   Rails lanes are skipped (loudly) when the checkout's
+#                   bundle isn't installable; the JVM lanes when jruby
+#                   isn't on PATH. JIT is pinned per lane via RUBYOPT —
+#                   the ambient environment can't leak in. Example:
+#                     scripts/bench-lobsters rails rails-int ruby ruby-int --time 20
+#
+#                   THE JVM LANES ARE OFF THE PUBLISHED MATRIX. They still
+#                   run on request — nothing here rejects them — but the
+#                   nightly no longer lists them, because this benchmark
+#                   cannot show what JRuby is good at. It is single-
+#                   threaded by construction, so JRuby's one decisive
+#                   advantage on scripts/bench (no GVL: ~5 cores against
+#                   the CRuby cells' 1, most of that page's 8.8x) is
+#                   excluded here by definition. What is left is a slow
+#                   warmup over a much larger code surface than the blog
+#                   fixture (--warmup 100 against the >=500 this file
+#                   recommends below, and a 1.67x min-max spread to show
+#                   for it) plus per-query JDBC marshalling on a
+#                   DB-heavy workload. Both JVM rows landed slower than
+#                   CRuby WITHOUT a JIT (2026-07-27: jruby 242.93 ms vs
+#                   ruby-int 165.42; rails-jruby 1314.36 vs rails-int
+#                   828.03) — a fact about the workload, not about either
+#                   stack, and not one worth a published row. Drop them
+#                   TOGETHER: the aggregator pairs JVM rows with
+#                   rails-jruby when present and silently falls back to
+#                   Rails+YJIT otherwise, so removing only the baseline
+#                   would restate the jruby row's ratio (5.41x -> 2.03x)
+#                   with no change in the measurement underneath.
+#
+#   With no LANE args this is the single-lane worker (the dev loop and
+#   the lane mode's own building block): emit + file-backed parity replay
+#   by default, plus the flags below. Until every route returns 200 the
+#   headline metric IS the parity count; --time N adds a ms/iter trend.
+#
+#   --src DIR       lobsters source checkout
+#                   (default $LOBSTERS_SRC, else ~/git/ruby-bench/benchmarks/lobsters)
+#   --runtime R     which runtime to emit for and replay under:
+#                     cruby  (default) — --target ruby,  replay under `ruby`
+#                     jruby            — --target jruby, replay under `jruby`
+#                   Both drive the SAME scripts/lobsters-replay; only the
+#                   emit target, interpreter, and gem/JVM setup differ.
+#                   --memory/--frozen work on both (JRuby seeds :memory: via
+#                   the JDBC driver's restore()); --vs-rails is CRuby-only
+#                   (same-interpreter baseline). Results land under a
+#                   per-runtime `latest`/`latest-jruby` symlink so the two
+#                   lanes don't cross-compare.
+#   --jruby         shorthand for --runtime jruby
+#   --skip-emit     reuse the existing build tree (fast replay iteration)
+#   --memory        serve from an in-memory SQLite seeded from the staged
+#                   DB at boot (SQLite3::Backup on CRuby, JDBC restore()
+#                   on JRuby) — the shape the real ruby-bench benchmark
+#                   runs; the file-backed default remains for bisection
+#                   against older runs
+#   --time N        run N timed iterations after the parity pass, preceded
+#                   by --warmup discarded iterations
+#   --warmup N      discarded warmup iterations before the timed run
+#                   (default: 5 for cruby, 100 for jruby's JIT — which warms
+#                   slowly here; a publication jruby number wants >=500)
+#   --vs-rails      P6 comparison: boot the REAL Rails lobsters (needs the
+#                   ruby-bench checkout's bundle), dump + time the frozen
+#                   114-visit sequence there, then replay the SAME sequence
+#                   against the emit (implies --memory — both stacks must
+#                   run the benchmark's in-mem DB shape) and report
+#                   roundhouse-vs-Rails ms/iter. The frozen sequence is
+#                   versioned at bench/lobsters/frozen-sequence.json; a
+#                   regeneration that differs means the ruby-bench DB or
+#                   generator changed — investigate before comparing.
+#   --frozen        time the emit on the committed frozen 114-visit sequence,
+#                   in-memory, WITHOUT booting Rails — the canonical ruby-bench
+#                   workload as an emit-only lane (the per-runtime matrix rows,
+#                   decoupled from the Rails baseline). Implies --memory;
+#                   mutually exclusive with --vs-rails. scripts/lobsters-matrix
+#                   drives one of these per runtime/JIT.
+#   --out DIR       results dir (default bench/results/lobsters/<timestamp>).
+#                   Passing this suppresses the shared `latest` symlink (the
+#                   caller owns placement).
+#
+# Output:
+#   bench/results/lobsters/<timestamp>/summary.json   # per-route parity + timing
+#   bench/results/lobsters/<timestamp>/summary.md     # rendered table + failures
+#   bench/results/lobsters/<timestamp>/emit.log       # transpile diagnostics
+#   bench/results/lobsters/<timestamp>/env.json       # run provenance (below)
+#   bench/results/lobsters/latest                     # symlink to newest run
+#
+# env.json names everything that produced the numbers, so a run's timings
+# stay attributable after the fact: the emitter (roundhouse commit + dirty
+# flag), the fixture (lobsters commit + dirty flag), the AOT toolchain
+# (`spinel --version` and `cc --version`), and the host (CPU, cores,
+# kernel) that ms/iter is measured against. Fields are omitted rather than
+# blanked when a tool or checkout is absent, and the report drops the rows
+# it has no data for — so an older archived run still renders.
+#
+# When a previous run exists, the console output ends with a comparison
+# against it: pass-count delta, regressed/fixed routes, and changed
+# failure signatures — so a nightly cron log doubles as the alarm.
+#
+# Exit code = number of failing routes, so it doubles as a dev gate;
+# nightly wrappers that want blog results regardless should `|| true`.
+#
+# Dev loop after a compiler change:
+#   scripts/bench-lobsters              # re-emit + replay
+#   scripts/bench-lobsters --skip-emit  # replay only
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# The deferred-route ledger. Read here by every path that times a sequence,
+# and again by the aggregation block below for parity classification.
+GAPS_JSON="$REPO_ROOT/bench/lobsters/declared-gaps.json"
+
+# Pre-flight: a top-level call placed above the `def` it calls is a runtime
+# NoMethodError that `ruby -c` cannot see. That exact mistake took both Rails
+# lanes and the AOT lane down on a published run — every lane reported "no
+# data" after minutes of booting. One second here, before anything boots.
+if ! ruby "$REPO_ROOT/scripts/check-ruby-def-order" \
+        "$REPO_ROOT/scripts/lobsters-replay" \
+        "$REPO_ROOT/scripts/lobsters-spinel-replay" \
+        "$REPO_ROOT/scripts/lobsters-rails-replay" \
+        "$REPO_ROOT/scripts/lobsters-report" >/dev/null; then
+    echo "bench-lobsters: replay script calls a helper before defining it (see above)" >&2
+    ruby "$REPO_ROOT/scripts/check-ruby-def-order" \
+        "$REPO_ROOT/scripts/lobsters-replay" \
+        "$REPO_ROOT/scripts/lobsters-spinel-replay" \
+        "$REPO_ROOT/scripts/lobsters-rails-replay" \
+        "$REPO_ROOT/scripts/lobsters-report" >&2 || true
+    exit 2
+fi
+SRC="${LOBSTERS_SRC:-$HOME/git/ruby-bench/benchmarks/lobsters}"
+OUT_DIR=""
+EXPLICIT_OUT=0
+SKIP_EMIT=0
+TIME_ITERS=0
+MEMORY=0
+VS_RAILS=0
+FROZEN=0
+RUNTIME=cruby
+WARMUP=""              # timed-run warmup iters; default derived per runtime below
+WARMUP_EXPLICIT=0      # explicit --warmup also overrides the sequence path's 15
+LANES=()               # positional lane args -> orchestrator mode
+# OUT_TREE, RUBY_BIN, EMIT_TARGET, GEMS are resolved from RUNTIME after parse.
+# Snapshot before the parse loop shifts everything away — the
+# provenance step reads this (a bare `$*` there always recorded an
+# arg-less command; caught on the first published Hetzner run).
+ORIG_ARGS="$*"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --src)       SRC="$2"; shift 2 ;;
+        --runtime)   RUNTIME="$2"; shift 2 ;;
+        --jruby)     RUNTIME=jruby; shift ;;
+        --skip-emit) SKIP_EMIT=1; shift ;;
+        --memory)    MEMORY=1; shift ;;
+        --vs-rails)  VS_RAILS=1; MEMORY=1; shift ;;
+        --frozen)    FROZEN=1; MEMORY=1; shift ;;
+        --time)      TIME_ITERS="$2"; shift 2 ;;
+        --warmup)    WARMUP="$2"; WARMUP_EXPLICIT=1; shift 2 ;;
+        --out)       OUT_DIR="$2"; EXPLICIT_OUT=1; shift 2 ;;
+        -h|--help)   sed -n '2,/^$/p' "$0" | sed 's/^# \?//'; exit 0 ;;
+        -*)          echo "unknown flag: $1" >&2; exit 2 ;;
+        *)           LANES+=("$1"); shift ;;
+    esac
+done
+
+step() { printf '\033[36m→\033[0m %s\n' "$*"; }
+ok()   { printf '\033[32m✓\033[0m %s\n' "$*"; }
+fail() { printf '\033[31m✗\033[0m %s\n' "$*" >&2; }
+# warn was CALLED (pack_tree, the spinel lane) but never defined — under
+# `set -e` each call was a 127 that killed the whole run, which is how the
+# 2026-08-03 alignment run died mid-lane. Defined here, beside its siblings.
+warn() { printf '\033[33m!\033[0m %s\n' "$*" >&2; }
+
+# ── vendored SQLite for the AOT link ─────────────────────────────────
+# Every interpreted lane queries the sqlite3 GEM's bundled SQLite; the AOT
+# binary links `-lsqlite3`, which resolves to the SYSTEM library — on this
+# box ~18 months older. /top runs ~94% inside libsqlite3, so that gap is a
+# library delta wearing a runtime delta's clothes (spinel#3513). The fix:
+# build the amalgamation at the BUNDLE's version (the canonical one —
+# ruby-bench's Gemfile.lock is the methodology) into a cache dir holding
+# only libsqlite3.a, and hand the dir to the spinel wrapper, which puts it
+# on LIBRARY_PATH for the link — the emitted tree itself is not touched,
+# so the published tarball still builds anywhere with `-lsqlite3`.
+# Compile flags are the amalgamation defaults (+THREADSAFE), not the gem's
+# exact extconf set — version is the lever that moves plans and btree
+# code; the flag residue is noted, not hidden.
+# Compile flags: -fPIC because the objects land inside a PIE-linked
+# binary; the feature defines are the ones both the gem's build and the
+# distro builds enable, so the vendored library is not a stripped-down
+# cousin of the ones it replaces. The flags are part of the cache key
+# (.flags stamp): a flag change rebuilds, a stale cache never lingers.
+SQLITE_VENDOR_CFLAGS="-O2 -fPIC -DSQLITE_THREADSAFE=1 -DSQLITE_ENABLE_COLUMN_METADATA -DSQLITE_ENABLE_MATH_FUNCTIONS -DSQLITE_ENABLE_FTS5 -DSQLITE_ENABLE_RTREE"
+ensure_sqlite_vendor() {
+    local ver="$1" dir="$REPO_ROOT/build/sqlite-vendor/$1"
+    if [[ -f "$dir/libsqlite3.a" ]] && [[ "$(cat "$dir/.flags" 2>/dev/null)" == "$SQLITE_VENDOR_CFLAGS" ]]; then
+        echo "$dir"; return 0
+    fi
+    rm -rf "$dir"
+    local maj min pat num yr got=""
+    IFS=. read -r maj min pat <<<"$ver"
+    num=$(printf '%d%02d%02d00' "$maj" "$min" "${pat:-0}") || return 1
+    mkdir -p "$dir"
+    for yr in 2026 2025 2024 2023; do
+        curl -fsSL --max-time 120 -o "$dir/amalgamation.zip"             "https://sqlite.org/$yr/sqlite-amalgamation-$num.zip" 2>/dev/null && { got=1; break; }
+    done
+    [[ -n "$got" ]] || { rm -rf "$dir"; return 1; }
+    (cd "$dir" && unzip -oq amalgamation.zip         && mv "sqlite-amalgamation-$num/sqlite3.c" "sqlite-amalgamation-$num/sqlite3.h" .         && rm -rf "sqlite-amalgamation-$num" amalgamation.zip         && cc $SQLITE_VENDOR_CFLAGS -c sqlite3.c -o sqlite3.o         && ar rcs libsqlite3.a sqlite3.o         && printf '%s' "$SQLITE_VENDOR_CFLAGS" > .flags) >/dev/null 2>&1 || { rm -rf "$dir"; return 1; }
+    echo "$dir"
+}
+
+# The version every lane should be on: whatever the ruby-bench bundle pins.
+bundle_sqlite_version() {
+    (cd "$SRC" && BUNDLE_GEMFILE="$SRC/Gemfile" bundle exec ruby         -e 'require "sqlite3"; print SQLite3::SQLITE_VERSION' 2>/dev/null)
+}
+
+
+
+# Route-parity trend vs a previous run: pass-count delta, regressed/fixed
+# routes, changed failure signatures. PARITY REGRESSION lines print loudly
+# so a `>> bench.log` cron capture stays greppable.
+compare_parity() {  # PREV_NAME PREV_JSON CUR_JSON
+    ruby -rjson -e '
+      prev_name, prev_path, cur_path = ARGV
+      prev = JSON.parse(File.read(prev_path))
+      cur  = JSON.parse(File.read(cur_path))
+      by_route = ->(s) { (s["routes"] || []).to_h { |r| [r["route"], r] } }
+      p_routes, c_routes = by_route.(prev), by_route.(cur)
+      puts "vs #{prev_name}: #{prev["pass"]}/#{prev["total"]} -> #{cur["pass"]}/#{cur["total"]}"
+      c_routes.each do |route, c|
+        p = p_routes[route] or next
+        if p["ok"] && !c["ok"]
+          puts "  PARITY REGRESSION: #{route} #{p["status"]} -> #{c["status"]}"
+        elsif !p["ok"] && c["ok"]
+          puts "  fixed: #{route} #{p["status"]} -> 200"
+        elsif !c["ok"]
+          pe = p["error"].to_s.lines.first.to_s.strip
+          ce = c["error"].to_s.lines.first.to_s.strip
+          puts "  signature changed: #{route}\n    was: #{pe}\n    now: #{ce}" if pe != ce
+        end
+      end
+    ' "$1" "$2" "$3" || true
+}
+
+# rails-jruby fixture: a sibling copy of the lobsters checkout patched to
+# run stock Rails under JRuby (the blog bench's rails-jruby precedent,
+# proven by the 2026-07-17 probe). The recipe:
+#   - sqlite3 (C ext) -> activerecord-jdbcsqlite3-adapter 80.0.pre1,
+#     which pins Rails to 8.0.x — one minor behind the CRuby lanes;
+#     ledgered as a caveat on the report page
+#   - markly (C ext) -> the emit tree's commonmark-java shim, snapshotted
+#     into the fixture (SAME markdown backend as the roundhouse jruby
+#     lane, so the JVM comparison is backend-for-backend fair)
+#   - rdoc < 8 (rdoc 8 pulls rbs, a C ext) + top-level ostruct (ruumba's
+#     rubocop 0.81 requires it; gone from jruby 10's stdlib)
+#   - initializer working around the JRuby 10.1 Time.new(str, in:) call-
+#     site bug (TypeError on the 3rd call; hits every Rails timestamp cast)
+# Rebuilt when the source Gemfile changes; the benchmark DB re-syncs every
+# run. Needs the jruby emit tree for the shim + jars — list the jruby lane
+# before rails-jruby.
+prep_rails_jruby_fixture() {
+    FIXTURE="$REPO_ROOT/build/lobsters-rails-jruby-fixture"
+    EMIT_JRUBY="$REPO_ROOT/build/transpiled-lobsters-jruby"
+    if [[ ! -f "$EMIT_JRUBY/runtime/markly_jruby.rb" ]] || ! ls "$EMIT_JRUBY/vendor/jars/"commonmark-*.jar >/dev/null 2>&1; then
+        fail "rails-jruby fixture needs the jruby emit tree (markly shim + jars): put the jruby lane before rails-jruby"
+        return 1
+    fi
+    if [[ ! -f "$FIXTURE/.source-gemfile" ]] || ! cmp -s "$SRC/Gemfile" "$FIXTURE/.source-gemfile"; then
+        step "building rails-jruby fixture at $FIXTURE"
+        rm -rf "$FIXTURE"
+        cp -R "$SRC" "$FIXTURE"
+        cp "$SRC/Gemfile" "$FIXTURE/.source-gemfile"
+        rm -f "$FIXTURE/Gemfile.lock"
+        perl -0pi -e 's/^gem "sqlite3"$/gem "sqlite3", platform: :mri\ngem "activerecord-jdbcsqlite3-adapter", "80.0.pre1", platform: :jruby/m' "$FIXTURE/Gemfile"
+        perl -0pi -e 's/^gem "markly"$/gem "markly", platform: :mri/m' "$FIXTURE/Gemfile"
+        perl -0pi -e 's/^gem "cgi"/gem "rdoc", "< 8", platform: :jruby # rdoc 8 pulls rbs (C ext, no jruby build)\ngem "ostruct", platform: :jruby # ruumba -> rubocop 0.81 needs it; not in jruby 10 stdlib\ngem "cgi"/m' "$FIXTURE/Gemfile"
+        mkdir -p "$FIXTURE/vendor/jars"
+        cp "$EMIT_JRUBY/vendor/jars/"*.jar "$FIXTURE/vendor/jars/"
+        cp "$EMIT_JRUBY/runtime/markly_jruby.rb" "$FIXTURE/vendor/markly_jruby.rb"
+        cat > "$FIXTURE/config/initializers/00_markly_jruby.rb" <<'INIT'
+# rails-jruby fixture: markly is C-ext only; under JRuby load the
+# roundhouse commonmark-java shim snapshotted into vendor/ (the same
+# markdown backend the roundhouse jruby lane uses).
+if RUBY_ENGINE == "jruby"
+  ENV["MARKLY_JRUBY_JARS"] ||= File.expand_path("../../vendor/jars", __dir__)
+  require File.expand_path("../../vendor/markly_jruby", __dir__)
+end
+INIT
+        cat > "$FIXTURE/config/initializers/01_jruby_time_workaround.rb" <<'INIT'
+# JRuby 10.1.0.0 call-site bug: Time.new(str, in: "UTC") raises
+# TypeError (no implicit conversion of Hash into Integer) on the 3rd
+# call with identical args:
+#   3.times { Time.new("2023-05-08 10:21:21", in: "UTC") }
+# Rails 8's fast_string_to_time hits it on every timestamp cast. Regex
+# fast path (the pre-Rails-8 shape) until fixed upstream; misses return
+# nil -> Rails falls back to its slow parse. Upstream: jruby/jruby#9531 --
+# drop this initializer (and the fixture rebuild will follow) once fixed.
+if RUBY_ENGINE == "jruby"
+  module ActiveModel
+    module Type
+      module Helpers
+        module TimeValue
+          FAST_TS = /\A(\d{4})-(\d\d)-(\d\d)[ T](\d\d):(\d\d):(\d\d)(?:\.(\d+))?\z/
+          def fast_string_to_time(string)
+            m = FAST_TS.match(string) or return nil
+            usec = m[7] ? m[7].ljust(6, "0")[0, 6].to_i : 0
+            args = [m[1].to_i, m[2].to_i, m[3].to_i, m[4].to_i, m[5].to_i, m[6].to_i, usec]
+            is_utc? ? ::Time.utc(*args) : ::Time.local(*args)
+          end
+        end
+      end
+    end
+  end
+end
+INIT
+    else
+        cp "$SRC/db/production.sqlite3" "$FIXTURE/db/production.sqlite3"
+    fi
+    step "rails-jruby fixture: bundle install (jruby)"
+    (cd "$FIXTURE" && BUNDLE_WITHOUT=development:test jruby -S bundle install --quiet) || {
+        fail "rails-jruby fixture bundle install failed"; return 1; }
+}
+
+# ── lane mode (orchestrator) ─────────────────────────────────────────
+# One run dir, one subdir per lane, one aggregated matrix.json — the
+# layout scripts/lobsters-report renders as the consolidated page. Each
+# lane re-invokes this script (or lobsters-rails-replay for the Rails
+# lanes) with JIT pinned via RUBYOPT, methodology fixed to the in-memory
+# frozen sequence, and output routed to the lane subdir. A lane that
+# fails is dropped with a note; the run aggregates whatever succeeded.
+if (( ${#LANES[@]} > 0 )); then
+    if (( MEMORY == 1 || VS_RAILS == 1 || FROZEN == 1 )) || [[ "$RUNTIME" != cruby ]]; then
+        fail "lane mode fixes the methodology (in-memory frozen sequence per lane); drop --memory/--vs-rails/--frozen/--runtime/--jruby"
+        exit 2
+    fi
+    # The retired heap-sensitivity cells FOLD INTO `spinel`, they are not
+    # rejected. A caller that still asks for one — the nightly's cron line, an
+    # archived recipe — asked for the generational collector, and the plain
+    # spinel lane is now exactly that, so it gets the row it wanted under the
+    # name that survives. Failing the invocation instead would blank the
+    # published page over a lane name, and dropping it silently would leave a
+    # caller believing a cell ran. Deduped: asking for the same binary four
+    # ways is still one lane.
+    KEPT_LANES=()
+    for LANE in "${LANES[@]}"; do
+        case "$LANE" in
+            spinel-gc|spinel-ballast|spinel-gc-ballast)
+                warn "lane $LANE retired: spinel has marked generationally by default since matz/spinel@d3b1400d, so the plain 'spinel' lane IS that configuration — folding into it"
+                LANE=spinel ;;
+            rails|rails-int|ruby|ruby-int|jruby|rails-jruby|spinel|futamura) ;;
+            *)
+                fail "unknown lane: $LANE (want rails rails-int ruby ruby-int jruby rails-jruby spinel futamura)"; exit 2 ;;
+        esac
+        for K in ${KEPT_LANES[@]+"${KEPT_LANES[@]}"}; do [[ "$K" == "$LANE" ]] && continue 2; done
+        KEPT_LANES+=("$LANE")
+    done
+    LANES=("${KEPT_LANES[@]}")
+    [[ -d "$SRC" ]] || { fail "lobsters source not found at $SRC (clone ruby-bench or pass --src)"; exit 2; }
+    FROZEN_SEQ="$REPO_ROOT/bench/lobsters/frozen-sequence.json"
+    [[ -f "$FROZEN_SEQ" ]] || { fail "no committed frozen sequence at $FROZEN_SEQ"; exit 2; }
+    # Deferred routes leave the TIMED sequence in EVERY lane, including the
+    # Rails oracle. Skipping them in the emit lanes alone would stop the emit
+    # paying for work Rails still pays for, and the ratio would improve for a
+    # reason that is not speed. One variable, passed everywhere.
+    [[ -f "$GAPS_JSON" ]] || { fail "no declared-gaps ledger at $GAPS_JSON"; exit 2; }
+    (( TIME_ITERS > 0 )) || TIME_ITERS=10
+
+    RUN_TS="$(date +%Y%m%d-%H%M%S)"
+    RUN_DIR="${OUT_DIR:-$REPO_ROOT/bench/results/lobsters/$RUN_TS}"
+    mkdir -p "$RUN_DIR"
+
+    RAILS_OK=0
+    (cd "$SRC" && bundle check >/dev/null 2>&1) && RAILS_OK=1
+    JRUBY_OK=0
+    command -v jruby >/dev/null 2>&1 && JRUBY_OK=1
+
+    EMITTED_CRUBY=$SKIP_EMIT
+    EMITTED_JRUBY=$SKIP_EMIT
+    EMITTED_SPINEL=$SKIP_EMIT
+    FAILED_LANES=0
+
+    # Every lane named on the command line leaves a status file, whether or
+    # not it produced data. A lane that dies — bundle missing, emit broken,
+    # SEGV mid-replay — must appear on the page as a lane that DIED, not
+    # vanish from it: a silently absent row reads as "never configured",
+    # which is the one thing it isn't. The aggregator builds a row from this
+    # file when there is no timing JSON to build one from.
+    lane_status() {  # lane state stage detail
+        ruby -rjson -e 'File.write(ARGV[0], JSON.pretty_generate(
+          "state" => ARGV[1], "stage" => ARGV[2], "detail" => ARGV[3]))' \
+          "$RUN_DIR/$1/lane-status.json" "$2" "$3" "$4" 2>/dev/null || true
+    }
+    # Last non-empty line of a lane log — enough to say WHY on the page
+    # without making the reader open the log.
+    lane_tail() { [[ -f "$1" ]] && grep -v '^[[:space:]]*$' "$1" | tail -1 | cut -c1-300 || echo ""; }
+
+    for LANE in "${LANES[@]}"; do
+        LDIR="$RUN_DIR/$LANE"
+        mkdir -p "$LDIR"
+        lane_status "$LANE" running start ""
+        case "$LANE" in
+            rails|rails-int)
+                if (( RAILS_OK == 0 )); then
+                    fail "lane $LANE skipped: bundle not installable in $SRC"
+                    lane_status "$LANE" skipped bundle "bundle not installable in $SRC"; continue
+                fi
+                RO=--yjit; JIT_LABEL=YJIT
+                [[ "$LANE" == rails-int ]] && { RO=; JIT_LABEL="no JIT"; }
+                step "lane $LANE: real Rails on the frozen sequence ($JIT_LABEL; boots Rails, minutes)"
+                # Built as an array and echoed into the lane log. The lane
+                # reported "no --defer given" for three runs while this call
+                # site demonstrably passed it, and a backslash-continued
+                # command leaves no record of what was actually run — so the
+                # log now carries the argv, and the array removes the
+                # continuation from the equation entirely.
+                RAILS_ARGS=(--src "$SRC" --warmup 15 --min-iters "$TIME_ITERS" --min-time 10
+                            --seq-out "$LDIR/sequence.json" --json "$LDIR/rails.json"
+                            --dump "$LDIR/bodies" --defer "$GAPS_JSON")
+                printf '$ RUBYOPT=%s ruby scripts/lobsters-rails-replay %s\n\n' \
+                    "$RO" "${RAILS_ARGS[*]}" > "$LDIR/run.log"
+                if RUBYOPT="$RO" ruby "$REPO_ROOT/scripts/lobsters-rails-replay" \
+                        "${RAILS_ARGS[@]}" >>"$LDIR/run.log" 2>&1; then
+                    # The rails lane regenerates the sequence; a mismatch with
+                    # the committed one means the ruby-bench DB or generator
+                    # changed — rows are NOT comparable across that boundary.
+                    if ! diff -q "$FROZEN_SEQ" "$LDIR/sequence.json" >/dev/null; then
+                        fail "lane $LANE: regenerated sequence != committed frozen-sequence.json"
+                    fi
+                    ok "lane $LANE done"
+                    lane_status "$LANE" ok "" ""
+                else
+                    fail "lane $LANE failed (see $LDIR/run.log)"; FAILED_LANES=$((FAILED_LANES + 1))
+                    lane_status "$LANE" failed replay "$(lane_tail "$LDIR/run.log")"
+                fi
+                ;;
+            futamura)
+                # `--target futamura`: the app as Rails runs it, with the
+                # specializations spliced in (docs/pipeline/specialization.md).
+                # Its output IS a Rails app, so it is timed the way the rails
+                # lane is — same replay, same arguments, YJIT — and its bodies
+                # go through the same content-parity check the emit lanes do.
+                if (( RAILS_OK == 0 )); then
+                    fail "lane $LANE skipped: bundle not installable in $SRC"
+                    lane_status "$LANE" skipped bundle "bundle not installable in $SRC"; continue
+                fi
+                FT_TREE="$REPO_ROOT/build/futamura-lobsters"
+                step "lane futamura: emit (--target futamura), then real Rails on the frozen sequence (YJIT)"
+                rm -rf "$FT_TREE"
+                if ! (cd "$REPO_ROOT" && cargo run --quiet --bin roundhouse -- \
+                        --target futamura "$SRC" -o "$FT_TREE" >"$LDIR/emit.log" 2>&1); then
+                    fail "lane $LANE: emit failed (see $LDIR/emit.log)"; FAILED_LANES=$((FAILED_LANES + 1))
+                    lane_status "$LANE" failed emit "$(lane_tail "$LDIR/emit.log")"; continue
+                fi
+                # The benchmark's seed is a binary file the identity tree does
+                # not carry (it is run-time state to the target); the replay
+                # loads it into memory, as for the rails lane.
+                cp "$SRC/db/production.sqlite3" "$FT_TREE/db/production.sqlite3"
+                FT_ARGS=(--src "$FT_TREE" --warmup 15 --min-iters "$TIME_ITERS" --min-time 10
+                         --seq-out "$LDIR/sequence.json" --json "$LDIR/rails.json"
+                         --dump "$LDIR/bodies" --defer "$GAPS_JSON")
+                # Whole-route replacement (vendor/futamura/bridge.rb) needs
+                # Ruby 4.1's Ruby::Box, started with RUBY_BOX=1. FUTAMURA_RUBY
+                # names that Ruby's bin directory; without it the tree runs
+                # with whole-route off, on the PATH Ruby, and the log says so.
+                # The summary records the Ruby it ran on either way.
+                FT_ENV=(RUBYOPT=--yjit)
+                FT_PATH="$PATH"
+                if [[ -n "${FUTAMURA_RUBY:-}" ]]; then
+                    FT_ENV+=(RUBY_BOX=1 FUTAMURA_STATS=1)
+                    FT_PATH="$FUTAMURA_RUBY:$PATH"
+                else
+                    FT_ENV+=(FUTAMURA_WHOLE_ROUTE=off)
+                    echo "futamura lane: FUTAMURA_RUBY unset, so whole-route replacement is OFF (needs Ruby 4.1 + RUBY_BOX=1)" >> "$LDIR/emit.log"
+                fi
+                printf '$ %s ruby scripts/lobsters-rails-replay %s\n\n' "${FT_ENV[*]}" "${FT_ARGS[*]}" > "$LDIR/run.log"
+                if env PATH="$FT_PATH" "${FT_ENV[@]}" ruby "$REPO_ROOT/scripts/lobsters-rails-replay" \
+                        "${FT_ARGS[@]}" >>"$LDIR/run.log" 2>&1; then
+                    ok "lane $LANE done"
+                    lane_status "$LANE" ok "" ""
+                else
+                    fail "lane $LANE failed (see $LDIR/run.log)"; FAILED_LANES=$((FAILED_LANES + 1))
+                    lane_status "$LANE" failed replay "$(lane_tail "$LDIR/run.log")"
+                fi
+                ;;
+            ruby|ruby-int)
+                RO=--yjit; JIT_LABEL=YJIT
+                [[ "$LANE" == ruby-int ]] && { RO=; JIT_LABEL="no JIT"; }
+                CMD=("$0" --frozen --time "$TIME_ITERS" --src "$SRC" --out "$LDIR")
+                (( EMITTED_CRUBY == 1 )) && CMD+=(--skip-emit)
+                step "lane $LANE: emit replay on the frozen sequence ($JIT_LABEL)"
+                if RUBYOPT="$RO" "${CMD[@]}" >"$LDIR/run.log" 2>&1; then
+                    EMITTED_CRUBY=1; ok "lane $LANE done"
+                    lane_status "$LANE" ok "" ""
+                else
+                    fail "lane $LANE failed (see $LDIR/run.log)"; FAILED_LANES=$((FAILED_LANES + 1))
+                    lane_status "$LANE" failed replay "$(lane_tail "$LDIR/run.log")"
+                fi
+                ;;
+            rails-jruby)
+                if (( JRUBY_OK == 0 )); then
+                    fail "lane rails-jruby skipped: no jruby on PATH"
+                    lane_status "$LANE" skipped toolchain "no jruby on PATH"; continue
+                fi
+                if ! prep_rails_jruby_fixture; then
+                    FAILED_LANES=$((FAILED_LANES + 1))
+                    lane_status "$LANE" failed fixture "rails-jruby fixture prep failed"; continue
+                fi
+                step "lane rails-jruby: real Rails under JRuby on the frozen sequence (long warmup; many minutes)"
+                if RUBYOPT= BUNDLE_WITHOUT=development:test \
+                        JAVA_OPTS="${BENCH_JRUBY_HEAP:--Xmx2g -Xms2g} --enable-native-access=ALL-UNNAMED ${JAVA_OPTS:-}" \
+                        jruby "$REPO_ROOT/scripts/lobsters-rails-replay" \
+                        --src "$FIXTURE" --warmup "${WARMUP:-100}" --min-iters "$TIME_ITERS" --min-time 10 \
+                        --seq-out "$LDIR/sequence.json" --json "$LDIR/rails.json" \
+                        --defer "$GAPS_JSON" \
+                        >"$LDIR/run.log" 2>&1; then
+                    if ! diff -q "$FROZEN_SEQ" "$LDIR/sequence.json" >/dev/null; then
+                        fail "lane rails-jruby: regenerated sequence != committed frozen-sequence.json"
+                    fi
+                    ok "lane rails-jruby done"
+                    lane_status "$LANE" ok "" ""
+                else
+                    fail "lane rails-jruby failed (see $LDIR/run.log)"; FAILED_LANES=$((FAILED_LANES + 1))
+                    lane_status "$LANE" failed replay "$(lane_tail "$LDIR/run.log")"
+                fi
+                ;;
+            spinel)
+                # AOT: emit, compile to a native binary, then replay
+                # IN-PROCESS through the compiled driver. One lane, not a
+                # JIT pair — there is no JIT to turn off, and since
+                # matz/spinel@d3b1400d no GC configuration to cross it with
+                # either: the lane runs the default collector, which marks
+                # generationally, and the replay attests that from the
+                # binary's own collection counters.
+                #
+                # `spin` is the one the build actually shells out to
+                # (the tree's Makefile runs `$(SPIN) build`), and it lives
+                # in the spinel checkout's bin/ — a PATH carrying only the
+                # checkout root resolves `spinel` (root symlink) but NOT
+                # `spin`, which would fail at build instead of skipping.
+                SP_MISSING=()
+                command -v spinel >/dev/null 2>&1 || SP_MISSING+=(spinel)
+                command -v spin   >/dev/null 2>&1 || SP_MISSING+=(spin)
+                if (( ${#SP_MISSING[@]} > 0 )); then
+                    fail "lane spinel skipped: not on PATH: ${SP_MISSING[*]} (add <spinel-checkout>/bin to PATH)"
+                    lane_status "$LANE" skipped toolchain \
+                        "not on PATH: ${SP_MISSING[*]} — add <spinel-checkout>/bin to PATH"; continue
+                fi
+                SP_TREE="$REPO_ROOT/build/transpiled-lobsters-spinel"
+                step "lane $LANE: emit + AOT compile + in-process replay"
+                # --skip-emit reuses the existing tree, as it does for the
+                # other lanes; the AOT compile behind it is ~30s, which is
+                # the whole cost of a dev-loop iteration here.
+                if (( SKIP_EMIT == 1 || EMITTED_SPINEL == 1 )) && [[ -f "$SP_TREE/main.rb" ]]; then
+                    : > "$LDIR/emit.log"
+                elif ! (cd "$REPO_ROOT" && cargo run --quiet --bin roundhouse -- \
+                        --target spinel "$SRC" -o "$SP_TREE" --allow-unsupported \
+                        >"$LDIR/emit.log" 2>&1); then
+                    fail "lane $LANE: emit failed (see $LDIR/emit.log)"
+                    FAILED_LANES=$((FAILED_LANES + 1))
+                    lane_status "$LANE" failed emit "$(lane_tail "$LDIR/emit.log")"; continue
+                fi
+                EMITTED_SPINEL=1
+                mkdir -p "$SP_TREE/storage"
+                # The staged file is now the SEED, not what gets served: the
+                # binary page-copies it into the same
+                # `file:lobsters_bench?mode=memory&cache=shared` database the
+                # interpreted lanes serve (Db.seed_from_file, invoked by the
+                # bench driver). Serving the file directly is what made this
+                # lane pay ~400 pread64 syscalls per query-heavy request that
+                # no other lane paid.
+                cp "$REPO_ROOT/build/transpiled-lobsters-ruby/storage/bench.sqlite3" \
+                   "$SP_TREE/storage/bench.sqlite3" 2>/dev/null || true
+                # --warmup 15 even though AOT has no JIT: ruby-bench's
+                # harness warms every engine identically (WARMUP_ITRS=15),
+                # and a lane that warms differently is running a different
+                # methodology, not a cheaper one.
+                SP_ARGS=(--tree "$SP_TREE" --sequence "$FROZEN_SEQ" --defer "$GAPS_JSON"
+                         --json "$LDIR/summary.json" --md "$LDIR/summary.md"
+                         --dump "$LDIR/bodies" --warmup 15
+                         --time "$TIME_ITERS" --min-time 10)
+                # Align the AOT link to the bundle's SQLite (see
+                # ensure_sqlite_vendor above). Degrades loudly: without the
+                # bundle or the download, the lane links system libsqlite3
+                # and the page's per-lane sqlite attestation says so.
+                SQ_VER="$(bundle_sqlite_version || true)"
+                if [[ -n "$SQ_VER" ]] && SQ_DIR="$(ensure_sqlite_vendor "$SQ_VER")"; then
+                    SP_ARGS+=(--sqlite-lib "$SQ_DIR")
+                    step "lane $LANE: linking vendored SQLite $SQ_VER (the bundle's version)"
+                else
+                    warn "lane $LANE: no vendored SQLite (bundle or download unavailable) — linking system libsqlite3"
+                fi
+                # bcrypt is a spin package the published index may not
+                # carry; a local checkout stands in. Look where people
+                # actually put it rather than assuming one layout.
+                for CAND in "${SPINEL_BCRYPT:-}" "$HOME/git/spinel-bcrypt" \
+                            "$HOME/spinel-bcrypt" "$(dirname "$(command -v spin)")/../../spinel-bcrypt"; do
+                    if [[ -n "$CAND" && -d "$CAND" ]]; then SP_ARGS+=(--bcrypt "$CAND"); break; fi
+                done
+                # `|| SP_RC=$?`, never a bare call: under `set -e` a failing
+                # replay would take this whole script down BEFORE the lane
+                # status is written and before aggregation runs — the page
+                # would then show yesterday's numbers, which is precisely
+                # the failure the dead-lane row exists to prevent.
+                SP_RC=0
+                ruby "$REPO_ROOT/scripts/lobsters-spinel-replay" "${SP_ARGS[@]}" \
+                    >"$LDIR/run.log" 2>&1 || SP_RC=$?
+                if (( SP_RC >= 100 )); then
+                    fail "lane $LANE failed (see $LDIR/run.log)"
+                    FAILED_LANES=$((FAILED_LANES + 1))
+                    lane_status "$LANE" failed replay "$(lane_tail "$LDIR/run.log")"
+                else
+                    # A non-zero rc under 100 is failing ROUTES, not a dead
+                    # lane: the run produced data and the page reports it.
+                    ok "lane $LANE done"
+                    lane_status "$LANE" ok "" ""
+                fi
+                ;;
+            jruby)
+                if (( JRUBY_OK == 0 )); then
+                    fail "lane jruby skipped: no jruby on PATH"
+                    lane_status "$LANE" skipped toolchain "no jruby on PATH"; continue
+                fi
+                # JRuby's JIT warms slowly; an unset --warmup gets a bigger
+                # default than the CRuby lanes' canonical sequence warmup.
+                CMD=("$0" --jruby --frozen --time "$TIME_ITERS" --warmup "${WARMUP:-100}" --src "$SRC" --out "$LDIR")
+                (( EMITTED_JRUBY == 1 )) && CMD+=(--skip-emit)
+                step "lane jruby: emit replay on the frozen sequence (JRuby/JVM, long warmup)"
+                if RUBYOPT= "${CMD[@]}" >"$LDIR/run.log" 2>&1; then
+                    EMITTED_JRUBY=1; ok "lane jruby done"
+                    lane_status "$LANE" ok "" ""
+                else
+                    fail "lane jruby failed (see $LDIR/run.log)"; FAILED_LANES=$((FAILED_LANES + 1))
+                    lane_status "$LANE" failed replay "$(lane_tail "$LDIR/run.log")"
+                fi
+                ;;
+        esac
+    done
+
+    # ── content parity ───────────────────────────────────────────────
+    # Status codes attest that a route answered; they cannot attest that it
+    # answered CORRECTLY. Every lane dumped its parity-route bodies, and the
+    # Rails lane's dump is the oracle, so compare them as parsed documents.
+    # Rails on CRuby is preferred as the reference (the published baseline);
+    # any Rails lane will do, since all three render the same app.
+    REF_BODIES=""
+    for REF_LANE in rails rails-int rails-jruby; do
+        if [[ -d "$RUN_DIR/$REF_LANE/bodies" ]]; then
+            REF_BODIES="$RUN_DIR/$REF_LANE/bodies"; break
+        fi
+    done
+    if [[ -n "$REF_BODIES" ]]; then
+        # Derived from the lanes that actually RAN, not a hand-kept list
+        # beside the lane vocabulary: a second list is a list that drifts, and
+        # when it did, three new lanes published ms/iter and a vs-Rails ratio
+        # with content parity never computed at all — the fastest row on the
+        # page attesting nothing about what it rendered. Rails lanes are the
+        # oracle and are not compared against themselves.
+        for LANE in "${LANES[@]}"; do
+            case "$LANE" in rails|rails-int|rails-jruby) continue ;; esac
+            [[ -d "$RUN_DIR/$LANE/bodies" ]] || continue
+            # A lane that DIED leaves whatever bodies it managed to dump
+            # before dying. Comparing those reports a content score for a
+            # run that never finished -- "4/26 equivalent" for a lane that
+            # crashed after 8 routes reads as a verdict on the emit when it
+            # is really a verdict on the crash. The dead-lane row already
+            # tells that story; scoring the wreckage only muddies it.
+            LSTATE="$(ruby -rjson -e 'print((JSON.parse(File.read(ARGV[0]))["state"] rescue "ok"))' \
+                      "$RUN_DIR/$LANE/lane-status.json" 2>/dev/null || echo ok)"
+            if [[ "$LSTATE" != "ok" ]]; then
+                step "content parity: $LANE SKIPPED (lane $LSTATE — its dump is partial)"
+                continue
+            fi
+            step "content parity: $LANE vs $REF_LANE"
+            # Non-zero exit = routes that differ, which is a finding to
+            # report, not an orchestration failure.
+            ruby "$REPO_ROOT/scripts/lobsters-content-diff" \
+                "$REF_BODIES" "$RUN_DIR/$LANE/bodies" \
+                --json "$RUN_DIR/$LANE/content-parity.json" \
+                --md   "$RUN_DIR/$LANE/content-parity.md" || true
+        done
+    else
+        fail "content parity skipped: no Rails lane in this run to compare against"
+    fi
+
+    # Top-level provenance: the ORIGINAL invocation (lane env.json files
+    # carry each lane's interpreter; this carries the orchestration).
+    #
+    # WHY MORE THAN THE ROUNDHOUSE COMMIT. A ms/iter number is only worth
+    # keeping if everything that produced it can be named. Recording only the
+    # emitter's commit left three things unattributable:
+    #
+    #   the AOT compiler  spinel compiles this lane and cc compiles its
+    #                     output; neither appeared anywhere in a run's
+    #                     artifacts, so an AOT row could not be tied to the
+    #                     compiler that built it, and a spinel fix landing
+    #                     between two runs read as an unexplained movement
+    #   the fixture       the lobsters checkout defines the workload and the
+    #                     seeded DB, so it dates a comparison as surely as
+    #                     the emitter does
+    #   the host          ms/iter is host-bound; two runs' numbers cannot be
+    #                     compared across machines without the CPU
+    #
+    # A commit is also only the truth when the tree is clean, so the dirty
+    # flags are recorded rather than assumed.
+    ruby - "$ORIG_ARGS" "$SRC" "$REPO_ROOT" <<'ENVJSON' > "$RUN_DIR/env.json" || true
+require "json"
+require "socket"
+require "shellwords"
+orig_args, src, repo = ARGV
+
+# nil, never "", for anything absent: kv_table in scripts/lobsters-report
+# drops nil rows, so a tool that is not installed leaves no row at all rather
+# than a blank one that reads as "measured, and empty".
+def sh(cmd)
+  out = `#{cmd} 2>/dev/null`
+  $?.success? && !out.strip.empty? ? out.strip : nil
+end
+
+def git_commit(dir)
+  sh("git -C #{dir.to_s.shellescape} rev-parse HEAD")
+end
+
+# nil when the directory is not a git checkout — distinct from false, which
+# is a checkout that is genuinely clean.
+def git_dirty(dir)
+  st = `git -C #{dir.to_s.shellescape} status --porcelain 2>/dev/null`
+  $?.success? ? !st.strip.empty? : nil
+end
+
+puts JSON.pretty_generate({
+  generated_at: Time.now.utc.strftime("%FT%TZ"),
+  command: "scripts/bench-lobsters #{orig_args}".strip,
+  src: src,
+  host: Socket.gethostname,
+  roundhouse_commit: git_commit(repo),
+  roundhouse_dirty: git_dirty(repo),
+  lobsters_commit: git_commit(src),
+  lobsters_dirty: git_dirty(src),
+  # AOT toolchain. Absent unless spinel is on PATH, which is exactly when
+  # the spinel lane could have run.
+  spinel: sh("spinel --version")&.lines&.first&.strip,
+  cc: sh("cc --version")&.lines&.first&.strip,
+  cpu: sh(%(grep -m1 "^model name" /proc/cpuinfo))&.split(":", 2)&.last&.strip,
+  cpu_cores: sh("nproc")&.to_i,
+  kernel: sh("uname -sr"),
+}.compact)
+ENVJSON
+
+    # Aggregate lane artifacts into matrix.json (one row per lane) and
+    # print the console table. Row fields feed scripts/lobsters-report.
+    step "aggregating matrix.json"
+    ruby - "$RUN_DIR" "$TIME_ITERS" "${LANES[*]}" "$REPO_ROOT/bench/lobsters/declared-gaps.json" <<'AGG' || FAILED_LANES=$((FAILED_LANES + 1))
+require "json"
+require "socket"
+run_dir, time_iters, requested, gaps_file = ARGV
+REQUESTED = requested.to_s.split(/\s+/).reject(&:empty?)
+
+# Routes we KNOW the emit does not render, declared in a file rather than
+# inferred from the failure. This classifies; it never subtracts. The
+# denominator, the badge and the red banner are all computed from the same
+# numbers as before -- an entry only lets the page say "declared gap" where
+# it would otherwise say nothing and leave a reader to assume a defect.
+#
+# The path is PASSED IN, not derived. This block is fed to `ruby -` on
+# stdin, where __dir__ is the working directory rather than scripts/, so
+# deriving it here resolved to a file that does not exist and the ledger
+# loaded silently empty -- every declared gap then read as an undiagnosed
+# difference. A ledger that quietly declares nothing is the exact failure
+# this file exists to prevent, so a missing one is fatal: to run without a
+# ledger, commit one whose `declared_gaps` is [].
+GAPS_FILE = gaps_file.to_s
+abort "declared-gaps ledger not found at #{GAPS_FILE.inspect}" unless File.exist?(GAPS_FILE)
+DECLARED_GAPS =
+  (JSON.parse(File.read(GAPS_FILE))["declared_gaps"] || []).each do |g|
+    %w[route reason owner since closes_with].each do |k|
+      abort "declared-gaps.json: entry #{g["route"].inspect} has no #{k}" if g[k].to_s.empty?
+    end
+  end
+GAP_ROUTES = DECLARED_GAPS.map { |g| g["route"] }
+META = {
+  "rails"       => { label: "Rails",      kind: "rails", runtime: "cruby", yjit: true,  jit: "YJIT",   src: "rails.json"   },
+  "rails-int"   => { label: "Rails",      kind: "rails", runtime: "cruby", yjit: false, jit: "no JIT", src: "rails.json"   },
+  "rails-jruby" => { label: "Rails",      kind: "rails", runtime: "jruby", yjit: nil,   jit: "JRuby",  src: "rails.json"   },
+  "ruby"        => { label: "Roundhouse", kind: "emit",  runtime: "cruby", yjit: true,  jit: "YJIT",   src: "summary.json" },
+  "ruby-int"    => { label: "Roundhouse", kind: "emit",  runtime: "cruby", yjit: false, jit: "no JIT", src: "summary.json" },
+  "jruby"       => { label: "Roundhouse", kind: "emit",  runtime: "jruby", yjit: nil,   jit: "JRuby",  src: "summary.json" },
+  "spinel"      => { label: "Roundhouse", kind: "emit",  runtime: "spinel", yjit: nil,  jit: "AOT",    src: "summary.json" },
+  # Rails running the futamura emit: timed by the rails replay, so its data
+  # is rails.json, but it is compared against Rails like the emit lanes.
+  "futamura"    => { label: "Futamura",   kind: "futamura", runtime: "cruby", yjit: true, jit: "YJIT", src: "rails.json" },
+}
+# A lane that produced no timing data still gets a row. Dropping it would
+# render the page as though the lane had never been asked for, which is the
+# one reading that is definitely wrong — a crashed lane must be LOUDER than
+# a slow one, not invisible.
+# Drift = how much the lane slowed (or sped up) BETWEEN the first and last
+# quarter of its own timed iterations. A lane that drifts is not noisy: its
+# median is a function of how long the run happened to be, so the headline
+# ratio moves with --time for no better reason. Rails sits at +/-0.5% here;
+# a lane in double digits is doing something the others are not.
+def drift_pct(iter_ms)
+  return nil unless iter_ms.is_a?(Array) && iter_ms.size >= 8
+  q = iter_ms.size / 4
+  med = lambda do |xs|
+    a = xs.sort
+    m = a.size / 2
+    a.size.odd? ? a[m] : (a[m - 1] + a[m]) / 2.0
+  end
+  first = med.call(iter_ms[0, q])
+  last  = med.call(iter_ms[-q, q])
+  return nil if first.nil? || first.zero?
+  (((last - first) / first) * 100).round(1)
+end
+
+def lane_status(run_dir, id)
+  JSON.parse(File.read(File.join(run_dir, id, "lane-status.json")))
+rescue StandardError
+  nil
+end
+
+# ── parity-restricted timing ─────────────────────────────────────────
+# A lane's ms/iter counts every visit in the frozen sequence, including
+# routes it renders WRONG. A route that renders a fraction of the page is
+# fast for a reason that is not speed, so a lane below full content parity
+# has a headline ratio that is not measuring the same work as its baseline.
+# The restricted ratio re-runs the arithmetic over only the routes that lane
+# renders equivalently to Rails, on both sides of the division.
+#
+# The join is the reason `body`/`template` exist on each summary route:
+# content parity is keyed by the dumped body's FILE name and per_route by
+# the route TEMPLATE, and neither derives from the other.
+PARITY_DETAIL = {}
+
+# Templates whose content DIFFERS from the oracle, by the same body->template
+# mapping ok_templates uses.
+def differing_templates(data, cp)
+  return [] unless cp && data["routes"]
+  by_body = {}
+  data["routes"].each { |r| by_body[r["body"]] = r["template"] if r["body"] && r["template"] }
+  cp["routes"].reject { |r| %w[identical equivalent].include?(r["verdict"]) }
+              .filter_map { |r| by_body[r["route"]] }.uniq
+end
+
+def gap_templates(data, cp) = differing_templates(data, cp)
+
+def all_templates(data)
+  (data && data["routes"] || []).filter_map { |r| r["template"] }.uniq
+end
+
+def ok_templates(data, cp)
+  return nil unless cp && data["routes"]
+  by_body = {}
+  data["routes"].each { |r| by_body[r["body"]] = r["template"] if r["body"] && r["template"] }
+  cp["routes"].select { |r| %w[identical equivalent].include?(r["verdict"]) }
+              .filter_map { |r| by_body[r["route"]] }.uniq
+end
+
+# Weighted per-iteration cost over `keep`, using each route's own visit
+# count so the frozen sequence's weighting survives the restriction.
+def restricted_ms(detail, keep)
+  return nil unless detail && detail[:pr] && detail[:iters] > 0
+  keep.sum do |k|
+    e = detail[:pr][k]
+    e ? e["ms_median"].to_f * e["n"].to_f / detail[:iters] : 0.0
+  end
+end
+
+rows = META.filter_map do |id, m|
+  path = File.join(run_dir, id, m[:src])
+  st = lane_status(run_dir, id)
+  data = File.exist?(path) ? (JSON.parse(File.read(path)) rescue nil) : nil
+  t = data && (m[:src] == "rails.json" ? data : data["sequence_timing"])
+  unless t && t["ms_per_iter_median"]
+    # No usable timing. Emit a dead row if the lane was asked for; stay
+    # silent only for lanes nobody requested.
+    next unless REQUESTED.include?(id) || st
+    dead = st || { "state" => "failed", "stage" => "unknown",
+                   "detail" => "no timing data and no lane-status.json" }
+    dead = dead.merge("state" => "failed", "stage" => "timing",
+                      "detail" => "lane produced no timing data") if dead["state"] == "ok"
+    next { "id" => id, "label" => m[:label], "kind" => m[:kind], "runtime" => m[:runtime],
+           "yjit" => m[:yjit], "jit" => m[:jit],
+           "state" => dead["state"], "stage" => dead["stage"], "detail" => dead["detail"] }
+  end
+  env = (JSON.parse(File.read(File.join(run_dir, id, "env.json"))) rescue {})
+  # Content parity vs the Rails lane's rendered bodies (emit lanes only —
+  # the Rails lanes ARE the reference). nil where the run had no Rails lane
+  # to compare against, which is different from "compared and matched".
+  cp = (JSON.parse(File.read(File.join(run_dir, id, "content-parity.json"))) rescue nil)
+  # Kept OUT of matrix.json (per_route is already published under the lane's
+  # own summary) but needed below to restrict the vs-Rails ratio to the
+  # routes a lane actually renders correctly.
+  PARITY_DETAIL[id] = { pr: t["per_route"], iters: t["iterations"].to_i,
+                        ok: ok_templates(data, cp), templates: all_templates(data) }
+  { "id" => id, "label" => m[:label], "kind" => m[:kind], "runtime" => m[:runtime],
+    "yjit" => m[:yjit], "jit" => m[:jit],
+    "state" => (st && st["state"]) || "ok",
+    # Visits the frozen sequence itself saw fail. The sequence verifies all
+    # 114; a lane that answers nothing answers it very fast, so this is the
+    # direct guard against a number that is quick because it did no work.
+    "failed_visits" => t["failed_visits"],
+    "drift_pct" => drift_pct(t["iter_ms"]),
+    # NOT "yjit" — that key already holds the lane's JIT boolean, which the
+    # vs-Rails pairing keys off. Colliding with it silently drops one lane's
+    # ratio and pairs another against the wrong baseline.
+    "yjit_stats" => (data["yjit"] if m[:src] != "rails.json"),
+    # ms_mean is the headline (ruby-bench reports the mean of non-warmup
+    # iters); ms_median stays as the robustness cross-check and as the
+    # fallback when re-aggregating a run that predates the mean.
+    "ms_mean" => t["ms_per_iter_mean"], "ms_median" => t["ms_per_iter_median"],
+    "ms_min" => t["ms_per_iter_min"],
+    "ms_max" => t["ms_per_iter_max"], "iters" => t["iterations"], "warmup" => t["warmup"],
+    "ruby" => data["ruby"] || env["ruby"], "rails" => data["rails"],
+    # The SQLite build the lane itself queried at runtime (`select
+    # sqlite_version()` through its own linked library). The interpreted
+    # lanes run the gem's bundled build; the AOT binary links the system
+    # one — the report attests a match or names the mismatch.
+    "sqlite" => data["sqlite"],
+    # Which collector the lane self-reported (spinel's GCCONFIG line; absent
+    # on interpreted lanes and on trees predating it). Always "minor" on a
+    # published spinel row — the replay refuses to write a summary saying
+    # otherwise — and the report attests it rather than assuming it.
+    "gc" => data["gc"],
+    "gc_stat" => data.dig("sequence_timing", "gc_stat"),
+    "visits" => t["visits_per_iter"], "partial" => t["partial"],
+    # Footprint of each lane's replay process, sampled by the replay
+    # itself (see the "rss" block in scripts/lobsters-replay). boot_kb is
+    # taken after the in-memory seed, so the shared fixture sits inside
+    # every lane's baseline; peak_kb is Linux-only (VmHWM).
+    "rss_boot_kb"  => data.dig("rss", "boot_kb"),
+    "rss_final_kb" => data.dig("rss", "final_kb"),
+    "rss_peak_kb"  => data.dig("rss", "peak_kb"),
+    "content_total"      => cp && cp["total"],
+    "content_equivalent" => cp && (cp["identical"] + cp["equivalent"]),
+    "content_differs"    => cp && cp["differs"],
+    "content_routes"     => cp && cp["routes"].reject { |r| %w[identical equivalent].include?(r["verdict"]) }
+                                              .map { |r| r.slice("route", "verdict", "diff_tokens", "hunks") },
+    "content_rules"      => cp && cp["rule_ledger"],
+    # Which of this lane's differing routes were declared, and which were
+    # not. `content_undeclared` is the number the red banner keys off: a
+    # declared gap is a known missing capability, an undeclared one is a
+    # defect nobody has looked at.
+    "content_gaps"       => cp && (gap_templates(data, cp) & GAP_ROUTES),
+    "content_undeclared" => cp && (differing_templates(data, cp) - GAP_ROUTES),
+    # Denominator with the deferred routes removed. A deferred route that
+    # starts rendering correctly is NOT in content_gaps, so it re-enters both
+    # numerator and denominator on its own -- the ledger entry going stale
+    # shows up as a score that stops moving, not as a silently inflated one.
+    "content_scope"      => cp && (cp["total"].to_i - (gap_templates(data, cp) & GAP_ROUTES).size),
+    "content_deferred"   => cp && (gap_templates(data, cp) & GAP_ROUTES).size }
+end
+abort "no lane produced any result" if rows.empty?
+
+# A declared route that matches nothing in this run is a hard error. A typo
+# that silently declares nothing is worse than no file at all, because the
+# page then reads as if the gap were accounted for.
+if (known = rows.filter_map { |r| r["content_gaps"] }.any?)
+  all_templates = rows.filter_map { |r| PARITY_DETAIL[r["id"]]&.fetch(:templates, nil) }.flatten.uniq
+  unless all_templates.empty?
+    unknown = GAP_ROUTES - all_templates
+    abort "declared-gaps.json names #{unknown.join(", ")}, which no route in this run matches" unless unknown.empty?
+  end
+end
+_ = known
+live = rows.select { |r| r["ms_median"] }
+# Headline stat: the mean when the lane recorded one (the statistic
+# ruby-bench itself reports), the median for runs that predate it.
+hl = ->(r) { r["ms_mean"] || r["ms_median"] }
+# Ratio = same-configuration Rails baseline / this row. CRuby emit rows
+# pair with Rails at the same JIT level; JVM rows pair with Rails on
+# JRuby when that lane ran (same runtime), else fall back to Rails+YJIT
+# (Rails' best CRuby configuration).
+rails_cruby = live.select { |r| r["kind"] == "rails" && r["runtime"] == "cruby" }.to_h { |r| [r["yjit"], r] }
+rails_jvm   = live.find { |r| r["kind"] == "rails" && r["runtime"] == "jruby" }
+live.each do |r|
+  base = case r["runtime"]
+         when "jruby"  then rails_jvm || rails_cruby[true]
+         # AOT has no JIT-off twin to pair with; compare against Rails'
+         # best CRuby configuration and let the page say that is what it is.
+         when "spinel" then rails_cruby[true]
+         else rails_cruby[r["yjit"]]
+         end
+  r["vs_rails"] = base ? (hl.(base) / hl.(r)).round(2) : nil
+  # Restricted ratio, only when this lane is BELOW full parity — at full
+  # parity it would equal the headline and the extra column would be noise.
+  # Both sides are restricted to the SAME route set (this lane's passing
+  # routes, intersected with what the baseline timed), or the division
+  # compares different work again.
+  mine = PARITY_DETAIL[r["id"]]
+  ok   = mine && mine[:ok]
+  scope = r["content_scope"] || r["content_total"]
+  if base && ok && scope && ok.size < scope.to_i
+    theirs = PARITY_DETAIL[base["id"]]
+    keep = ok.select { |k| mine[:pr]&.key?(k) && theirs&.dig(:pr)&.key?(k) }
+    a = restricted_ms(mine, keep)
+    b = restricted_ms(theirs, keep)
+    if a && b && a > 0
+      r["parity_routes"]     = keep.size
+      r["parity_ms_median"]  = a.round(2)
+      r["parity_base_ms"]    = b.round(2)
+      r["vs_rails_parity"]   = (b / a).round(2)
+    end
+  end
+end
+matrix = {
+  "generated_at" => Time.now.utc.strftime("%FT%TZ"),
+  "host"         => Socket.gethostname,
+  "workload"     => "frozen #{rows.filter_map { |r| r["visits"] }.first || 114}-visit sequence, in-memory, in-process, single-threaded",
+  "time"         => Integer(time_iters),
+  "rows"         => rows,
+}
+File.write(File.join(run_dir, "matrix.json"), JSON.pretty_generate(matrix))
+dead = rows.reject { |r| r["ms_median"] }
+puts "\n== lobsters lanes (#{live.size}, avg ms/iter, lower=better) =="
+live.sort_by { |r| hl.(r) }.each do |r|
+  rss = r["rss_peak_kb"] || r["rss_final_kb"]
+  dr = r["drift_pct"]
+  printf "  %-11s %-7s %9.2f ms/iter  %9s  %-16s %s\n", r["label"], r["jit"], hl.(r),
+         (rss ? "#{(rss / 1024.0).round} MB" : "-"),
+         (r["vs_rails"] ? "#{r["vs_rails"]}x vs Rails" : ""),
+         (dr && dr.abs >= 5 ? "DRIFT #{dr > 0 ? '+' : ''}#{dr}% within run" : "")
+end
+dead.each do |r|
+  printf "  %-11s %-7s %9s  %s\n", r["label"], r["jit"], "NO DATA",
+         "#{r['state']} at #{r['stage']}: #{r['detail']}"
+end
+content = live.select { |r| r["content_total"] }
+if content.any?
+  puts "\n== content parity vs Rails (parsed documents, not status codes) =="
+  content.each do |r|
+    printf "  %-11s %s  %d/%d routes equivalent%s\n", r["label"], r["jit"],
+           r["content_equivalent"], r["content_total"],
+           (r["content_differs"].to_i.zero? ? "" :
+             " — differs: #{r["content_routes"].map { |x| x["route"] }.join(", ")}")
+  end
+end
+AGG
+
+# ── emitted-tree tarballs ────────────────────────────────────────────
+# Publish the trees the lanes actually ran, so a compiler author can pick up
+# a lane's numbers without a roundhouse checkout. The AOT lane's headline is
+# a ratio against the CRuby lane, and the two trees are ~90% byte-identical
+# Ruby, so shipping only one would leave the other side of that ratio
+# unverifiable. Small enough not to think about: ~390 KB and ~820 KB.
+#
+# The seed database is deliberately NOT included. It is 40 MB, it changes
+# only when ruby-bench does, and frozen-sequence.json's drift check already
+# fails loudly if it moves — REPRODUCE.md carries the exact rebuild recipe
+# (ruby-bench is public; the DB is a .backup of its fixture plus ANALYZE).
+pack_tree() {
+    local name="$1" dir="$2"
+    [[ -d "$dir" ]] || { warn "no $name tree at $dir — not packed"; return 0; }
+    local rh sp
+    rh="$(cd "$REPO_ROOT" && git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+    sp="$(command -v spinel >/dev/null 2>&1 && spinel --version 2>/dev/null || echo 'not on PATH')"
+
+    # The AOT archive carries the exact workload its lane timed — the
+    # driver's route list and the deferral-applied visit sequence — staged
+    # to the tree root so REPRODUCE.md's command runs as written from an
+    # unpacked archive. The CRuby tree ships no driver inputs: it is
+    # replayed by scripts/lobsters-replay from this repo, so its
+    # REPRODUCE.md points there instead of at files it cannot use.
+    local staged=""
+    local build_section run_section bcrypt_section gc_section
+    gc_section=""
+    if [[ "$name" == spinel ]]; then
+        local wf
+        for wf in routes.txt sequence.txt; do
+            if [[ -f "$dir/bench-work/$wf" ]]; then
+                cp "$dir/bench-work/$wf" "$dir/$wf"
+                staged="$staged $wf"
+            else
+                warn "no bench-work/$wf in the $name tree — archive ships without the timed workload"
+            fi
+        done
+        build_section=$(cat <<'EOS'
+## Build it
+
+    # needs spinel + spin on PATH
+    rm -f build/bin/blog && spin build
+
+The published lane did NOT link your system libsqlite3: the bench box puts
+a vendored SQLite static library — built at the same version the ruby-bench
+bundle pins, so every lane queries one build — on LIBRARY_PATH for this
+link. A plain build here uses your system library instead, which is fine
+for exploring the codegen; just know that query-heavy timings move with
+the SQLite version, and the lane summary's `sqlite` field records what the
+published binary actually queried.
+EOS
+)
+        run_section=$(cat <<'EOS'
+## Run the benchmark sequence
+
+`routes.txt` and `sequence.txt` at the tree root are the exact inputs the
+published lane ran: the parity route list, and the frozen sequence with the
+declared gaps already deferred — 106 of ruby-bench's 114 visits. Both
+deferred routes are roundhouse-side gaps, not spinel's; the ledger is
+`bench/lobsters/declared-gaps.json` in the roundhouse repo.
+
+    BLOG_DB="file:lobsters_bench?mode=memory&cache=shared" \
+      ./build/bin/blog --bench routes.txt sequence.txt bodies 15 10 10 storage/bench.sqlite3
+
+Positional args after the two files: a directory for response-body dumps,
+then WARMUP MIN_ITERS MIN_TIME — ruby-bench's harness rule (15 discarded
+warmup iterations; iterate until the minimum timed iterations AND the
+minimum seconds of total wall clock, warmup included, are both met) — and
+last the seed database, page-copied into the named in-memory DB at boot so
+the timed loop never touches disk.
+EOS
+)
+        gc_section=$(cat <<'EOS'
+## Reproducing the #3513 minor-mark failure
+
+As of spinel 4b099a1a (2026-08-04) the opt-in generational mark still
+loses objects on this app — matz/spinel#3513. To see it, add
+`SPINEL_GC_MINOR=1` to the benchmark command above. Expect a SIGBUS or
+SIGABRT partway through the sequence, but NOT on every run: the lost
+object only kills the process if its memory is reused before its last
+read, and that is decided by address-space layout. Measured here: 2
+crashes in 24 full-sequence runs at spinel 576e3f06, 14 in 20 at
+4b099a1a — same tree both times, so a single clean run is luck, not
+resolution. Loop it; on macOS every crash leaves a symbolized backtrace
+in `~/Library/Logs/DiagnosticReports/blog-*.ips`.
+
+Three levers, all measured on this app:
+
+- **Deterministic repro:** with matz/spinel#3519 (GC stress pins the
+  threshold it seeds), `SPINEL_GC_MINOR=1 SPINEL_GC_STRESS=1` failed at
+  the first collections during boot in every measured run (3/3), about
+  a second in; add `SPINEL_GC_VERIFY=1 SPINEL_GC_VERIFY_GEN=1` for the
+  collector's own corrupt-object report. Without that change stress is
+  a no-op at this heap size — its 2 KB threshold is a base the
+  live-size retune floats away from after the first collection, so it
+  collects no more often than the default.
+- **`--profile` (frame-pointer) builds mask the failure entirely**;
+  only the default `-O2` build shows it, and the rate moves between
+  spinel versions as register allocation reshuffles which temps
+  survive a collection.
+- **The default collector is clean** under every configuration above,
+  including pinned stress over the full sequence — the loss is on the
+  minor-mark path.
+EOS
+)
+        bcrypt_section=$(cat <<'EOS'
+## bcrypt
+
+`spin.lock` is deliberately omitted: it pinned bcrypt to an absolute path on
+the machine that ran the benchmark, so shipping it would fail here with
+"not in the index: bcrypt". The app needs it for password hashing on the
+login path. Either:
+
+    spin add bcrypt --git https://github.com/roundhouse-rb/spinel-bcrypt
+
+or point at a local checkout and let spin re-lock. Nothing the benchmark
+measures goes through bcrypt — the frozen sequence is authenticated once at
+setup, not per visit.
+EOS
+)
+    else
+        build_section=$(cat <<'EOS'
+## Build it
+
+Nothing to build — plain CRuby. `ruby -e 'require "./main"'` boots the
+server; the native gems it needs are `sqlite3` and `bcrypt`.
+EOS
+)
+        run_section=$(cat <<'EOS'
+## Run the benchmark sequence
+
+The CRuby lanes have no --bench driver; this tree is replayed in-process by
+`scripts/lobsters-replay` from a roundhouse checkout, run at this tree's
+root:
+
+    RUBYOPT=--yjit ruby ROUNDHOUSE/scripts/lobsters-replay --memory \
+      --sequence ROUNDHOUSE/bench/lobsters/frozen-sequence.json \
+      --defer ROUNDHOUSE/bench/lobsters/declared-gaps.json
+
+`RUBYOPT=--yjit` is the published `ruby` row; drop it for `ruby-int`. The
+--defer file removes the same 8 visits every published lane defers — a run
+without it does more work than the page and is not comparable to it. The
+published lanes run this under the ruby-bench checkout's bundle
+(`BUNDLE_GEMFILE=<ruby-bench>/benchmarks/lobsters/Gemfile bundle exec`),
+so the sqlite3 gem — and the SQLite build inside it — matches the Rails
+lanes; the summary's `sqlite` field records what was actually queried.
+EOS
+)
+        bcrypt_section=""
+    fi
+
+    cat > "$dir/REPRODUCE.md" <<REPRO
+# lobsters — $name tree, as benchmarked
+
+Emitted by roundhouse \`$rh\` from ruby-bench's lobsters fixture. This is the
+tree the published numbers were measured on, minus build output.
+
+    roundhouse : $rh
+    spinel     : $sp
+    packed     : $(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+$build_section
+
+$run_section
+
+## The seed database
+
+\`storage/bench.sqlite3\` is NOT in this archive (40 MB). It is ruby-bench's
+public lobsters fixture plus planner statistics — rebuild it exactly:
+
+    git clone --depth 1 https://github.com/ruby/ruby-bench /tmp/ruby-bench
+    mkdir -p storage
+    sqlite3 /tmp/ruby-bench/benchmarks/lobsters/db/production.sqlite3 \\
+      ".backup storage/bench.sqlite3"
+    sqlite3 storage/bench.sqlite3 "ANALYZE"
+
+The ANALYZE is load-bearing: the fixture ships without \`sqlite_stat1\`,
+every published lane ran with statistics (the harness applies them outside
+the timed section), and without them the planner turns the hottest-stories
+SELECT into a table walk. The tree is fully inspectable without any of
+this; only running the sequence needs the DB.
+
+$gc_section
+
+$bcrypt_section
+
+## What the numbers say
+
+Per-lane timings, per-route medians and visit counts are in the run's
+\`matrix.json\` and each lane's \`summary.json\`, published beside this
+archive. The comparison that matters here is the AOT lane against the CRuby
++YJIT lane: same emitter, same route table, and \`runtime/action_dispatch/router.rb\`
+byte-identical between the two.
+REPRO
+    tar czf "$RUN_DIR/$name-tree.tgz" -C "$(dirname "$dir")" \
+        --exclude=build --exclude=bench-work --exclude=storage \
+        --exclude='*.sqlite3' --exclude='*.o' --exclude='*.log' \
+        --exclude=spin.lock \
+        "$(basename "$dir")" 2>/dev/null \
+      && ok "packed $name tree -> $RUN_DIR/$name-tree.tgz ($(du -h "$RUN_DIR/$name-tree.tgz" | cut -f1))" \
+      || fail "could not pack $name tree"
+    rm -f "$dir/REPRODUCE.md"
+    local sf
+    for sf in $staged; do rm -f "$dir/$sf"; done
+}
+pack_tree spinel "$REPO_ROOT/build/transpiled-lobsters-spinel"
+pack_tree ruby   "$REPO_ROOT/build/transpiled-lobsters-ruby"
+
+
+    # Per-lane parity trend vs the previous run (resolve BEFORE repointing
+    # latest). Older layouts kept the cruby summary at the run root — the
+    # ruby lane falls back to it so the trend survives the layout change.
+    LATEST_LINK="$REPO_ROOT/bench/results/lobsters/latest"
+    if [[ -e "$LATEST_LINK" ]]; then
+        PREV_NAME="$(readlink "$LATEST_LINK" 2>/dev/null || echo previous)"
+        for LANE in ruby ruby-int jruby; do
+            CUR="$RUN_DIR/$LANE/summary.json"
+            [[ -f "$CUR" ]] || continue
+            PREV="$LATEST_LINK/$LANE/summary.json"
+            if [[ ! -f "$PREV" && "$LANE" == ruby ]]; then PREV="$LATEST_LINK/summary.json"; fi
+            [[ -f "$PREV" ]] || continue
+            compare_parity "$PREV_NAME ($LANE)" "$PREV" "$CUR"
+        done
+    fi
+    (( EXPLICIT_OUT == 0 )) && ln -sfn "$(basename "$RUN_DIR")" "$LATEST_LINK"
+
+    ok "lane run complete: $RUN_DIR ($FAILED_LANES failed lane(s))"
+    exit "$FAILED_LANES"
+fi
+
+# ── runtime resolution ───────────────────────────────────────────────
+# The lobsters lane runs the SAME emitted app + replay driver under
+# either CRuby or JRuby; only the emit target, the interpreter, and the
+# gem/JVM setup differ. lobsters-replay is interpreter-agnostic (it
+# samples ids and serves through the tree's own adapter), so one driver
+# covers both.
+case "$RUNTIME" in
+    cruby)
+        RUBY_BIN=ruby
+        EMIT_TARGET=ruby
+        OUT_TREE="$REPO_ROOT/build/transpiled-lobsters-ruby"
+        GEMS=(sqlite3 bcrypt htmlentities rotp markly nokogiri)
+        : "${WARMUP:=5}"
+        ;;
+    jruby)
+        RUBY_BIN=jruby
+        EMIT_TARGET=jruby
+        OUT_TREE="$REPO_ROOT/build/transpiled-lobsters-jruby"
+        # jdbc-sqlite3 replaces the C-ext sqlite3; markly is the
+        # commonmark-java shim (jars via bin/fetch-jars), not a gem;
+        # bcrypt/nokogiri resolve to their java-platform builds.
+        GEMS=(jdbc-sqlite3 bcrypt htmlentities rotp nokogiri)
+        # JRuby's JIT needs a LONG warm run before its numbers mean
+        # anything, and a pinned heap keeps GC behaviour from drifting
+        # between runs (managed-runtime bench discipline). Override the heap
+        # with BENCH_JRUBY_HEAP; --enable-native-access silences the
+        # jdbc-sqlite3 restricted-method warnings on recent JDKs.
+        #
+        # Convergence is slow on this metric — the route set round-robins 26
+        # cold paths, so each warms independently. Measured ms/iter median
+        # vs --warmup (100 timed iters, file-backed, jruby 10.1): warmup 20
+        # -> 91, 200 -> 47, 500 -> 42 (steady). So 20 wildly under-reports;
+        # 100 is the fast-dev default; a publication-grade number wants an
+        # explicit --warmup (which also overrides the sequence path's 15 —
+        # a frozen-sequence warmup iteration is 114 visits, so the same
+        # steady-state needs fewer iterations there than on the route set).
+        : "${WARMUP:=100}"
+        export JAVA_OPTS="${BENCH_JRUBY_HEAP:--Xmx2g -Xms2g} --enable-native-access=ALL-UNNAMED ${JAVA_OPTS:-}"
+        ;;
+    *)
+        fail "unknown runtime: $RUNTIME (want cruby|jruby)"; exit 2 ;;
+esac
+
+# --vs-rails stays CRuby-only: its point is a same-interpreter baseline
+# (real Rails boots under plain `ruby`), so pairing it with a jruby emit
+# would compare across runtimes AND stacks at once. Cross-runtime rows
+# belong to the matrix, where each lane is labeled. --memory/--frozen work
+# on both runtimes (JRuby seeds via the JDBC driver's restore()).
+if [[ "$RUNTIME" == jruby ]] && (( VS_RAILS == 1 )); then
+    fail "--vs-rails is CRuby-only (same-interpreter baseline); use --frozen for the jruby in-memory lane."
+    exit 2
+fi
+
+# --frozen: time the emit on the committed frozen 114-visit sequence,
+# in-memory, WITHOUT booting Rails — the canonical ruby-bench workload as an
+# emit-only lane (the matrix's per-runtime rows, decoupled from the Rails
+# baseline). Mutually exclusive with --vs-rails (which owns the Rails side).
+FROZEN_SEQ="$REPO_ROOT/bench/lobsters/frozen-sequence.json"
+if (( FROZEN == 1 )); then
+    (( VS_RAILS == 1 )) && { fail "--frozen and --vs-rails are mutually exclusive (--frozen is the emit-only lane)"; exit 2; }
+    [[ -f "$FROZEN_SEQ" ]] || { fail "no committed frozen sequence at $FROZEN_SEQ (run --vs-rails once to freeze it)"; exit 2; }
+fi
+
+[[ -d "$SRC" ]] || { fail "lobsters source not found at $SRC (clone ruby-bench or pass --src)"; exit 2; }
+[[ -f "$SRC/db/production.sqlite3" ]] || { fail "no benchmark DB at $SRC/db/production.sqlite3"; exit 2; }
+
+TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
+[[ -z "$OUT_DIR" ]] && OUT_DIR="$REPO_ROOT/bench/results/lobsters/$TIMESTAMP"
+mkdir -p "$OUT_DIR"
+
+# ── emit ─────────────────────────────────────────────────────────────
+if (( SKIP_EMIT == 0 )) || [[ ! -f "$OUT_TREE/main.rb" ]]; then
+    step "transpiling lobsters (--target $EMIT_TARGET --allow-unsupported)"
+    # Emit into an empty tree: writing a tree never deletes, so a file a
+    # previous emit wrote and this one no longer does (lobsters' twitter.rb,
+    # 10-11) would linger and mask the gap. Not the JRuby tree, which also
+    # holds the jars bin/fetch-jars downloads into it.
+    if [[ "$RUNTIME" == cruby ]]; then rm -rf "$OUT_TREE"; fi
+    # cargo run rebuilds the compiler when sources changed, so the dev
+    # loop never replays against a stale binary. Survey-mode warnings
+    # are the expected torrent — keep them in emit.log, not the console.
+    if ! (cd "$REPO_ROOT" && cargo run --quiet --bin roundhouse -- \
+            --target "$EMIT_TARGET" "$SRC" -o "$OUT_TREE" --allow-unsupported \
+            >"$OUT_DIR/emit.log" 2>&1); then
+        fail "emit failed; last lines of $OUT_DIR/emit.log:"
+        tail -20 "$OUT_DIR/emit.log" >&2
+        exit 1
+    fi
+    ok "emitted to $OUT_TREE ($(grep -c 'warning' "$OUT_DIR/emit.log" || true) warnings in emit.log)"
+fi
+
+# The JRuby tree's Markly shim needs the commonmark-java jars, which can't
+# ride the text-only emit. Fetch them into the tree (idempotent — the
+# generated bin/fetch-jars skips jars already present). Run every time
+# (even under --skip-emit) so a tree that predates the jars self-heals.
+if [[ "$RUNTIME" == jruby ]]; then
+    step "fetching commonmark-java jars (bin/fetch-jars)"
+    sh "$OUT_TREE/bin/fetch-jars" >/dev/null || { fail "bin/fetch-jars failed"; exit 1; }
+fi
+
+# ── stage DB ─────────────────────────────────────────────────────────
+# Fresh copy every run: the replay logs in and writes session state, and
+# stale WAL/SHM artifacts from a crashed run would skew the next one.
+step "staging benchmark DB"
+DB="$OUT_TREE/storage/bench.sqlite3"
+mkdir -p "$(dirname "$DB")"
+rm -f "$DB" "$DB-wal" "$DB-shm"
+sqlite3 "$SRC/db/production.sqlite3" ".backup $DB"
+
+# ── provenance ───────────────────────────────────────────────────────
+# Run under the target interpreter so RUBY_DESCRIPTION names the runtime
+# actually replayed (jruby vs cruby), not whatever `ruby` is on PATH.
+"$RUBY_BIN" -rjson -e 'puts JSON.pretty_generate({
+  generated_at: Time.now.utc.strftime("%FT%TZ"),
+  command: ARGV[0], src: ARGV[1],
+  runtime: ARGV[3],
+  roundhouse_commit: `git -C #{ARGV[2]} rev-parse HEAD`.strip,
+  ruby: RUBY_DESCRIPTION,
+  java_opts: ENV["JAVA_OPTS"],
+})' "scripts/bench-lobsters $ORIG_ARGS" "$SRC" "$REPO_ROOT" "$RUNTIME" > "$OUT_DIR/env.json" || true
+
+# ── runtime gems ─────────────────────────────────────────────────────
+# The replay runs under the ambient interpreter's gem home, not a bundle.
+# A runtime bump empties the per-version gem dir (same hazard scripts/bench
+# self-heals around), so check-then-install rather than assume. markly +
+# nokogiri back Markdowner (guarded requires in the overlay: boot survives
+# without them but /u/:username fails), so a fresh box needs them too. The
+# GEMS set is runtime-resolved above (jruby swaps sqlite3->jdbc-sqlite3 and
+# drops markly, which its tree provides via the commonmark-java shim); the
+# gem tool is the interpreter's own so java-platform builds resolve.
+if [[ "$RUNTIME" == jruby ]]; then GEM=(jruby -S gem); else GEM=(gem); fi
+for g in "${GEMS[@]}"; do
+    if ! "${GEM[@]}" list -i "^${g}$" >/dev/null 2>&1; then
+        step "installing gem $g ($RUNTIME)"
+        "${GEM[@]}" install --no-document "$g" >/dev/null
+    fi
+done
+
+# ── Rails side (P6 comparison) ───────────────────────────────────────
+FROZEN_SEQ="$REPO_ROOT/bench/lobsters/frozen-sequence.json"
+if (( VS_RAILS == 1 )); then
+    step "timing real Rails on the frozen sequence (boot + 15 warmup + >=10 iters; several minutes)"
+    ruby "$REPO_ROOT/scripts/lobsters-rails-replay" \
+        --src "$SRC" \
+        --seq-out "$OUT_DIR/sequence.json" \
+        --json "$OUT_DIR/rails.json"
+    if [[ -f "$FROZEN_SEQ" ]]; then
+        if ! diff -q "$FROZEN_SEQ" "$OUT_DIR/sequence.json" >/dev/null; then
+            fail "regenerated sequence DIFFERS from $FROZEN_SEQ — ruby-bench DB/generator changed; comparison vs older runs is invalid"
+        fi
+    else
+        mkdir -p "$(dirname "$FROZEN_SEQ")"
+        cp "$OUT_DIR/sequence.json" "$FROZEN_SEQ"
+        ok "froze sequence at $FROZEN_SEQ (commit it)"
+    fi
+fi
+
+# ── replay ───────────────────────────────────────────────────────────
+step "replaying benchmark routes under $RUNTIME (in-process Main.run_rack)"
+# Bodies are dumped unconditionally: 26 files, written during the parity
+# pass that runs anyway, and they are what scripts/lobsters-content-diff
+# needs to answer the question status codes cannot — does this lane RENDER
+# what Rails renders?
+REPLAY_ARGS=(--json "$OUT_DIR/summary.json" --md "$OUT_DIR/summary.md" --dump "$OUT_DIR/bodies")
+if (( TIME_ITERS > 0 )); then
+    REPLAY_ARGS+=(--time "$TIME_ITERS")
+    # The --vs-rails and --frozen paths time the frozen --sequence, which
+    # keeps its OWN established warmup (15) so the canonical-metric
+    # methodology stays fixed — the per-runtime WARMUP default doesn't
+    # touch it. An EXPLICIT --warmup overrides everywhere: the jruby
+    # sequence lane needs a longer warm run than the CRuby-derived 15.
+    if (( VS_RAILS == 0 && FROZEN == 0 )) || (( WARMUP_EXPLICIT == 1 )); then
+        REPLAY_ARGS+=(--warmup "$WARMUP")
+    fi
+fi
+# Deferred routes leave the timed sequence here too — this is the path the
+# ruby/ruby-int/jruby emit lanes reach by recursion.
+[[ -f "$GAPS_JSON" ]] && REPLAY_ARGS+=(--defer "$GAPS_JSON")
+(( MEMORY == 1 ))    && REPLAY_ARGS+=(--memory)
+(( VS_RAILS == 1 ))  && REPLAY_ARGS+=(--sequence "$OUT_DIR/sequence.json")
+# --frozen replays the COMMITTED frozen sequence (no Rails boot, no per-run
+# regeneration) so an emit-only run lands on the exact ruby-bench workload.
+(( FROZEN == 1 ))    && REPLAY_ARGS+=(--sequence "$FROZEN_SEQ")
+
+status=0
+# Same gem universe as the Rails lanes: the ruby-bench bundle pins sqlite3
+# (and bcrypt/htmlentities/rotp), so running the emit replay under it makes
+# every interpreted lane query the same SQLite build instead of whatever
+# the ambient gem env carries. Falls back to plain ruby when the bundle
+# isn't usable — the per-lane sqlite attestation on the page then says so.
+RUN_RUBY=("$RUBY_BIN")
+if [[ "$RUNTIME" == cruby ]] && (cd "$SRC" 2>/dev/null && bundle check >/dev/null 2>&1); then
+    RUN_RUBY=(env "BUNDLE_GEMFILE=$SRC/Gemfile" bundle exec "$RUBY_BIN")
+fi
+# The replay's output is also kept on its own, so a failure can be NAMED
+# below: the outer lane runner reports the last line of run.log as the
+# reason, and for ten days that line was this script's own "summary
+# written" while the real one — `uninitialized constant Net (NameError)`
+# — sat twelve lines up.
+REPLAY_LOG="$OUT_DIR/replay.log"
+(cd "$OUT_TREE" && "${RUN_RUBY[@]}" "$REPO_ROOT/scripts/lobsters-replay" "${REPLAY_ARGS[@]}") 2>&1 | tee "$REPLAY_LOG" || status=${PIPESTATUS[0]}
+
+# ── compare against the previous run ─────────────────────────────────
+# Resolve the runtime's own `latest` BEFORE repointing it (cruby keeps the
+# bare `latest` for back-compat; other runtimes get `latest-<runtime>`) so
+# the two lanes never cross-compare. Regressions print loudly so a
+# `>> bench.log` cron capture is greppable (PARITY REGRESSION).
+#
+# Skipped entirely when --out was given explicitly: that means a caller (e.g.
+# scripts/lobsters-matrix) owns result placement, and repointing the shared
+# `latest` symlink at a run buried under a caller's dir would break it.
+LATEST_NAME="latest"; [[ "$RUNTIME" != cruby ]] && LATEST_NAME="latest-$RUNTIME"
+PREV_LINK="$REPO_ROOT/bench/results/lobsters/$LATEST_NAME"
+if (( EXPLICIT_OUT == 0 )) && [[ -f "$OUT_DIR/summary.json" ]]; then
+    PREV_NAME="$(readlink "$PREV_LINK" 2>/dev/null || echo previous)"
+    PREV_SUM="$PREV_LINK/summary.json"
+    # `latest` may point at a lane-layout run (no root summary); compare
+    # against its matching emit lane instead.
+    if [[ ! -f "$PREV_SUM" ]]; then
+        PREV_SUM="$PREV_LINK/ruby/summary.json"
+        [[ "$RUNTIME" == jruby ]] && PREV_SUM="$PREV_LINK/jruby/summary.json"
+    fi
+    [[ -f "$PREV_SUM" ]] && compare_parity "$PREV_NAME" "$PREV_SUM" "$OUT_DIR/summary.json"
+fi
+
+# ── roundhouse vs Rails ──────────────────────────────────────────────
+if (( VS_RAILS == 1 )) && [[ -f "$OUT_DIR/rails.json" && -f "$OUT_DIR/summary.json" ]]; then
+    ruby -rjson -e '
+      rails   = JSON.parse(File.read(ARGV[0]))
+      ours    = JSON.parse(File.read(ARGV[1]))["sequence_timing"]
+      abort "no sequence_timing in summary.json" unless ours
+      r, o = rails["ms_per_iter_median"], ours["ms_per_iter_median"]
+      ratio = (r / o).round(2)
+      partial = ours["partial"] ? " [PARTIAL — #{ours["failed_visits"]} failing visits]" : ""
+      puts "", "== roundhouse vs Rails (frozen #{rails["visits_per_iter"]}-visit sequence) =="
+      puts "  rails:      #{r} ms/iter (#{rails["iterations"]} iters, #{rails["ruby"][/ruby [^ ]+/]}, rails #{rails["rails"]})"
+      puts "  roundhouse: #{o} ms/iter (#{ours["iterations"]} iters)#{partial}"
+      puts "  ratio:      #{ratio}x #{r > o ? "faster" : "SLOWER"} than Rails"
+      md = "\n## roundhouse vs Rails\n\n| stack | ms/iter median | iters |\n|-------|---:|---:|\n" \
+           "| rails #{rails["rails"]} | #{r} | #{rails["iterations"]} |\n" \
+           "| roundhouse#{partial} | #{o} | #{ours["iterations"]} |\n\n" \
+           "**#{ratio}x #{r > o ? "faster" : "slower"} than Rails**\n"
+      File.write(ARGV[2], md, mode: "a")
+    ' "$OUT_DIR/rails.json" "$OUT_DIR/summary.json" "$OUT_DIR/summary.md" || true
+fi
+
+# Repoint the shared `latest` symlink only for default-placement runs; a
+# caller passing --out (the matrix) manages its own tree.
+(( EXPLICIT_OUT == 0 )) && ln -sfn "$(basename "$OUT_DIR")" "$REPO_ROOT/bench/results/lobsters/$LATEST_NAME" 2>/dev/null || true
+ok "summary written to $OUT_DIR/summary.md"
+# LAST, because it is the line the lane runner reads as the reason. A
+# Ruby exception's own line ends in its class, `… (NameError)`, ahead of
+# the frames and the "Did you mean?"; the replay's own refusals
+# (LOGINFAIL, PARITY) are single lines, so the last non-blank line is
+# the one to repeat when no exception was raised.
+if (( status != 0 )); then
+    reason="$(grep -m1 -E '\([A-Z][A-Za-z:]*(Error|Exception|Interrupt)\)$' "$REPLAY_LOG" 2>/dev/null \
+              || grep -v '^[[:space:]]*$' "$REPLAY_LOG" 2>/dev/null | tail -1)"
+    fail "replay exited $status: $(printf '%s' "${reason:-no output}" | cut -c1-300)"
+fi
+exit "$status"

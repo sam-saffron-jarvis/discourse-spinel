@@ -1,0 +1,48 @@
+diff --git a/SOURCE_LOCK.json b/SOURCE_LOCK.json
+index bfd2b96..20b042d 100644
+--- a/SOURCE_LOCK.json
++++ b/SOURCE_LOCK.json
+@@ -165,6 +165,30 @@
+     {
+       "path": "config/official_plugins.json",
+       "sha256": "17333326631618d7260445d80de70fae67cf71da078fcc683e12fb7f2bb316c5"
++    },
++    {
++      "path": "app/models/topic_list.rb",
++      "sha256": "5247ac80e9469741140f8d93e8cf2be750dc04b9af9907e6973780ab1c534e58"
++    },
++    {
++      "path": "lib/topic_query/private_message_lists.rb",
++      "sha256": "6c040c2356f0877bc726e1264bba9503b93207a25b96e8653b270f92e4ef03d8"
++    },
++    {
++      "path": "plugins/discourse-assign/plugin.rb",
++      "sha256": "419250982037f029a2a70ba905d062840b6f42440be9abc09318571b25aad4b9"
++    },
++    {
++      "path": "plugins/discourse-events/plugin.rb",
++      "sha256": "33b1f44e052ca133c406e85e6afb898d8bb62b2c19b7db5b0184b4f4dd4eb7d5"
++    },
++    {
++      "path": "plugins/discourse-solved/plugin.rb",
++      "sha256": "15682ea70f9d82f58e41cd216575507e2154eaa60cc25be292062c78cdca2955"
++    },
++    {
++      "path": "plugins/discourse-solved/lib/discourse_solved/register_filters.rb",
++      "sha256": "7e8b44407967c57ebe44f5e88dbe88324414ff3145cc8ae1655b91ba62dc72a1"
+     }
+   ]
+ }
+diff --git a/tools/project_source.rb b/tools/project_source.rb
+index 1e4ab59..1eaf457 100644
+--- a/tools/project_source.rb
++++ b/tools/project_source.rb
+@@ -39,7 +39,7 @@ specs.each do |path, (owner, selectors)|
+   end
+   # Original class/module header and its matching end; not a synthetic model.
+   header_end = source.index("\n", declaration.location.start_offset)
+-  projected[declaration.location.start_offset...header_end] = source[declaration.location.start_offset...header_end]
++  copy.call(Prism::Location.new(result.source, declaration.location.start_offset, header_end - declaration.location.start_offset), "owner_header")
+   copy.call(declaration.end_keyword_loc, "owner_end")
+   selectors.each do |kind, name, first|
+     found = all.select do |node|

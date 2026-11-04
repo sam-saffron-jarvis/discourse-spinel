@@ -1,0 +1,3 @@
+class SeedAttrTarget
+  attr_accessor pc: Integer
+end

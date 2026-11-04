@@ -1,0 +1,22 @@
+each_slice map n=20 out=20
+each_slice map params n=14 out=14 last=a40
+each_cons map n=39 out=39
+each_cons map params n=39 out=39 last=a39a40
+each_cons with_index map n=39 out=39 last=40
+each_cons with_index offset map n=39 out=39 last=a39a4039
+slice_when n=39 len=255
+chunk n=40 len=455
+max n=39 r="a9"
+min n=39 r="a1"
+minmax r=[1, 140]
+sort! size=40 first="a1" last="a9"
+sort! ints size=40 first=140 last=1
+sum string n=40 len=111
+sum int n=40 r=2820
+sum float n=40 r=2820.5
+with_index inject n=40 r="z"
+with_index inject string acc n=40 len=112
+with_index inject int acc n=40 r=3640
+control each_cons map n=39 out=39
+control max n=39 r="a9"
+control sort! size=40 first="a1"

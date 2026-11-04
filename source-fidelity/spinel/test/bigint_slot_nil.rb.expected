@@ -1,0 +1,23 @@
+nil
+1
+nil
+1
+nil
+2
+9223372036854775808
+nil
+""
+interp: [] [1]
+true
+false
+"f"
+42
+1
+
+|
+nil
+true
+{k: nil, j: 1}
+[nil, 1]
+-9223372036854775808
+false

@@ -1,0 +1,6 @@
+"https://id:secret@api.github.com/applications/id/grant"
+["https", "id:secret", "api.github.com", "/applications/id/grant"]
+"/applications/id/grant"
+"http://example.com/a?q=1"
+"https://example.com:8443/"
+"https://example.com"

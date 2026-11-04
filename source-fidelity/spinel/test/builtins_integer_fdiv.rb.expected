@@ -1,0 +1,27 @@
+3.5
+-3.5
+-3.5
+2.8
+Infinity
+Infinity
+-Infinity
+0.0
+7.0
+[TypeError, "Array can't be coerced into Integer"]
+[TypeError, "Hash can't be coerced into Integer"]
+[TypeError, ":sym can't be coerced into Integer"]
+[TypeError, "nil can't be coerced into Integer"]
+[TypeError, "String can't be coerced into Integer"]
+[TypeError, "true can't be coerced into Integer"]
+[TypeError, "false can't be coerced into Integer"]
+3.935305402391371e+20
+2.541098841762901e-21
+2.0
+4.666666666666667
+0.2857142857142857
+3.5
+3.935305402391371e+20
+"widget"
+3.5
+"widget-diff-arity"
+3.5

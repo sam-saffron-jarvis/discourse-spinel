@@ -1,0 +1,13 @@
+"falsy"
+true
+"falsy"
+true
+"truthy"
+42
+false
+"truthy"
+false
+"no pgid"
+-123
+true
+"x"

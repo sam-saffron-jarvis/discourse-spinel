@@ -1,0 +1,621 @@
+#!/usr/bin/env bash
+# scripts/campfire-suite — run ONCE Campfire's OWN test suite against the emit.
+#
+# The C4 rung of the campfire coverage ladder: transpile campfire for the
+# `ruby` target (or `spinel` — see below), then run each of the app's own
+# test files and tally pass/fail. Unlike the walk (scripts/campfire-walk), which drives one
+# hand-written path, this measures the app's own assertions — the suite is
+# the spec campfire's authors wrote, so "how many of its files run green" is
+# the honest coverage number.
+#
+# THE FILE LIST IS THE APP'S, NOT OURS. The emitted Makefile's SPINEL_TESTS
+# is generated from the app's own test tree, so it is read from the emit
+# rather than restated here. `find test -name '*_test.rb'` would also sweep
+# in the scaffold's own tests (cgi_io_test, article_broadcasts_test, the
+# blog's view tests), which campfire's list correctly excludes — counting
+# those inflates both numerator and denominator with tests that are not
+# campfire's.
+#
+# STUBS: when `scripts/campfire-walk-stubs.rb` exists it is spliced in
+# (same ledger rule — a closed gap is a deleted entry). Tip Campfire
+# cleared the ledger (#818); the file is gone, so the default splice is
+# a no-op. `--no-stubs` / `--stubs` still force the choice when a ledger
+# returns.
+#
+# THE SPINEL LANE (`--target spinel`) compiles each of campfire's test
+# files to its own native binary and runs THAT. Same emitted source and
+# the same autorun shim (emit/ruby.rs::render_autorun_shim is emitted for
+# both ruby shapes), so a compiled test prints the per-test lines this
+# script already parses and the tally format is unchanged — with ONE
+# addition. The compiled lane has a failure mode the interpreted one
+# cannot have: a file that never links. That is a third status, BUILD,
+# carrying the file's whole test count against its first compile error.
+# Three outcomes per file, and the three are the point of the lane:
+# didn't link / linked and diverged / linked and agreed.
+#
+# The compiles are PARALLEL (`--jobs`, default 8) and the SPINEL runs are
+# SERIAL — the binaries share one sqlite file. Each compile is a whole-
+# program build, so this lane costs minutes where the ruby lane costs
+# seconds. Never batch several test files into one compile: that is what
+# found matz/spinel#4340, and it measures a different thing.
+#
+# The RUBY runs are also parallel (`--jobs`), one process per file. Each
+# file already opens its own sqlite path from `$0`, but Active Storage
+# writes `storage/files` (or `tmp/storage` under RAILS_ENV=test). A parallel
+# file bind-mounts private directories over both roots and keeps the emit
+# as its working directory, so `$0`, `Dir.pwd` and `__dir__` stay what a serial run
+# sees. The tally is still printed in file-list order. `--jobs 1`, or a
+# box whose `unshare` cannot mount, runs the files in this process as
+# before.
+#
+# NO STUBS BY DEFAULT ON THAT LANE. walk_stubs.rb is Ruby spliced into
+# boot.rb, which every test requires — under spinel it must also COMPILE,
+# so a stub that does not takes all 54 files rather than the one it was
+# written for. `--stubs` asks for it anyway; the JSON records which.
+#
+# Usage:  scripts/campfire-suite [options] [APP_PATH]
+#
+#   APP_PATH   Rails app to transpile. Default: ~/git/once-campfire
+#
+# Options:
+#   --target T   `ruby` (default) or `spinel` — see above.
+#   --jobs N     Parallel spinel compiles, and parallel ruby file runs
+#                (default 8). Ruby runs fall back to serial when the
+#                mount probe fails. Spinel RUNS stay serial either way.
+#   --timeout N  Seconds a single spinel binary may run (default 120).
+#   --out DIR    Emit into DIR and keep it (default: a temp dir, removed).
+#   --keep       Keep the temp emit and print its path.
+#   --reuse DIR  Skip transpiling; run against an emit DIR prepared earlier.
+#   --no-stubs   Splice nothing (see scripts/campfire-walk's note).
+#   --stubs      Splice anyway — the spinel lane's default is off.
+#   --filter PAT Only run test files whose path matches PAT (grep -E).
+#   --tally FILE Write the `STATUS|file|passed|total|first-error` table
+#                to FILE.
+#   --fail-log FILE  Write EVERY failing test's line (`file|Class#test|msg`)
+#                to FILE. The tally keeps only a file's FIRST failure, which
+#                is the right thing to work on but the wrong thing to rank by:
+#                it credits that one wall with every unpassed test in the file,
+#                and `messages_controller_test` reads as 12 tests behind
+#                `fresh_when` when only 3 of them ever call it. Rank from this.
+#   --json FILE  Write the machine-readable summary the published page is
+#                rendered from (scripts/campfire-suite-summary, then
+#                scripts/campfire-suite-report). Implies --tally and
+#                --fail-log; both go to temp files unless also asked for.
+#
+# Exit status is 0 when the run completes, whatever the tally — this
+# reports a number, it does not gate on one. A CI rung that pins a floor
+# reads the tally.
+#
+# Requires: cargo, ruby, the sqlite3 CLI.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+. "$REPO_ROOT/scripts/lib/spinel-link-path.sh"   # spinel_link_path: jemalloc's -L on a mac
+. "$REPO_ROOT/scripts/lib/roundhouse-bin.sh"     # ROUNDHOUSE_BIN or cargo run
+
+APP="$HOME/git/once-campfire"
+OUT=""
+KEEP=0
+STUBS=1
+STUBS_SET=0
+TARGET=ruby
+JOBS=8
+TIMEOUT=120
+REUSE=""
+FILTER=""
+TALLY=""
+FAIL_LOG=""
+JSON=""
+TMP_TALLY=""
+TMP_FAIL=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --out)       OUT="$2"; KEEP=1; shift 2 ;;
+        --keep)      KEEP=1;   shift ;;
+        --reuse)     REUSE="$2"; shift 2 ;;
+        --no-stubs)  STUBS=0; STUBS_SET=1; shift ;;
+        --stubs)     STUBS=1; STUBS_SET=1; shift ;;
+        --target)    TARGET="$2"; shift 2 ;;
+        --jobs)      JOBS="$2"; shift 2 ;;
+        --timeout)   TIMEOUT="$2"; shift 2 ;;
+        --filter)    FILTER="$2"; shift 2 ;;
+        --tally)     TALLY="$2"; shift 2 ;;
+        --fail-log)  FAIL_LOG="$2"; shift 2 ;;
+        --json)      JSON="$2"; shift 2 ;;
+        -h|--help)   sed -n '2,/^$/p' "$0" | sed 's/^# \?//'; exit 0 ;;
+        -*)          echo "unknown flag: $1" >&2; exit 2 ;;
+        *)           APP="$1"; shift ;;
+    esac
+done
+
+# The summary is a pure function of the tally and the fail-log, so --json
+# just guarantees both exist. Asking for them explicitly as well keeps
+# them; otherwise they are scratch.
+if [[ -n "$JSON" ]]; then
+    if [[ -z "$TALLY" ]]; then
+        TALLY="$(mktemp -t campfire-tally.XXXXXX)"; TMP_TALLY="$TALLY"
+    fi
+    if [[ -z "$FAIL_LOG" ]]; then
+        FAIL_LOG="$(mktemp -t campfire-faillog.XXXXXX)"; TMP_FAIL="$FAIL_LOG"
+    fi
+fi
+
+# EVERY CALLER PATH IS RESOLVED BEFORE ANYTHING CHDIRS. This script
+# `cd`s into the emit to run the tests (line ~283 below), so a relative
+# `--tally` / `--fail-log` / `--json` / `--out` / APP_PATH silently
+# retargets at that point: the tally lands somewhere else, and the
+# per-file build logs are written to a path under the emit that does not
+# exist, so EVERY file reports `BUILD  (no build log)` and the run reads
+# as a total compile failure.
+#
+# That is exactly how the first cron-shaped run of this lane failed —
+# `scripts/campfire-suite-publish` passes `bench/results/...`, a repo
+# relative path, where every hand run had passed an absolute one. The
+# harness accepted both and only one worked, which is the worst split to
+# leave to a caller.
+abs_path() {
+    local p="$1" d b
+    [[ -z "$p" || "$p" = /* ]] && { printf '%s' "$p"; return 0; }
+    d="$(dirname "$p")"
+    b="$(basename "$p")"
+    mkdir -p "$d" 2>/dev/null
+    printf '%s/%s' "$(cd "$d" && pwd)" "$b"
+}
+APP="$(abs_path "$APP")"
+OUT="$(abs_path "$OUT")"
+REUSE="$(abs_path "$REUSE")"
+TALLY="$(abs_path "$TALLY")"
+FAIL_LOG="$(abs_path "$FAIL_LOG")"
+JSON="$(abs_path "$JSON")"
+
+case "$TARGET" in
+    ruby)   ;;
+    spinel) ;;
+    *) echo "campfire-suite: --target must be ruby or spinel, got $TARGET" >&2; exit 2 ;;
+esac
+
+# See NO STUBS BY DEFAULT in the header: on the spinel lane a stub has to
+# compile as well as run, and boot.rb is loaded by every test file.
+if [[ "$TARGET" == spinel && $STUBS_SET -eq 0 ]]; then STUBS=0; fi
+
+command -v sqlite3 >/dev/null || { echo "campfire-suite: needs the sqlite3 CLI" >&2; exit 2; }
+if [[ "$TARGET" == spinel ]]; then
+    command -v spinel >/dev/null || { echo "campfire-suite: --target spinel needs spinel on PATH" >&2; exit 2; }
+    command -v spin   >/dev/null || { echo "campfire-suite: --target spinel needs spin on PATH" >&2; exit 2; }
+    # The emit names jemalloc and `spin` links it with no -L; on a mac that
+    # is not on clang's search path. See the helper for the whole story.
+    spinel_link_path
+fi
+
+step() { printf '\n\033[1;34m==>\033[0m %s\n' "$*"; }
+
+if [[ -n "$REUSE" ]]; then
+    [[ -d "$REUSE" ]] || { echo "campfire-suite: no emit at $REUSE" >&2; exit 2; }
+    OUT="$REUSE"; KEEP=1
+else
+    [[ -d "$APP" ]] || { echo "campfire-suite: no app at $APP" >&2; exit 2; }
+    [[ -z "$OUT" ]] && OUT="$(mktemp -d -t roundhouse-campfire-suite.XXXXXX)"
+fi
+
+cleanup() {
+    local code=$?
+    if [[ -n "$TMP_TALLY" ]]; then rm -f "$TMP_TALLY"; fi
+    if [[ -n "$TMP_FAIL" ]]; then rm -f "$TMP_FAIL"; fi
+    if [[ -n "${RUBY_RUNS:-}" ]]; then rm -rf "$RUBY_RUNS"; fi
+    if (( KEEP )); then
+        echo ""
+        echo "emit retained at $OUT"
+    else
+        rm -rf "$OUT"
+    fi
+    exit "$code"
+}
+trap cleanup EXIT INT TERM
+
+if [[ -z "$REUSE" ]]; then
+    # Strict emit: tip Campfire checks at 0 errors, so the suite no longer
+    # needs `--allow-unsupported`. An unsupported construct is an error —
+    # the same contract as campfire-conformance's spinel strict emit.
+    step "transpiling $APP → $OUT (target: $TARGET)"
+    rm -rf "$OUT"
+    roundhouse_run \
+        --target "$TARGET" "$APP" -o "$OUT" 2>"$OUT.log" | tail -1
+    echo "  emit diagnostics: $OUT.log"
+
+    # The suite's own fixtures populate every table, so the database only
+    # needs the schema. Each test file resets and reloads it (SchemaSetup).
+    step "preparing storage/development.sqlite3 from db/seed.sql"
+    mkdir -p "$OUT/storage"
+    sqlite3 "$OUT/storage/development.sqlite3" < "$OUT/db/seed.sql"
+
+    if (( STUBS )) && [[ -f "$REPO_ROOT/scripts/campfire-walk-stubs.rb" ]]; then
+        cp "$REPO_ROOT/scripts/campfire-walk-stubs.rb" "$OUT/walk_stubs.rb"
+        # Into BOOT.rb, not main.rb: `test/test_helper.rb` requires boot.rb
+        # (main.rb is boot plus the server, and a test run never loads it).
+        # Ahead of `app/models`, the first emitted code to reference an
+        # unmodeled base class at LOAD time.
+        ruby -e '
+          path = ARGV[0]
+          src = File.read(path)
+          anchor = %(require_relative "app/models")
+          abort "campfire-suite: no #{anchor} in boot.rb" unless src.include?(anchor)
+          File.write(path, src.sub(anchor, %(require_relative "walk_stubs"\n) + anchor))
+        ' "$OUT/boot.rb"
+        echo "  spliced walk_stubs.rb ($(grep -c '^# GAP' "$OUT/walk_stubs.rb") ledger entries) into boot.rb"
+    elif (( STUBS )); then
+        echo "  no scripts/campfire-walk-stubs.rb — ledger empty, splice skipped"
+    fi
+fi
+
+# -------- the app's own file list --------
+
+[[ -f "$OUT/Makefile" ]] || { echo "campfire-suite: no Makefile in $OUT" >&2; exit 2; }
+mapfile -t TESTS < <(
+    ruby -e '
+      src = File.read(ARGV[0])
+      block = src[/^SPINEL_TESTS :=(.*?)(?=\n\n|\n[A-Z])/m] or abort "no SPINEL_TESTS"
+      puts block.scan(%r{test/\S+_test})
+    ' "$OUT/Makefile"
+)
+if [[ -n "$FILTER" ]]; then
+    mapfile -t TESTS < <(printf '%s\n' "${TESTS[@]}" | grep -E "$FILTER" || true)
+fi
+
+# -------- the spinel lane: one native binary per test file --------
+
+BUILD_LOGS=""
+if [[ "$TARGET" == spinel ]]; then
+    BUILD_LOGS="$OUT/build-logs"
+    mkdir -p "$BUILD_LOGS"
+
+    # `spin flags` resolves the packages and prints the -I / --rbs / --link
+    # line the per-test compiles need (spinel docs/spin.md, "Building
+    # outside spin"). Resolved ONCE here and passed to every make on the
+    # command line, which overrides the emitted Makefile's own
+    # `SPIN_TEST_FLAGS = $(shell $(SPIN) flags ...)`.
+    #
+    # NOT an optimization. CONCURRENT `spin flags` IN ONE TREE COLLIDE:
+    # each re-resolves the git dependency through a FIXED staging path
+    # (~/.cache/spin/packages/.fetch-bcrypt), so all but one fail with
+    #
+    #   fatal: destination path '.../.fetch-bcrypt' already exists
+    #   spin: fetch failed: git clone https://github.com/rubys/spinel-bcrypt
+    #
+    # and exit 1 — 7 of 8 in a plain probe. The Makefile's `2>/dev/null`
+    # then turns that into an EMPTY flag set, and the compile proceeds with
+    # no -I, no --rbs and no bcrypt. That is not a build failure: it
+    # SUCCEEDS, and reports type errors from a program missing its
+    # dependencies. Thirteen of the first seventeen files of a -j8 sweep
+    # built that way before this was caught — exactly the fault f19692bc
+    # fixed, reintroduced by parallelism.
+    #
+    # `tail -1` because a COLD cache prints its `cc bcrypt/...` progress
+    # above the flag line, and `$(shell)` would fold those into the
+    # arguments too. `--strict-require` (`--require-gate` before Spinel 6aaec4f41) is stripped for the reason the
+    # Makefile strips it: a test tree requires gems with no spinel surface
+    # at all (vips, mocha, webmock), and gating them fails the compile
+    # ahead of the type errors this lane exists to count.
+    step "resolving package flags"
+    SPIN_FLAGS="$( (cd "$OUT" && spin flags 2>/dev/null) | tail -1 | sed -e 's/--strict-require //' -e 's/--require-gate //' )"
+    if [[ -z "$SPIN_FLAGS" ]]; then
+        echo "campfire-suite: \`spin flags\` produced nothing in $OUT." >&2
+        echo "  Every test would compile without its dependencies and the run would" >&2
+        echo "  measure a program that is not the one under test. Refusing." >&2
+        exit 2
+    fi
+    echo "  ${SPIN_FLAGS:0:100}…"
+
+    step "compiling ${#TESTS[@]} test binaries (-j $JOBS)"
+    started=$SECONDS
+    # ONE FILE PER COMPILE — never batched, see the header — and one log
+    # per file, because a row's `why` is its own first compile error and
+    # `make -j` interleaves every file's into a single stream.
+    #
+    # A FAILED COMPILE REMOVES THE BINARY. The run step reads "never
+    # linked" off the binary's absence, and under --reuse the tree still
+    # holds the one an earlier run built: without the rm, a compile that
+    # failed was reported as that stale binary's results, as if they were
+    # this build's.
+    printf '%s\n' "${TESTS[@]}" |
+        (cd "$OUT" && xargs -P "$JOBS" -I{} sh -c '
+            t="$1"; log="$2/$(echo "$t" | tr / _).log"
+            if make SPIN_TEST_FLAGS="$3" "build/$t" >"$log" 2>&1; then
+                printf "  \033[32mok   \033[0m %s\n" "$t"
+            else
+                rm -f "build/$t"
+                printf "  \033[33mBUILD\033[0m %s\n" "$t"
+            fi
+        ' _ {} "$BUILD_LOGS" "$SPIN_FLAGS")
+    echo "  compiled in $((SECONDS - started))s; logs in $BUILD_LOGS"
+fi
+
+if [[ "$TARGET" == ruby && "$JOBS" -gt 1 ]]; then
+    step "running ${#TESTS[@]} test files (-j $JOBS)"
+else
+    step "running ${#TESTS[@]} test files"
+fi
+
+cd "$OUT"
+pass=0
+fail=0
+unbuilt=0
+tests_total=0
+tests_skip=0
+
+# SKIPS COME OUT OF BOTH SIDES OF THE TALLY. A test that called `skip`
+# — campfire's vips policy test does, once per format the local libvips
+# did not compile in — neither passed nor failed, and the set differs
+# by HOST: two on a Linux runner where a mac has one, for the same
+# emit. Counting it failed reads as a transpiler gap; counting it
+# passed claims a check that never ran. So it leaves the denominator
+# and the run reports what it actually checked.
+#
+# Applied in BOTH branches below, which is the whole reason this is a
+# function: a file whose only non-pass is a skip EXITS ZERO, so the
+# green path is the one that meets skips most often.
+#
+# `n` is this file's denominator in the row; `tests_total` is the
+# suite's, already credited the full count from the shim's
+# `__t.__txn_test_*` calls. The shim prints one `SKIP <Class>#<test>: <why>`
+# line per skip (emit/ruby.rs::render_autorun_shim).
+take_skips_out() {
+    local ns
+    ns=$(printf '%s\n' "$1" | grep -cE '^SKIP ' || true)
+    [[ -z "$ns" ]] && ns=0
+    n=$((n - ns))
+    tests_total=$((tests_total - ns))
+    tests_skip=$((tests_skip + ns))
+}
+tests_pass=0
+table=""
+fail_lines=""
+
+# The two lanes differ in exactly one thing: what runs the file. Same
+# emitted source, same autorun shim, same output to parse. The timeout is
+# `perl -e alarm` because a binary that hangs has no analogue on the ruby
+# lane and macOS ships no coreutils `timeout`.
+#
+# Ruby's SECRET_KEY_BASE default lives HERE, not in the parallel wrapper:
+# both paths call this function, so an unset key is the same string
+# either way.
+run_test() {
+    local t="$1" priv="${2:-}"
+    export SECRET_KEY_BASE="${SECRET_KEY_BASE:-campfire-suite-secret}"
+    if [[ "$TARGET" == spinel ]]; then
+        perl -e 'alarm shift; exec @ARGV' "$TIMEOUT" "./build/$t"
+    else
+        local ruby_command=(ruby -Itest -r "$REPO_ROOT/scripts/campfire-test-bcrypt.rb" "$t.rb")
+        if [[ -n "$priv" ]]; then
+            ruby_isolated "$priv" "${ruby_command[@]}"
+        else
+            "${ruby_command[@]}"
+        fi
+    fi
+}
+
+# Active Storage uses `storage/files` by default and `tmp/storage` under
+# RAILS_ENV=test. Isolate both without changing the serial environment;
+# the sqlite file is already named from `$0`. Run the same ruby the
+# serial path uses, so argv0, cwd and the load path do not move.
+#
+# `--map-current-user` keeps the real uid. `--keep-caps` is what lets
+# the mount happen inside that mapping; it also fills every capability
+# set, including the ones a child would inherit. `setpriv` clears the
+# inherited and ambient sets before ruby. Effective and permitted are
+# already empty in the ruby process (it is not privileged), and the
+# bounding set is left as the caller's — clearing it is irreversible
+# and would make the process stricter than a serial run.
+ruby_isolated() {
+    local priv="$1"
+    shift
+    mkdir -p "$priv/tmp-storage" "$priv/files" "$OUT/tmp/storage" "$OUT/storage/files" || return
+    unshare --user --map-current-user --keep-caps --mount bash -c '
+        mount --bind "$1/tmp-storage" tmp/storage || exit $?
+        mount --bind "$1/files" storage/files || exit $?
+        shift
+        exec setpriv --inh-caps -all --ambient-caps -all "$@"
+    ' _ "$priv" "$@"
+}
+
+# True when parallel ruby runs can isolate the storage roots. Probed once:
+# a missing unshare, or a mount that the kernel refuses, is a serial
+# run rather than a suite of failed files.
+ruby_parallel_ok() {
+    command -v unshare >/dev/null 2>&1 || return 1
+    command -v setpriv >/dev/null 2>&1 || return 1
+    local probe
+    probe="$(mktemp -d -t campfire-suite-unshare.XXXXXX)"
+    mkdir -p "$probe/src" "$probe/dst"
+    if unshare --user --map-current-user --keep-caps --mount \
+        mount --bind "$probe/src" "$probe/dst" >/dev/null 2>&1; then
+        rm -rf "$probe"
+        return 0
+    fi
+    rm -rf "$probe"
+    return 1
+}
+
+# The first line of a failed compile, for the BUILD row's `why`.
+#
+# THREE DIFFERENT SPELLINGS, and only one of them says "error". clang's
+# type mismatches do (`error: passing 'sp_PolyArray *' to parameter of
+# incompatible type`), and so do spinel's own; but a spinel FRONTEND
+# refusal reads `spinel: <file>:<line>: unsupported call: ...` with no
+# such token, and matching only on `error` sends every one of those to
+# the fallback, where the row's label becomes `make: *** Error 1` — true,
+# and useless to triage against. Warnings are excluded explicitly: spinel
+# prints several on every compile, before any of them.
+#
+# The `note:` under a clang error is what names the C parameter, so the
+# whole log is kept and this is only the label.
+build_error() {
+    local log line
+    log="$BUILD_LOGS/$(printf '%s' "$1" | tr / _).log"
+    [[ -f "$log" ]] || { echo "(no build log)"; return 0; }
+    line=$(grep -E "error:|error\[|unsupported |cannot |fatal:" "$log" |
+           grep -vE "warning:|^make|^cc |^spinel .*-o build/" | head -1 || true)
+    if [[ -z "$line" ]]; then
+        line=$(grep -vE "^\s*$|^make" "$log" | tail -1 || true)
+    fi
+    # TRUNCATE BY CHARACTER, NOT BY BYTE. `cut -c` counts bytes in a C
+    # locale, and GCC quotes identifiers with U+2018/U+2019 (`initialization
+    # of âsp_Relation *â`) where clang uses ASCII
+    # quotes — so on LINUX this cut landed mid-character and wrote an
+    # invalid UTF-8 byte into the tally. `campfire-suite-summary` then died
+    # on `String#split` AFTER a 19-minute sweep whose tally was otherwise
+    # complete, and the mac never reproduced it.
+    printf '%s' "$line" | sed "s|$OUT/||g" |
+        ruby -e 'print ARGF.read.force_encoding("UTF-8").scrub("?")[0, 160].to_s' 
+}
+# Ruby file runs may overlap. Their output is captured per file and
+# folded below in the app's own file order, so the tally, the fail-log
+# and the printed rows do not depend on which file finished first.
+# Spinel stays in the loop: its binaries share one sqlite file.
+RUBY_PARALLEL=0
+RUBY_RUNS=""
+if [[ "$TARGET" == ruby && "$JOBS" -gt 1 && ${#TESTS[@]} -gt 0 ]] && ruby_parallel_ok; then
+    RUBY_PARALLEL=1
+    RUBY_RUNS="$(mktemp -d -t campfire-suite-runs.XXXXXX)"
+    started=$SECONDS
+    # Functions are exported because xargs starts a new shell. The
+    # runs directory is an environment variable: xargs appends each
+    # file as $1 and would shift a positional argument out from under it.
+    export -f ruby_isolated run_test
+    export REPO_ROOT OUT TARGET TIMEOUT
+    export RUBY_RUNS
+    # NUL-separated slot/path pairs preserve each file's position and name.
+    listed=0
+    for t in "${TESTS[@]}"; do
+        listed=$((listed + 1))
+        printf '%s\0%s\0' "$listed" "$t"
+    done | xargs -0 -P "$JOBS" -n 2 bash -c '
+            slot="$1"; t="$2"
+            # One combined stream, the same `2>&1` the serial path uses.
+            if run_test "$t" "$RUBY_RUNS/$slot" >"$RUBY_RUNS/$slot.log" 2>&1; then
+                printf 0 > "$RUBY_RUNS/$slot.status"
+            else
+                printf 1 > "$RUBY_RUNS/$slot.status"
+            fi
+        ' _ || true
+    echo "  ruby files ran in $((SECONDS - started))s"
+fi
+
+ruby_slot=0
+for t in "${TESTS[@]}"; do
+    # The emitted autorun shim (emit/ruby.rs::render_autorun_shim) runs
+    # EVERY test and prints one `FAIL <Class>#<test>: <msg>` line per
+    # failure, so a file's score is tests, not a boolean. The
+    # denominator comes from the shim's own `__t.__txn_test_*` calls,
+    # which exist even when the file dies before running any of them.
+    # Each one is the fixture-transaction wrapper around a `test_*`.
+    n=$(grep -cE '^  __t\.__txn_test_' "$t.rb" || true)
+    tests_total=$((tests_total + n))
+    # THE THIRD STATUS, and only the spinel lane can produce it: a file
+    # that never linked ran nothing, so nothing can be credited and its
+    # whole count goes against the compile error.
+    if [[ "$TARGET" == spinel && ! -x "build/$t" ]]; then
+        why=$(build_error "$t")
+        fail=$((fail + 1))
+        unbuilt=$((unbuilt + 1))
+        printf '\033[1;33m BUILD\033[0m %-56s %d/%d\n         %s\n' "$t" 0 "$n" "$why"
+        table+="BUILD|$t|0|$n|$why"$'\n'
+        continue
+    fi
+    ran_ok=0
+    if (( RUBY_PARALLEL )); then
+        ruby_slot=$((ruby_slot + 1))
+        # Missing status is a failed file, not a quiet skip: a worker
+        # that died before writing one must not be counted green.
+        status="$(cat "$RUBY_RUNS/$ruby_slot.status" 2>/dev/null || echo 1)"
+        out="$(cat "$RUBY_RUNS/$ruby_slot.log" 2>/dev/null || true)"
+        [[ "$status" == 0 ]] && ran_ok=1
+    elif out=$(run_test "$t" 2>&1); then
+        ran_ok=1
+    fi
+    if (( ran_ok )); then
+        take_skips_out "$out"
+        pass=$((pass + 1))
+        tests_pass=$((tests_pass + n))
+        printf '\033[1;32m  ok  \033[0m %-56s %d/%d\n' "$t" "$n" "$n"
+        table+="PASS|$t|$n|$n|"$'\n'
+    else
+        fail=$((fail + 1))
+        # The shim's own `<Class>: X of N tests failed` is the
+        # authoritative count — it can only be reached once every test
+        # has run. Its absence means the file ABORTED (a load error, or
+        # a raise from teardown — the two places left outside the
+        # per-test guard), and nothing ran that we can credit.
+        # `|| true` on every pipeline below: `set -o pipefail` turns
+        # `head -1`'s early exit into a SIGPIPE failure for the
+        # upstream grep, which `set -e` then treats as fatal — it ends
+        # the run mid-suite with a partial tally and no summary.
+        nf=$(printf '%s\n' "$out" |
+             sed -nE 's/.*: ([0-9]+) of [0-9]+ tests failed.*/\1/p' | head -1 || true)
+        take_skips_out "$out"
+        if [[ -n "$nf" ]]; then
+            ok=$((n - nf))
+        else
+            ok=0
+        fi
+        tests_pass=$((tests_pass + ok))
+        # The FIRST per-test failure, which is the wall to work on. The
+        # trailing `<Class>: X of N tests failed` raise is a summary,
+        # not a diagnosis, so it is only the fallback — and for an
+        # aborted file it is absent and the load error shows instead.
+        # Every per-test failure, for ranking (see --fail-log above).
+        # Same `|| true` reason as the pipelines around it.
+        if [[ -n "$FAIL_LOG" ]]; then
+            while IFS= read -r line; do
+                [[ -z "$line" ]] && continue
+                fail_lines+="$t|${line#FAIL }"$'\n'
+            done < <(printf '%s\n' "$out" | grep -E '^FAIL ' | cut -c1-200 || true)
+        fi
+        why=$(printf '%s\n' "$out" | grep -E '^FAIL ' | head -1 | cut -c1-160 || true)
+        if [[ -z "$why" ]]; then
+            why=$(printf '%s\n' "$out" | grep -vE '^\s|^$' | head -1 |
+                  sed "s|$OUT/||" | cut -c1-160 || true)
+        fi
+        printf '\033[1;31m FAIL \033[0m %-56s %d/%d\n         %s\n' "$t" "$ok" "$n" "$why"
+        table+="FAIL|$t|$ok|$n|$why"$'\n'
+    fi
+done
+
+if [[ -n "$TALLY" ]]; then
+    printf '%s' "$table" > "$TALLY"
+    echo ""
+    echo "tally written to $TALLY"
+fi
+
+if [[ -n "$FAIL_LOG" ]]; then
+    printf '%s' "$fail_lines" > "$FAIL_LOG"
+    echo "per-test failures written to $FAIL_LOG"
+fi
+
+if [[ -n "$JSON" ]]; then
+    # The SHA, not the checkout: CI unpacks a tarball, which has no .git.
+    # $CAMPFIRE_SHA is what pinned it, so it is the authority when set.
+    summary_args=(--tally "$TALLY" --fail-log "$FAIL_LOG" --out "$JSON" --target "$TARGET")
+    if [[ -f "$OUT.log" ]]; then summary_args+=(--emit-log "$OUT.log"); fi
+    if [[ -n "${CAMPFIRE_SHA:-}" ]]; then
+        summary_args+=(--campfire-sha "$CAMPFIRE_SHA")
+    else
+        summary_args+=(--app "$APP")
+    fi
+    if (( ! STUBS )); then summary_args+=(--no-stubs); fi
+    ruby "$REPO_ROOT/scripts/campfire-suite-summary" "${summary_args[@]}"
+fi
+
+summary_line="$tests_pass of $tests_total tests pass ($pass of $((pass + fail)) files green)"
+# Skips are OUT of the two counts above, so say how many — a
+# denominator that moved has to name its reason, or the next reader
+# reads a regression. campfire's vips policy test is the only source
+# today, and how many it skips is a property of the HOST's libvips.
+if (( tests_skip > 0 )); then
+    summary_line="$summary_line, $tests_skip skipped"
+fi
+if [[ "$TARGET" == spinel ]]; then
+    summary_line="$summary_line — $unbuilt of $((pass + fail)) never linked"
+fi
+step "$summary_line"

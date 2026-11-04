@@ -1,0 +1,11 @@
+optional default taken 100001 "abb"
+optional default given 100002 "aPb"
+optional short 2 "ab"
+required control 100001 "abb"
+count default 100001 "abb"
+count given 200001 "abb"
+own default 100000
+own default given 100001
+own default caller 100001 "abb"
+reads sibling 1
+reads sibling caller 100001 "abb"

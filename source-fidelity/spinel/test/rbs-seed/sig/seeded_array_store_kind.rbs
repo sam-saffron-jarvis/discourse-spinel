@@ -1,0 +1,4 @@
+class SeedStoreMem
+  @storage: Array[Integer]
+  @lazy: Array[Integer]
+end

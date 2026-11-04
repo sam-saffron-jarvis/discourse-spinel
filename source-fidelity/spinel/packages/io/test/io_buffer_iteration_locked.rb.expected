@@ -1,0 +1,37 @@
+== iteration ==
+each: => [true, [[0, 65], [1, 66], [2, 67], [3, 68], [4, 69], [5, 70], [6, 71], [7, 72]]]
+each u16: => [[0, 16961], [2, 17475], [4, 17989], [6, 18503]]
+each off: => [[1, 17218], [3, 17732], [5, 18246]]
+each cnt: => [[1, 17218], [3, 17732]]
+each odd: => [[0, 0], [2, 0]]
+each noargs: => [65, 66, 67, 68, 69, 70, 71, 72]
+each_byte: => [true, [65, 66, 67, 68, 69, 70, 71, 72]]
+each_byte args: => [67, 68, 69]
+values: => [16961, 17475, 17989, 18503]
+values def: => [65, 66, 67, 68, 69, 70, 71, 72]
+values args: => [71, 72]
+values null: => []
+get_values: => [65, 17218]
+get_values empty: => []
+get_values nonarray: ArgumentError: Argument buffer_types should be an array!
+set_values: => 2
+set_values mism: ArgumentError: Argument buffer_types and values should have the same length!
+bad each type: ArgumentError: Invalid type name!
+== locked ==
+locked ret: => [true, true]
+after: => false
+nested: IO::Buffer::LockedError: Buffer already locked!
+write in: => 1
+read in: => 1
+get_string in: => "\x01\x00\x00\x00"
+slice in: => #<IO::Buffer 0xX+2 SLICE>
+0xX  01 00                                           ..
+dup in: => #<IO::Buffer 0xX+4 INTERNAL>
+0xX  01 00 00 00                                     ....
+resize in: IO::Buffer::LockedError: Cannot resize locked buffer!
+transfer in: IO::Buffer::LockedError: Cannot transfer ownership of locked buffer!
+free in: IO::Buffer::LockedError: Buffer is locked!
+hexdump in: => "0xX  01 00 00 00                                     ...."
+clear in: => #<IO::Buffer 0xX+4 INTERNAL>
+0xX  00 00 00 00                                     ....
+value after: => 3

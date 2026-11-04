@@ -1,0 +1,5 @@
+module ActionController
+  module RateLimiter
+    def self.exceeded?: (Rails::Cache store, String key, Integer within, Integer to) -> bool
+  end
+end

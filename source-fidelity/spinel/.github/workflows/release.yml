@@ -1,0 +1,41 @@
+name: Release
+
+# A pushed release tag (YYYY.MM.DD, or YYYY.MM.DD.N) gets its source archive
+# attached: the tree plus the vendored parsers `make deps` would fetch, so
+# the recipient builds with no network (#4447). `make dist` is the whole
+# recipe; this only runs it at the tag and uploads what it wrote. Re-runnable
+# by hand for a tag that was pushed before this workflow existed.
+
+on:
+  push:
+    tags:
+      - "[0-9][0-9][0-9][0-9].[0-9][0-9].[0-9][0-9]"
+      - "[0-9][0-9][0-9][0-9].[0-9][0-9].[0-9][0-9].[0-9]*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build the archive for"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  dist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+          fetch-depth: 0   # git describe needs the tags
+
+      - name: Build the source archive
+        run: make dist
+
+      - name: Attach it to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ inputs.tag || github.ref_name }}"
+          gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" --title "$tag" --notes "spinel $tag"
+          gh release upload "$tag" build/dist/spinel-"$tag".tar.xz --clobber

@@ -1,0 +1,2661 @@
+//! Expression emission: the per-AST-node converter for Ruby.
+//!
+//! `emit_expr` is the entry; `emit_node` dispatches on `ExprNode`. Helpers
+//! for arrays, hashes, sends, blocks, literals, lvalues, patterns, and
+//! match arms live here too.
+
+use crate::diagnostic::DiagnosticKind;
+use crate::expr::{Arm, Expr, ExprNode, LValue, Literal, Pattern};
+use crate::ident::Symbol;
+use crate::ty::Ty;
+
+use super::shared::indent_lines;
+
+use std::cell::{Cell, RefCell};
+
+thread_local! {
+    /// True while emitting the body of a CORE-CLASS REOPEN (`class
+    /// String` in campfire's `lib/rails_ext/string.rb`, `class Integer`,
+    /// …). Inside one, the `self.` receiver on a send that carries
+    /// arguments is NOT cosmetic and must survive the elision below —
+    /// see the comment there. Off everywhere else, so ordinary app and
+    /// library bodies keep reading the way they always have.
+    static IN_CORE_CLASS_REOPEN: Cell<bool> = const { Cell::new(false) };
+    /// The Spinel project cannot load arbitrary source-gem/app features by
+    /// their original load paths. Preserve those sites as named refusals.
+    static SPINEL_REQUIRES: Cell<bool> = const { Cell::new(false) };
+    /// True while emitting the futamura whole-route box's own internal
+    /// copy of the `ruby` target (`project::futamura_whole_route`). An
+    /// include the analyzer could not resolve is guarded there
+    /// (`include X if defined?(X)`) rather than written plain: the
+    /// planner blocks only the routes that reach the including file, so
+    /// the box must still LOAD when such a route is never served from
+    /// it. The CLI's own `--target ruby` leaves this off and stays
+    /// fail-loud — an app meant to run on its own should not silently
+    /// swallow a mixin it could not resolve.
+    static FUTAMURA_BOX: Cell<bool> = const { Cell::new(false) };
+    /// True while emitting a CRuby or JRuby tree, whose interpreters run
+    /// a body statement where the source has it (`expr::BODY_STATEMENT`)
+    /// and have singleton classes (`expr::SINGLETON_BODY`). Off for the
+    /// Spinel tree, which keeps those constants on the class and drops
+    /// the statements.
+    static BODY_STATEMENTS: Cell<bool> = const { Cell::new(false) };
+    /// Direct, locked unknown-gem namespaces admitted by the Ruby project
+    /// emitter. Other targets retain their constant refusal.
+    static EXTERNAL_GEM_NAMESPACES: RefCell<std::collections::BTreeSet<String>> = const {
+        RefCell::new(std::collections::BTreeSet::new())
+    };
+    /// The same namespaces as a hash index with a per-detail memo, so the
+    /// per-constant check is not a scan of every namespace.
+    static EXTERNAL_ROOT_INDEX: RefCell<crate::gems::ExternalRootIndex> = RefCell::new(crate::gems::ExternalRootIndex::default());
+    /// `gems::statically_resolved_external_includes` of the app being
+    /// emitted, computed once with the namespaces above: it scans every
+    /// class, and asked per class it was most of Mastodon's emit.
+    static EXTERNAL_INCLUDES: RefCell<std::collections::BTreeMap<String, Vec<String>>> = const {
+        RefCell::new(std::collections::BTreeMap::new())
+    };
+    /// The emitted path (relative to the output root) of the file being
+    /// rendered. A `SOURCE_FILE_PATH` literal anchors on it; `None`
+    /// outside a per-file emit, where the literal is written as is.
+    static EMITTED_FILE: RefCell<Option<std::path::PathBuf>> =
+        const { RefCell::new(None) };
+}
+
+/// Run `f` while emitting the file that lands at `out_path` (relative
+/// to the output root), restoring the previous setting after.
+pub(super) fn with_emitted_file<R>(out_path: &std::path::Path, f: impl FnOnce() -> R) -> R {
+    let prev = EMITTED_FILE.with(|c| c.replace(Some(out_path.to_path_buf())));
+    let r = f();
+    EMITTED_FILE.with(|c| *c.borrow_mut() = prev);
+    r
+}
+
+/// `__FILE__` / `__dir__` from a source file the Ruby family emits
+/// elsewhere. Ruby answers the loaded file's absolute path, so this is
+/// the source's app-relative path resolved from the emitted file's own
+/// directory: `app/models/loader.rb` carrying
+/// `lib/x/loader.rb` writes
+/// `File.expand_path("../../lib/x/loader.rb", __dir__)`.
+/// The app root maps to the output root, so walks up from `__FILE__`
+/// land on the files carried there, whatever the process's cwd.
+fn source_file_path(e: &Expr) -> Option<String> {
+    if e.decisions & crate::expr::SOURCE_FILE_PATH == 0 {
+        return None;
+    }
+    let ExprNode::Lit { value: Literal::Str { value } } = &*e.node else { return None };
+    if std::path::Path::new(value).is_absolute() {
+        return None;
+    }
+    let out = EMITTED_FILE.with(|c| c.borrow().clone())?;
+    let ups = out.parent().map_or(0, |d| d.components().count());
+    let rel = format!("{}{}", "../".repeat(ups), value);
+    Some(format!(
+        "File.expand_path({}, __dir__)",
+        emit_node(&ExprNode::Lit { value: Literal::Str { value: rel } })
+    ))
+}
+
+/// Run `f` while emitting a core-class reopen's body (or not). The
+/// library emitter wraps each file, restoring the previous setting
+/// after — nested emits (a synthesized sibling rendered mid-file) do
+/// not leak their answer to the enclosing one.
+pub(super) fn with_core_class_reopen<R>(yes: bool, f: impl FnOnce() -> R) -> R {
+    let prev = IN_CORE_CLASS_REOPEN.with(|c| c.replace(yes));
+    let r = f();
+    IN_CORE_CLASS_REOPEN.with(|c| c.set(prev));
+    r
+}
+
+/// Run `f` while emitting futamura's internal `ruby` copy. See
+/// `FUTAMURA_BOX`.
+pub(crate) fn with_futamura_box<R>(f: impl FnOnce() -> R) -> R {
+    let prev = FUTAMURA_BOX.with(|c| c.replace(true));
+    let r = f();
+    FUTAMURA_BOX.with(|c| c.set(prev));
+    r
+}
+
+pub(super) fn in_futamura_box() -> bool {
+    FUTAMURA_BOX.with(Cell::get)
+}
+
+/// Run `f` while emitting a CRuby or JRuby tree. See `BODY_STATEMENTS`.
+pub(crate) fn with_body_statements<R>(f: impl FnOnce() -> R) -> R {
+    let prev = BODY_STATEMENTS.with(|c| c.replace(true));
+    let r = f();
+    BODY_STATEMENTS.with(|c| c.set(prev));
+    r
+}
+
+pub(crate) fn carries_body_statements() -> bool {
+    BODY_STATEMENTS.with(Cell::get)
+}
+
+pub(super) fn with_external_gem_namespaces<R>(
+    namespaces: &std::collections::BTreeSet<String>,
+    includes: std::collections::BTreeMap<String, Vec<String>>,
+    f: impl FnOnce() -> R,
+) -> R {
+    let previous = EXTERNAL_GEM_NAMESPACES
+        .with(|current| std::mem::replace(&mut *current.borrow_mut(), namespaces.clone()));
+    let previous_index = EXTERNAL_ROOT_INDEX
+        .with(|current| current.replace(crate::gems::ExternalRootIndex::new(namespaces)));
+    let previous_includes = EXTERNAL_INCLUDES.with(|current| current.replace(includes));
+    let result = f();
+    EXTERNAL_ROOT_INDEX.with(|current| current.replace(previous_index));
+    EXTERNAL_GEM_NAMESPACES.with(|current| {
+        *current.borrow_mut() = previous;
+    });
+    EXTERNAL_INCLUDES.with(|current| current.replace(previous_includes));
+    result
+}
+
+/// The literal requires that carry an external include (`detail` is its
+/// "X includes unresolved Y" key), when the emit admitted them.
+pub(super) fn external_include_features(detail: &str) -> Vec<String> {
+    EXTERNAL_INCLUDES.with(|includes| includes.borrow().get(detail).cloned().unwrap_or_default())
+}
+
+pub(crate) fn external_gem_namespace_is_enabled(namespace: &str) -> bool {
+    EXTERNAL_GEM_NAMESPACES.with(|namespaces| namespaces.borrow().contains(namespace))
+}
+
+/// Enable Spinel's named refusal for source load paths that are not carried.
+pub(crate) fn with_spinel_requires<R>(f: impl FnOnce() -> R) -> R {
+    let prev = SPINEL_REQUIRES.with(|c| c.replace(true));
+    let result = f();
+    SPINEL_REQUIRES.with(|c| c.set(prev));
+    result
+}
+
+// Features supplied by Spinel's packages or its native/core require table.
+// Deliberately not Ruby's stdlib list: e.g. `etc` has no Spinel provider.
+fn spinel_require_feature(feature: &str) -> bool {
+    matches!(feature,
+        "base64" | "benchmark" | "bigdecimal" | "cgi" | "csv" | "date" | "digest"
+        | "digest/md5" | "digest/sha1" | "digest/sha2" | "erb" | "fileutils" | "find"
+        | "forwardable" | "io/console" | "io/wait" | "ipaddr" | "json" | "logger"
+        | "monitor" | "net/http" | "observer" | "open3" | "openssl" | "optparse"
+        | "ostruct" | "pathname" | "pp" | "pty" | "securerandom" | "set" | "shellwords"
+        | "singleton" | "socket" | "stringio" | "strscan" | "tempfile" | "time"
+        | "timeout" | "tmpdir" | "uri" | "weakref" | "yaml" | "zlib" | "psych"
+        | "thread" | "fiber" | "enumerator" | "ffi" | "rational" | "complex"
+        | "rbconfig" | "rubygems")
+}
+
+/// Pure classification shared with Spinel entry reachability. Only the
+/// emitter reports the refusal; scanning a closure must not emit diagnostics.
+pub(crate) fn unmapped_spinel_require(e: &Expr) -> Option<&str> {
+    let ExprNode::Send { recv, method, args, .. } = &*e.node else { return None };
+    if method.as_str() != "require" || !recv.as_ref().is_none_or(|r| {
+        matches!(&*r.node, ExprNode::SelfRef)
+            || matches!(&*r.node, ExprNode::Const { path } if path.len() == 1 && path[0].as_str() == "Kernel")
+    }) { return None; }
+    let feature = match args.as_slice() {
+        [arg] => match &*arg.node {
+            ExprNode::Lit { value: Literal::Str { value } } => Some(value.as_str()),
+            _ => None,
+        },
+        _ => None,
+    };
+    if feature.is_some_and(|f| {
+        spinel_require_feature(f)
+            || crate::gems::GEM_REQUIRES.contains(&f)
+    }) { return None; }
+    Some(feature.unwrap_or("dynamic feature"))
+}
+
+fn unsupported_spinel_require(e: &Expr) -> Option<String> {
+    if !SPINEL_REQUIRES.with(Cell::get) { return None; }
+    let construct = format!("require {}", unmapped_spinel_require(e)?);
+    Some(crate::emit::diagnostics::report_unsupported(
+        e.span, "spinel", construct,
+        "source-gem/app load paths are not preserved in the emitted project; needs feature-to-emitted-file load mapping",
+    ))
+}
+
+/// Emit Ruby-family syntax while retaining diagnostics and typed primitive
+/// semantics, including the no-block form of String#bytes with literal &nil.
+pub fn emit_expr(e: &Expr) -> String {
+    if let Some(stub) = unsupported_spinel_require(e) {
+        return format!("({stub})");
+    }
+    if is_locked_external_gem_constant(e) {
+        return emit_node(&e.node);
+    }
+    // A constant of `X`'s `class << self` lives on its singleton class.
+    if e.decisions & crate::expr::SINGLETON_CONSTANT_REF != 0
+        && carries_body_statements()
+        && let ExprNode::Const { path } = &*e.node
+        && let [owner @ .., name] = &path[..]
+        && !owner.is_empty()
+    {
+        return format!("{}.singleton_class::{}", emit_const_path(owner), name.as_str());
+    }
+    // `self.class::KINDS`, which ingest gave the analysis as `const_get`.
+    if e.decisions & crate::expr::CONST_PATH != 0
+        && let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &*e.node
+        && method.as_str() == "const_get"
+        && let [arg] = args.as_slice()
+        && let Some(name) = match &*arg.node {
+            ExprNode::Lit { value: crate::expr::Literal::Sym { value } } => Some(value.as_str().to_string()),
+            ExprNode::Lit { value: crate::expr::Literal::Str { value } } => Some(value.clone()),
+            _ => None,
+        }
+    {
+        return format!("{}::{name}", emit_postfix_recv(r));
+    }
+    // A site a lowering replaced with a stub — `lower::object_extend`,
+    // the arel `ColumnSpec::Named` placeholder — renders as the raise
+    // the report describes, so the program fails THERE with the reason
+    // rather than compiling a construct no target can run. Only the
+    // `Unsupported` kind: an `IncompatibleBinop` the analyzer stamps is
+    // left to Ruby itself, which raises at the same site on its own.
+    if let Some(kind @ DiagnosticKind::Unsupported { .. }) = &e.diagnostic() {
+        // This is an expression, including in a rescue list or a binary
+        // operand. A bare command-style `raise` is not valid there.
+        let stub = crate::emit::diagnostics::StubStyle::Raise
+            .render(&crate::diagnostic::Diagnostic::stub_text(kind));
+        return format!("({stub})");
+    }
+    if crate::emit::shared::string_bytes::materializes_array(e) {
+        if let ExprNode::Send { recv, method, args, parenthesized, .. } = &*e.node {
+            // Literal &nil supplies no block. Canonicalize it here so Spinel
+            // takes the array-returning native bytes path too; arbitrary block
+            // expressions retain their effects through the ordinary emitter.
+            return emit_send_base(recv.as_ref(), method, args, *parenthesized);
+        }
+    }
+    if let Some(path) = source_file_path(e) {
+        return path;
+    }
+    if is_mutable_string_literal(e) {
+        return format!("+{}", emit_node(&e.node));
+    }
+    // Set when `iso8601` was grounded. Scope-chain rebuilds the send
+    // and can widen the receiver, so the type alone is not enough.
+    if e.decisions & crate::expr::GROUNDED_TIME_FORMAT != 0 {
+        if let ExprNode::Send { recv, method, args, parenthesized, block: None } = &*e.node {
+            if method.as_str() == "to_rfc3339" && args.is_empty() {
+                return emit_send_base(recv.as_ref(), &Symbol::from("iso8601"), args, *parenthesized);
+            }
+        }
+    }
+    emit_node(&e.node)
+}
+
+fn is_locked_external_gem_constant(expr: &Expr) -> bool {
+    let Some(DiagnosticKind::Unsupported {
+        construct, detail, ..
+    }) = &expr.diagnostic()
+    else {
+        return false;
+    };
+    if construct.as_str() != "constant" {
+        return false;
+    }
+    EXTERNAL_ROOT_INDEX.with(|index| index.borrow_mut().names_any(detail))
+}
+
+/// A string literal ingested from `+"literal"`. Written back with its
+/// `+`: spinel freezes a bare literal, and the source made this copy
+/// because it mutates it.
+fn is_mutable_string_literal(e: &Expr) -> bool {
+    e.hint() == &Some(crate::expr::IrHint::MutableStringLiteral)
+        && matches!(&*e.node, ExprNode::Lit { value: Literal::Str { .. } })
+}
+
+/// A receiver that a postfix form (`[i]`, `.attr = v`, `.method(:m)`)
+/// follows directly. `+"a"[0]` is `+("a"[0])`: unary `+` binds looser
+/// than both, so a `+"literal"` there keeps parentheses. The general
+/// call path makes the same call through `recv_needs_parens`.
+fn emit_postfix_recv(r: &Expr) -> String {
+    let s = emit_expr(r);
+    // `(@values ||= {})[key]` bare is `@values ||= {}[key]`: the index binds to the default.
+    if recv_needs_parens(r) { format!("({s})") } else { s }
+}
+
+/// True when an If's else-branch carries no statements: an empty `Seq`
+/// or `nil`. The two surface forms `if cond; expr; end` (no else) and
+/// `expr if cond` (modifier) both rely on this predicate.
+fn is_empty_branch(e: &Expr) -> bool {
+    matches!(&*e.node, ExprNode::Seq { exprs } if exprs.is_empty())
+        || matches!(&*e.node, ExprNode::Lit { value: Literal::Nil })
+}
+
+/// True when any node in this expression tree assigns a variable —
+/// `Assign`/`OpAssign`/`MultiAssign` at any depth. Used to keep an
+/// `if` whose condition binds locals in statement form (see the If
+/// arm in `emit_node`).
+fn contains_assign(e: &Expr) -> bool {
+    if matches!(
+        &*e.node,
+        ExprNode::Assign { .. } | ExprNode::OpAssign { .. } | ExprNode::MultiAssign { .. }
+    ) {
+        return true;
+    }
+    let mut names = Vec::new();
+    match &*e.node {
+        ExprNode::MatchPredicate { pattern, .. } | ExprNode::MatchRequired { pattern, .. } => {
+            pattern.bound_names(&mut names);
+        }
+        ExprNode::CaseMatch { arms, .. } => {
+            for arm in arms { arm.pattern.bound_names(&mut names); }
+        }
+        _ => {}
+    }
+    if !names.is_empty() { return true; }
+    let mut found = false;
+    e.node.for_each_child(&mut |c| {
+        if !found && contains_assign(c) {
+            found = true;
+        }
+    });
+    found
+}
+
+fn emit_node(n: &ExprNode) -> String {
+    match n {
+        ExprNode::Lit { value } => emit_literal(value),
+        ExprNode::Var { name, .. } => emit_local_read(name.as_str()),
+        ExprNode::Ivar { name } => format!("@{name}"),
+        ExprNode::SelfRef => "self".to_string(),
+        ExprNode::Const { path } => emit_const_path(path),
+        ExprNode::Hash { entries, kwargs } => emit_hash(entries, *kwargs),
+        ExprNode::Array { elements, style } => emit_array(elements, style),
+        ExprNode::StringInterp { parts } => emit_string_interp(parts),
+        ExprNode::BoolOp { op, surface, left, right } => {
+            emit_bool_op(*op, *surface, left, right)
+        }
+        // The value as an argument would be: `x = (a if c)`, not the
+        // trailing modifier `x = a if c`, which skips the assignment.
+        ExprNode::Let { name, value, body, .. } => {
+            format!("{name} = {}\n{}", emit_arg(value), emit_expr(body))
+        }
+        ExprNode::Lambda { params, rest_param, extra_params, block_param, body, .. } => {
+            let mut ps = lambda_params(params, extra_params, rest_param.as_ref());
+            if let Some(b) = block_param { ps.push(format!("&{b}")); }
+            if ps.is_empty() {
+                format!("-> {{ {} }}", emit_expr(body))
+            } else {
+                format!("->({}) {{ {} }}", ps.join(", "), emit_expr(body))
+            }
+        }
+        // `method(:name)` / `recv.method(:name)` — verbatim. Spinel
+        // supports `Method` objects natively (see
+        // `~/working/spinel/README.md`'s block-methods list and
+        // `docs/limitations.md`'s `obj.method(:m)` coverage), so this
+        // is not an approximation: the emitted call is exactly the
+        // Ruby source's own construct. In block-argument position
+        // (`&method(:name)`), `emit_do_block`'s non-Lambda fallback
+        // re-attaches this as `&` — see its doc comment.
+        ExprNode::MethodRef { recv, name } => match recv {
+            Some(r) => format!("{}.method(:{name})", emit_postfix_recv(r)),
+            None => format!("method(:{name})"),
+        },
+        ExprNode::Apply { fun, args, block } => {
+            let args_s: Vec<String> = args.iter().map(emit_arg).collect();
+            let base = format!("{}.call({})", emit_expr(fun), args_s.join(", "));
+            if let Some(b) = block { format!("{base} {{ {} }}", emit_expr(b)) } else { base }
+        }
+        ExprNode::Send { recv, method, args, block, parenthesized } => {
+            // A brace block binds to the nearest call: after paren-less
+            // arguments it is the last argument's block (`f a, b { }` is
+            // `f(a, b { })`) or a syntax error (`f a, k: 1 { }`). The
+            // call's own `{ }` block (`field :name, :string,
+            // &:upcase`, ingested as `{ |x| x.upcase }`) takes the
+            // arguments in parentheses.
+            let brace = block.as_ref().is_some_and(|b| {
+                matches!(&*b.node, ExprNode::Lambda { block_style: crate::expr::BlockStyle::Brace, .. })
+            });
+            let base = emit_send_base(recv.as_ref(), method, args, *parenthesized || (brace && !args.is_empty()));
+            match block {
+                None => base,
+                Some(b) => emit_do_block(&base, b),
+            }
+        }
+        ExprNode::If { cond, then_branch, else_branch } => {
+            // Empty `else` branch — render without the else clause. If the
+            // then-branch is also a single short expression, prefer the
+            // modifier form `expr if cond` (matches the surface form
+            // synthesized lowerings expect, e.g. controller before-action
+            // dispatch). Empty here means `Seq{[]}` or `Lit::Nil`, the two
+            // shapes lowerings produce for "no-op."
+            // `emit_arg` parenthesizes a trailing-modifier condition
+            // (`if (x rescue false)`) so the modifier binds to the cond,
+            // not the whole `if`.
+            let cond_s = emit_arg(cond);
+            let then_s = emit_expr(then_branch);
+            let else_empty = is_empty_branch(else_branch);
+            // A condition that ASSIGNS a local read by the then-branch
+            // must keep statement form: Ruby decides local-vs-method at
+            // parse time by lexical position, so in `@user = user if
+            // (user = …)` the body's `user` sits before the assignment
+            // and parses as a method call (NameError at runtime).
+            // Statement form keeps the assignment lexically first.
+            // Conservative: any Assign in the cond forces statement form.
+            if else_empty
+                && !matches!(&*then_branch.node, ExprNode::Seq { .. })
+                && !then_s.contains('\n')
+                && !contains_assign(cond)
+                && !renders_as_trailing_modifier(then_branch)
+            {
+                format!("{then_s} if {cond_s}")
+            } else if else_empty {
+                format!("if {cond_s}\n{}\nend", indent_lines(&then_s, 1))
+            } else {
+                format!(
+                    "if {cond_s}\n{}\nelse\n{}\nend",
+                    indent_lines(&then_s, 1),
+                    indent_lines(&emit_expr(else_branch), 1),
+                )
+            }
+        }
+        ExprNode::Case { scrutinee, arms } => {
+            let mut s = format!("case {}\n", emit_arg(scrutinee));
+            for arm in arms {
+                s.push_str(&emit_arm(arm));
+            }
+            s.push_str("end");
+            s
+        }
+        // No explicit `else … raise` needed: CRuby's own `case/in`
+        // already raises `NoMatchingPatternError` on an unmatched
+        // scrutinee when there's no `else` clause, which is exactly
+        // the semantics `else_body: None` means in this IR.
+        ExprNode::CaseMatch { scrutinee, arms, else_body } => {
+            let mut s = format!("case {}\n", emit_arg(scrutinee));
+            for arm in arms {
+                s.push_str(&emit_match_arm(arm));
+            }
+            if let Some(eb) = else_body {
+                s.push_str("else\n");
+                s.push_str(&indent_lines(&emit_expr(eb), 1));
+                s.push('\n');
+            }
+            s.push_str("end");
+            s
+        }
+        ExprNode::MatchPredicate { value, pattern } => {
+            // `in` binds below assignment and boolean operators. Protect
+            // both the subject and the match when embedded in another expression.
+            format!("(({}) in {})", emit_expr(value), emit_match_pattern(pattern))
+        }
+        ExprNode::MatchRequired { value, pattern } => {
+            format!("(({}) => {})", emit_expr(value), emit_match_pattern(pattern))
+        }
+        ExprNode::Seq { exprs } => {
+            let mut out = String::new();
+            let last = exprs.len().saturating_sub(1);
+            let mut first = true;
+            for (i, e) in exprs.iter().enumerate() {
+                // A self binding whose value nothing reads only informs
+                // the typer: a `#: self as T` comment never runs, and a
+                // `T.bind` keeps just its value, `self`, as `T.cast` does.
+                if i < last && crate::expr::is_self_binding(e) {
+                    continue;
+                }
+                if !first {
+                    out.push('\n');
+                    if e.leading_blank_line {
+                        out.push('\n');
+                    }
+                    // Not before the first: a value-site Seq renders as
+                    // `(a\nb)`, and the marker must start its line. The
+                    // enclosing statement's or def's marker covers it.
+                    if let Some(m) = super::source_markers::marker_for(&e.span) {
+                        out.push_str(&m);
+                        out.push('\n');
+                    }
+                }
+                first = false;
+                out.push_str(&emit_expr(e));
+            }
+            out
+        }
+        ExprNode::Assign { target, value } => {
+            // Multi-stmt Seq as RHS (mattr/cattr block defaults) must
+            // group so the assign value is the last expression — bare
+            // newlines end the statement after the first line.
+            let rhs = emit_expr(value);
+            // `x = (y if c)`: bare, `x = y if c` assigns only when `c`
+            // holds, where the `if` without an else gives nil.
+            let rhs = if is_multi_seq(value) || assigns_as_modifier_if(value) {
+                format!("({rhs})")
+            } else {
+                rhs
+            };
+            format!("{} = {}", emit_lvalue(target), rhs)
+        }
+        // Native Ruby compound assignment — `target ||= value`,
+        // `target += value`, etc. Preserves source short-circuit
+        // semantics (and Rails dirty-tracking on `||=`).
+        ExprNode::OpAssign { target, op, value } => {
+            // `x ||= (y if c)`, every form below: bare, the modifier
+            // guards the assignment.
+            let rhs = emit_expr(value);
+            let rhs = if assigns_as_modifier_if(value) { format!("({rhs})") } else { rhs };
+            // `ENV[k] ||= v`: spinel models ENV only as a call receiver,
+            // and an op-assign target reads it as a value. Expand to the
+            // read-then-write Ruby defines it as.
+            if let LValue::Index { recv, index } = target {
+                // Only duplicate a literal key. A computed key must retain
+                // Ruby's native single-evaluation compound assignment.
+                if matches!(&*index.node, ExprNode::Lit { value: Literal::Str { .. } })
+                    && matches!(&*recv.node, ExprNode::Const { path } if path.len() == 1 && path[0].as_str() == "ENV") {
+                    let k = emit_expr(index);
+                    let v = rhs.clone();
+                    let infix = op.as_ruby().trim_end_matches('=');
+                    return match infix {
+                        "||" | "&&" => format!("(ENV[{k}] {infix} (ENV[{k}] = {v}))"),
+                        _ => format!("ENV[{k}] = ENV[{k}] {infix} {v}"),
+                    };
+                }
+            }
+            // Attr-target arithmetic compounds (`node.string_content +=
+            // user`) desugar to read-op-write: spinel AOT rejects the
+            // compound form on a method attr, and arithmetic ops have no
+            // short-circuit to preserve (the IR contract explicitly
+            // allows free desugar; `||=`/`&&=` keep their native form).
+            // Only when the receiver is a pure read — evaluating it
+            // twice must be side-effect-free.
+            if let (crate::expr::LValue::Attr { recv, name }, false) = (
+                target,
+                matches!(op, crate::expr::OpAssignOp::OrOr | crate::expr::OpAssignOp::AndAnd),
+            ) {
+                if matches!(
+                    &*recv.node,
+                    ExprNode::Var { .. } | ExprNode::Ivar { .. } | ExprNode::SelfRef
+                        | ExprNode::Const { .. }
+                ) {
+                    let r = emit_expr(recv);
+                    let infix = op.as_ruby().trim_end_matches('=');
+                    return format!("{r}.{name} = {r}.{name} {infix} {rhs}");
+                }
+            }
+            format!("{} {} {}", emit_lvalue(target), op.as_ruby(), rhs)
+        }
+        ExprNode::Yield { args } => {
+            let args_s: Vec<String> = args.iter().map(emit_arg).collect();
+            // Parenthesized: `html << yield x` does not parse bare.
+            if args_s.is_empty() { "yield".to_string() } else { format!("yield({})", args_s.join(", ")) }
+        }
+        ExprNode::Raise { value } => format!("raise {}", emit_expr(value)),
+        ExprNode::RescueModifier { expr, fallback } => {
+            format!("{} rescue {}", emit_expr(expr), emit_expr(fallback))
+        }
+        ExprNode::Return { value } => {
+            // `return nil` round-trips as bare `return` for source fidelity.
+            if matches!(&*value.node, ExprNode::Lit { value: crate::expr::Literal::Nil }) {
+                "return".to_string()
+            } else if matches!(
+                &*value.node,
+                ExprNode::If { .. } | ExprNode::Case { .. } | ExprNode::RescueModifier { .. }
+            ) {
+                // `return if c … else … end` re-parses as a modifier `if`
+                // guarding a bare `return`, and the `else` is then a
+                // syntax error. Parenthesize the value.
+                format!("return ({})", emit_expr(value))
+            } else {
+                format!("return {}", paren_multiline(emit_expr(value)))
+            }
+        }
+        ExprNode::Super { args } => match args {
+            None => "super".to_string(),
+            Some(args) => {
+                let args_s: Vec<String> = args.iter().map(emit_keyword_forward_arg).collect();
+                format!("super({})", args_s.join(", "))
+            }
+        },
+        ExprNode::Next { value } => match value {
+            None => "next".to_string(),
+            Some(v) => format!("next {}", paren_multiline(emit_expr(v))),
+        },
+        ExprNode::Break { value } => match value {
+            None => "break".to_string(),
+            Some(v) => format!("break {}", paren_multiline(emit_expr(v))),
+        },
+        ExprNode::Retry => "retry".to_string(),
+        ExprNode::Redo => "redo".to_string(),
+        // `*(handles unless ready)`: bare, a modifier operand ends the
+        // element (`[*handles unless ready, x]` does not parse) or binds
+        // the whole enclosing statement; a command operand takes the
+        // following elements as its arguments.
+        ExprNode::Splat { value } => {
+            if renders_open_ended(value) {
+                format!("*({})", emit_expr(value))
+            } else {
+                format!("*{}", emit_arg(value))
+            }
+        }
+        ExprNode::ForwardArgs => "...".to_string(),
+        ExprNode::ForwardKeywords => "**".to_string(),
+        ExprNode::ForwardKeywordsWithPairs { entries } => {
+            let pairs = emit_hash(entries, true);
+            if pairs.is_empty() {
+                "**".to_string()
+            } else {
+                format!("{pairs}, **")
+            }
+        }
+        ExprNode::Defined { operand } => format!("defined?({})", emit_expr(operand)),
+        ExprNode::KeywordSplat { value } => format!("**{}", paren_multiline(emit_arg(value))),
+        ExprNode::MultiAssign { targets, value } => {
+            let lhs: Vec<String> = targets.iter().map(emit_lvalue).collect();
+            format!("{} = {}", lhs.join(", "), emit_expr(value))
+        }
+        ExprNode::While { cond, body, until_form } => {
+            let kw = if *until_form { "until" } else { "while" };
+            format!(
+                "{kw} {}\n{}\nend",
+                emit_expr(cond),
+                indent_lines(&emit_expr(body), 1),
+            )
+        }
+        ExprNode::Range { begin, end, exclusive } => {
+            let op = if *exclusive { "..." } else { ".." };
+            let b = begin.as_ref().map(emit_expr).unwrap_or_default();
+            let e = end.as_ref().map(emit_expr).unwrap_or_default();
+            format!("{b}{op}{e}")
+        }
+        ExprNode::BeginRescue { body, rescues, else_branch, ensure, implicit } => {
+            let mut s = String::new();
+            if !*implicit {
+                s.push_str("begin\n");
+            }
+            s.push_str(&indent_lines(&emit_expr(body), 1));
+            s.push('\n');
+            for rc in rescues {
+                s.push_str("rescue");
+                if !rc.classes.is_empty() {
+                    let cs: Vec<String> = rc.classes.iter().map(emit_expr).collect();
+                    s.push(' ');
+                    s.push_str(&cs.join(", "));
+                }
+                if let Some(name) = &rc.binding {
+                    s.push_str(&format!(" => {name}"));
+                }
+                s.push('\n');
+                s.push_str(&indent_lines(&emit_expr(&rc.body), 1));
+                s.push('\n');
+            }
+            if let Some(eb) = else_branch {
+                s.push_str("else\n");
+                s.push_str(&indent_lines(&emit_expr(eb), 1));
+                s.push('\n');
+            }
+            if let Some(en) = ensure {
+                s.push_str("ensure\n");
+                s.push_str(&indent_lines(&emit_expr(en), 1));
+                s.push('\n');
+            }
+            if !*implicit {
+                s.push_str("end");
+            }
+            s
+        }
+        // Cast: explicit IR coercion marker. Ruby is dynamic so we
+        // don't need a runtime cast operator — but a downstream Ruby
+        // consumer might be a type-narrowing compiler (spinel AOT)
+        // that benefits from explicit per-use-site coercion calls.
+        // When the target_ty is a primitive and value's body-typer ty
+        // is poly (Untyped or a Union), emit an explicit Ruby
+        // coercion call (`(value).to_s`, etc.). For a String value
+        // this is identity; for a poly value flowing into a typed
+        // slot the call narrows the result and lets spinel infer the
+        // unboxed primitive at the use site without per-ivar RBS
+        // annotations (spinel #651 was the canonical surfacing case).
+        ExprNode::Cast { value, target_ty } => emit_cast(value, target_ty),
+    }
+}
+
+/// Is this cast target a boolean slot? A NULLABLE boolean column types
+/// as `Union{Bool, Nil}` rather than `Bool`, and the nil half is already
+/// handled by the `row["c"].nil? ? nil : …` guard the hydration wraps
+/// around the cast — so inside it the target is effectively `Bool`.
+fn is_bool_target(ty: &crate::ty::Ty) -> bool {
+    use crate::ty::Ty;
+    match ty {
+        Ty::Bool => true,
+        Ty::Union { variants } => {
+            variants.iter().any(|v| matches!(v, Ty::Bool))
+                && variants.iter().all(|v| matches!(v, Ty::Bool | Ty::Nil))
+        }
+        _ => false,
+    }
+}
+
+/// Translate an `ExprNode::Cast` to a Ruby expression.
+///
+/// Default: identity — Ruby is dynamic and doesn't need a runtime cast
+/// operator at most positions. Specialization: when the target is a
+/// primitive (`Str`/`Sym`/`Int`/`Float`) and the inner value's
+/// body-typer ty is poly (`Untyped` or a `Union` over several variants),
+/// emit an explicit Ruby coercion call (`(value).to_s` and friends).
+/// This is a no-op semantically for already-narrow values (String#to_s
+/// returns self, Integer#to_i returns self) but it surfaces the
+/// narrowing intent in the emitted source — load-bearing for downstream
+/// Ruby compilers (spinel AOT) that do per-use-site type narrowing.
+fn emit_cast(value: &Expr, target_ty: &crate::ty::Ty) -> String {
+    use crate::ty::Ty;
+    let inner = emit_expr(value);
+    // A Bool target is coerced even when the value is not poly, unlike
+    // the narrowing casts. Those are semantic no-ops on an already-narrow
+    // value (`String#to_s` is self), so they are skipped when the inner
+    // value is not poly — and the row-hydration lookups this pass
+    // rewrites carry no stamped type at all, so that gate would skip
+    // them too. For a boolean, identity is not a no-op: it is the bug.
+    // The Bool arm sits after `pure_read` so a nullable read keeps nil.
+    let value_is_poly = matches!(
+        value.ty.as_ref(),
+        Some(Ty::Untyped) | Some(Ty::Union { .. })
+    );
+    if !value_is_poly && !is_bool_target(target_ty) {
+        return inner;
+    }
+    // NIL-SAFE coercion for pure reads (Var/Ivar — no double-eval
+    // hazard): `nil.to_i` is 0 and `nil.to_s` is "", which destroys
+    // SQL NULL on the typed-slot hydration path (`self[:col]=`) —
+    // `group_by(&:fk)[nil]` finds no roots, `banned_at?` is true for
+    // everyone. Rails keeps nil nil; so do we. Ternary + `.nil?`
+    // rather than `&.` — the spinel AOT consumer of this emit has no
+    // proven safe-nav support. Effectful operands keep the plain
+    // coercion (legacy behavior) rather than risk double evaluation.
+    // What counts as re-evaluable: a name, plus the two shapes the two
+    // hydration paths actually read a column through — `row["col"]` on
+    // the raw-hash path and `row.col` on the typed-row path. Both are
+    // side-effect-free lookups off a local, so evaluating twice costs a
+    // second lookup and nothing else. This has to cover them, because a
+    // NILABLE target now reaches a coercion arm (see the match below)
+    // and `nil.to_i` is 0 — the exact NULL-destroying shape the guard
+    // above exists to prevent. Widening the arms without widening this
+    // set collapsed lobsters' /u from 292KB to 3KB: `invited_by_user_id`
+    // read 0 instead of nil, so `group_by(&:fk)[nil]` found no roots
+    // and the whole invite tree rendered empty.
+    // A NILABLE target extends the re-evaluable set to the two shapes
+    // the hydration paths read a column through — `row["col"]` and
+    // `row.col`, both side-effect-free lookups off a local. It has to,
+    // because such a target now reaches a coercion arm (see the match
+    // below) and `nil.to_i` is 0, the exact NULL-destroying shape the
+    // guard exists to prevent. Non-nilable targets keep the original,
+    // narrower set: nothing there can be nil, and widening the guard
+    // for them wrapped `karma` — declared `null: false` — in a ternary
+    // that could assign nil into a slot the RBS pins `Integer`.
+    let target_is_nilable = matches!(
+        target_ty,
+        Ty::Union { variants } if variants.iter().any(|v| matches!(v, Ty::Nil))
+    );
+    // BOTH arms gate on a nilable target, for the reason the paragraph
+    // above gives for the second one: a guard exists to keep SQL NULL
+    // alive, and a target that cannot be nil has no NULL to keep. The
+    // Var/Ivar arm used to fire unconditionally, which is how `[]=`'s
+    // `value` param — always a Var — wrapped EVERY column, including
+    // `id`. That emitted `@id = (value).nil? ? nil : (value).to_i` into
+    // a slot the RBS pins `Integer` and the runtime seeds `0`: a write
+    // of the one value the design forbids. Unreachable (nothing calls
+    // `self[:id] = nil`), and it still cost the representation —
+    // spinel widens on the POSSIBILITY, so `@id` boxed to `sp_RbVal`
+    // on every model in the corpus and every `--rbs` pin was dropped.
+    // Dropping the guard is not a substitution either: `nil.to_i` is
+    // already `0`, so the plain coercion produces the sentinel by
+    // construction.
+    let pure_read = match &*value.node {
+        ExprNode::Var { .. } | ExprNode::Ivar { .. } => target_is_nilable,
+        ExprNode::Send { recv: Some(r), method, args, block: None, .. } if target_is_nilable => {
+            let recv_is_name = matches!(&*r.node, ExprNode::Var { .. } | ExprNode::Ivar { .. });
+            let reader_or_lookup = args.is_empty()
+                || (method.as_str() == "[]"
+                    && args.iter().all(|a| matches!(&*a.node, ExprNode::Lit { .. })));
+            recv_is_name && reader_or_lookup
+        }
+        _ => false,
+    };
+    // Boolean casts need the same nil guard as numeric/string casts:
+    // their `to_s` would otherwise turn a nullable NULL into false.
+    if is_bool_target(target_ty) {
+        let cast = format!("![\"0\", \"\", \"false\"].include?(({inner}).to_s)");
+        return if pure_read {
+            format!("({inner}).nil? ? nil : ({cast})")
+        } else {
+            cast
+        };
+    }
+    // `x&.to_s`, not `(x).nil? ? nil : (x).to_s`: the same value on every
+    // Ruby, and the one spelling spinel types as a nullable primitive --
+    // nil met with a String at a ternary is untyped there (spinel#4567),
+    // while `&.` is a NULL-able `const char *`. The receiver is a name or
+    // a one-hop read off a name (`pure_read`), so it needs no parentheses.
+    let coerce = |m: &str| {
+        if pure_read {
+            format!("{inner}&.{m}")
+        } else {
+            format!("({inner}).{m}")
+        }
+    };
+    // Peeled, so a NULLABLE column reaches its own arm. A nullable
+    // scalar types `T | Nil`, which matched none of these and fell to
+    // the identity arm below — the same hole `is_bool_target` already
+    // peels around for `Bool | Nil`, left open for every other scalar.
+    // NULL survives it: the hydration wraps this cast in its own
+    // `.nil?` guard, and `coerce` adds a second one for pure reads.
+    match target_ty.peel_nilable() {
+        Ty::Str => coerce("to_s"),
+        Ty::Sym => coerce("to_sym"),
+        Ty::Int => coerce("to_i"),
+        Ty::Float => coerce("to_f"),
+        // Ruby has no `to_b`, which is why this arm was missing — but
+        // the coercion is the load-bearing one on the row-hydration
+        // path, and leaving it as identity is a correctness bug rather
+        // than a missed narrowing.
+        //
+        // Adapters disagree about what a boolean column reads as: the
+        // gem-backed shims give `true`/`false` or `1`/`0`, and spinel's
+        // `Db.column_value` gives the `0`/`1` of the INTEGER storage
+        // class (it used to give the STRING `"0"`, before storage-class
+        // dispatch landed in runtime/spinel/db.rb — the string spelling
+        // stays covered below because nothing guarantees a future
+        // adapter won't reintroduce it). Assigning a raw `"0"` into a
+        // slot the RBS pins `bool` makes it `true`, and lobsters'
+        // `Rack::MiniProfiler.authorize_request if @user &&
+        // @user.is_admin?` then fired for a user whose `is_admin` is 0,
+        // taking the whole request down under spinel AOT.
+        //
+        // Compare the string form so one expression covers every
+        // adapter: `false`/`0`/`"0"` are the false spellings, plus `""`
+        // for an adapter that renders NULL-ish as empty. Single
+        // evaluation of `inner` — this runs per row per boolean column.
+        // NULL is already handled by the nil guard the hydration wraps
+        // around this cast, so no nil check is needed here.
+        _ => inner,
+    }
+}
+
+fn emit_bool_op(
+    op: crate::expr::BoolOpKind,
+    surface: crate::expr::BoolOpSurface,
+    left: &Expr,
+    right: &Expr,
+) -> String {
+    use crate::expr::{BoolOpKind, BoolOpSurface};
+    let op_s = match (op, surface) {
+        (BoolOpKind::Or, BoolOpSurface::Symbol) => "||",
+        (BoolOpKind::Or, BoolOpSurface::Word) => "or",
+        (BoolOpKind::And, BoolOpSurface::Symbol) => "&&",
+        (BoolOpKind::And, BoolOpSurface::Word) => "and",
+    };
+    format!(
+        "{} {} {}",
+        emit_bool_op_operand(left, op, surface),
+        op_s,
+        emit_bool_op_operand(right, op, surface),
+    )
+}
+
+/// Ruby boolean-operator precedence: `&&` binds tighter than `||`, and
+/// the word forms `and`/`or` are equal to each other and lower than both
+/// symbolic forms. Higher number = binds tighter.
+fn bool_op_prec(op: crate::expr::BoolOpKind, surface: crate::expr::BoolOpSurface) -> u8 {
+    use crate::expr::{BoolOpKind, BoolOpSurface};
+    match (op, surface) {
+        (BoolOpKind::And, BoolOpSurface::Symbol) => 3, // &&
+        (BoolOpKind::Or, BoolOpSurface::Symbol) => 2,  // ||
+        (_, BoolOpSurface::Word) => 1,                 // and / or (equal precedence)
+    }
+}
+
+/// Emit a `BoolOp` operand, wrapping a nested `BoolOp` child in parens
+/// when omitting them would re-associate the tree. The grouping is in the
+/// AST, not the surface text, so `And(user, Or(a, b))` must come out as
+/// `user && (a || b)` — without the parens Ruby's tighter-binding `&&`
+/// re-parses it as `(user && a) || b`, a different (and crash-prone)
+/// expression. Parens are added when the child binds looser than the
+/// parent, or when two equal-precedence word operators (`and`/`or`)
+/// differ. Same-operator chains (`a || b || c`) stay paren-free —
+/// boolean operators are truth-associative, so re-grouping is harmless.
+fn emit_bool_op_operand(
+    child: &Expr,
+    parent_op: crate::expr::BoolOpKind,
+    parent_surface: crate::expr::BoolOpSurface,
+) -> String {
+    let s = emit_expr(child);
+    match &*child.node {
+        ExprNode::BoolOp { op, surface, .. } => {
+            let child_prec = bool_op_prec(*op, *surface);
+            let parent_prec = bool_op_prec(parent_op, parent_surface);
+            if child_prec < parent_prec || (child_prec == parent_prec && *op != parent_op) {
+                return format!("({s})");
+            }
+        }
+        // Assignment binds looser than any boolean operator, so an
+        // Assign operand must keep its parens: the guard idiom
+        // `a && (user = find) && user.active?` re-parses without them
+        // as `a && (user = (find && user.active?))` — evaluating
+        // `user.active?` before `user` is bound (nil crash), then
+        // binding `user` to a boolean.
+        ExprNode::Assign { .. } | ExprNode::OpAssign { .. } => {
+            return format!("({s})");
+        }
+        // A command (`raise E`, `puts a, b`) or a method assignment
+        // (`obj.x = v`, `h[k] = v`) takes everything after it as its
+        // argument. As the right operand of `||`/`&&` a command does not
+        // parse (`user || raise NotFound`); anywhere else either one
+        // swallows what follows: `raise E || x` is `raise(E || x)`, and
+        // `a && obj.x = 1 && b` is `a && (obj.x = (1 && b))`. `and`/`or`
+        // bind looser than both, so their operands stay bare.
+        _ if parent_surface == crate::expr::BoolOpSurface::Symbol
+            && renders_open_ended(child) =>
+        {
+            return format!("({s})");
+        }
+        ExprNode::Seq { exprs } if exprs.len() > 1 => {
+            return format!("({s})");
+        }
+        // `..`/`...` bind looser than `&&`/`||`: `r || a..b` is
+        // `(r || a)..b`.
+        ExprNode::Range { .. } => {
+            return format!("({s})");
+        }
+        // A CONDITIONAL AS AN OPERAND, same argument one construct over.
+        // The modifier form binds looser than every boolean operator, so
+        // `x.m if c || fallback` re-parses as `x.m if (c || fallback)` —
+        // the `||` is swallowed INTO the condition and the whole
+        // expression answers nil instead of the fallback. `lower::
+        // try_guard` is what produced one: `s.try(:to_gid_param) || s`
+        // became `s.to_gid_param if s.is_a?(…) || s`, which is campfire's
+        // broadcast assertion reading a nil stream name.
+        //
+        // The multi-line `if/else/end` form has the same problem for the
+        // same reason (`|| x` lands inside the else branch), and `case`
+        // with it, so all three are wrapped rather than only the shape
+        // that bit. `recv_needs_parens` makes the identical call for a
+        // receiver.
+        ExprNode::If { .. } | ExprNode::Case { .. } | ExprNode::RescueModifier { .. } => {
+            return format!("({s})");
+        }
+        _ => {}
+    }
+    s
+}
+
+/// A command as a backtick literal. It takes a double-quoted String's
+/// escapes, so the command's text is escaped as one, with a backtick in
+/// the text escaped as well; an interpolated expression is emitted as
+/// code, untouched (`%x{echo #{`printf hi`}}` keeps its inner literal).
+fn emit_backtick_literal(arg: &Expr) -> Option<String> {
+    match &*arg.node {
+        ExprNode::Lit { value: Literal::Str { value } } => {
+            let quoted = ruby_str_literal(value);
+            let inner = quoted.strip_prefix('"').and_then(|q| q.strip_suffix('"'))?;
+            Some(format!("`{}`", inner.replace('`', "\\`")))
+        }
+        ExprNode::StringInterp { parts } => Some(crate::emit::shared::interp::render(
+            parts,
+            &crate::emit::shared::interp::InterpDelims { open_quote: "`", close_quote: "`", expr_open: "#{", expr_close: "}" },
+            emit_expr,
+            |value| interp_text(value).replace('`', "\\`"),
+        )),
+        _ => None,
+    }
+}
+
+/// A double-quoted String's text between interpolations, escaped.
+fn interp_text(value: &str) -> String {
+    let mut out = String::new();
+    for c in value.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '#' => out.push_str("\\#"),
+            c if c.is_control() => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+fn emit_string_interp(parts: &[crate::expr::InterpPart]) -> String {
+    crate::emit::shared::interp::render(
+        parts,
+        &crate::emit::shared::interp::InterpDelims {
+            open_quote: "\"",
+            close_quote: "\"",
+            expr_open: "#{",
+            expr_close: "}",
+        },
+        emit_expr,
+        interp_text,
+    )
+}
+
+fn emit_array(elements: &[Expr], style: &crate::expr::ArrayStyle) -> String {
+    use crate::expr::ArrayStyle;
+    match style {
+        ArrayStyle::Brackets => {
+            let parts: Vec<String> = elements.iter().map(emit_arg).collect();
+            format!("[{}]", parts.join(", "))
+        }
+        ArrayStyle::BracketsSpaced => {
+            let parts: Vec<String> = elements.iter().map(emit_arg).collect();
+            if parts.is_empty() {
+                "[]".to_string()
+            } else {
+                format!("[ {} ]", parts.join(", "))
+            }
+        }
+        ArrayStyle::PercentI => {
+            // Symbol values are decoded. Protect word separators and the
+            // canonical bracket delimiter when rebuilding their source.
+            let parts: Vec<String> = elements
+                .iter()
+                .map(|e| match &*e.node {
+                    ExprNode::Lit { value: Literal::Sym { value } } => {
+                        let mut escaped = String::new();
+                        for c in value.as_str().chars() {
+                            if matches!(c, '\\' | '[' | ']' | ' ' | '\t' | '\n' | '\r' | '\u{000b}' | '\u{000c}') {
+                                escaped.push('\\');
+                            }
+                            escaped.push(c);
+                        }
+                        escaped
+                    }
+                    _ => emit_expr(e),
+                })
+                .collect();
+            format!("%i[{}]", parts.join(" "))
+        }
+        ArrayStyle::PercentW => {
+            // Word list: elements must be string literals. Emit without quotes.
+            let parts: Vec<String> = elements
+                .iter()
+                .map(|e| match &*e.node {
+                    ExprNode::Lit { value: Literal::Str { value } } => value.to_string(),
+                    _ => emit_expr(e),
+                })
+                .collect();
+            format!("%w[{}]", parts.join(" "))
+        }
+    }
+}
+
+fn emit_hash(entries: &[(Expr, Expr)], kwargs: bool) -> String {
+    let parts: Vec<String> = entries
+        .iter()
+        .map(|(k, v)| {
+            // Rails-idiomatic shorthand `key: value` when key is a symbol
+            // literal. Bare shorthand requires a simple identifier; symbols
+            // with special characters (e.g. `"turbo_confirm"`, `"text-sm"`)
+            // use the quoted-key form `"name": value`. Rocket `k => v`
+            // falls through for non-symbol keys.
+            // Values go through `emit_arg`: a modifier-if value
+            // (`open: true if cond`, often from a `cond ? x : nil` ternary)
+            // needs the same parenthesization as a positional argument.
+            if let ExprNode::Lit { value: Literal::Sym { value } } = &*k.node {
+                let name = value.as_str();
+                if is_simple_ident(name) {
+                    format!("{name}: {}", emit_arg(v))
+                } else {
+                    format!("{:?}: {}", name, emit_arg(v))
+                }
+            } else {
+                format!("{} => {}", emit_expr(k), emit_arg(v))
+            }
+        })
+        .collect();
+    // `kwargs: true` → bare trailing-kwargs form (`a: 1, b: 2`).
+    // `kwargs: false` → explicit Hash literal with `{...}` braces.
+    // Ruby treats both as Hash at runtime; the distinction is purely
+    // surface — preserving it makes round-trips faithful.
+    if kwargs {
+        parts.join(", ")
+    } else if parts.is_empty() {
+        "{}".to_string()
+    } else {
+        format!("{{ {} }}", parts.join(", "))
+    }
+}
+
+/// Can `s` appear as a bareword hash key (`s: value`)? The bareword form
+/// requires a `[A-Za-z_][A-Za-z0-9_]*` identifier, optionally ending in
+/// `?` or `!`. Anything else (hyphens, spaces, colons, digits-first, `=`)
+/// must be quoted: `"s": value`.
+fn is_simple_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else { return false };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    let mut saw_suffix = false;
+    for c in chars {
+        if saw_suffix {
+            return false;
+        }
+        if c.is_ascii_alphanumeric() || c == '_' {
+            continue;
+        }
+        if matches!(c, '?' | '!') {
+            saw_suffix = true;
+            continue;
+        }
+        return false;
+    }
+    true
+}
+
+/// Emit an expression in argument position. A bare modifier `if`/`unless`
+/// (`x if c`) is a syntax error as a call argument — `foo(x if c)` — so
+/// wrap it in parens. A command-style (paren-less, arg-bearing) send
+/// carrying a `do` block also wraps: CRuby parses
+/// `f(g a: 1 do ... end)` but JRuby (through at least 10.1) rejects it,
+/// and `f((g a: 1 do ... end))` parses identically everywhere.
+/// Everything else passes through unchanged.
+fn emit_arg(e: &Expr) -> String {
+    // A multiple assignment is a statement unless parenthesized: `if a, b
+    // = pair` does not parse, and as an argument its comma splits it.
+    // A Seq may contain just a Let after lowering (e.g. an interpolated
+    // translation in a hash value). Inspect that single child as well.
+    if let ExprNode::Seq { exprs } = &*e.node
+        && let [inner] = exprs.as_slice()
+    {
+        return emit_arg(inner);
+    }
+    let multi_assign = matches!(&*e.node, ExprNode::MultiAssign { .. });
+    // A `Let` emits as two lines, its binding and its body; as an argument
+    // the parens keep them one value.
+    let binding = matches!(&*e.node, ExprNode::Let { .. });
+    if renders_as_trailing_modifier(e) || renders_as_command_with_block(e) || is_multi_seq(e) || multi_assign || binding {
+        format!("({})", emit_expr(e))
+    } else {
+        emit_expr(e)
+    }
+}
+
+/// Does `e` emit as a paren-less call with arguments AND a `do` block
+/// (`tag.details class: "x" do ... end`)? Fine in statement position;
+/// as a call argument it needs wrapping parens (see `emit_arg`).
+fn renders_as_command_with_block(e: &Expr) -> bool {
+    matches!(
+        &*e.node,
+        ExprNode::Send { args, block: Some(_), parenthesized: false, .. } if !args.is_empty()
+    )
+}
+
+/// Does `e` emit with an argument that runs to the end of the
+/// expression? That is a command, meaning a paren-less call with
+/// arguments (`puts a, b`) or a keyword with a value (`raise E`,
+/// `return v`, `next v`, `break v`), or an assignment through a method
+/// (`obj.x = v`, `h[k] = v`, which emit that way whether or not the
+/// call was written with parens). Such an expression is fine as a
+/// statement or a last argument, but as an operand of a tighter-binding
+/// operator it either does not parse or takes the operator's other
+/// operand into its argument. `recv_needs_parens` treats a paren-less
+/// call as a receiver the same way.
+fn renders_open_ended(e: &Expr) -> bool {
+    match &*e.node {
+        ExprNode::Raise { .. } => true,
+        // `return nil` emits as a bare `return`, which has no argument.
+        ExprNode::Return { value } => !matches!(&*value.node, ExprNode::Lit { value: Literal::Nil }),
+        ExprNode::Next { value } | ExprNode::Break { value } => value.is_some(),
+        ExprNode::Send { recv, method, args, parenthesized, .. } => {
+            let m = method.as_str();
+            let r = recv.is_some();
+            let assigns =
+                r && ((m == "[]=" && args.len() == 2) || (is_setter_method(m) && args.len() == 1));
+            // The shapes `emit_send_base` renders with no trailing
+            // argument list: an index read (`h[k]`), a binary operator
+            // with its one operand (`a == b`; `p.=== 1, 2` is a command),
+            // and a receiver-less `!` (a lowering's `! x.nil?`, the
+            // prefix operator, which binds tighter than `&&`).
+            let bracketed = r && m == "[]";
+            let infix = r && args.len() == 1 && is_binary_operator(m);
+            let prefix_not = !r && m == "!";
+            let command = !parenthesized && !args.is_empty() && !bracketed && !infix && !prefix_not;
+            assigns || command
+        }
+        _ => false,
+    }
+}
+
+/// Does `e` emit with a trailing modifier (`x if cond` / `x rescue f`)?
+/// Such forms must be parenthesized anywhere but statement position
+/// (array elements, call args, hash values, conditions) — a bare
+/// `"a" if c, b` or `if x rescue f` mis-parses (the modifier swallows the
+/// rest of the construct).
+fn renders_as_trailing_modifier(e: &Expr) -> bool {
+    match &*e.node {
+        ExprNode::If { then_branch, else_branch, .. } => {
+            is_empty_branch(else_branch)
+                && !matches!(&*then_branch.node, ExprNode::Seq { .. })
+                && !emit_expr(then_branch).contains('\n')
+        }
+        ExprNode::RescueModifier { .. } => true,
+        _ => false,
+    }
+}
+
+/// Does `e` emit as a modifier `if`? On an assignment's right it would
+/// guard the assignment itself (`x = y if c`); `rescue` does not, Ruby
+/// binds it to the value.
+fn assigns_as_modifier_if(e: &Expr) -> bool {
+    matches!(&*e.node, ExprNode::If { .. }) && renders_as_trailing_modifier(e)
+}
+
+/// Would `r`, emitted as a bare method-call receiver (`<r>.method`),
+/// mis-associate the trailing `.method`? Lower-precedence-than-`.`
+/// forms bind the `.method` to their tail rather than the whole
+/// expression: a boolean/infix operator (`a || b.to_s` parses as
+/// `a || (b.to_s)`), a command-style (paren-less, arg-bearing) send
+/// (`f.x :a, b.to_s`), a range (`1..5.to_s`), or a trailing modifier.
+/// Such receivers need wrapping parens. Postfix forms — a no-arg send
+/// (`a.b`), an index (`a[i]`), or a parenthesized call (`f(x)`) — parse
+/// correctly as receivers and don't. Exercised by the view auto-escape
+/// path, which wraps interpolated expressions in `html_escape(<expr>.to_s)`.
+/// A statement sequence of more than one expression — the shape a
+/// lowering leaves behind when it inlines a hydrate loop (`stmt = …;
+/// results = []; while …; results`) at a value site. Bare, the
+/// newlines end the enclosing call; wrapped in parens Ruby reads
+/// `(a\nb)` as one grouped expression answering `b`.
+fn is_multi_seq(e: &Expr) -> bool {
+    matches!(&*e.node, ExprNode::Seq { exprs } if exprs.len() > 1)
+}
+
+fn recv_needs_parens(r: &Expr) -> bool {
+    // `+"a".freeze` is `+("a".freeze)`: unary `+` binds looser than `.`.
+    if is_mutable_string_literal(r) {
+        return true;
+    }
+    match &*r.node {
+        ExprNode::Seq { exprs } if exprs.len() == 1 => recv_needs_parens(&exprs[0]),
+        ExprNode::Seq { exprs } if exprs.len() > 1 => true,
+        ExprNode::Let { .. } => true,
+        ExprNode::BoolOp { .. } | ExprNode::Range { .. } | ExprNode::RescueModifier { .. } => true,
+        // An assignment as receiver (`(rd = session[:k]).present?`,
+        // lobsters login) MUST keep its parens: rendered bare, Ruby
+        // re-parses `rd = session[:k].present?` — the local becomes the
+        // METHOD's result (a bool handed to redirect_to), not the value.
+        ExprNode::Assign { .. } | ExprNode::OpAssign { .. } | ExprNode::MultiAssign { .. } => true,
+        // Conditionals as a value (`<%= cond ? a : b %>`). A modifier-if
+        // (`x if c`) flat-out mis-parses as a receiver; a full `if/else`
+        // or `case/when` block parses (the `end` terminates it) but only
+        // because the emitter renders them multi-line — wrap defensively so
+        // the `.to_s` binds to the whole conditional regardless of form.
+        ExprNode::If { .. } | ExprNode::Case { .. } => true,
+        ExprNode::Send { method, args, parenthesized, .. } => {
+            let m = method.as_str();
+            // Index reads/writes emit as `recv[idx]` — a fine receiver.
+            if m == "[]" || m == "[]=" {
+                false
+            } else {
+                // Unary `!` emits prefix (`!(user)`); a following call
+                // binds tighter than `!`, so `!(user).to_s` re-parses as
+                // `!(user.to_s)` — the whole negation needs the wrap.
+                m == "!"
+                    || is_binary_operator(m)
+                    || (!parenthesized && !args.is_empty())
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Only an indifferent params store coerces keys. A plain Hash's static
+/// String-keyed type is not permission to turn a Symbol lookup into String:
+/// the actual caller may pass either key kind, and misses must stay misses.
+/// Other proven indifferent hashes are normalized by the shared lowerer.
+fn is_indifferent_keyed_store(recv: &Expr) -> bool {
+    if recv.decisions & crate::expr::INDIFFERENT_PARAMS_STORE != 0 { return true; }
+    match recv.ty.as_ref() {
+        Some(Ty::Hash { key, .. }) if **key == Ty::Str => is_indifferent_params(recv),
+        Some(Ty::Class { id, .. }) => id.0.as_str() == crate::analyze::PARAM_VALUE,
+        _ => false,
+    }
+}
+
+/// Is `recv` a request's params, the indifferent-access store? Either a
+/// params value (`ParamValue`) or the lowered controller's own `@params`,
+/// which is typed as a plain `Hash[String, untyped]` and is told apart
+/// from other hashes by being that ivar.
+fn is_indifferent_params(recv: &Expr) -> bool {
+    if recv.decisions & crate::expr::INDIFFERENT_PARAMS_STORE != 0 { return true; }
+    match &*recv.node {
+        ExprNode::Ivar { name } if name.as_str() == "params" => true,
+        _ => matches!(recv.ty.as_ref(), Some(Ty::Class { id, .. }) if id.0.as_str() == crate::analyze::PARAM_VALUE),
+    }
+}
+
+/// Normalize a key after indifferent-store provenance is established:
+/// a Symbol literal becomes String and a dynamic key uses `to_s`.
+/// Callers must not infer this semantic guarantee from Hash[String, _]
+/// alone. The defensive non-indifferent form leaves untyped keys alone.
+fn coerce_str_key(key: &Expr, indifferent: bool) -> String {
+    match &*key.node {
+        ExprNode::Lit { value: Literal::Sym { value } } => format!("{:?}", value.as_str()),
+        ExprNode::Lit { value: Literal::Str { .. } } => emit_expr(key),
+        _ if !indifferent && !matches!(key.ty, Some(Ty::Sym)) => emit_expr(key),
+        _ => {
+            let k = emit_expr(key);
+            if recv_needs_parens(key) { format!("({k}).to_s") } else { format!("{k}.to_s") }
+        }
+    }
+}
+
+/// Coerce only an unambiguous `:sym` literal key to a string, leaving
+/// every other shape (string, integer, dynamic) untouched. Used for the
+/// nested-walking forms (`dig`, `fetch`) where positions past the first
+/// index a nested value whose key type we don't know here.
+fn coerce_str_sym_key(key: &Expr) -> String {
+    match &*key.node {
+        ExprNode::Lit { value: Literal::Sym { value } } => format!("{:?}", value.as_str()),
+        _ => emit_arg(key),
+    }
+}
+
+/// Emit an index/lookup on a proven indifferent store
+/// (`is_indifferent_keyed_store` already established) with its key(s)
+/// normalized to strings, or `None` for an unrelated method.
+fn emit_str_hash_access(recv: &Expr, method: &str, args: &[Expr]) -> Option<String> {
+    let recv_s = emit_expr(recv);
+    let indifferent = is_indifferent_params(recv);
+    match method {
+        "[]" if args.len() == 1 => {
+            let key = &args[0];
+            let param_value = matches!(recv.ty.as_ref(), Some(Ty::Class { id, .. })
+                if id.0.as_str() == crate::analyze::PARAM_VALUE);
+            let string_key = matches!(&*key.node,
+                ExprNode::Lit { value: Literal::Str { .. } | Literal::Sym { .. } })
+                || key.ty.as_ref().is_some_and(Ty::is_stringish);
+            let key_s = if param_value && !string_key {
+                format!("Params.nested_key({})", emit_arg(key))
+            } else {
+                coerce_str_key(key, indifferent)
+            };
+            Some(format!("{recv_s}[{key_s}]"))
+        }
+        "[]=" if args.len() == 2 => Some(format!(
+            "{recv_s}[{}] = {}",
+            coerce_str_key(&args[0], indifferent),
+            emit_arg(&args[1])
+        )),
+        "fetch" | "key?" | "has_key?" | "include?" | "delete" if !args.is_empty() => {
+            let mut parts = vec![coerce_str_sym_key(&args[0])];
+            parts.extend(args[1..].iter().map(emit_arg));
+            Some(format!("{recv_s}.{method}({})", parts.join(", ")))
+        }
+        "dig" if !args.is_empty() => {
+            let parts: Vec<String> = args.iter().map(coerce_str_sym_key).collect();
+            Some(format!("{recv_s}.dig({})", parts.join(", ")))
+        }
+        _ => None,
+    }
+}
+
+/// Emit the receiver/method/args portion of a Send without its block.
+/// Used by normal Ruby emission and by ERB template reconstruction.
+pub(super) fn emit_send_base(
+    recv: Option<&Expr>,
+    method: &Symbol,
+    args: &[Expr],
+    parenthesized: bool,
+) -> String {
+    let args_s: Vec<String> = args.iter().map(emit_keyword_forward_arg).collect();
+    let m = method.as_str();
+    // A receiverless call, or one the typer folded onto `self`, is the
+    // backtick literal. An override of `` ` `` still runs through that
+    // syntax. An explicit other receiver stays a normal send.
+    if m == "`" && args.len() == 1 && recv.is_none_or(|r| matches!(&*r.node, ExprNode::SelfRef)) {
+        if let Some(literal) = emit_backtick_literal(&args[0]) {
+            return literal;
+        }
+    }
+    // `time_calendar` stores Crystal's clock spelling (`Time.utc`,
+    // `to_rfc3339`). MRI `Time.utc` requires a year, and Time has
+    // `iso8601` rather than `to_rfc3339`, so the ruby target prints the
+    // MRI names of that same IR. `Time.utc(year, …)` and `iso8601(n)`
+    // are different calls and stay as written.
+    // The IR spelling of a time `iso8601`. MRI has `iso8601`, not
+    // `to_rfc3339`. An application method of that name is left as written.
+    if m == "to_rfc3339" && args.is_empty() {
+        if let Some(r) = recv {
+            if crate::lower::time_calendar::is_time_rfc3339_receiver(r) {
+                return emit_send_base(Some(r), &Symbol::from("iso8601"), args, parenthesized);
+            }
+        }
+    }
+    if m == "utc" && args.is_empty() {
+        if let Some(r) = recv {
+            // Bare `Time` and rooted `::Time`. `Foo::Time.utc` is that class's method.
+            if matches!(&*r.node, ExprNode::Const { path }
+                if path.last().is_some_and(|s| s.as_str() == "Time")
+                    && path.iter().rev().skip(1).all(|s| s.as_str().is_empty()))
+            {
+                return format!("{}.now.utc", emit_expr(r));
+            }
+        }
+    }
+    // `...` is a send argument packet, never an index or infix operand.
+    // Preserve explicit call syntax even for operator/setter method names
+    // and `self`, before any surface-syntax prettification below.
+    if args.iter().any(|a| matches!(&*a.node, ExprNode::ForwardArgs | ExprNode::ForwardKeywords | ExprNode::ForwardKeywordsWithPairs { .. } | ExprNode::KeywordSplat { .. })) {
+        return match recv {
+            Some(r) => {
+                let receiver = emit_expr(r);
+                let receiver = if recv_needs_parens(r) { format!("({receiver})") } else { receiver };
+                format!("{receiver}.{method}({})", args_s.join(", "))
+            }
+            None => format!("{method}({})", args_s.join(", ")),
+        };
+    }
+    // Params are an indifferent String-keyed store; normalize its keys.
+    // A plain Hash must keep the key the source actually supplied.
+    if let Some(r) = recv {
+        if is_indifferent_keyed_store(r) {
+            if let Some(s) = emit_str_hash_access(r, m, args) {
+                return s;
+            }
+        }
+    }
+    // Index-read (`recv[idx]`) and index-write (`recv[idx] = value`)
+    // Sends round-trip to bracket-syntax regardless of receiver shape
+    // — handled before the SelfRef-implicit shortcut, which would
+    // emit `[](idx)` / `[]=(idx, value)` (bare method-call to `[]` /
+    // `[]=`, not valid Ruby in those positions).
+    if m == "[]" && !args_s.is_empty() {
+        if let Some(r) = recv {
+            return format!("{}[{}]", emit_postfix_recv(r), args_s.join(", "));
+        }
+    }
+    if m == "[]=" && args_s.len() == 2 {
+        if let Some(r) = recv {
+            return format!("{}[{}] = {}", emit_postfix_recv(r), args_s[0], args_s[1]);
+        }
+    }
+    // Unary `!` Send (`Send { recv: cond, method: "!", args: [] }`)
+    // → prefix form `!cond`. Both forms (`!cond` and `cond.!`) are
+    // valid Ruby, but the prefix form is the idiomatic one and what
+    // the validation lowerer's negation patterns expect to emit
+    // (e.g. `unless cond` modifier from a wrapped `!cond` cond).
+    //
+    // Wrap operand in parens — `!` binds tighter than the binary
+    // operators (`<`, `==`, `=~`, `||`, etc.), so `!recv.op(arg)`
+    // emitted as `!recv < arg` would parse as `(!recv) < arg`.
+    // Explicit parens preserve the intended `!(recv.op(arg))`. For
+    // simple-identifier operands the parens are harmless extra
+    // characters; for Send/comparison operands they're necessary.
+    if m == "!" && args_s.is_empty() {
+        if let Some(r) = recv {
+            return format!("!({})", emit_expr(r));
+        }
+    }
+    // SelfRef receivers come from the body-typer's self-dispatch
+    // annotation. Ruby's idiomatic surface for self-dispatch is
+    // implicit (`foo` not `self.foo`) for getters/methods — but
+    // setters MUST keep the explicit `self.x =` form because Ruby
+    // parses `x = value` as a local-variable creation, not a method
+    // call. Fall through to the standard `(Some(r), _)` path for
+    // setter sends so emit_send_base's setter arm picks it up.
+    if matches!(recv, Some(r) if matches!(&*r.node, ExprNode::SelfRef))
+        && !is_setter_method(m)
+        // These address the receiver's storage, not the nominal instance
+        // layout. Keep an explicit class-object capability explicit instead
+        // of erasing it to a native compiler's implicit-instance call path.
+        && !matches!(m, "instance_variable_get" | "instance_variable_set")
+        // Operators are infix, not messages, in Ruby's surface: dropping
+        // the receiver from `self == other` leaves `== other`, which
+        // doesn't parse. Both the operator arm below and the `[]` arm
+        // want the explicit receiver.
+        && !is_binary_operator(m)
+        && m != "[]"
+        // A method whose name is a Ruby keyword (`self.class`, `self.then`)
+        // can't drop to the implicit form — bare `class` parses as the
+        // keyword. Keep the explicit `self.class` (falls to the Some(r) arm).
+        && !is_ruby_keyword(m)
+        // A ZERO-ARG bare name is the one form Ruby resolves lexically:
+        // after `comments = self.comments.x`, a bare `comments` on the
+        // RHS is the just-declared (nil) local, not the method. Args or
+        // parens always parse as a call, so those forms still elide;
+        // zero-arg reads keep the explicit `self.` (unconditionally
+        // safe — since Ruby 2.7 explicit self reaches private methods).
+        && !args_s.is_empty()
+        // …EXCEPT inside a core-class reopen, where the receiver is the
+        // thing being said. campfire's `lib/rails_ext/string.rb` is
+        // `class String; def all_emoji?; self.match?(/…/); end; end` —
+        // the author wrote `self.`, and elided to a bare `match?` the
+        // call no longer resolves to `String#match?` on a strict target
+        // (`spinel: unsupported call: CallNode 'match?' recv=-`). CRuby
+        // reaches the same method either way, which is why this was
+        // invisible until the emitted tree was compiled rather than run.
+        //
+        // The rule is the ENCLOSING CLASS and not the method name: what
+        // makes the bareword ambiguous is being inside a reopen of a
+        // class whose other methods are the interpreter's, so a name the
+        // reopen does not define may still answer. Keeping `self.` is
+        // always valid Ruby, so the ruby lane is unchanged bar the
+        // spelling.
+        && !IN_CORE_CLASS_REOPEN.with(Cell::get)
+    {
+        if parenthesized {
+            return format!("{method}({})", args_s.join(", "));
+        }
+        return format!("{method} {}", args_s.join(", "));
+    }
+    match (recv, m) {
+        (Some(r), "[]") => format!("{}[{}]", emit_postfix_recv(r), args_s.join(", ")),
+        // Binary operator methods (`@x == 0`, `a + b`) round-trip as
+        // infix syntax — Ruby parses them as `Send` with method names
+        // like `==`, `+`, etc., but emitting `recv.== 0` is technically
+        // valid yet ugly enough to be a bug. Single-arg only.
+        //
+        // Operands that are THEMSELVES binary-op Sends re-parse by
+        // Ruby's precedence, not the AST's grouping — `(a - b) / 60`
+        // flattened to `a - b / 60` rebinds the division (the exact
+        // lobsters commentbox bug; same class as the BoolOp
+        // parenthesization fix). Parenthesize a receiver whose op binds
+        // looser than the current one, and an ARGUMENT whose op binds
+        // looser OR equal (left-associativity: `a - (b - c)` needs the
+        // parens even at equal precedence).
+        (Some(r), op) if is_binary_operator(op) && args_s.len() == 1 => {
+            let prec = binop_prec(op);
+            // Equality/comparison operators are non-associative in Ruby:
+            // `a <=> b == 0` does not parse, so an equal-precedence left
+            // operand needs parens too.
+            // A trailing-modifier operand (`(x rescue nil) == true`) would
+            // swallow the operator.
+            let lhs = if renders_as_trailing_modifier(r)
+                || binop_of(r).is_some_and(|o| {
+                    binop_prec(o) < prec || (prec == 30 && binop_prec(o) == 30)
+                })
+            {
+                format!("({})", emit_expr(r))
+            } else {
+                emit_expr(r)
+            };
+            let rhs = if binop_of(&args[0]).is_some_and(|o| binop_prec(o) <= prec) {
+                format!("({})", args_s[0])
+            } else {
+                args_s[0].clone()
+            };
+            format!("{lhs} {op} {rhs}")
+        }
+        // Setter calls (`self.id = value`). Method names ending in `=`
+        // that aren't on the operator list are attribute setters; the
+        // surface form is `recv.attr = value`, not `recv.attr= value`.
+        (Some(r), name) if is_setter_method(name) && args_s.len() == 1 => {
+            let attr = &name[..name.len() - 1];
+            format!("{}.{attr} = {}", emit_postfix_recv(r), args_s[0])
+        }
+        (None, _) => {
+            // A capitalized name without parens reads as a constant:
+            // `Success()` is a call, `Success` is not.
+            if args_s.is_empty() && method.as_str().starts_with(|c: char| c.is_ascii_uppercase()) {
+                format!("{method}()")
+            } else if args_s.is_empty() {
+                method.to_string()
+            } else if parenthesized || first_arg_opens_block(&args_s) {
+                format!("{method}({})", args_s.join(", "))
+            } else {
+                format!("{method} {}", args_s.join(", "))
+            }
+        }
+        (Some(r), _) => {
+            let recv_s = emit_expr(r);
+            let recv_s = if recv_needs_parens(r) { format!("({recv_s})") } else { recv_s };
+            if args_s.is_empty() {
+                format!("{recv_s}.{method}")
+            } else if parenthesized || first_arg_opens_block(&args_s) {
+                format!("{recv_s}.{method}({})", args_s.join(", "))
+            } else {
+                format!("{recv_s}.{method} {}", args_s.join(", "))
+            }
+        }
+    }
+}
+
+/// A leading `if`/`case`/… argument must be parenthesized: paren-less,
+/// `j if c … end` reads `if` as a statement modifier of the call. So
+/// must a leading Hash literal: `arrange {}, rel` reads `{}` as a block.
+fn first_arg_opens_block(args_s: &[String]) -> bool {
+    args_s.first().is_some_and(|a| {
+        a.starts_with('{') || ["if ", "unless ", "case ", "while ", "until ", "begin"].iter().any(|k| a.starts_with(k))
+    })
+}
+
+/// A read of the local `name`. A reserved-word local (a keyword param
+/// such as `class:`) has no bare spelling, so the read goes through
+/// `binding`. Ingest turns that form back into the same local read.
+fn emit_local_read(name: &str) -> String {
+    if crate::naming::is_reserved_local(name) {
+        format!("binding.local_variable_get(:{name})")
+    } else {
+        name.to_string()
+    }
+}
+
+/// Names that Ruby can spell after `def`. Other method-table names need
+/// define_method (Ruby) and a quoted name (RBS).
+pub(super) fn is_def_name(name: &str) -> bool {
+    let bare = name.strip_suffix(['?', '!', '=']).unwrap_or(name);
+    is_simple_ident(bare) || matches!(name,
+        "[]" | "[]=" | "+" | "-" | "*" | "/" | "%" | "**" | "<<" | ">>"
+        | "&" | "|" | "^" | "~" | "!" | "+@" | "-@" | "==" | "==="
+        | "!=" | "=~" | "!~" | "<" | "<=" | ">" | ">=" | "<=>" | "`")
+}
+
+pub(super) fn emit_symbol_name(name: &str) -> String {
+    if is_def_name(name) { format!(":{name}") } else { format!(":{name:?}") }
+}
+
+/// Ruby reserved words. A method whose name collides with one (the
+/// callable cases are `class` / `then`; the rest can't be implicit either)
+/// must keep an explicit receiver — a bare keyword doesn't parse as a call.
+pub(crate) fn is_ruby_keyword(m: &str) -> bool {
+    matches!(
+        m,
+        "__ENCODING__" | "__LINE__" | "__FILE__" | "BEGIN" | "END" | "alias" | "and" | "begin"
+            | "break" | "case" | "class" | "def" | "defined?" | "do" | "else" | "elsif" | "end"
+            | "ensure" | "false" | "for" | "if" | "in" | "module" | "next" | "nil" | "not" | "or"
+            | "redo" | "rescue" | "retry" | "return" | "self" | "super" | "then" | "true" | "undef"
+            | "unless" | "until" | "when" | "while" | "yield"
+    )
+}
+
+/// The top-level binary operator of an expression, when it is an
+/// unparenthesized infix Send — the shape whose emitted text re-parses
+/// by precedence rather than AST grouping.
+fn binop_of(e: &Expr) -> Option<&str> {
+    match &*e.node {
+        ExprNode::Send { recv: Some(_), method, args, .. }
+            if is_binary_operator(method.as_str()) && args.len() == 1 =>
+        {
+            Some(method.as_str())
+        }
+        // `&&`/`||` (and their `and`/`or` word forms) bind looser than
+        // every infix operator here, so a BoolOp operand of one (`a << (b
+        // && c)`, e.g. the `try`/`&.` desugar `moderation && moderation.
+        // reason` inside a `<<` chain) re-parses wrong without parens.
+        ExprNode::BoolOp { op, surface, .. } => Some(match (op, surface) {
+            (crate::expr::BoolOpKind::And, crate::expr::BoolOpSurface::Symbol) => "&&",
+            (crate::expr::BoolOpKind::Or, crate::expr::BoolOpSurface::Symbol) => "||",
+            (crate::expr::BoolOpKind::And, crate::expr::BoolOpSurface::Word) => "and",
+            (crate::expr::BoolOpKind::Or, crate::expr::BoolOpSurface::Word) => "or",
+        }),
+        // An assignment binds looser than every operator a Send spells:
+        // lobsters' layout `(hrc = HatRequest.count) > 0` rendered bare
+        // re-parses as `hrc = (HatRequest.count > 0)`, the local becoming
+        // the comparison.
+        ExprNode::Assign { .. } | ExprNode::OpAssign { .. } | ExprNode::MultiAssign { .. }
+            | ExprNode::Let { .. } => Some("="),
+        ExprNode::Seq { exprs } => match exprs.as_slice() {
+            [inner] => binop_of(inner),
+            [] => None,
+            _ => Some("="),
+        },
+        // A range binds looser than every infix operator and `||`/`&&`:
+        // `out << (start...limit)` written bare is `(out << start)...limit`,
+        // which pushes the Integer (and `ruby -w` flags the range as
+        // void), and `(a..b) == r` bare is `a..(b == r)`.
+        ExprNode::Range { .. } => Some(".."),
+        _ => None,
+    }
+}
+
+/// Ruby operator precedence for the infix set `is_binary_operator`
+/// covers (higher binds tighter). Comparisons/equality sit below
+/// arithmetic; `**` above `*`.
+fn binop_prec(op: &str) -> u8 {
+    match op {
+        "**" => 90,
+        "*" | "/" | "%" => 80,
+        "+" | "-" => 70,
+        "<<" | ">>" => 60,
+        "&" => 55,
+        "|" | "^" => 50,
+        ">" | ">=" | "<" | "<=" => 40,
+        "==" | "!=" | "<=>" | "=~" | "!~" | "===" => 30,
+        // Below every infix operator above; `&&` binds tighter than `||`,
+        // and the `and`/`or` word forms are the loosest of all.
+        "&&" => 26,
+        "||" => 25,
+        ".." => 22,
+        "=" => 15,
+        "and" => 11,
+        "or" => 10,
+        _ => 20,
+    }
+}
+
+/// Ruby's binary infix operators, as method names. Excludes `[]` and
+/// `[]=` (handled separately as index access) and unary operators
+/// (`-@`, `+@`, `!`, `~`) which don't have a stable two-arg infix shape.
+fn is_binary_operator(m: &str) -> bool {
+    matches!(
+        m,
+        "==" | "!="
+            | "<"
+            | "<="
+            | ">"
+            | ">="
+            | "<=>"
+            | "==="
+            | "=~"
+            | "!~"
+            | "+"
+            | "-"
+            | "*"
+            | "/"
+            | "%"
+            | "**"
+            | "<<"
+            | ">>"
+            | "&"
+            | "|"
+            | "^"
+    )
+}
+
+/// True if the method name is an attribute setter — ends in `=` but
+/// isn't one of the comparison operators that also end in `=`.
+fn is_setter_method(m: &str) -> bool {
+    if !m.ends_with('=') || m.len() < 2 {
+        return false;
+    }
+    if matches!(m, "==" | "!=" | "<=" | ">=" | "<=>" | "===" | "=~") {
+        return false;
+    }
+    // `[]=` is handled by callers via LValue::Index, not here. The
+    // lowerer can still send `[]=` literally; reject it so we don't
+    // mangle `recv[].x = value` into something weird.
+    if m == "[]=" {
+        return false;
+    }
+    true
+}
+
+/// A lambda or block signature in Ruby order: required, optional
+/// (`size = 18`), `*rest`, keywords (`key:`, `limit: 10`), `**opts` (or
+/// a bare `**`). Every name the body reads has to be bound here; one
+/// left out raises `NameError` when the emitted program runs.
+fn lambda_params(params: &[Symbol], extra_params: &[crate::dialect::Param], rest_param: Option<&Symbol>) -> Vec<String> {
+    let mut ps: Vec<String> = params.iter().map(|p| p.to_string()).collect();
+    for p in extra_params.iter().filter(|p| !p.keyword) {
+        match &p.default {
+            Some(d) => ps.push(format!("{} = {}", p.name, emit_expr(d))),
+            None => ps.push(p.name.to_string()),
+        }
+    }
+    if let Some(r) = rest_param {
+        ps.push(format!("*{r}"));
+    }
+    for p in extra_params.iter().filter(|p| p.keyword && !p.rest) {
+        match &p.default {
+            Some(d) => ps.push(format!("{}: {}", p.name, emit_expr(d))),
+            None => ps.push(format!("{}:", p.name)),
+        }
+    }
+    for p in extra_params.iter().filter(|p| p.keyword && p.rest) {
+        ps.push(format!("**{}", p.name));
+    }
+    ps
+}
+
+/// Emit a `Send + block` in plain Ruby form. Honors the Lambda's
+/// `block_style` to pick `{ … }` vs `do … end`. `{ }` emits a single-line
+/// body; `do … end` spans multiple lines when the body has newlines.
+pub(super) fn emit_do_block(base: &str, block: &Expr) -> String {
+    use crate::expr::BlockStyle;
+    let ExprNode::Lambda { params, rest_param, extra_params, body, block_style, .. } = &*block.node else {
+        // A non-Lambda block expression is a Proc FORWARD (`&block` —
+        // ingest lowers the block-pass arg to a bare Var in the block
+        // slot). Rendering it as a literal `{ block }` block made the
+        // callee YIELD THE PROC OBJECT instead of calling it —
+        // lobsters' `Rails.cache.fetch(key, &block)` forward returned
+        // the Proc, poisoning `@comments` to Proc under spinel and
+        // silently mis-caching on CRuby. Re-attach as a `&` argument.
+        let fwd = match &*block.node {
+            ExprNode::If { .. } | ExprNode::Case { .. } | ExprNode::CaseMatch { .. } => {
+                format!("({})", emit_expr(block))
+            }
+            _ => emit_arg(block),
+        };
+        return if let Some(stripped) = base.strip_suffix(')') {
+            if stripped.ends_with('(') {
+                format!("{stripped}&{fwd})")
+            } else {
+                format!("{stripped}, &{fwd})")
+            }
+        } else {
+            format!("{base}(&{fwd})")
+        };
+    };
+    let body_str = emit_expr(body);
+    // `|a, b|`, and `|*args|` for a block whose parameter is a REST.
+    // The splat has to survive to the emitted source: the body reads
+    // `args`, and an emitted module answers a bare name from its own
+    // functions when no local binds it.
+    let ps = lambda_params(params, extra_params, rest_param.as_ref());
+    let params_str = if ps.is_empty() {
+        String::new()
+    } else {
+        format!(" |{}|", ps.join(", "))
+    };
+    match block_style {
+        BlockStyle::Brace => {
+            // Single-line brace form — the common use for one-liner
+            // callbacks and small block args.
+            format!("{base} {{{params_str} {body_str} }}")
+        }
+        BlockStyle::Do => emit_do_form(base, &params_str, &body_str),
+    }
+}
+
+fn emit_do_form(base: &str, params_str: &str, body_str: &str) -> String {
+    let params_clause = if params_str.is_empty() {
+        "do".to_string()
+    } else {
+        format!("do{params_str}")
+    };
+    if body_str.contains('\n') {
+        format!(
+            "{base} {}\n{}\nend",
+            params_clause,
+            indent_lines(&body_str, 1),
+        )
+    } else {
+        format!("{base} {} {} end", params_clause, body_str)
+    }
+}
+
+/// A multi-line value (`if … else … end`) after `return`/`next`/`break`
+/// reads as a modifier `if` unless it is parenthesized.
+fn paren_multiline(v: String) -> String {
+    if v.contains('\n') { format!("({v})") } else { v }
+}
+
+/// A double-quoted Ruby literal. Rust's `{:?}` escapes match Ruby's except
+/// for interpolation: single-quoted source `'#{{number}}'` must not come
+/// out as an interpolating `"#{{number}}"`.
+pub(crate) fn ruby_str_literal(value: &str) -> String {
+    format!("{value:?}").replace("#{", "\\#{").replace("#$", "\\#$").replace("#@", "\\#@")
+}
+
+/// `:name` when the symbol is a bare identifier (optionally `?`/`!`/`=`
+/// suffixed, or an ivar/gvar/cvar/constant) or an operator; `:"..."` otherwise.
+/// Test names like `test_x:mysql_only:true` must be quoted or they misparse.
+pub(crate) fn ruby_sym_literal(value: &str) -> String {
+    const OPS: &[&str] = &[
+        "+", "-", "*", "/", "%", "**", "==", "!=", "===", "=~", "!~", "<=>", "<", "<=", ">",
+        ">=", "<<", ">>", "&", "|", "^", "~", "!", "+@", "-@", "[]", "[]=", "`",
+    ];
+    let ident = value.trim_start_matches(['@', '$']);
+    let body = ident.strip_suffix(['?', '!', '=']).unwrap_or(ident);
+    let bare = !body.is_empty()
+        && !body.starts_with(|c: char| c.is_ascii_digit())
+        && body.chars().all(|c| c.is_alphanumeric() || c == '_')
+        && (ident.len() == value.len() || body.len() == ident.len());
+    if bare || OPS.contains(&value) {
+        format!(":{value}")
+    } else {
+        format!(":{}", ruby_str_literal(value))
+    }
+}
+
+/// A call or `super` argument. A bare `**` is already a keyword splat;
+/// wrapping it again would print `****`. A splat the shared lowering
+/// made positional is written back as one.
+fn emit_keyword_forward_arg(arg: &Expr) -> String {
+    match &*arg.node {
+        ExprNode::KeywordSplat { .. } => emit_node(&arg.node),
+        ExprNode::ForwardKeywordsWithPairs { entries } => {
+            let pairs = emit_hash(entries, true);
+            if pairs.is_empty() {
+                "**".to_string()
+            } else {
+                format!("{pairs}, **")
+            }
+        }
+        _ if arg.decisions & crate::expr::ERASED_KEYWORD_SPLAT != 0 => {
+            format!("**{}", paren_multiline(emit_arg(arg)))
+        }
+        _ => emit_arg(arg),
+    }
+}
+
+/// `::File` is stored with an empty first segment. Joining that as
+/// `::File` keeps the rooted spelling; a relative path stays `A::B`.
+fn emit_const_path(path: &[crate::Symbol]) -> String {
+    if path.first().is_some_and(|s| s.as_str().is_empty()) {
+        format!("::{}", path[1..].iter().map(|s| s.to_string()).collect::<Vec<_>>().join("::"))
+    } else {
+        path.iter().map(|s| s.to_string()).collect::<Vec<_>>().join("::")
+    }
+}
+
+pub(super) fn emit_literal(l: &Literal) -> String {
+    match l {
+        Literal::Nil => "nil".to_string(),
+        Literal::Bool { value } => value.to_string(),
+        Literal::Int { value } => value.to_string(),
+        Literal::Float { value } => {
+            let s = value.to_string();
+            if s.contains('.') { s } else { format!("{s}.0") }
+        }
+        Literal::Str { value } => ruby_str_literal(value),
+        Literal::Sym { value } => ruby_sym_literal(value.as_str()),
+        // `pattern` is stored unescaped (the regex engine's view), so a
+        // literal `/` in it (e.g. `/page/\d+$`) must be re-escaped before
+        // wrapping in `/.../` delimiters, or it terminates the literal early
+        // and breaks parsing. Already-escaped `\/` is left alone.
+        Literal::Regex { pattern, flags } => {
+            format!("/{}/{flags}", crate::emit::shared::regex_literal::escape_regex_delimiters(pattern))
+        }
+    }
+}
+
+fn emit_lvalue(lv: &LValue) -> String {
+    match lv {
+        LValue::Var { name, .. } => name.to_string(),
+        LValue::Ivar { name } => format!("@{name}"),
+        LValue::Attr { recv, name } => format!("{}.{name}", emit_postfix_recv(recv)),
+        LValue::Index { recv, index } => {
+            // An indifferent params write normalizes like its read; a
+            // plain Hash write retains the source key's identity.
+            let key = if is_indifferent_keyed_store(recv) {
+                coerce_str_key(index, is_indifferent_params(recv))
+            } else {
+                emit_expr(index)
+            };
+            format!("{}[{}]", emit_postfix_recv(recv), key)
+        }
+        LValue::Const { path } => path.iter().map(|s| s.as_str().to_string()).collect::<Vec<_>>().join("::"),
+    }
+}
+
+fn emit_arm(arm: &Arm) -> String {
+    // A guard-free Wildcard is the case's `else` clause (that's what
+    // ingest lowers `else` to); `when _` would read an undefined local.
+    let mut s = if matches!(arm.pattern, Pattern::Wildcard) && arm.guard.is_none() {
+        "else".to_string()
+    } else {
+        let mut s = format!("when {}", emit_pattern(&arm.pattern));
+        if let Some(g) = &arm.guard { s.push_str(&format!(" if {}", emit_expr(g))); }
+        s
+    };
+    s.push('\n');
+    s.push_str(&indent_lines(&emit_expr(&arm.body), 1));
+    s.push('\n');
+    s
+}
+
+fn emit_pattern(p: &Pattern) -> String {
+    match p {
+        Pattern::Wildcard => "_".to_string(),
+        Pattern::Bind { name } => name.to_string(),
+        Pattern::Lit { value } => emit_literal(value),
+        Pattern::Array { elems, rest } => {
+            let mut parts: Vec<String> = elems.iter().map(emit_pattern).collect();
+            if let Some(r) = rest { parts.push(format!("*{r}")); }
+            format!("[{}]", parts.join(", "))
+        }
+        Pattern::Record { fields, rest } => {
+            let mut parts: Vec<String> = fields.iter()
+                .map(|(k, v)| format!("{k}: {}", emit_pattern(v))).collect();
+            if *rest { parts.push("**".into()); }
+            format!("{{ {} }}", parts.join(", "))
+        }
+        // Non-literal pattern (lambda predicate, range, class ref,
+        // call, …). Emit verbatim — Ruby's `when` invokes
+        // `pattern === scrutinee` and the dispatch handles Proc /
+        // Range / Class / etc. natively.
+        Pattern::Expr { expr } => emit_expr(expr),
+    }
+}
+
+/// Emit one `CaseMatch` arm as Ruby's `in pattern [if/unless guard]`.
+fn emit_match_arm(arm: &crate::expr::MatchArm) -> String {
+    use crate::expr::MatchGuardKind;
+    let mut s = format!("in {}", emit_match_pattern(&arm.pattern));
+    if let Some((kind, g)) = &arm.guard {
+        let kw = match kind {
+            MatchGuardKind::If => "if",
+            MatchGuardKind::Unless => "unless",
+        };
+        s.push_str(&format!(" {kw} {}", emit_expr(g)));
+    }
+    s.push('\n');
+    s.push_str(&indent_lines(&emit_expr(&arm.body), 1));
+    s.push('\n');
+    s
+}
+
+/// Emit a `MatchPattern` as Ruby `case/in` pattern syntax — the
+/// round-trip-checked inverse of `ingest_pattern`.
+///
+/// `Value`'s pin handling is the one non-obvious case: CRuby's pattern
+/// grammar treats a bare identifier as ALWAYS binding (that's
+/// `MatchPattern::Bind`, handled below), so the only way a `Var`/`Ivar`
+/// read ends up wrapped in `Value` is if the source pinned it (`^name`,
+/// `^@name`) — `ingest_pattern` folds both `PinnedVariableNode` and
+/// `PinnedExpressionNode` into `Value` with no separate "was this
+/// pinned" flag, since the pin sigil is recoverable from the payload
+/// shape alone. Anything else non-literal/non-const/non-range inside a
+/// `Value` (a method call, a boolop, …) is equally pin-only — Ruby's
+/// grammar rejects an unpinned arbitrary expression in pattern
+/// position — so it gets the general `^(expr)` form. This loses exact
+/// byte fidelity for a source that wrote `^(x)` around a bare variable
+/// (re-emitted as `^x`), which is fine: `roundhouse-ast --round-trip`
+/// checks that re-ingesting reaches the same IR, and `^x` and `^(x)`
+/// ingest identically.
+fn emit_match_pattern(p: &crate::expr::MatchPattern) -> String {
+    use crate::expr::{HashRest, MatchPattern};
+    match p {
+        MatchPattern::Nil => "nil".to_string(),
+        MatchPattern::Bind { name } => name.to_string(),
+        MatchPattern::Value { expr } => match &*expr.node {
+            // A bare `nil` ingests as MatchPattern::Nil, so this shape
+            // can only have come from a pinned expression.
+            ExprNode::Lit { value: Literal::Nil } => "^(nil)".to_string(),
+            ExprNode::Lit { .. } | ExprNode::Const { .. } | ExprNode::Range { .. } => {
+                emit_expr(expr)
+            }
+            ExprNode::Var { name, .. } => format!("^{name}"),
+            ExprNode::Ivar { name } => format!("^@{name}"),
+            _ => format!("^({})", emit_expr(expr)),
+        },
+        MatchPattern::Capture { pattern, name } => {
+            format!("({} => {name})", emit_match_pattern(pattern))
+        }
+        MatchPattern::Alt { alternatives } => {
+            format!("({})", alternatives.iter().map(emit_match_pattern).collect::<Vec<_>>().join(" | "))
+        }
+        MatchPattern::Array { constant, pre, rest, post } => {
+            let mut parts: Vec<String> = pre.iter().map(emit_match_pattern).collect();
+            if let Some(r) = rest {
+                parts.push(match r {
+                    Some(name) => format!("*{name}"),
+                    None => "*".to_string(),
+                });
+            }
+            parts.extend(post.iter().map(emit_match_pattern));
+            match constant {
+                Some(c) => format!("{}({})", emit_expr(c), parts.join(", ")),
+                None => format!("[{}]", parts.join(", ")),
+            }
+        }
+        MatchPattern::Find { constant, pre_rest, middle, post_rest } => {
+            let mut parts: Vec<String> = Vec::new();
+            parts.push(match pre_rest {
+                Some(name) => format!("*{name}"),
+                None => "*".to_string(),
+            });
+            parts.extend(middle.iter().map(emit_match_pattern));
+            parts.push(match post_rest {
+                Some(name) => format!("*{name}"),
+                None => "*".to_string(),
+            });
+            let inner = format!("[{}]", parts.join(", "));
+            match constant {
+                Some(c) => format!("{}{inner}", emit_expr(c)),
+                None => inner,
+            }
+        }
+        MatchPattern::Hash { constant, pairs, rest } => {
+            let mut parts: Vec<String> = pairs
+                .iter()
+                .map(|(key, sub)| {
+                    let key = if is_simple_ident(key.as_str()) {
+                        key.to_string()
+                    } else {
+                        ruby_str_literal(key.as_str())
+                    };
+                    match sub {
+                        Some(p) => format!("{key}: {}", emit_match_pattern(p)),
+                        None => format!("{key}:"),
+                    }
+                })
+                .collect();
+            if let Some(r) = rest {
+                parts.push(match r {
+                    HashRest::Ignore => "**".to_string(),
+                    HashRest::Collect { name } => format!("**{name}"),
+                    HashRest::Nil => "**nil".to_string(),
+                });
+            }
+            match constant {
+                Some(c) => format!("{}({})", emit_expr(c), parts.join(", ")),
+                None => format!("{{ {} }}", parts.join(", ")),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::expr::Literal;
+    use crate::ident::Symbol;
+    use crate::span::Span;
+
+    fn lit_sym(s: &str) -> Expr {
+        Expr::new(Span::default(), ExprNode::Lit { value: Literal::Sym { value: Symbol::from(s) } })
+    }
+
+    fn lit_str(s: &str) -> Expr {
+        Expr::new(Span::default(), ExprNode::Lit { value: Literal::Str { value: s.to_string() } })
+    }
+
+    #[test]
+    fn a_rescue_modifier_operand_keeps_its_parens() {
+        let rescued = Expr::new(
+            Span::default(),
+            ExprNode::RescueModifier {
+                expr: send(None, "a", vec![]),
+                fallback: lit_sym("n"),
+            },
+        );
+        let eq = send(Some(rescued.clone()), "==", vec![lit_sym("n")]);
+        assert_eq!(emit_expr(&eq), "(a rescue :n) == :n");
+        let eq = send(Some(lit_sym("n")), "==", vec![rescued]);
+        assert_eq!(emit_expr(&eq), ":n == (a rescue :n)");
+    }
+
+    #[test]
+    fn a_command_call_with_an_if_argument_is_parenthesized() {
+        let cond = send(None, "c", vec![]);
+        let branch = Expr::new(
+            Span::default(),
+            ExprNode::If { cond, then_branch: lit_str("m"), else_branch: lit_str("f") },
+        );
+        let call = Expr::new(
+            Span::default(),
+            ExprNode::Send {
+                recv: None,
+                method: Symbol::from("j"),
+                args: vec![branch],
+                block: None,
+                parenthesized: false,
+            },
+        );
+        assert!(emit_expr(&call).starts_with("j(if "), "got {}", emit_expr(&call));
+    }
+
+    /// A modifier `if` on an assignment's right is parenthesized in every
+    /// form: bare, it would guard the assignment (`x = y if c` leaves `x`
+    /// as it was where the `if` gives nil).
+    #[test]
+    fn an_assigned_modifier_if_is_parenthesized() {
+        let modifier = || {
+            Expr::new(
+                Span::default(),
+                ExprNode::If {
+                    cond: send(None, "c", vec![]),
+                    then_branch: lit_str("y"),
+                    else_branch: Expr::new(Span::default(), ExprNode::Lit { value: Literal::Nil }),
+                },
+            )
+        };
+        let var = || crate::expr::LValue::Var { id: crate::ident::VarId(0), name: Symbol::from("x") };
+        let assign = Expr::new(Span::default(), ExprNode::Assign { target: var(), value: modifier() });
+        assert_eq!(emit_expr(&assign), "x = (\"y\" if c)");
+        let env = Expr::new(
+            Span::default(),
+            ExprNode::OpAssign {
+                target: crate::expr::LValue::Index {
+                    recv: Expr::new(Span::default(), ExprNode::Const { path: vec![Symbol::from("ENV")] }),
+                    index: lit_str("K"),
+                },
+                op: crate::expr::OpAssignOp::OrOr,
+                value: modifier(),
+            },
+        );
+        assert!(emit_expr(&env).contains("(ENV[\"K\"] = (\"y\" if c))"), "got {}", emit_expr(&env));
+        let attr = Expr::new(
+            Span::default(),
+            ExprNode::OpAssign {
+                target: crate::expr::LValue::Attr { recv: self_ref(), name: Symbol::from("n") },
+                op: crate::expr::OpAssignOp::Add,
+                value: modifier(),
+            },
+        );
+        assert!(emit_expr(&attr).ends_with("+ (\"y\" if c)"), "got {}", emit_expr(&attr));
+    }
+
+    fn self_ref() -> Expr {
+        Expr::new(Span::default(), ExprNode::SelfRef)
+    }
+
+    fn send(recv: Option<Expr>, method: &str, args: Vec<Expr>) -> Expr {
+        Expr::new(
+            Span::default(),
+            ExprNode::Send {
+                recv,
+                method: Symbol::from(method),
+                args,
+                block: None,
+                parenthesized: true,
+            },
+        )
+    }
+
+    #[test]
+    fn percent_symbol_arrays_preserve_decoded_values() {
+        let ingest = |source: &str| {
+            let parsed = ruby_prism::parse(source.as_bytes());
+            assert!(parsed.errors().next().is_none(), "invalid Ruby: {source}");
+            let statements = parsed.node().as_program_node().unwrap().statements().as_node();
+            crate::ingest::ingest_expr(&statements, "<symbols>").unwrap()
+        };
+        for (source, expected) in [
+            (r"%i[foo\ bar]", vec!["foo bar"]),
+            (r"%i[foo\]bar]", vec!["foo]bar"]),
+            (r"%i[foo\[bar]", vec!["foo[bar"]),
+            (r"%i[foo\\bar]", vec!["foo\\bar"]),
+            ("%i[one\\\ttwo three\\\nfour]", vec!["one\ttwo", "three\nfour"]),
+            ("%i[a\\\rb b\\\u{000b}c c\\\u{000c}d]", vec!["a\rb", "b\u{000b}c", "c\u{000c}d"]),
+            (r"%i[plain other]", vec!["plain", "other"]),
+        ] {
+            let emitted = emit_expr(&ingest(source));
+            for expression in [ingest(source), ingest(&emitted)] {
+                let ExprNode::Array { elements, style } = &*expression.node else {
+                    panic!("not an array: {source}");
+                };
+                assert_eq!(*style, crate::expr::ArrayStyle::PercentI);
+                let values: Vec<_> = elements.iter().map(|element| {
+                    let ExprNode::Lit { value: Literal::Sym { value } } = &*element.node else {
+                        panic!("not a symbol: {source}");
+                    };
+                    value.as_str()
+                }).collect();
+                assert_eq!(values, expected, "source: {source}; emitted: {emitted}");
+            }
+            let output = std::process::Command::new("ruby")
+                .args(["-rjson", "-e", &format!("print JSON.generate(({emitted}).map(&:to_s))")])
+                .output().expect("native Ruby");
+            assert!(output.status.success(), "{emitted}: {}", String::from_utf8_lossy(&output.stderr));
+            let values: Vec<String> = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(values, expected, "native Ruby: {emitted}");
+        }
+    }
+
+    #[test]
+    fn self_index_write_emits_bracket_assign() {
+        // `Send { recv: SelfRef, method: "[]=", args: [:k, "v"] }`
+        // must emit as `self[:k] = "v"`, not `[]=(:k, "v")`. Surfaces
+        // when copy-pasting parsed Ruby method bodies (e.g. per-
+        // subclass specialization) — the SelfRef-implicit-receiver
+        // shortcut would otherwise render `[]=` as a bare method
+        // call which Ruby parses as a name, not an index assign.
+        let expr = send(Some(self_ref()), "[]=", vec![lit_sym("k"), lit_str("v")]);
+        assert_eq!(emit_expr(&expr), r#"self[:k] = "v""#);
+    }
+
+    #[test]
+    fn self_index_read_emits_bracket() {
+        // Mirror of the above for `[]`. `Send { recv: SelfRef,
+        // method: "[]", args: [:k] }` → `self[:k]`, not `[](:k)`.
+        let expr = send(Some(self_ref()), "[]", vec![lit_sym("k")]);
+        assert_eq!(emit_expr(&expr), "self[:k]");
+    }
+
+    fn modifier_if(then_branch: Expr, cond: Expr) -> Expr {
+        Expr::new(
+            Span::default(),
+            ExprNode::If {
+                cond,
+                then_branch,
+                else_branch: Expr::new(Span::default(), ExprNode::Lit { value: Literal::Nil }),
+            },
+        )
+    }
+
+    #[test]
+    fn modifier_if_in_arg_position_is_parenthesized() {
+        // `foo(x if c)` is a Ruby syntax error; a modifier-if argument
+        // must be wrapped: `foo((x if c))`. Found against lobsters
+        // (`html_escape(... if cond)`, strong-params `permit(..., :sym if cond)`).
+        let arg = modifier_if(lit_sym("b"), send(None, "cond?", vec![]));
+        let expr = send(None, "permit", vec![lit_sym("a"), arg]);
+        assert_eq!(emit_expr(&expr), "permit(:a, (:b if cond?))");
+    }
+
+    #[test]
+    fn modifier_if_in_statement_position_is_not_parenthesized() {
+        // The wrap is surgical to argument position — a bare statement-level
+        // modifier-if must still round-trip without parens.
+        let stmt = modifier_if(lit_sym("b"), send(None, "cond?", vec![]));
+        assert_eq!(emit_expr(&stmt), ":b if cond?");
+    }
+
+    #[test]
+    fn modifier_if_as_hash_value_is_parenthesized() {
+        // A `cond ? x : nil` ternary lowers to a modifier-if; as a hash
+        // value (`open: (x if cond)`) it needs the same parens as an arg.
+        let val = modifier_if(lit_str("y"), send(None, "cond?", vec![]));
+        let hash = Expr::new(
+            Span::default(),
+            ExprNode::Hash { entries: vec![(lit_sym("open"), val)], kwargs: false },
+        );
+        assert_eq!(emit_expr(&hash), r#"{ open: ("y" if cond?) }"#);
+    }
+
+    #[test]
+    fn command_with_block_in_arg_position_is_parenthesized() {
+        // `f(g :a do ... end)` parses under CRuby but not JRuby
+        // (through at least 10.1); the wrapped `f((g :a do ... end))`
+        // parses identically everywhere. Found against lobsters'
+        // stories/_form.erb (`html_escape(tag.details class: "…",
+        // open: (…) do … end)`). Statement position stays unwrapped —
+        // the wrap is surgical to argument position, like the
+        // modifier-if wrap above.
+        let block = Expr::new(
+            Span::default(),
+            ExprNode::Lambda { extra_params: Vec::new(), rest_param: None,
+                params: vec![],
+                block_param: None,
+                body: lit_sym("body"),
+                block_style: Default::default(),
+            },
+        );
+        let mut inner = cmd_send(None, "g", vec![lit_sym("a")]);
+        if let ExprNode::Send { block: b, .. } = &mut *inner.node {
+            *b = Some(block);
+        }
+        let statement = emit_expr(&inner);
+        assert!(statement.starts_with("g :a do"), "got: {statement}");
+        let arg_position = emit_expr(&send(None, "f", vec![inner]));
+        assert!(arg_position.starts_with("f((g :a do"), "got: {arg_position}");
+        assert!(arg_position.trim_end().ends_with("end))"), "got: {arg_position}");
+    }
+
+    /// Paren-less command-style send (`recv.method arg, ...`).
+    fn cmd_send(recv: Option<Expr>, method: &str, args: Vec<Expr>) -> Expr {
+        Expr::new(
+            Span::default(),
+            ExprNode::Send {
+                recv,
+                method: Symbol::from(method),
+                args,
+                block: None,
+                parenthesized: false,
+            },
+        )
+    }
+
+    #[test]
+    fn command_send_receiver_is_parenthesized() {
+        // `html_escape(f.password_field :p, size: 40)` re-coerces to
+        // `(f.password_field :p, size: 40).to_s` — without the parens the
+        // `.to_s` binds to the last arg (`size: 40.to_s`), silently dropping
+        // the outer coercion. Found re-emitting lobsters form views.
+        let inner = cmd_send(Some(send(None, "f", vec![])), "password_field", vec![lit_sym("p")]);
+        // `f` is itself a no-arg send (a local read); the command send is
+        // `f.password_field :p`.
+        let to_s = send(Some(inner), "to_s", vec![]);
+        assert_eq!(emit_expr(&to_s), "(f.password_field :p).to_s");
+    }
+
+    #[test]
+    fn bool_op_receiver_is_parenthesized() {
+        // `<%= content_for(:t) || "Real Blog" %>` auto-escapes to
+        // `html_escape((content_for_get(:t) || "Real Blog").to_s)`; without
+        // parens the `.to_s` binds to the `||` right operand.
+        let left = send(None, "content_for_get", vec![lit_sym("t")]);
+        let bool_op = Expr::new(
+            Span::default(),
+            ExprNode::BoolOp {
+                op: crate::expr::BoolOpKind::Or,
+                surface: crate::expr::BoolOpSurface::Symbol,
+                left,
+                right: lit_str("Real Blog"),
+            },
+        );
+        let to_s = send(Some(bool_op), "to_s", vec![]);
+        assert_eq!(emit_expr(&to_s), r#"(content_for_get(:t) || "Real Blog").to_s"#);
+    }
+
+    #[test]
+    fn if_else_value_receiver_is_parenthesized() {
+        // `<%= cond ? story.score : "~" %>` lowers to an If with a non-empty
+        // else and auto-escapes to `html_escape((if cond ... end).to_s)`.
+        // The `end` already terminates the block, but the wrap keeps the
+        // `.to_s` bound to the whole conditional independent of emit form.
+        let cond = send(None, "cond?", vec![]);
+        let if_else = Expr::new(
+            Span::default(),
+            ExprNode::If {
+                cond,
+                then_branch: send(Some(send(None, "story", vec![])), "score", vec![]),
+                else_branch: lit_str("~"),
+            },
+        );
+        let to_s = send(Some(if_else), "to_s", vec![]);
+        let out = emit_expr(&to_s);
+        assert!(out.starts_with("(if cond?"), "if/else receiver wrapped:\n{out}");
+        assert!(out.ends_with("end).to_s"), "to_s binds to whole conditional:\n{out}");
+    }
+
+    #[test]
+    fn plain_receiver_is_not_parenthesized() {
+        // The common case — `comment.score.to_s` — stays paren-free: a
+        // no-arg send and a parenthesized call both parse as receivers.
+        let score = send(Some(send(None, "comment", vec![])), "score", vec![]);
+        assert_eq!(emit_expr(&send(Some(score), "to_s", vec![])), "comment.score.to_s");
+
+        let call = send(Some(send(None, "render", vec![lit_sym("x")])), "to_s", vec![]);
+        assert_eq!(emit_expr(&call), "render(:x).to_s");
+    }
+
+    fn or_sym(left: Expr, right: Expr) -> Expr {
+        Expr::new(
+            Span::default(),
+            ExprNode::BoolOp {
+                op: crate::expr::BoolOpKind::Or,
+                surface: crate::expr::BoolOpSurface::Symbol,
+                left,
+                right,
+            },
+        )
+    }
+    fn and_sym(left: Expr, right: Expr) -> Expr {
+        Expr::new(
+            Span::default(),
+            ExprNode::BoolOp {
+                op: crate::expr::BoolOpKind::And,
+                surface: crate::expr::BoolOpSurface::Symbol,
+                left,
+                right,
+            },
+        )
+    }
+
+    #[test]
+    fn or_nested_under_and_is_parenthesized() {
+        // `user && (a || b)` — the AST grouping must survive emission.
+        // Without parens Ruby's tighter `&&` re-parses it as `(user && a)
+        // || b`, which is the lobsters `can_be_seen_by_user?` nil-crash:
+        // `user.id` runs even when `user` is nil. (Found re-running GET /.)
+        let inner = or_sym(send(None, "a", vec![]), send(None, "b", vec![]));
+        let expr = and_sym(send(None, "user", vec![]), inner);
+        assert_eq!(emit_expr(&expr), "user && (a || b)");
+    }
+
+    #[test]
+    fn and_nested_under_or_is_not_parenthesized() {
+        // `(a && b) || c` is the same tree Ruby parses from `a && b || c`
+        // (`&&` binds tighter), so no parens are needed — keeps the common
+        // `guard && val || default` shape paren-free.
+        let inner = and_sym(send(None, "a", vec![]), send(None, "b", vec![]));
+        let expr = or_sym(inner, send(None, "c", vec![]));
+        assert_eq!(emit_expr(&expr), "a && b || c");
+    }
+
+    #[test]
+    fn assignment_operand_of_an_operator_is_parenthesized() {
+        // `(hrc = count) > 0` — bare, Ruby reads `hrc = (count > 0)`.
+        let assign = Expr::new(
+            Span::default(),
+            ExprNode::Assign {
+                target: LValue::Var { id: crate::ident::VarId(0), name: Symbol::from("hrc") },
+                value: send(None, "count", vec![]),
+            },
+        );
+        let zero = Expr::new(Span::default(), ExprNode::Lit { value: Literal::Int { value: 0 } });
+        assert_eq!(emit_expr(&send(Some(assign.clone()), ">", vec![zero.clone()])), "(hrc = count) > 0");
+        assert_eq!(emit_expr(&send(Some(zero), "+", vec![assign])), "0 + (hrc = count)");
+    }
+
+    #[test]
+    fn open_ended_operand_of_a_symbol_bool_op_keeps_its_parens() {
+        // Source parens are surface only (ingest unwraps them), so the
+        // emitter has to put back the ones a command or a method
+        // assignment needs. Bare, each of the first eleven either does
+        // not parse or parses as something else (`raise E || x` raises
+        // `E || x`). The rest need no parentheses and get none.
+        let ingest = |src: &str| {
+            let parsed = ruby_prism::parse(src.as_bytes());
+            assert_eq!(parsed.errors().count(), 0, "invalid Ruby: {src}");
+            let stmts = parsed.node().as_program_node().unwrap().statements().as_node();
+            crate::ingest::ingest_expr(&stmts, "operand.rb").unwrap()
+        };
+        for (src, want) in [
+            ("user || (raise NotFound.new(404))", "user || (raise NotFound.new(404))"),
+            ("user && (fail \"no\")", "user && (fail \"no\")"),
+            ("user || (puts 1, 2)", "user || (puts 1, 2)"),
+            ("(raise NotFound) || user", "(raise NotFound) || user"),
+            ("(puts 1, 2) && user", "(puts 1, 2) && user"),
+            ("a && (record.slug = s) && b", "a && (record.slug = s) && b"),
+            ("a && (h[:k] = 1) && b", "a && (h[:k] = 1) && b"),
+            ("-> { user || (return 1) }", "-> { user || (return 1) }"),
+            ("xs.each { |x| x || (next 1) }", "xs.each { |x| x || (next 1) }"),
+            ("ok && (pred.=== 1, 2)", "ok && (pred.=== 1, 2)"),
+            ("(pred.=== 1, 2) && ok", "(pred.=== 1, 2) && ok"),
+            // Already fine bare, and still emitted bare.
+            ("user || raise(NotFound)", "user || raise(NotFound)"),
+            ("user || (a + b)", "user || a + b"),
+            ("user || h[:k]", "user || h[:k]"),
+            ("-> { user || (return) }", "-> { user || return }"),
+            ("user or raise NotFound", "user or raise NotFound"),
+            ("a and record.slug = s and b", "a and record.slug = s and b"),
+        ] {
+            let expr = ingest(src);
+            let emitted = emit_expr(&expr);
+            assert_eq!(emitted, want, "source: {src}");
+            assert!(ingest(&emitted) == expr, "IR diverged across emit: {src} -> {emitted}");
+        }
+    }
+
+    #[test]
+    fn synthesized_prefix_not_operand_stays_bare() {
+        // `notice.present?` lowers to `! notice.nil? && …`: a receiver-
+        // less `!` Send, emitted prefix, which binds tighter than `&&`.
+        let nil_check = send(Some(send(None, "notice", vec![])), "nil?", vec![]);
+        let mut not = send(None, "!", vec![nil_check]);
+        if let ExprNode::Send { parenthesized, .. } = &mut *not.node {
+            *parenthesized = false;
+        }
+        assert_eq!(emit_expr(&and_sym(not, send(None, "ok", vec![]))), "! notice.nil? && ok");
+    }
+
+    #[test]
+    fn synthesized_raise_operand_of_a_bool_op_is_parenthesized() {
+        // A lowering builds `Raise` rather than a `raise` call; it emits
+        // as the same command.
+        let raise = Expr::new(Span::default(), ExprNode::Raise { value: lit_str("missing") });
+        assert_eq!(emit_expr(&or_sym(send(None, "found", vec![]), raise)), "found || (raise \"missing\")");
+    }
+
+    #[test]
+    fn same_operator_chain_stays_paren_free() {
+        // `a || b || c` — boolean ops are truth-associative, so a same-op
+        // chain needs no parens regardless of how the tree nests.
+        let right_nested = or_sym(send(None, "a", vec![]), or_sym(send(None, "b", vec![]), send(None, "c", vec![])));
+        assert_eq!(emit_expr(&right_nested), "a || b || c");
+    }
+
+    #[test]
+    fn a_mutable_string_literal_keeps_its_plus() {
+        // `+"lit"` ingests as the literal, which is what every other
+        // target emits, with a hint; the ruby family writes the `+`
+        // back, because spinel freezes a bare literal.
+        let ingest = |src: &str| {
+            let parsed = ruby_prism::parse(src.as_bytes());
+            let stmts = parsed.node().as_program_node().unwrap().statements().as_node();
+            crate::ingest::ingest_expr(&stmts, "literal.rb").unwrap()
+        };
+        for (src, want) in [
+            ("buf = +\"\"", "buf = +\"\""),
+            ("tag = +\"#\"", "tag = +\"#\""),
+            ("(+\"a\").upcase", "(+\"a\").upcase"),
+            ("x = (+\"ab\")[9]", "x = (+\"ab\")[9]"),
+            ("(+\"ab\")[0] = \"c\"", "(+\"ab\")[0] = \"c\""),
+            ("x = +\"a\" + b", "x = +\"a\" + b"),
+            ("buf = \"\"", "buf = \"\""),
+        ] {
+            let expr = ingest(src);
+            let emitted = emit_expr(&expr);
+            assert_eq!(emitted, want, "source: {src}");
+            assert!(ingest(&emitted) == expr, "IR diverged across emit: {src} -> {emitted}");
+        }
+    }
+
+    fn ruby_value(source: &str, expected: &str) {
+        let parsed = ruby_prism::parse(source.as_bytes());
+        assert!(parsed.errors().next().is_none(), "{source}");
+        let output = std::process::Command::new("ruby").args(["-e", source]).output().expect("ruby");
+        assert!(output.status.success(), "{}\n{source}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), expected, "{source}");
+    }
+
+    #[test]
+    fn first_light_single_child_sequence_groups_a_let_hash_value() {
+        let binding = Expr::new(Span::synthetic(), ExprNode::Let {
+            id: crate::ident::VarId(1), name: Symbol::from("x"), value: lit_str("value"),
+            body: Expr::new(Span::synthetic(), ExprNode::Var { id: crate::ident::VarId(1), name: Symbol::from("x") }),
+        });
+        let seq = Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![binding] });
+        let concatenated = send(Some(seq.clone()), "+", vec![lit_str("!")]);
+        ruby_value(&format!("p({})", emit_expr(&concatenated)), "\"value!\"");
+        let hash = Expr::new(Span::synthetic(), ExprNode::Hash { entries: vec![(lit_str("key"), concatenated)], kwargs: false });
+        ruby_value(&format!("p ({})[\"key\"]", emit_expr(&hash)), "\"value!\"");
+    }
+
+    #[test]
+    fn first_light_case_scrutinee_groups_a_modifier_if() {
+        let cond = Expr::new(Span::synthetic(), ExprNode::If {
+            cond: Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Bool { value: true } }),
+            then_branch: lit_str("value"),
+            else_branch: Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil }),
+        });
+        let expr = Expr::new(Span::synthetic(), ExprNode::Case {
+            scrutinee: cond, arms: vec![crate::expr::Arm { pattern: crate::expr::Pattern::Expr { expr: lit_str("value") }, guard: None, body: lit_str("matched") }],
+        });
+        ruby_value(&format!("p({})", emit_expr(&expr)), "\"matched\"");
+    }
+
+    #[test]
+    fn first_light_forwarded_conditional_proc_keeps_its_grouping() {
+        for otherwise in [lit_sym("reverse"), Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil })] {
+            let proc = Expr::new(Span::synthetic(), ExprNode::If {
+                cond: Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Bool { value: true } }),
+                then_branch: lit_sym("upcase"), else_branch: otherwise,
+            });
+            let text = emit_do_block("[\"hi\"].map()", &proc);
+            ruby_value(&format!("p({text})"), "[\"HI\"]");
+        }
+    }
+
+    #[test]
+    fn first_light_spinel_unmapped_require_is_a_named_raise_not_a_dropped_load() {
+        let expr = send(None, "require", vec![lit_str("unmapped-feature")]);
+        assert!(emit_expr(&expr).contains("require"));
+        let (text, diagnostics) = crate::emit::diagnostics::scope(|| with_spinel_requires(|| emit_expr(&expr)));
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert!(text.contains("require unmapped-feature"), "{text}");
+        ruby_value(&format!("begin; {text}; rescue RuntimeError => e; puts e.message; end"), "roundhouse: require unmapped-feature not supported (spinel)");
+        assert!(!emit_expr(&expr).contains("raise"), "Spinel's scope leaked into Ruby");
+        let (text, diagnostics) = crate::emit::diagnostics::scope(|| with_spinel_requires(|| emit_expr(&send(None, "require", vec![lit_str("csv")]))));
+        assert!(diagnostics.is_empty());
+        assert!(!text.contains("raise"));
+    }
+
+}

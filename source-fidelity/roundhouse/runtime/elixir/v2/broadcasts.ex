@@ -1,0 +1,104 @@
+# Roundhouse Elixir v2 Turbo Streams broadcasts shim — hand-written.
+#
+# The model lowerer's broadcasts expansion (see `src/lower/
+# model_to_library/broadcasts.rs`) produces calls like
+# `Broadcasts.prepend(%{stream: "x", target: "y", html: "..."})` from
+# inside model after_*_commit callbacks. elixir2 emits each as
+# `Broadcasts.<action>(%{…})`, so this module provides one function
+# per Ruby `def self.<action>`.
+#
+# The log is the test-visible contract (framework Ruby's
+# `runtime/spinel/test/models/article_broadcasts_test.rb` asserts on
+# it); transport (WebSocket fan-out) is the live-server contract, not
+# wired here — mirrors the go2/rust2 stub stance. Hand-written like the
+# sibling per-target shims (runtime/{go,rust,crystal}/broadcasts.*)
+# because the canonical `runtime/spinel/broadcasts.rb` relies on
+# module-level constant-Array mutation that doesn't translate to
+# Elixir's immutable / process model.
+#
+# State is held in a lazily-started, named `Agent` so the log survives
+# across the calls in one request and can be asserted/reset by tests.
+
+defmodule Broadcasts do
+  @doc false
+  # Compose the `<turbo-stream>` element for a `turbo_stream.<action>`
+  # call in a `.turbo_stream.erb` template. Positional and String-typed
+  # on purpose: it is the ONE shape the view lowerer emits on every
+  # target.
+  #
+  # `attributes` is the EXTRA attribute text the element carries —
+  # ` maintain_scroll="true"` — rendered by the broadcast lowering, where
+  # the literal hash the app wrote can be read. It carries its own
+  # leading space and rides BEFORE `action`/`target`, where turbo-rails'
+  # `tag.turbo_stream(template, **attributes, action:, target:)` puts it.
+  # Optional, so the three-argument call the view lowerer emits is
+  # unchanged.
+  def turbo_stream_fragment(action, target, html, attributes \\ "") do
+    if action == "remove" do
+      ~s(<turbo-stream#{attributes} action="remove" target="#{target}"></turbo-stream>)
+    else
+      ~s(<turbo-stream#{attributes} action="#{action}" target="#{target}"><template>#{html}</template></turbo-stream>)
+    end
+  end
+
+  @moduledoc false
+
+  def append(attrs), do: record(:append, attrs)
+  def prepend(attrs), do: record(:prepend, attrs)
+  def replace(attrs), do: record(:replace, attrs)
+  def update(attrs), do: record(:update, attrs)
+  def remove(attrs), do: record(:remove, attrs)
+
+  @doc "The recorded broadcasts, oldest first."
+  def log do
+    Agent.get(ensure_started(), &Enum.reverse/1)
+  end
+
+  @doc "Clear the recorded broadcasts (test setup)."
+  def reset_log! do
+    Agent.update(ensure_started(), fn _ -> [] end)
+  end
+
+  defp record(action, attrs) do
+    entry = Map.put(attrs, :action, action)
+    Agent.update(ensure_started(), fn log -> [entry | log] end)
+
+    # Live fan-out: compose the <turbo-stream> fragment and push it to every
+    # /cable subscriber of this stream. The Agent log above is the test-visible
+    # contract; this is the live-server contract (no-op when nothing's
+    # subscribed, e.g. test runs).
+    stream = Map.get(attrs, :stream)
+
+    if is_binary(stream) do
+      target = Map.get(attrs, :target, "")
+      html = Map.get(attrs, :html, "")
+      # Rendered attribute text the broadcast lowering composed. Read
+      # here so an app that writes `attributes:` is not silently
+      # stripped of it.
+      attributes = Map.get(attrs, :attributes, "")
+
+      Cable.dispatch(
+        stream,
+        Cable.turbo_stream_html(action, to_string(target), to_string(html), to_string(attributes))
+      )
+    end
+
+    nil
+  end
+
+  # The log Agent is started on first use (no supervision tree needed
+  # for the test-visible stub). `start` (not `start_link`) so a crashing
+  # request process doesn't take the log down with it.
+  defp ensure_started do
+    case Process.whereis(__MODULE__) do
+      nil ->
+        case Agent.start(fn -> [] end, name: __MODULE__) do
+          {:ok, pid} -> pid
+          {:error, {:already_started, pid}} -> pid
+        end
+
+      pid ->
+        pid
+    end
+  end
+end

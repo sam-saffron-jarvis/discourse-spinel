@@ -1,0 +1,13 @@
+"wrong number of arguments (given 0, expected 1)"
+"wrong number of arguments (given 0, expected 1+)"
+[:A, 1]
+[:B]
+"wrong number of arguments (given 0, expected 1+)"
+"wrong number of arguments (given 0, expected 1..2)"
+:C_reader
+:C
+"wrong number of arguments (given 0, expected 1)"
+:K
+"wrong number of arguments (given 0, expected 1)"
+"wrong number of arguments (given 0, expected 1)"
+"wrong number of arguments (given 0, expected 1)"

@@ -1,0 +1,603 @@
+//! `X.prepend Y` / `X.include Y` in a `config/initializers/` file.
+//!
+//! THE ONE INITIALIZER SHAPE THAT CHANGES METHOD LOOKUP. Everything
+//! else an initializer does is configuration some lowering reads; this
+//! one rewrites an ancestor chain, so dropping it leaves a module
+//! defined and unreachable.
+//!
+//! campfire is the case that forced it. `turbo_streams_authorization.rb`
+//! is one line —
+//!
+//! ```ruby
+//! Rails.application.config.to_prepare do
+//!   Turbo::StreamsChannel.prepend RoomStreamsAreAuthorized
+//! end
+//! ```
+//!
+//! — and it is what makes `RoomMessagesChannel` the only door onto a
+//! room's message stream. The concern itself ingests (it lives in
+//! `app/channels/concerns/`), so without the prepend the guard is in the
+//! tree, tested, and out of the lookup chain: a security control that
+//! reads as present and does nothing.
+//!
+//! Two things are asserted here and they pull opposite ways. A mixin
+//! whose constants WILL BE DEFINED must be EMITTED, at the end of boot
+//! where both are loaded — and "defined" spans the ingested tree and
+//! the framework classes the runtime ships, which is what the campfire
+//! line above needs. A mixin naming a constant nothing defines must be
+//! DROPPED — the line would `NameError` at require time and take the
+//! whole boot down — and REPORTED, because silently losing this
+//! particular construct is the worse failure of the two. campfire's
+//! OTHER prepend, onto the `WebPush::Request` gem class, is that case.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+use roundhouse::ingest::ingest_app_from_tree;
+
+const SCHEMA: &str = r#"ActiveRecord::Schema.define do
+  create_table "rooms", force: :cascade do |t|
+    t.string "name", null: false
+  end
+end
+"#;
+
+fn tree(files: &[(&str, &str)]) -> HashMap<PathBuf, Vec<u8>> {
+    files
+        .iter()
+        .map(|(p, c)| (PathBuf::from(p), c.as_bytes().to_vec()))
+        .collect()
+}
+
+fn app_from(initializer: &str, extra: &[(&str, &str)]) -> roundhouse::App {
+    let mut files: Vec<(&str, &str)> = vec![
+        ("db/schema.rb", SCHEMA),
+        ("app/models/room.rb", "class Room < ApplicationRecord\nend\n"),
+        ("config/initializers/mixins.rb", initializer),
+    ];
+    files.extend_from_slice(extra);
+    let mut app = ingest_app_from_tree(tree(&files)).expect("ingest");
+    roundhouse::session::analyze_and_lower(&mut app);
+    app
+}
+
+/// The concern as campfire files it: a module under
+/// `app/channels/concerns/`, which ingests as a library class.
+const GUARD: (&str, &str) = (
+    "app/channels/concerns/room_streams_are_authorized.rb",
+    "module RoomStreamsAreAuthorized\n  def subscribed\n    super\n  end\nend\n",
+);
+
+/// A stand-in for the prepend TARGET, so both constants resolve.
+const CHANNEL: (&str, &str) = (
+    "app/channels/streams_channel.rb",
+    "class StreamsChannel\n  def subscribed\n    nil\n  end\nend\n",
+);
+
+#[test]
+fn a_top_level_prepend_is_recorded() {
+    let app = app_from(
+        "StreamsChannel.prepend RoomStreamsAreAuthorized\n",
+        &[GUARD, CHANNEL],
+    );
+    assert_eq!(app.module_mixins.len(), 1, "{:?}", app.module_mixins);
+    let m = &app.module_mixins[0];
+    assert_eq!(m.target.as_str(), "StreamsChannel");
+    assert_eq!(m.module.as_str(), "RoomStreamsAreAuthorized");
+    assert_eq!(m.kind, roundhouse::app::MixinKind::Prepend);
+}
+
+/// campfire's own spelling. The block is unwrapped rather than modeled:
+/// to a tree that boots once, `to_prepare` means exactly its body.
+#[test]
+fn a_to_prepare_block_is_unwrapped() {
+    let app = app_from(
+        "Rails.application.config.to_prepare do\n  \
+         StreamsChannel.prepend RoomStreamsAreAuthorized\nend\n",
+        &[GUARD, CHANNEL],
+    );
+    assert_eq!(app.module_mixins.len(), 1, "{:?}", app.module_mixins);
+    assert_eq!(app.module_mixins[0].target.as_str(), "StreamsChannel");
+}
+
+#[test]
+fn include_is_recorded_distinctly_from_prepend() {
+    let app = app_from("StreamsChannel.include RoomStreamsAreAuthorized\n", &[GUARD, CHANNEL]);
+    assert_eq!(app.module_mixins.len(), 1);
+    assert_eq!(app.module_mixins[0].kind, roundhouse::app::MixinKind::Include);
+}
+
+/// The emitted line lands at the END of boot.rb, after `app/models` and
+/// `app/views`: a mixin names two constants and both have to be loaded.
+///
+/// Emitted from the real-blog fixture — `target_files` reads a fixture
+/// from disk, so the in-memory trees above cannot reach the emit half.
+/// The mixin is pushed onto the App directly, which is exactly the state
+/// `lower::module_mixins` leaves behind for one it kept.
+#[test]
+fn a_resolvable_mixin_reaches_the_end_of_boot() {
+    use roundhouse::app::{MixinKind, ModuleMixin};
+    use roundhouse::ident::Symbol;
+    use roundhouse::project::{target_files, BuildTarget};
+
+    let fixture = roundhouse::fixtures::real_blog().to_path_buf();
+    let mut app = roundhouse::ingest::ingest_app(&fixture).expect("ingest real-blog");
+    roundhouse::session::analyze_and_lower(&mut app);
+    app.module_mixins.push(ModuleMixin {
+        target: Symbol::from("Article"),
+        module: Symbol::from("Publishable"),
+        kind: MixinKind::Prepend,
+    });
+
+    let files = target_files(&app, &fixture, BuildTarget::Ruby).expect("ruby target files");
+    let boot = files
+        .iter()
+        .find(|(p, _)| p == "boot.rb")
+        .map(|(_, c)| c.clone())
+        .expect("boot.rb");
+
+    assert!(
+        boot.contains("Article.prepend Publishable"),
+        "the prepend never reached boot.rb:\n{boot}"
+    );
+    let mixin_at = boot.find("Article.prepend Publishable").unwrap();
+    let models_at = boot.find("require_relative \"app/models\"").unwrap();
+    assert!(
+        mixin_at > models_at,
+        "the mixin must run AFTER app/models loads, or neither constant is defined"
+    );
+}
+
+/// campfire's own line, whose target is a FRAMEWORK class rather than
+/// an ingested one: `Turbo::StreamsChannel` is turbo-rails', supplied by
+/// `runtime/spinel/turbo_streams.rb`. It resolves at boot, so it is
+/// emitted — the tree-only check that used to drop it left campfire's
+/// guard defined, tested, and out of the lookup chain.
+#[test]
+fn a_mixin_onto_a_runtime_class_is_kept() {
+    let mut app = {
+        let files = vec![
+            ("db/schema.rb", SCHEMA),
+            ("app/models/room.rb", "class Room < ApplicationRecord\nend\n"),
+            (
+                "config/initializers/mixins.rb",
+                "Rails.application.config.to_prepare do\n  \
+                 Turbo::StreamsChannel.prepend RoomStreamsAreAuthorized\nend\n",
+            ),
+            GUARD,
+        ];
+        ingest_app_from_tree(tree(&files)).expect("ingest")
+    };
+    assert_eq!(app.module_mixins.len(), 1);
+
+    let diags = roundhouse::session::analyze_and_lower(&mut app);
+
+    assert_eq!(
+        app.module_mixins.len(),
+        1,
+        "the guard's target is a class the runtime ships; dropping it \
+         leaves the module out of the lookup chain"
+    );
+    assert!(
+        !diags.iter().any(|d| d.message.contains("Turbo::StreamsChannel")),
+        "a kept mixin must not also be reported as a gap: {:#?}",
+        diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+/// The reason the lowering reports at Warning rather than Error: a
+/// prepend onto a GEM class no tree here defines. Emitting it would
+/// `NameError` at require time; refusing to emit the app over it would
+/// block the tree forever. (campfire's `WebPush::Request` was this
+/// case until the runtime defined it — see the test below.)
+#[test]
+fn a_mixin_naming_an_undefined_constant_is_dropped_and_reported() {
+    let mut app = {
+        let files = vec![
+            ("db/schema.rb", SCHEMA),
+            ("app/models/room.rb", "class Room < ApplicationRecord\nend\n"),
+            (
+                "config/initializers/mixins.rb",
+                "Stripe::Client.prepend Stripe::PinnedClient\n",
+            ),
+            GUARD,
+        ];
+        ingest_app_from_tree(tree(&files)).expect("ingest")
+    };
+    // Recorded at ingest — resolution is not ingest's question.
+    assert_eq!(app.module_mixins.len(), 1);
+
+    let diags = roundhouse::session::analyze_and_lower(&mut app);
+
+    assert!(app.module_mixins.is_empty(), "an unresolvable mixin must not be emitted");
+
+    // Both halves are missing, so the diagnostic names both — the
+    // "neither X nor Y" arm, which carries its own negation.
+    let reported = diags.iter().any(|d| {
+        d.message
+            .contains("neither Stripe::Client nor Stripe::PinnedClient is defined")
+    });
+    assert!(
+        reported,
+        "dropping it silently leaves the module defined and out of the lookup chain; \
+         diagnostics were:\n{:#?}",
+        diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+/// campfire's `config/initializers/web_push.rb`: the module is DEFINED
+/// in the initializer that prepends it, onto the web-push gem's
+/// `WebPush::Request`. No autoload path holds the module, so it has to
+/// be ingested from the initializer itself, or the mixin names nothing
+/// and is dropped — taking the app's SSRF guard with it (delivery then
+/// connects to the endpoint's host instead of the vetted address). The
+/// target is the gem's class on the ruby family and the runtime's port
+/// on spinel, so the mixin is kept.
+#[test]
+fn a_module_an_initializer_defines_and_prepends_is_ingested_and_kept() {
+    let mut app = {
+        let files = vec![
+            ("db/schema.rb", SCHEMA),
+            ("app/models/room.rb", "class Room < ApplicationRecord\nend\n"),
+            (
+                "config/initializers/web_push.rb",
+                "require \"web-push\"\n\
+                 \n\
+                 module WebPush::PersistentRequest\n\
+                 \x20 def perform\n\
+                 \x20   @options[:endpoint_ip]\n\
+                 \x20 end\n\
+                 end\n\
+                 \n\
+                 module WebPush::Unrelated\n\
+                 end\n\
+                 \n\
+                 WebPush::Request.prepend WebPush::PersistentRequest\n",
+            ),
+        ];
+        ingest_app_from_tree(tree(&files)).expect("ingest")
+    };
+    let names: Vec<&str> = app.library_classes.iter().map(|lc| lc.name.0.as_str()).collect();
+    assert!(names.contains(&"WebPush::PersistentRequest"), "library classes: {names:?}");
+    assert!(
+        !names.contains(&"WebPush::Unrelated"),
+        "only the mixed-in module is ingested from an initializer: {names:?}"
+    );
+
+    let _ = roundhouse::session::analyze_and_lower(&mut app);
+    assert_eq!(app.module_mixins.len(), 1, "the prepend onto WebPush::Request must be kept");
+}
+
+/// The same initializer, EMITTED, on both trees: each carries the guard
+/// module AND its prepend. The gem supplies `WebPush::Request` on CRuby,
+/// runtime/spinel/web_push.rb's port on spinel. Both halves have to
+/// travel together — a tree with the prepend and not the module is a
+/// `NameError` at boot (18775c4f's first cut did that to CRuby), and one
+/// with the module and not the prepend delivers unpinned.
+#[test]
+fn the_web_push_guard_ships_on_both_trees() {
+    use roundhouse::project::{target_files, BuildTarget};
+
+    let mut app = {
+        let files = vec![
+            ("db/schema.rb", SCHEMA),
+            ("app/models/room.rb", "class Room < ApplicationRecord\nend\n"),
+            (
+                "config/initializers/web_push.rb",
+                "module WebPush::PersistentRequest\n\
+                 \x20 def perform\n\
+                 \x20   verify_response(nil)\n\
+                 \x20 end\n\
+                 end\n\
+                 \n\
+                 WebPush::Request.prepend WebPush::PersistentRequest\n",
+            ),
+        ];
+        ingest_app_from_tree(tree(&files)).expect("ingest")
+    };
+    roundhouse::session::analyze_and_lower(&mut app);
+    let fixture = roundhouse::fixtures::real_blog().to_path_buf();
+    let guard = "app/models/web_push/persistent_request.rb";
+
+    let ruby = target_files(&app, &fixture, BuildTarget::Ruby).expect("ruby target files");
+    let boot = &ruby.iter().find(|(p, _)| p == "boot.rb").expect("boot.rb").1;
+    assert!(boot.contains("WebPush::Request.prepend WebPush::PersistentRequest"), "{boot}");
+    assert!(
+        ruby.iter().any(|(p, _)| p == guard),
+        "the CRuby boot prepends the guard, so the tree must define it"
+    );
+
+    let spinel = target_files(&app, &fixture, BuildTarget::Spinel).expect("spinel target files");
+    assert!(
+        spinel.iter().any(|(p, c)| p.ends_with("boot.rb")
+            && c.contains("class WebPush::Request\n  prepend WebPush::PersistentRequest\nend")),
+        "the spinel boot must prepend the guard onto the port's Request"
+    );
+    assert!(spinel.iter().any(|(p, _)| p.ends_with("web_push/persistent_request.rb")));
+    let port = &spinel
+        .iter()
+        .find(|(p, _)| p.ends_with("runtime/web_push.rb"))
+        .expect("the WebPush anchor resolves")
+        .1;
+    assert!(port.contains("class Request"), "the spinel anchor must be the port:\n{port}");
+}
+
+/// The mixin's companion: `X.before_action :m` in the same initializer.
+/// campfire's `active_storage_authentication.rb` includes a session
+/// check into Active Storage's two direct-upload controllers and adds
+/// the `before_action` that makes an anonymous upload a 401 — a guard
+/// that is nothing without the second line. Read at ingest (with its
+/// `only:`), kept by the lowering when the target is a runtime
+/// controller carrying the seam and a kept mixin supplies the method.
+#[test]
+fn a_before_action_on_a_runtime_controller_is_kept_with_its_mixin() {
+    let mut app = {
+        let files = vec![
+            ("db/schema.rb", SCHEMA),
+            ("app/models/room.rb", "class Room < ApplicationRecord\nend\n"),
+            (
+                "config/initializers/active_storage_authentication.rb",
+                "Rails.application.config.to_prepare do\n  \
+                 ActiveStorage::DirectUploadsController.include ActiveStorageAuthentication\n  \
+                 ActiveStorage::DirectUploadsController.before_action :require_active_storage_authentication\n  \
+                 ActiveStorage::DiskController.include ActiveStorageAuthentication\n  \
+                 ActiveStorage::DiskController.before_action :require_active_storage_authentication, only: :update\n\
+                 end\n",
+            ),
+            (
+                "app/controllers/concerns/active_storage_authentication.rb",
+                "module ActiveStorageAuthentication\n  extend ActiveSupport::Concern\n\n  private\n    \
+                 def require_active_storage_authentication\n      head :unauthorized unless cookies[:session_token].present?\n    end\nend\n",
+            ),
+        ];
+        ingest_app_from_tree(tree(&files)).expect("ingest")
+    };
+    assert_eq!(app.module_mixins.len(), 2);
+    assert_eq!(app.initializer_filters.len(), 2, "{:?}", app.initializer_filters);
+    assert!(app.initializer_filters[0].only.is_empty(), "every action");
+    assert_eq!(
+        app.initializer_filters[1].only.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        vec!["update"]
+    );
+
+    let diags = roundhouse::session::analyze_and_lower(&mut app);
+    assert_eq!(app.module_mixins.len(), 2, "both controllers are runtime classes the tree ships");
+    assert_eq!(
+        app.initializer_filters.len(),
+        2,
+        "the guard's method is defined by the module the same initializer mixes in: {:#?}",
+        diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+/// A `before_action` whose target takes no filter (an ingested
+/// controller, or a runtime class without the seam), or whose method
+/// no kept mixin supplies, is dropped and reported — a filter that
+/// never runs is the same silent absence a dropped mixin is.
+#[test]
+fn a_before_action_nothing_supplies_is_dropped_and_reported() {
+    let mut app = {
+        let files = vec![
+            ("db/schema.rb", SCHEMA),
+            ("app/models/room.rb", "class Room < ApplicationRecord\nend\n"),
+            (
+                "config/initializers/guard.rb",
+                "ActiveStorage::DiskController.before_action :require_active_storage_authentication\n",
+            ),
+        ];
+        ingest_app_from_tree(tree(&files)).expect("ingest")
+    };
+    assert_eq!(app.initializer_filters.len(), 1);
+    let diags = roundhouse::session::analyze_and_lower(&mut app);
+    assert!(app.initializer_filters.is_empty());
+    assert!(
+        diags.iter().any(|d| d.message.contains("no module mixed into ActiveStorage::DiskController")),
+        "{:#?}",
+        diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+/// The emit: one reopen per target at the end of boot.rb, redefining
+/// the runtime controller's `initializer_filters` seam with the
+/// filters in order, `only:` rendered as the lowered controllers spell
+/// it. Pushed onto a real-blog App directly, as the mixin test above is.
+#[test]
+fn a_kept_before_action_reaches_boot_as_the_controllers_filter_seam() {
+    use roundhouse::app::{InitializerFilter, MixinKind, ModuleMixin};
+    use roundhouse::ident::Symbol;
+    use roundhouse::project::{target_files, BuildTarget};
+
+    let fixture = roundhouse::fixtures::real_blog().to_path_buf();
+    let mut app = roundhouse::ingest::ingest_app(&fixture).expect("ingest real-blog");
+    roundhouse::session::analyze_and_lower(&mut app);
+    app.module_mixins.push(ModuleMixin {
+        target: Symbol::from("ActiveStorage::DiskController"),
+        module: Symbol::from("ActiveStorageAuthentication"),
+        kind: MixinKind::Include,
+    });
+    app.initializer_filters.push(InitializerFilter {
+        target: Symbol::from("ActiveStorage::DiskController"),
+        method: Symbol::from("require_active_storage_authentication"),
+        only: vec![Symbol::from("update")],
+    });
+
+    let files = target_files(&app, &fixture, BuildTarget::Ruby).expect("ruby target files");
+    let boot = files.iter().find(|(p, _)| p == "boot.rb").map(|(_, c)| c.clone()).expect("boot.rb");
+    assert!(boot.contains("ActiveStorage::DiskController.include ActiveStorageAuthentication"), "{boot}");
+    assert!(
+        boot.contains(
+            "class ActiveStorage::DiskController\n  def initializer_filters(action_name)\n    \
+             require_active_storage_authentication if [:update].include?(action_name)\n    \
+             return nil if performed?\n    nil\n  end\nend"
+        ),
+        "the filter reopen never reached boot.rb:\n{boot}"
+    );
+}
+
+/// campfire's `active_storage.rb`: an `after_action` inside
+/// `ActiveSupport.on_load` whose block only writes a literal header. It
+/// needs no mixin, so it survives the lowering on the seam alone.
+#[test]
+fn an_after_action_writing_a_header_is_kept_on_a_runtime_controller() {
+    let mut app = app_from(
+        "ActiveSupport.on_load(:active_storage_blob) do\n  \
+         ActiveStorage::DiskController.after_action only: :show do\n    \
+         response.set_header(\"Cache-Control\", \"max-age=3600, public\")\n  end\nend\n",
+        &[],
+    );
+    let headers: Vec<_> = app
+        .initializer_response_headers
+        .iter()
+        .map(|h| (h.target.as_str(), h.only.iter().map(|s| s.as_str()).collect::<Vec<_>>(), h.name.as_str(), h.value.as_str()))
+        .collect();
+    assert_eq!(
+        headers,
+        vec![("ActiveStorage::DiskController", vec!["show"], "Cache-Control", "max-age=3600, public")]
+    );
+    let diags = roundhouse::session::analyze_and_lower(&mut app);
+    assert_eq!(app.initializer_response_headers.len(), 1, "{:#?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
+}
+
+/// Anything in the block besides a literal header write, and an
+/// `on_load` that holds anything besides such filters, is not read: the
+/// rest of the block would never run.
+#[test]
+fn an_after_action_doing_more_than_a_header_is_not_recorded() {
+    for source in [
+        "ActiveStorage::DiskController.after_action do\n  response.set_header(\"X\", \"1\")\n  log_it\nend\n",
+        "ActiveStorage::DiskController.after_action do\n  response.set_header(\"X\", ENV[\"X\"])\nend\n",
+        "ActiveStorage::DiskController.after_action except: :show do\n  headers[\"X\"] = \"1\"\nend\n",
+        "ActiveSupport.on_load(:active_storage_blob) do\n  \
+         ActiveStorage::DiskController.after_action { headers[\"X\"] = \"1\" }\n  \
+         ActiveStorage::Blob.include Tracking\nend\n",
+    ] {
+        let app = app_from(source, &[]);
+        assert!(app.initializer_response_headers.is_empty(), "{source}");
+    }
+}
+
+/// A header filter onto a controller without the seam would never run,
+/// and the ledger counts the statement as read, so the drop is an error.
+#[test]
+fn an_after_action_header_without_a_seam_is_an_error() {
+    let mut app = {
+        let files = vec![
+            ("db/schema.rb", SCHEMA),
+            ("app/models/room.rb", "class Room < ApplicationRecord\nend\n"),
+            (
+                "config/initializers/headers.rb",
+                "Turbo::StreamsChannel.after_action { response.headers[\"X-Seen\"] = \"1\" }\n",
+            ),
+        ];
+        ingest_app_from_tree(tree(&files)).expect("ingest")
+    };
+    assert_eq!(app.initializer_response_headers.len(), 1);
+    let diags = roundhouse::session::analyze_and_lower(&mut app);
+    assert!(app.initializer_response_headers.is_empty());
+    let d = diags
+        .iter()
+        .find(|d| d.message.contains("Turbo::StreamsChannel.after_action"))
+        .expect("the dropped header is reported");
+    assert_eq!(d.severity, roundhouse::diagnostic::Severity::Error);
+}
+
+/// The emit: the runtime controller's `initializer_after_filters` seam,
+/// redefined at the end of boot.rb with each header behind its `only:`.
+#[test]
+fn a_kept_header_reaches_boot_as_the_controllers_after_filter_seam() {
+    use roundhouse::app::InitializerResponseHeader;
+    use roundhouse::ident::Symbol;
+    use roundhouse::project::{target_files, BuildTarget};
+
+    let fixture = roundhouse::fixtures::real_blog().to_path_buf();
+    let mut app = roundhouse::ingest::ingest_app(&fixture).expect("ingest real-blog");
+    roundhouse::session::analyze_and_lower(&mut app);
+    app.initializer_response_headers.push(InitializerResponseHeader {
+        target: Symbol::from("ActiveStorage::DiskController"),
+        only: vec![Symbol::from("show")],
+        name: "Cache-Control".to_string(),
+        value: "max-age=3600, public".to_string(),
+    });
+
+    let files = target_files(&app, &fixture, BuildTarget::Ruby).expect("ruby target files");
+    let boot = files.iter().find(|(p, _)| p == "boot.rb").map(|(_, c)| c.clone()).expect("boot.rb");
+    assert!(
+        boot.contains(
+            "class ActiveStorage::DiskController\n  def initializer_after_filters(action_name)\n    \
+             headers[\"Cache-Control\"] = \"max-age=3600, public\" if [:show].include?(action_name)\n    nil\n  end\nend"
+        ),
+        "the header reopen never reached boot.rb:\n{boot}"
+    );
+}
+
+/// THE DRIFT GUARD on `RUNTIME_MIXIN_TARGETS`. That list is the one
+/// place the lowering credits a constant it cannot see — the runtime is
+/// not in `App` — so it is also the one place a rename in
+/// `runtime/spinel/` turns a dropped-and-reported line into an emitted
+/// `NameError` that takes boot down with no diagnostic at all.
+#[test]
+fn every_credited_runtime_mixin_target_is_actually_defined() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let source = std::fs::read_to_string(root.join("runtime/spinel/turbo_streams.rb"))
+        .expect("runtime/spinel/turbo_streams.rb");
+    assert!(
+        source.contains("class StreamsChannel < ActionCable::Channel::Base"),
+        "`Turbo::StreamsChannel` is credited by lower::module_mixins but no longer \
+         defined in runtime/spinel/turbo_streams.rb"
+    );
+    // The two direct-upload controllers, and the seam a filter is
+    // written into — `process_action` must ASK it, or the generated
+    // reopen defines a method nothing calls.
+    let disk = std::fs::read_to_string(root.join("runtime/spinel/active_storage_disk.rb"))
+        .expect("runtime/spinel/active_storage_disk.rb");
+    for class in ["DirectUploadsController", "DiskController"] {
+        assert!(
+            disk.contains(&format!("class {class} < ActionController::Base")),
+            "`ActiveStorage::{class}` is credited by lower::module_mixins but no longer \
+             defined in runtime/spinel/active_storage_disk.rb"
+        );
+    }
+    assert_eq!(
+        disk.matches("initializer_filters(action_name)\n      return nil if performed?").count(),
+        2,
+        "each direct-upload controller's process_action asks the filter seam before its action"
+    );
+}
+
+/// An app with no such initializer carries no mixins at all.
+#[test]
+fn an_app_without_mixins_is_untouched() {
+    let app = app_from("# nothing here\n", &[]);
+    assert!(app.module_mixins.is_empty());
+}
+
+/// campfire's `fragment_cache.rb`: inside `to_prepare`, the store cached
+/// collections read is pointed at the app's bounded store. Recorded at
+/// ingest, kept because `FragmentCache.store` resolves, and written at
+/// the end of boot.rb on both trees, where `FragmentCache` has loaded.
+/// A reader no class defines is dropped and reported, not written.
+#[test]
+fn the_collection_cache_store_reaches_the_end_of_boot() {
+    use roundhouse::project::{target_files, BuildTarget};
+
+    let store = (
+        "app/models/fragment_cache.rb",
+        "class FragmentCache\n  def self.store\n    nil\n  end\nend\n",
+    );
+    let line = "ActionView::PartialRenderer.collection_cache = FragmentCache.store";
+    let app = app_from(&format!("Rails.application.config.to_prepare do\n  {line}\nend\n"), &[store]);
+    let kept = app.collection_cache_store.as_ref().expect("recorded and kept");
+    assert_eq!((kept.receiver.as_str(), kept.reader.as_str()), ("FragmentCache", "store"));
+
+    let fixture = roundhouse::fixtures::real_blog().to_path_buf();
+    for target in [BuildTarget::Ruby, BuildTarget::Spinel] {
+        let files = target_files(&app, &fixture, target).expect("target files");
+        let boot = &files.iter().find(|(p, _)| p.ends_with("boot.rb")).expect("boot.rb").1;
+        let at = boot.find(line).unwrap_or_else(|| panic!("never reached boot.rb:\n{boot}"));
+        let models_at = boot.find("app/models").expect("models load");
+        assert!(at > models_at, "the store's class must load first");
+    }
+
+    let missing = app_from(&format!("{line}\n"), &[]);
+    assert!(missing.collection_cache_store.is_none(), "an unresolvable reader is dropped");
+}

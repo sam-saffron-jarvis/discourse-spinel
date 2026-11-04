@@ -1,0 +1,1408 @@
+# frozen_string_literal: true
+require_relative "errors"
+require "time"
+
+module ActiveRecord
+  class << self
+    attr_accessor :adapter
+  end
+
+  # An enum column assigned by LABEL. Rails' `enum :role, %i[member
+  # administrator bot]` lets `user.role = "administrator"` store `1`;
+  # the synthesized per-column writers cast to the column's slot type,
+  # and `"administrator".to_i` is zero — which is `member`. campfire's
+  # role change silently demoted the user rather than failing, which is
+  # the worst shape a gap can take.
+  #
+  # `lower::enum_symbols` translates the labels an app writes DOWN
+  # (`where(role: :bot)`); this is the half that only exists at
+  # runtime, where the label came off the request.
+  #
+  # `labels`/`values` are parallel — the declaration's order — rather
+  # than a Hash, because the emitters render a two-Array call with one
+  # element type each and a `Hash[String, Integer]` literal argument is
+  # a shape several of them place differently. Scanning three entries
+  # costs nothing next to the write that follows.
+  #
+  # `text`, not an untyped value: the caller wraps the raw attrs read
+  # in a `Cast` to String, which is the seam the strict targets already
+  # use for every other attribute write — and it keeps this body
+  # concretely typed, which the framework-runtime residual gate counts.
+  # Not `values.index(value)`: a stored value no label names answers nil, the way Rails' reader does.
+  def self.enum_label(value, labels, values)
+    found = -1
+    i = 0
+    while i < values.length
+      found = i if found == -1 && values[i] == value
+      i += 1
+    end
+    found == -1 ? nil : labels[found]
+  end
+
+  # Not a `to_i` fallback: a label no mapping names (`"bogus"`, `"Draft"`, `5`) raises as Rails' enum type does, rather than storing 0.
+  # Not `values[i].to_s`: the caller passes each value's spelling, so the comparison stays String to String on every target.
+  def self.enum_int(text, labels, values, texts, attr)
+    result = 0
+    found = text == ""
+    i = 0
+    while i < labels.length
+      if labels[i] == text || texts[i] == text
+        result = values[i]
+        found = true
+      end
+      i += 1
+    end
+    raise ArgumentError, "'" + text + "' is not a valid " + attr unless found
+    result
+  end
+
+  def self.enum_int_or_nil(text, labels, values, texts, attr)
+    text == "" ? nil : enum_int(text, labels, values, texts, attr)
+  end
+
+  def self.enum_str(text, labels, values, attr)
+    result = text + ""
+    found = text == ""
+    i = 0
+    while i < labels.length
+      if labels[i] == text || values[i] == text
+        result = values[i]
+        found = true
+      end
+      i += 1
+    end
+    raise ArgumentError, "'" + text + "' is not a valid " + attr unless found
+    result
+  end
+
+  def self.enum_str_or_nil(text, labels, values, attr)
+    text == "" ? nil : enum_str(text, labels, values, attr)
+  end
+
+  def self.enum_label_str(value, labels, values)
+    found = -1
+    i = 0
+    while i < values.length
+      found = i if found == -1 && values[i] == value
+      i += 1
+    end
+    found == -1 ? nil : labels[found]
+  end
+
+  # The first index in `sorted` (ascending) whose value is >= `value`,
+  # or `sorted.length` when none is: a binary search. The
+  # `includes(:assoc)` distribute calls it twice per parent over the
+  # loaded children's foreign keys -- which the preload query returns
+  # `ORDER BY fk` -- to find that parent's run,
+  # `lower_bound(fks, id)...lower_bound(fks, id + 1)`, so the cost is
+  # O(N log M + M) where the nested scan this replaced was O(N * M): at
+  # 1,000 parents and 1,000 children that scan was a million
+  # comparisons per request, and the emitted index fell behind Rails'
+  # keyed preloader (koduki/example-rails-aot).
+  #
+  # Integers in, an integer out, counters bumped by `x = x + 1`: one
+  # typed body serves every target, and the lowered caller needs no
+  # Integer-keyed Hash, no index assignment, and no counter shared
+  # across its block's iterations. No division either -- Crystal,
+  # Python and TypeScript render Ruby's Integer `/` as true division --
+  # and no scratch Array, whose element type an empty literal leaves
+  # unknown: the search descends through powers of two, finding each
+  # next-smaller one by doubling from 1 (O(log^2 M) additions, a few
+  # hundred at M = 1,000). `lo` grows by each step whose last element
+  # is still below `value`, which leaves it at the count of such
+  # elements.
+  def self.lower_bound(sorted, value)
+    n = sorted.length
+    step = 1
+    while step + step <= n
+      step = step + step
+    end
+    lo = 0
+    # Declared before the loop: a local first assigned inside it is
+    # hoisted as a nullable on C#, and `step = half` then narrows it.
+    half = 0
+    while step > 0
+      # `.to_i`: an Array read types `Integer | nil`, and an ordering
+      # comparison on a nilable is Ruby's NoMethodError, which the
+      # strict targets refuse to emit. The index is in range here, so
+      # the read is an Integer and `to_i` is its identity.
+      if lo + step <= n && sorted[lo + step - 1].to_i < value
+        lo = lo + step
+      end
+      half = 0
+      if step > 1
+        half = 1
+        while half + half < step
+          half = half + half
+        end
+      end
+      step = half
+    end
+    lo
+  end
+
+  # Thin reflection surface for `Model.reflect_on_association(:name)`.
+  # Campfire asks `counter_cache_column` (nil when the belongs_to did not
+  # declare `counter_cache:`). Deeper Rails reflection stays unmodeled.
+  module Reflection
+    class AssociationReflection
+      def initialize(name, counter_cache_column)
+        @name = name
+        @counter_cache_column = counter_cache_column
+      end
+
+      def name
+        @name
+      end
+
+      def counter_cache_column
+        @counter_cache_column
+      end
+
+      # Catalog also types `.klass` / `.macro`; presence-only callers get
+      # nil rather than a NameError until those halves are synthesized.
+      # Bare `nil` (return-tail untyped) — not `result = nil; result`,
+      # which rust emits as `Option`/`None` against a Value return
+      # (issue #832). Same shape as `request_for_csrf`.
+      def klass
+        nil
+      end
+
+      def macro
+        nil
+      end
+    end
+  end
+
+  # One error as Rails' `ActiveModel::Error` holds it: the attribute, the
+  # error type (the message itself when `errors.add` was given a String),
+  # the message without the attribute's name, the full message
+  # `errors` lists for it, whether the type is a Symbol, and whether
+  # Rails' `details` keeps nothing beside the type (no `count:` or `value:`).
+  # Not `ActiveModel::Error`: the strict targets emit the class unqualified, beside their own `Error`.
+  class ErrorDetail
+    # `kind`, not Rails' `type`: a field named `type` does not compile in Rust or Go
+    attr_reader :attribute, :kind, :message, :full_message, :symbolic, :optionless
+
+    def initialize(attribute, kind, message, full_message, symbolic, optionless)
+      @attribute = attribute
+      @kind = kind
+      @message = message
+      @full_message = full_message
+      @symbolic = symbolic
+      @optionless = optionless
+    end
+  end
+
+  # Base class for all models. Designed to contain *zero* metaprogramming:
+  # subclasses provide their own `attributes`, `[]`, `[]=`, `update`, and
+  # `initialize`-from-attrs methods (typically by writing them out per
+  # column). This Base class supplies the shared protocol — CRUD that
+  # delegates to the adapter + validations + lifecycle hooks — without
+  # any reflective access to ivars.
+  class Base
+    # Escape existing markers before adding markers to LIKE wildcards.
+    def self.sanitize_sql_like(value, escape_character = "\\")
+      source = value
+      if escape_character != "%" && escape_character != "_" && !escape_character.empty?
+        source = like_escapes_doubled(value, escape_character)
+      end
+      like_wildcards_marked(source, escape_character)
+    end
+
+    # The helpers below hold one counter loop each, accumulating with `x = x + y` rather than `+=`: the Elixir emit turns only that shape into recursion.
+    # `gsub(escape_character, '\0\0')`: every escape character doubled.
+    def self.like_escapes_doubled(value, escape_character)
+      doubled = ""
+      index = 0
+      while index < value.length
+        piece = value[index, 1]
+        step = 1
+        if value[index, escape_character.length] == escape_character
+          piece = escape_character + escape_character
+          step = escape_character.length
+        end
+        doubled = doubled + piece
+        index += step
+      end
+      doubled
+    end
+
+    # `gsub(/(?=[%_])/, escape_character)`: the expanded replacement before each wildcard.
+    def self.like_wildcards_marked(source, escape_character)
+      result = ""
+      index = 0
+      while index < source.length
+        character = source[index, 1]
+        if character == "%" || character == "_"
+          result = result + like_replacement(source, index, escape_character)
+        end
+        result = result + character
+        index += 1
+      end
+      result
+    end
+
+    # gsub replacement escapes expand against a zero-width match at `index`.
+    def self.like_replacement(source, index, escape_character)
+      result = ""
+      replacement_index = 0
+      while replacement_index < escape_character.length
+        replacement = escape_character[replacement_index, 1]
+        step = 1
+        if replacement == "\\" && replacement_index + 1 < escape_character.length
+          step = 2
+          replacement = escape_character[replacement_index + 1, 1]
+          if replacement == "\\"
+            result = result + replacement
+          elsif replacement == "`"
+            result = result + source[0, index]
+          elsif replacement == "'"
+            result = result + source[index, source.length - index]
+          elsif replacement == "k" && escape_character[replacement_index + 2, 1] == "<"
+            like_group_reference(escape_character, replacement_index + 3)
+          elsif !"0123456789&+".include?(replacement)
+            result = result + "\\" + replacement
+          end
+        else
+          result = result + replacement
+        end
+        replacement_index += step
+      end
+      result
+    end
+
+    # A named group reference raises: the zero-width match has no groups.
+    def self.like_group_reference(escape_character, start)
+      group_name = ""
+      group_index = start
+      while group_index < escape_character.length && escape_character[group_index, 1] != ">"
+        group_name = group_name + escape_character[group_index, 1]
+        group_index += 1
+      end
+      raise RuntimeError, "invalid group name reference format" if group_index == escape_character.length
+      raise IndexError, "undefined group name reference: " + group_name
+    end
+
+    # No `attr_accessor :id` and no `@id` here — the key lives on each
+    # model. Under Spinel a base-class ivar is a UNION POINT: the slot
+    # on the ancestor must hold every subclass's writes, so one
+    # String-keyed model (`create_table id: :uuid`) widened `@id` to
+    # poly for every model in the program and dropped each one's
+    # `--rbs` pin ("ancestor ApplicationRecord holds it as poly"). The
+    # lowerer synthesizes `id`/`id=` per model, typed from the key
+    # column; the base reaches the key only by self-send (`self.id =
+    # _adapter_insert`), the way it already reaches `_adapter_insert`
+    # itself. A hand-written subclass declares `attr_accessor :id` and
+    # its own unsaved sentinel (roundhouse#90).
+    #
+    # What the base DOES declare is the contract: `id`/`id=` exist on
+    # every record, with the key's type per model. The bodies raise, the
+    # `_adapter_insert` shape below — a base arm for dispatch to land on,
+    # never reached, touching no ivar.
+    def id
+      raise NotImplementedError, "id: subclasses must override"
+    end
+
+    def id=(_value)
+      raise NotImplementedError, "id=: subclasses must override"
+    end
+
+    # The primary key, which is `id` unless the model names another
+    # column. A table can have both; `id` then stays that column and
+    # this method still answers the key. Models override it.
+    def _primary_key_value
+      id
+    end
+
+    # `to_param` — the same contract. The lowerer synthesizes it on
+    # ApplicationRecord (the key as a String, Rails' `id&.to_s`) and a
+    # model may override it (lobsters' Story answers `short_id`).
+    # Declared here so code holding a record only as a `Base` —
+    # `ActiveSupport.to_param(value)` after `is_a?(ActiveRecord::Base)` —
+    # has a typed method to call.
+    def to_param
+      raise NotImplementedError, "to_param: subclasses must override"
+    end
+
+    # Error message accumulator populated by the lowerer-emitted
+    # `validate` method (one `errors << "..."` per failed rule). Lives
+    # on Base directly — Phase 2.5(a) inlined every `validates :x, …`
+    # declaration, so the runtime `ActiveRecord::Validations` mixin no
+    # longer ships. `errors` is reached via implicit-self Send in the
+    # lowered IR; defining it here keeps that call resolvable.
+    # `@errors` is initialized to `[]` in `initialize` — the prior
+    # defensive `@errors = [] if @errors.nil?` lazy-init was redundant
+    # AND compiler-hostile for typed targets (Rust struct types
+    # `@errors` as `Vec<String>`, not `Option<Vec<String>>`; `.nil?`
+    # on a Vec doesn't exist).
+    def errors
+      @errors
+    end
+
+    # Each message in `errors` as Rails' `ActiveModel::Error` holds it,
+    # index for index: `errors` keeps the full messages because there is
+    # no i18n at run time to build them from these.
+    def error_details
+      @error_details
+    end
+
+    # Rails' `errors[attribute]`: the messages added on one attribute.
+    def error_messages_for(attribute)
+      out = []
+      error_details.each { |error| out << error.message if error.attribute == attribute }
+      out
+    end
+
+    # Not `errors`, the full messages: Rails renders a record's errors keyed by attribute, as `errors.as_json` answers.
+    def errors_json
+      out = {}
+      error_details.each { |error| out[error.attribute] = error_messages_for(error.attribute) }
+      out
+    end
+
+    # The one frozen empty Hash a model's `initialize(attrs = …)` defaults
+    # to on the ruby family (`lower::lazy_model_state`). A record built
+    # bare — which is every hydration path: `from_row` is `new` then the
+    # column writers — used to allocate a `{}` it never read; on
+    # campfire's room page that was one Hash per hydrated record, ~800 a
+    # request. The constructor only READS `attrs`, and FROZEN is what
+    # makes sharing safe: a write through it raises on the spot rather
+    # than leaking into every record built afterwards. The strict targets
+    # keep the per-call default the shared lowering emits (an empty map is
+    # a stack value there) and never read this.
+    EMPTY_ATTRS = {}.freeze
+
+    # What a hydration factory (`from_row` / `from_stmt`) passes to `new`
+    # when the model declares `after_initialize`: the constructor skips
+    # the hook for it by IDENTITY (`attrs.equal?(HYDRATE_ATTRS)`) and the
+    # factory fires it once the columns are set. Rails loads a record
+    # without running `initialize`, so the hook sees a loaded record
+    # exactly once; before this it also ran on the empty shell, where
+    # `new_record?` is true and every column is blank. A distinct object
+    # from EMPTY_ATTRS, which is also what a bare `Model.new` receives.
+    # `Hash.new`, NOT a `{}` literal: CRuby compiles `{}.freeze` to one
+    # shared frozen empty Hash, so two constants spelled that way are
+    # the same object and a bare `new` would be taken for hydration.
+    # The transpiled targets read a bare `Hash.new` constant as `{}`
+    # (`runtime_src::is_bare_hash_new`).
+    HYDRATE_ATTRS = Hash.new.freeze
+
+    # `attrs = {}` keeps Base's constructor signature compatible
+    # with subclasses that take attrs (`def initialize(attrs = {})`).
+    # TS-side, this lets `new this(attrs)` in static `create` /
+    # `create!` factories type-check against `typeof Base` whose
+    # constructor signature is what TS sees at the dispatch site.
+    # Body ignores attrs — subclass override is the place that
+    # populates the column slots from the hash.
+    def initialize(_attrs = {})
+      # `0`, NOT `nil` — the UNSAVED SENTINEL, and a deliberate
+      # divergence from Rails, which answers `Article.new.id == nil`
+      # (measured). See docs/pipeline/runtime.md § Deliberate
+      # divergences from Rails.
+      #
+      # It exists for the strict targets: a nullable primary key means
+      # `Option<i64>` in Rust and `Int?` in Kotlin/Swift/C#, with an
+      # unwrap at every foreign-key comparison, path helper and join.
+      # The sentinel keeps ids plain machine integers across all
+      # thirteen, and foreign keys use the same convention (the
+      # synthesized `belongs_to` readers test `@creator_id == 0`).
+      #
+      # It is never the thing that answers "is this saved" — `@persisted`
+      # below is. `form_with` picks its action from `persisted?`, and so
+      # does `dom_id`; app code that reads `id` on an unsaved record is
+      # where the divergence becomes visible.
+      #
+      # The sentinel is written by the MODEL's own `initialize`
+      # (`self.id = (attrs[:id] || 0)` — `|| ""` for a string key), not
+      # here: see the class comment on why the base holds no `@id`.
+      @errors = []
+      @error_details = []
+      @id_previously_changed = false
+      @persisted = false
+      @destroyed = false
+    end
+
+    # `Model.connection` / `Model.transaction` — the raw-SQL surface —
+    # live in connection.rb's `class Base` reopen, NOT here: base.rb is
+    # transpiled into every strict target's runtime (runtime_loader
+    # tables), and that surface leans on constructs several emitters
+    # don't lower yet (begin/rescue) plus a class those tables don't
+    # ship. connection.rb is walked only into the ruby-family trees.
+
+    # ---- Per-model overrides ----------------------------------------
+    # Subclasses MUST override these. The base implementations exist as
+    # contract markers; calling them on Base directly raises.
+
+    def self.table_name
+      raise NotImplementedError, "#{name}.table_name must be overridden"
+    end
+
+    # Emitted schema-backed models override this with the compiler's
+    # quoted identifier. The default preserves hand-written ordinary
+    # models; table_name itself always remains raw metadata.
+    def self._table_sql
+      table_name
+    end
+
+    def self.schema_columns
+      raise NotImplementedError, "#{name}.schema_columns must be overridden"
+    end
+
+    # The column this model treats as its identity. Unlike its
+    # neighbours this one does NOT raise unoverridden: Rails' default is
+    # `id` and almost every model takes it, so the lowering emits an
+    # override only for the models that declared `self.primary_key =`.
+    # Read by the upsert builder to name its conflict target.
+    def self.primary_key
+      "id"
+    end
+
+    # Association names this model declares — overridden by the model
+    # lowerer (`_association_names`). Empty on Base so an unknown model
+    # answers `reflect_on_association` with nil the way Rails does.
+    def self._association_names
+      []
+    end
+
+    # Rails' `Model.reflect_on_association(:name)`. Looks the name up in
+    # `_association_names`; `counter_cache:` is unmodeled so every hit
+    # answers `counter_cache_column == nil` (honest for campfire's
+    # trigger-backed `messages_count`, which is not an AR counter cache).
+    # Index recursion — not `each`+`return` — so rust/kotlin/swift do
+    # not lower the match into a for_each closure that cannot return
+    # the outer Option (issue #832).
+    def self.reflect_on_association(name)
+      reflect_on_association_at(name.to_s, 0)
+    end
+
+    def self.reflect_on_association_at(needle, i)
+      names = _association_names
+      if i >= names.length
+        return nil
+      end
+      assoc = names[i]
+      if assoc.to_s == needle
+        return ActiveRecord::Reflection::AssociationReflection.new(assoc, nil)
+      end
+      reflect_on_association_at(needle, i + 1)
+    end
+
+    # Finder casting runs in connection.rb (Relation is ruby-family
+    # only). Keep the typed contract here without transpiling a union
+    # receiver's conversion into strict targets.
+    def self._cast_primary_key(_id)
+      raise NotImplementedError, "finder casting requires the Relation runtime"
+    end
+
+    def self._string_primary_key
+      false
+    end
+
+    # friendly_id (`friendly_id :col, use: [:slugged ...]`): the column
+    # `Model.friendly.find` looks a slug up in, and whether `:history`
+    # also consults `friendly_id_slugs`. lower::friendly_id overrides both
+    # on a declaring model; any other model has no `friendly`, as in Rails.
+    def self._friendly_slug_column
+      raise NotImplementedError, "#{name} does not declare friendly_id"
+    end
+
+    def self._friendly_history
+      false
+    end
+
+    # The temporal subset of `schema_columns`. Unlike its siblings this
+    # one does NOT raise unoverridden: a model with no temporal column
+    # legitimately has none, and the lowering emits the (possibly empty)
+    # list for every schema-backed model. `_as_json_only` reads it to
+    # decide which values need Rails' ISO8601 JSON form.
+    def self.schema_time_columns
+      []
+    end
+
+    def self.schema_date_columns
+      []
+    end
+
+    def self.schema_boolean_columns
+      []
+    end
+
+    def self.schema_decimal_columns
+      []
+    end
+
+    def self.instantiate(_row)
+      raise NotImplementedError, "#{name}.instantiate must be overridden"
+    end
+
+    # Declaration metadata supplied by shared model lowering. A referenced
+    # include must never be treated as a successful no-op without metadata.
+    def self._include_reference_join(name, reference)
+      raise NotImplementedError, "referenced include has no association metadata: #{name} (#{reference})"
+    end
+
+    # Eager-load hook: `Relation#to_a` calls this on its model with the
+    # hydrated records and the recorded `includes(...)` specs. The Ruby
+    # emit path synthesizes per-model overrides (batched IN-loads into
+    # the `_preload_<assoc>` caches — see `apply_preload_lowering`);
+    # models without one fall back to this no-op, which leaves the lazy
+    # association readers doing the work (correct, just N+1).
+    def self.preload_associations(_records, _specs)
+    end
+
+    # Per-model adapter primitives — public AR API delegates here.
+    # Default implementations route through the legacy
+    # `ActiveRecord.adapter.X` + `instantiate` path so subclasses that
+    # haven't received the lowerer's Level-3 emit (and tests on `Base`
+    # itself) keep working unchanged. The lowerer-emitted per-model
+    # overrides go straight to the typed `Db.prepare` / `Db.column_*`
+    # path — no Hash crossing the adapter boundary. Underscore-prefix
+    # marks framework-internal; not part of the public AR API.
+
+    def self._adapter_find_by_id(id)
+      row = ActiveRecord.adapter.find(table_name, id)
+      return nil if row.nil?
+      instantiate(row)
+    end
+
+    def self._adapter_all
+      ActiveRecord.adapter.all(table_name).map { |row| instantiate(row) }
+    end
+
+    # Default `_adapter_last` for hand-written subclasses / Base-level
+    # tests — the original `all` + `[-1]`, correct everywhere and cheap
+    # on the small tables those models carry. Uses `_adapter_all` (not
+    # `select_rows`) because the per-target `AdapterInterface` implements
+    # `all`/`find`/`count` but not raw `select_rows` — and not bare
+    # `all`, which the ruby-family connection.rb reopen overrides with a
+    # lazy Relation (no `[-1]`); this wants the eager Array primitive.
+    # Lowerer-emitted Level-3 models OVERRIDE this with a
+    # `Db.prepare("... ORDER BY <pk> DESC LIMIT 1")` single-hydrate
+    # (synth_adapter_last), so real apps get one row — lobsters' /u no
+    # longer loads 10k users for its `User.last.id` cache key.
+    def self._adapter_last
+      records = _adapter_all
+      records.empty? ? nil : records[-1]
+    end
+
+    # The Relation load path. `Relation#to_a` composes its SELECT over
+    # `_columns_sql` and hands it to `_hydrate_all`, so the two are one
+    # contract: whatever the first projects, the second reads. The
+    # lowerer-emitted per-model overrides project the schema columns in
+    # `from_stmt` order and hydrate typed records straight from the
+    # statement (synth_columns_sql / synth_hydrate_all) — no String-keyed
+    # Hash per row, which on a 600-row page was the largest single
+    # allocation the request made. This default is the compile surface
+    # only, like `instantiate` above: the Hash-path fallback for
+    # hand-written models (`<table>.*` + `select_rows` + `instantiate`)
+    # lives in the ruby-family connection.rb reopen, because the
+    # strict targets' `AdapterInterface` has no `select_rows`.
+    def self._columns_sql
+      "#{table_name}.*"
+    end
+
+    def self._hydrate_all(_sql)
+      raise NotImplementedError, "#{name}._hydrate_all must be overridden"
+    end
+
+    # _adapter_insert / _adapter_update / _adapter_delete are
+    # instance methods (not class methods) so Base#save / Base#destroy
+    # call them via implicit-self dispatch — bypassing the
+    # Abstract per-instance adapter primitives. Subclasses MUST
+    # override — lowerer-emitted models (Article, Comment, …) get
+    # `Db.exec` + `Db.last_insert_rowid` overrides per the Level-3
+    # adapter-emit pipeline; hand-written subclasses opt into the
+    # legacy `ActiveRecord.adapter.*` shim explicitly (see
+    # `BaseTest::Item` in active_record/base_test.rb).
+    #
+    # `_adapter_update`/`_adapter_delete` keep EMPTY bodies: spinel's
+    # polymorphic dispatch generates a class-id switch only when the
+    # base body is empty (the `after_create_commit`/etc. callback
+    # pattern), and a concrete base body was believed to force
+    # monomorphic inlining to base, which then no-ops because
+    # `ActiveRecord.adapter` isn't wired under Level-3.
+    #
+    # `_adapter_insert` CANNOT: an empty body returns nil, and this one
+    # RETURNS A VALUE — `@id = _adapter_insert`. That nil widened `@id`
+    # on the shared base, and because a base-class ivar is the union of
+    # every subclass's writes, spinel dropped the `@id: Integer` pin on
+    # all eleven campfire models ("ancestor holds it as poly"), boxing
+    # every id read in the program. Raising types it and keeps the base
+    # honest — nothing should reach it.
+    #
+    # The inlining fear did NOT reproduce: measured at spinel a7a9c994,
+    # the emitted C keeps the full 17-way class-id switch and every
+    # model still dispatches to its own override. Two other shapes also
+    # type it, and BOTH are worse — a `0` tail silently fabricates an id
+    # if the base is ever reached, and `raise` + a typed tail (the
+    # gem_facades pattern) is dead code that `go vet` rejects
+    # (`real_blog_go_vet_passes`: unreachable code).
+    def _adapter_insert
+      raise NotImplementedError, "_adapter_insert: subclasses must override"
+    end
+    def _adapter_update; end
+    def _adapter_touch; end
+    def _adapter_delete; end
+
+    def self._adapter_count
+      ActiveRecord.adapter.count(table_name)
+    end
+
+    # Unscoped non-emptiness. Level-3 models override with SELECT 1 LIMIT 1;
+    # this default keeps hand-written / Base tests on the universal count
+    # adapter method (strict AdapterInterface has no select_rows).
+    def self._adapter_any?
+      count > 0
+    end
+
+    def self._adapter_exists_by_id?(id)
+      ActiveRecord.adapter.exists?(table_name, id)
+    end
+
+    def self._adapter_truncate
+      ActiveRecord.adapter.truncate(table_name)
+    end
+
+    # Refresh self's persisted columns from the DB (by @id), writing
+    # back into self rather than constructing a new instance. Returns
+    # self on success, nil when the row has been deleted. Empty Base
+    # body for the same reason as `_adapter_insert`/etc. above —
+    # spinel polymorphic dispatch needs the base method body empty so
+    # the class-id switch fires; the lowerer-emitted per-model override
+    # goes straight to `Db.prepare` / per-column ivar writes. Hand-
+    # written subclasses (`BaseTest::Item`) provide their own override.
+    def _adapter_reload; end
+
+    # Subclasses override to return an attribute hash for adapter writes.
+    def attributes
+      {}
+    end
+
+    # Column-name indexer. Subclasses override with a per-column case
+    # dispatch over the typed ivars (each model has a fixed set of
+    # columns from the schema). The Base implementation raises so a
+    # call on a record without a per-column override surfaces as an
+    # error rather than silently returning nil.
+    #
+    # Defined here so abstract callers (FormBuilder.text_field's
+    # `@model[field]`) type-check against `ActiveRecord::Base` at the
+    # call site; Crystal needs the method to exist on the static type
+    # for the call to compile.
+    def [](_name)
+      raise NotImplementedError, "[] must be overridden by subclass"
+    end
+
+    def []=(_name, _value)
+      raise NotImplementedError, "[]= must be overridden by subclass"
+    end
+
+    # `record.has_attribute?(:token)` — does this model carry that
+    # column? Answered from `schema_columns` rather than the
+    # `attributes` hash, which is what Rails consults: the emitted
+    # `attributes` omits `id`, so asking it would deny an attribute
+    # every model has. The column list is also the honest answer here —
+    # this runtime has no partial-select mode, so a loaded record
+    # always carries every column.
+    #
+    # Monomorphic on Symbol ([[feedback_monomorphize_polymorphic_apis]]).
+    # Rails also accepts a String; a String call site should coerce at
+    # the lowering rather than widen this signature.
+    # The schema columns a partial `select` left out of this row —
+    # Rails answers `has_attribute?` false for them. `instantiate` calls
+    # this for a model that declares `after_initialize` (lobsters' Token
+    # guard reads it). EMPTY here, as `_note_hydrated` is: the real body
+    # and the `has_attribute?` that honours it are the ruby-family reopen
+    # in connection.rb, and the strict lanes keep the schema-level
+    # answer below.
+    def _note_unloaded(_row)
+    end
+
+    def has_attribute?(name)
+      # Bound to a local before the `include?`, matching
+      # `fill_timestamps` below rather than chaining straight off
+      # `self.class`. Not style: elixir2's receiver typing does not see
+      # through the class-method send, so the direct chain lowers
+      # `include?` as a struct-field access (`schema_columns().__struct__`)
+      # and fails the warnings-as-errors gate. The local gives the
+      # body-typer the Array it needs.
+      cols = self.class.schema_columns
+      cols.include?(name)
+    end
+
+    # Subclasses MUST override to mutate state from a row hash. Empty
+    # base body (rather than `raise NotImplementedError`) so spinel-AOT
+    # generates a class-id switch at call sites — a concrete base body
+    # causes monomorphic inlining to base, which then no-ops because
+    # subclass overrides never get dispatched. See same pattern on
+    # `_adapter_insert`/etc. above. The raise was a safety net for a
+    # case that never fires in practice (every concrete model
+    # overrides).
+    def assign_from_row(_row); end
+
+    # Per-model DOM prefix string ("article", "comment", ...). The
+    # lowerer's `push_dom_prefix_method` synthesizes the actual constant-
+    # returning body per concrete model so `dom_id(record)` resolves to
+    # a known string at transpile time across every target (no
+    # `record.class.name.downcase` reflection chain). The Base body
+    # raises — calling `dom_prefix` on a bare ActiveRecord::Base would
+    # indicate the per-model synthesizer didn't run for this class.
+    def dom_prefix
+      raise NotImplementedError, "dom_prefix must be overridden by subclass"
+    end
+
+    # `dom_id`'s row-key half (see dom_prefix above) — same abstract
+    # contract, same reason for the raising body.
+    def dom_record_key
+      raise NotImplementedError, "dom_record_key must be overridden by subclass"
+    end
+
+    # ---- Persistence state ------------------------------------------
+
+    def persisted?
+      @persisted
+    end
+
+    def new_record?
+      !@persisted
+    end
+
+    def destroyed?
+      @destroyed
+    end
+
+    def mark_persisted!
+      @persisted = true
+      @destroyed = false
+    end
+
+    # ---- Class-level CRUD -------------------------------------------
+
+    def self.all
+      _adapter_all
+    end
+
+    def self.find(id)
+      result = _adapter_find_by_id(id)
+      raise RecordNotFound, "Couldn't find #{name} with id=#{id}" if result.nil?
+      result
+    end
+
+    def self.find_by(conditions)
+      # `ActiveRecord.adapter.where` is typed `untyped` (the adapter
+      # interface is target-specific), so the body-typer can't
+      # narrow the return as `Array`. Avoid Array idioms that
+      # require Ty::Array dispatch (`empty?`, `first`) — use
+      # `length` and `[0]` which are JS-array-native and Ruby-
+      # Array-native both. Same shape for every target.
+      #
+      # `.to_h` on `conditions`: no-op on a Ruby Hash, NamedTuple→
+      # Hash conversion under Crystal. Call sites that pass kwargs
+      # (`Item.find_by(title: "B")`) lift to NamedTuple in Crystal,
+      # but the adapter's `where` slot is typed `Hash(Symbol, _)`.
+      rows = ActiveRecord.adapter.where(table_name, conditions.to_h)
+      return nil if rows.length == 0
+      instantiate(rows[0])
+    end
+
+    # `find_by!` — `find_by` that raises `RecordNotFound` (→ 404) instead
+    # of returning nil on no match.
+    def self.find_by!(conditions)
+      result = find_by(conditions)
+      raise RecordNotFound, "Couldn't find #{name}" if result.nil?
+      result
+    end
+
+    def self.where(conditions)
+      # See `find_by` above for the `.to_h` rationale. The ruby-family
+      # trees OVERRIDE this with a lazy-Relation version (connection.rb
+      # reopen — dynamic call-sites chain off the fallback there);
+      # this Array shape stays for the strict-target runtime
+      # transpiles, which have no Relation class in their tables.
+      ActiveRecord.adapter.where(table_name, conditions.to_h).map { |row| instantiate(row) }
+    end
+
+    def self.count
+      _adapter_count
+    end
+
+    def self.exists?(id)
+      _adapter_exists_by_id?(id)
+    end
+
+    # Unscoped class emptiness via `_adapter_any?` (Level-3: SELECT 1
+    # LIMIT 1; Base default: count > 0). Scoped forms go through Relation;
+    # ruby-family connection.rb still overrides with Relation.exists?.
+    def self.none?
+      !_adapter_any?
+    end
+
+    def self.any?
+      _adapter_any?
+    end
+
+    # Bulk DELETE without instantiating records or running callbacks —
+    # ActiveRecord's `Model.delete_all` (used by seeds/tests for table
+    # resets; `Relation#delete_all` covers the scoped form). Returns
+    # the affected-row count, as Rails does. This default is the
+    # compile surface: the strict targets' adapter contract has no
+    # `changes`, and their models carry the lowerer-emitted Db-direct
+    # override, so the count is read before the delete. The
+    # ruby-family connection.rb reopen answers with the exact count.
+    def self.delete_all
+      n = _adapter_count
+      ActiveRecord.adapter.delete_all(table_name)
+      n
+    end
+
+    def self.destroy_all
+      # `_adapter_all`, not `all`: the eager Array primitive, so the
+      # return value is the destroyed records themselves (a lazy
+      # Relation would re-query the now-empty table on a later read).
+      records = _adapter_all
+      records.each { |r| r.destroy() }
+      records
+    end
+
+    # `Article.create(title: "...", body: "...")` — convenience that
+    # constructs and saves in one call. Mirrors Rails' `create`. The
+    # Hash-shaped constructor signature accepts the kwargs-as-hash
+    # the seed scripts use (`Article.create(title: ..., body: ...)`).
+    def self.create(attrs = {})
+      instance = new(attrs)
+      instance.save
+      instance
+    end
+
+    # `Article.create!(...)` — bang variant: raises RecordInvalid
+    # when validation fails instead of returning the unsaved
+    # instance. Used by seeds and tests that expect creation to
+    # succeed unconditionally; failure is a fatal error rather
+    # than a flow-control branch.
+    # Rails' block form (`create! do |kv| ... end`) is grounded at emit
+    # — `apply_create_block_inline` expands the call site into
+    # new/block-body/save — so the runtime signature stays blockless on
+    # every target (a `yield` here forced a block param onto all twelve
+    # transpiled runtimes and broke their 1-arg callers).
+    def self.create!(attrs = {})
+      instance = new(attrs)
+      raise RecordInvalid, instance unless instance.save
+      instance
+    end
+
+    # `Article.last` — highest-id row, or nil when the table is empty.
+    # Real-blog tests use it after a create-action redirect:
+    # `assert_redirected_to article_url(Article.last)`. Delegates to
+    # `_adapter_last` (ORDER BY <pk> DESC LIMIT 1, one row) rather than
+    # `all` + `[-1]`, which materialized the whole table — lobsters' /u
+    # cache key is `User.last.id` over 10k+ users, run per request.
+    def self.last
+      _adapter_last
+    end
+
+    # ---- Instance lifecycle ------------------------------------------
+
+    def save
+      # Here and not in before_validation, which valid? runs: a
+      # direct valid? would write an unsaved belongs_to target, and
+      # Rails' does not (it autosaves in before_save).
+      _autosave_belongs_to
+      ok = valid?
+      return false unless ok
+
+      save_after_validation
+    end
+
+    # The post-validation half of `save`, extracted so Rails'
+    # validation-skipping writes (`update_attribute`, in the
+    # ruby-family connection.rb reopen) can enter here directly:
+    # validations and their callbacks skipped, save callbacks run —
+    # Rails' documented contract for those writes.
+    def save_after_validation
+      before_save
+      was_new = new_record?
+      if was_new
+        before_create
+        fill_timestamps(true) if stamps_timestamps?
+        inserted_key = _adapter_insert
+        self.id = inserted_key unless self.class.primary_key.nil?
+        @persisted = true
+        __track_saved_changes(was_new)
+        after_create
+      else
+        before_update
+        fill_timestamps(false) if stamps_timestamps?
+        _adapter_update
+        __track_saved_changes(was_new)
+        after_update
+      end
+      after_save
+      # The commit callbacks fire once the save's own callbacks are
+      # done, as Rails runs them after the transaction: an
+      # `after_update_commit` reads what `after_save` wrote (an
+      # attachment, a rich-text body), not the record half saved.
+      _save_committed(was_new)
+      true
+    end
+
+    # A save's commit callbacks. Here they run at once, since a strict
+    # target has no transaction for them to wait on; the ruby-family
+    # reopen (connection.rb) holds them until the enclosing
+    # transaction's COMMIT, and drops them on its ROLLBACK, as Rails
+    # does.
+    def _save_committed(was_new)
+      if was_new
+        after_create_commit
+      else
+        after_update_commit
+      end
+      after_save_commit
+      after_commit
+    end
+
+    # `destroy`'s half of the same seam.
+    def _destroy_committed
+      after_destroy_commit
+      after_commit
+    end
+
+    # A row inserted raw, as Rails' fixture loader (`insert_fixtures_set`)
+    # and bulk inserts (`insert_all` / `insert_all!`) write one: no
+    # validations and NO CALLBACKS. Timestamps the attributes left out
+    # are filled, as Rails fills them. Running the save
+    # callbacks here was wrong in a way a test can see: campfire's
+    # Message `after_create_commit` marks the room's memberships unread,
+    # so loading the message fixtures left the fixture users with unread
+    # rooms Rails never gives them.
+    def _insert_row
+      fill_timestamps(true) if stamps_timestamps?
+      self.id = _adapter_insert
+      @persisted = true
+      _note_hydrated
+      true
+    end
+
+    # ---- Saved-change tracking (ActiveModel::Dirty subset) ----------
+    # Rails exposes what the last save changed via `saved_changes` /
+    # `id_previously_changed?` / the per-attribute predicates the
+    # lowerer synthesizes over `saved_changes` — moderation-log
+    # callbacks branch on them (lobsters' Category/Tag#log_modifications).
+    # These are STUBS: the attributes-hash diff lives in the
+    # ruby-family-only connection.rb reopen — its heterogeneous
+    # before/after hashes fought every strict transpile's type
+    # inference (crystal unified the ivar across attributes overrides,
+    # go typed the empty literals inconsistently), while the strict
+    # lanes only need the surface to COMPILE for the synthesized
+    # per-column predicates. Not-tracked is the honest strict-target
+    # subset: `saved_changes` stays empty (the same empty-literal
+    # shape as `attributes` above, which every target already types),
+    # so every predicate answers false.
+    def __track_saved_changes(was_new)
+      @id_previously_changed = was_new
+      nil
+    end
+
+    def saved_changes
+      {}
+    end
+
+    # ONE leading underscore, like `_adapter_*` beside it: this is
+    # called ACROSS the class boundary (a model's `from_row` reaching
+    # Base's method), and Python mangles a `__`-prefixed name per class
+    # — `Base.__note_hydrated` becomes `_Base__note_hydrated`, which the
+    # subclass's call cannot see. The `__`-prefixed names in this file
+    # (`__track_saved_changes`) are all called from within Base itself,
+    # where the mangling is consistent.
+    #
+    # Called by the hydration factories (`from_row` / `from_stmt`) on a
+    # record read from the DB: what it just received is its state as
+    # SAVED, not a change. No-op here for the same reason
+    # `saved_changes` is empty here — the snapshot lives in the
+    # ruby-family connection.rb reopen, and the strict lanes carry the
+    # not-tracked subset where every Dirty answer is already the honest
+    # default.
+    # EMPTY body, not `nil`, exactly like the lifecycle hooks below:
+    # a `nil` tail on a void method emits as a bare `None;` in rust
+    # ("cannot infer type of the type parameter T"). An empty body is
+    # the shape every target already renders for a no-op.
+    def _note_hydrated
+    end
+
+    # The argument-taking half of the ActiveModel::Dirty read surface,
+    # for call sites that name the attribute at runtime rather than in
+    # the method name (`saved_change_to_attribute?(:url)`,
+    # `cols.map { |c| record.saved_change_to_attribute(c) }`). The
+    # per-column `saved_change_to_<col>?` / `<col>_previously_changed?`
+    # spellings are synthesized by the lowering instead, since a static
+    # runtime cannot answer a name it only learns at emit time.
+    #
+    # Defined against `saved_changes` rather than the tracking ivar, so
+    # they inherit whichever implementation the target has: the real
+    # snapshot diff on the ruby-family trees (the connection.rb reopen)
+    # and the empty-Hash subset on the strict lanes, where every Dirty
+    # predicate already answers false by design.
+    # Two shapes here are load-bearing, both learned from strict lanes
+    # going red — neither is style, and neither is visible to
+    # `compare ruby` or the unit tests:
+    #
+    # (1) `key?`, not `!saved_changes[name].nil?`. rust2 lowers an
+    #     untyped map read to the total
+    #     `.get().cloned().unwrap_or(Value::Null)`, and `.nil?` on that
+    #     renders as `is_none()` — an Option method
+    #     `serde_json::Value` does not have (E0599). The per-column
+    #     synthesis CAN use the nil-test, because it runs against the
+    #     model's own typed slot table rather than a json bag.
+    #     Presence and non-nil are the same question here anyway:
+    #     `__track_saved_changes` inserts a key only when the value
+    #     actually changed, and always as a [prev, value] pair.
+    #
+    # (2) Bind the collection to a local before calling a collection
+    #     method on it. elixir2's receiver typing does not see through
+    #     a method-call receiver, so `saved_changes.key?(name)` lowers
+    #     the `key?` as a struct-field access
+    #     (`saved_changes(record).__struct__`) and fails the
+    #     warnings-as-errors gate. `has_attribute?` above and
+    #     `fill_timestamps` below take the same precaution.
+    def saved_change_to_attribute?(name)
+      changes = saved_changes
+      changes.key?(name)
+    end
+
+    def saved_change_to_attribute(name)
+      changes = saved_changes
+      changes[name]
+    end
+
+    # The PREVIOUS value of an attribute the last save changed — the
+    # value half of the Dirty pair, which the per-column
+    # `<col>_previously_was` readers delegate to.
+    #
+    # NO `[0]` here, and that is the whole reason this method exists
+    # instead of the readers indexing the diff themselves: the pair is
+    # `[prev, value]` in a heterogeneous Hash, and indexing it renders
+    # as an index on `interface{}` in go ("cannot index __prev"), on
+    # `object?` in C#, and so on through every strict lane. The
+    # indexing belongs in the ruby-family reopen, where the diff is
+    # real; here the empty diff makes this nil, which is the honest
+    # strict answer and matches every Dirty predicate answering false.
+    #
+    # It ENDS IN A READ rather than in a bare `nil`, exactly like
+    # `saved_change_to_attribute` above
+    # ([[project_shared_runtime_strict_return_shapes]]). A `nil` tail
+    # gave swift no contextual type ("'nil' requires a contextual
+    # type") and made rust emit an associated function rather than a
+    # method, so `Article` could not find it at all.
+    def attribute_previously_was(name)
+      changes = saved_changes
+      changes[name]
+    end
+
+    # ---- Pending-change tracking (the BEFORE-save half of Dirty) ----
+    # `changes_to_save` is what the NEXT save would write:
+    # `<col>_changed?`, `will_save_change_to_<col>?` and `<col>_was`,
+    # read by validations and before_* callbacks (lobsters'
+    # `validate_username_timeouts` is guarded on `username_changed?`
+    # and runs on every User save; campfire's
+    # `direct_rooms_keep_their_type` reads `type_changed?` /
+    # `type_was`). The per-column spellings are synthesized by the
+    # lowering and delegate here, exactly as the saved-change readers
+    # above delegate to `saved_changes`.
+    #
+    # STUBS on the strict lanes for the same reason as `saved_changes`:
+    # the diff is ruby-family-only (connection.rb reopen). Here nothing
+    # is pending, so every `<col>_changed?` answers false and `<col>_was`
+    # answers nil, the same subset `<col>_previously_was` already has.
+    # Same two load-bearing shapes as `saved_change_to_attribute?`:
+    # `key?` rather than a nil test, and the Hash bound to a local.
+    def changes_to_save
+      {}
+    end
+
+    def attribute_changed?(name)
+      changes = changes_to_save
+      changes.key?(name)
+    end
+
+    # Rails' `changed?` / `has_changes_to_save?`: any column pending.
+    # campfire's `RecordCache` snapshots only records with none.
+    def changed?
+      changes = changes_to_save
+      !changes.empty?
+    end
+
+    def has_changes_to_save?
+      changed?
+    end
+
+    def attribute_was(name)
+      changes = changes_to_save
+      changes[name]
+    end
+
+    # `clear_<col>_change` and `restore_<col>!`: nothing is ever pending
+    # here (see `changes_to_save`), so there is nothing to forget or
+    # write back. The ruby family's connection.rb reopen holds the real
+    # ones.
+    def clear_attribute_change(name)
+      nil
+    end
+
+    def restore_attribute!(name)
+      nil
+    end
+
+    # `id` never appears in the subclass `attributes` hash, so the
+    # created-vs-updated question is answered by the save path itself
+    # rather than the snapshot diff.
+    def id_previously_changed?
+      @id_previously_changed
+    end
+
+    # Rails' `previously_new_record?` — the last save was the INSERT.
+    # The same fact `id_previously_changed?` answers from the same flag:
+    # an insert is exactly the save that assigns the id (lobsters'
+    # Comment#log_hat_use runs on a new comment or a changed hat).
+    def previously_new_record?
+      @id_previously_changed
+    end
+
+    def save!
+      raise RecordInvalid, self unless save
+      self
+    end
+
+    # `record.touch` — write the current time to `updated_at` and
+    # UPDATE, skipping validations and save callbacks. The catalog has
+    # typed this as an instance DbWrite returning Bool since before it
+    # existed here; this is the implementation catching up to the
+    # declaration.
+    #
+    # NO-ARG ONLY, and that is a decision, not an omission. Rails'
+    # `touch(:column)` names the extra column to stamp, which as a
+    # shared method means `self[name] = …` — an index write through a
+    # VARIABLE key. rust2 colors an index-write key for a Hash receiver
+    # and for nothing else (`decide/str_color.rs` walks the key with
+    # `ParentExpect::None` on the `LValue::Index` arm), so the owned
+    # `String` lands in `set_index`'s `&str` slot and the app crate
+    # fails to compile — E0308, and it takes every rust test with it.
+    # The column form belongs at the CALL SITE, where the column is a
+    # literal (`touch :connected_at` → `self.connected_at = …; touch`),
+    # which is the same posture `insert_all` and `has_json` landed on:
+    # inline what would otherwise need an untyped or dynamic parameter.
+    # That lowering is `lower::column_ops` for an implicit-self call
+    # (campfire's `Membership#connected`) and `lower::update_kwargs` for
+    # an explicit receiver (lobsters' `@user&.touch(:last_read_newest_
+    # story)`); both reach `touch_written` below with the column
+    # already written.
+    #
+    # `after_touch` FIRES, and that is load-bearing rather than
+    # cosmetic: it is the only thing that makes `belongs_to … touch:
+    # true` transitive. campfire boosts a message, the boost touches
+    # its Message, and Message's own `belongs_to :room, touch: true`
+    # is registered on `after_touch` — so without this call the
+    # cascade stops one level short and a room's `updated_at` never
+    # moves. (Rails also fires the commit callbacks here; the ruby-family
+    # reopen in connection.rb does, the strict targets still do not.)
+    #
+    # The bare form writes `updated_at` ALONE (`_adapter_touch`), as
+    # Rails' `touch` does. Writing the whole row put back every column
+    # the record had loaded, and a column the database keeps behind the
+    # record — campfire's trigger-maintained `rooms.messages_count`,
+    # reached by a message's `belongs_to :room, touch: true` — took the
+    # stale value.
+    def touch
+      fill_timestamps(false)
+      _adapter_touch
+      after_touch
+      true
+    end
+
+    # `touch_later` — what Rails' `belongs_to …, touch: true` calls.
+    # Rails defers the write to just before the transaction's COMMIT and
+    # stamps each record once, however many children asked; the
+    # ruby-family reopen (connection.rb) does that. A strict target has
+    # no transaction to wait on, so here it is `touch`.
+    def touch_later
+      touch
+    end
+
+    # `touch` after a call-site column write (`touch :connected_at`,
+    # `increment!(:connections, touch: true)`): the whole row, so the
+    # assigned column is written with the timestamp.
+    def touch_written
+      fill_timestamps(false)
+      _adapter_update
+      after_touch
+      true
+    end
+
+    # `destroy!` — Rails raises `RecordNotDestroyed` when a
+    # `before_destroy` callback throws `:abort`. The strict targets have
+    # no abort channel (`throw` is reported as Ruby-only there), so the
+    # bang form is the same operation; the Ruby targets' connection.rb
+    # catches the abort and raises. Written out rather than aliased for
+    # the strict targets.
+    def destroy!
+      destroy
+    end
+
+    def destroy
+      return self unless persisted?
+      before_destroy
+      _adapter_delete
+      @persisted = false
+      @destroyed = true
+      after_destroy
+      _destroy_committed
+      self
+    end
+
+    # Re-fetch the row by id and reassign all column slots. Mirrors
+    # Rails' `record.reload` — used after a controller action that
+    # updates the row, to refresh the in-memory copy. Returns self;
+    # silently no-ops when the row no longer exists.
+    #
+    # NOTE: still uses the legacy `ActiveRecord.adapter.find` Hash-
+    # returning path — the typed `_adapter_find_by_id` returns a
+    # whole instance, but `assign_from_row` (the per-model contract)
+    # expects a row Hash. Migrating reload to typed-instance copy
+    # requires either an `assign_from_instance` lowering or an
+    # `[]=`-based field copy that subclasses override (today's Item
+    # subclass in base_test doesn't override `[]`/`[]=`). Deferred.
+    # Rails accepts `reload(options = nil)` (and `lock!` forwards a
+    # Hash with `:lock`). SQLite ignores locking options; keep the
+    # arity so model forwarders can `super(options)` without ArgumentError.
+    def reload(options = nil)
+      # Delegates to the lowerer-emitted (or Base default) per-model
+      # `_adapter_reload` instance primitive, which re-reads the row
+      # by `@id` and writes column values back into self (preserving
+      # identity). Implicit-self dispatch (no `self.class` chain) so
+      # async profiles emit `await _adapter_reload(this)` cleanly
+      # rather than awaiting the receiver Send. Returns self on
+      # success, self unchanged when the row has been deleted.
+      _adapter_reload
+      self
+    end
+
+    # `#lock!` (`ActiveRecord::Locking::Pessimistic#lock!`) — reloads
+    # the record with a row lock and answers self. SQLite is a single
+    # writer with no `SELECT … FOR UPDATE` support, so inside a
+    # transaction a plain `reload` already gives the guarantee Rails
+    # extracts from the row lock: the enclosing `BEGIN` serializes
+    # writers, so nothing can land between this read and a following
+    # write in the same transaction. A Postgres adapter would spell
+    # the `lock` argument as `FOR UPDATE` / `FOR SHARE` here; this
+    # runtime keeps the Rails signature — `lock` may be `true` or a
+    # String locking clause (`lock!("FOR UPDATE NOWAIT")`) — but
+    # doesn't need either under SQLite; both are accepted and ignored.
+    def lock!(lock = nil)
+      # Rails passes `reload(lock: lock)`; this runtime ignores the
+      # clause under SQLite, so a bare reload keeps the same guarantee.
+      reload
+    end
+
+    # ---- Lifecycle hooks (no-ops; subclasses override) --------------
+
+    # Fired by the synthesized `initialize` tail and the hydration
+    # factories (`from_row`/`from_stmt`) when a model declares it —
+    # Rails: after new AND after find.
+    def after_initialize;  end
+    def before_validation; end
+    def after_validation;  end
+    # Saves each unsaved belongs_to target and takes its id into the
+    # foreign key. The ruby family fills it (`apply_belongs_to_autosave`).
+    def _autosave_belongs_to; end
+    def before_save;       end
+    def after_save;        end
+    def before_create;     end
+    def after_create;      end
+    def before_update;     end
+    def after_update;      end
+    def before_destroy;    end
+    def after_destroy;     end
+    def after_commit;      end
+    def after_create_commit;  end
+    def after_update_commit;  end
+    def after_destroy_commit; end
+    def after_save_commit;    end
+    def after_touch;          end
+
+    # Subclasses define their own `validate` if they need any.
+    def validate; end
+
+    # Fills `created_at` (on insert) and `updated_at` (always) when the
+    # subclass declares those columns in `schema_columns`. Uses the
+    # subclass's `[]=` to assign — no `instance_variable_set`. Mirrors
+    # the Rails ActiveRecord::Timestamp callback semantics.
+    #
+    # `ActiveSupport.db_now` stamps Rails' exact storage form —
+    # "YYYY-MM-DD HH:MM:SS.ffffff", UTC, space separator, zero-padded
+    # 6-digit fractional seconds, no zone marker — so a column's TEXT
+    # values stay homogeneous (and lexicographically ordered) when a
+    # roundhouse-emitted app writes into a Rails-created database.
+    # Each target maps the intrinsic to its native clock+format helper;
+    # CRuby/JRuby resolve it in active_support_time_parsing.rb.
+    #
+    # `created_at` is stamped on every insert, unconditionally — we do
+    # NOT read the column back and skip when already set. The earlier
+    # `self[:created_at].nil?` guard meant well (don't clobber a value
+    # the caller pre-assigned), but it was the source of a cross-target
+    # bug: targets that type string columns non-nullable (TS/Crystal/
+    # Rust/Swift) initialize a fresh record's `created_at` to `""`, not
+    # nil, so the guard never fired and the column shipped empty — which
+    # collapsed `ORDER BY created_at DESC` to insertion (rowid) order.
+    # The blank-check is also hard to express portably: the generic `[]`
+    # accessor returns a different type per target (String, serde_json::
+    # Value, Any?), so a literal `== ""` won't type-check everywhere.
+    # An unconditional stamp sidesteps all of that and matches how
+    # `updated_at` above is already handled.
+    #
+    # Positional `creating` (was kwarg `creating:`). Kwargs in Ruby
+    # call sites lower to a Hash arg; rust2 emit doesn't yet unflatten
+    # the Hash back to a positional bool, so the call becomes
+    # `fill_timestamps({"creating" => true})` and fails to match the
+    # method's `bool` param. Positional sidesteps that — TS/Crystal
+    # accept either shape, Rust gets the simpler one.
+    # Not a check of the class switch: only the ruby family's connection.rb keeps one, and answers it there
+    def stamps_timestamps?
+      true
+    end
+
+    def fill_timestamps(creating)
+      cols = self.class.schema_columns
+      now = ActiveSupport.db_now
+      self[:updated_at] = now if cols.include?(:updated_at)
+      self[:created_at] = now if creating && cols.include?(:created_at)
+    end
+
+    # Rails runs the validation callbacks inside `valid?`
+    # (`run_validations!` wraps the validation chain), so a direct
+    # `valid?` runs them too, not only `save`. The answer is taken
+    # before `after_validation`, as Rails' is: an error that callback
+    # adds is on the record but does not change what `valid?` returns.
+    # The ruby family restates this in connection.rb so that a
+    # before_validation `throw :abort` halts it.
+    def valid?
+      @errors = []
+      @error_details = []
+      before_validation
+      validate
+      ok = @errors.empty?
+      after_validation
+      ok
+    end
+
+    # ---- Equality ---------------------------------------------------
+    #
+    # Ruby's `==` / `eql?` / `hash` equality protocol is intentionally
+    # not defined here. The protocol is Ruby-specific (used by Hash
+    # keys and Set membership) and has no cross-target analog: TS
+    # `Map`/`Set` use `===` reference equality, Rust uses `Eq`/`Hash`
+    # derives, etc. Per-target runtimes that need value equality
+    # implement it on the appropriate target shape (e.g.
+    # `juntos.ts`'s ApplicationRecord exposes `equals(other)` if
+    # callers need it). Adding the methods to base.rb produced
+    # broken emit (`[Klass, @id].hash` has no JS equivalent) without
+    # any caller benefit.
+  end
+end

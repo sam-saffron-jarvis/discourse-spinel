@@ -1,0 +1,5 @@
+per thread [300, 300, 300, 300, 300, 300, 300, 300]
+thread value 5
+shared after 5
+seen after [0, 1, 2]
+tagged [[0, 50], [10, 50], [20, 50], [30, 50]]

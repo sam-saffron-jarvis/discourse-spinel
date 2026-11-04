@@ -1,0 +1,15 @@
+if-yes
+tern-yes
+unless-yes
+sub-yes
+inst-no
+plain-no
+cmp-yes
+when Named
+when Comparable
+in Named
+in Comparable
+other
+plain other
+true
+not Enumerable

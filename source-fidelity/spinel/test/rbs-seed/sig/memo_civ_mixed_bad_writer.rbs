@@ -1,0 +1,5 @@
+class MixedBadWriter
+  def marker: () -> Integer
+  def self.table: () -> Hash[String, String]
+  def self.poison: () -> Integer
+end

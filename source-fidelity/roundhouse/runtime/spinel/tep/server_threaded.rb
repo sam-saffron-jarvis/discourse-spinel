@@ -1,0 +1,382 @@
+# frozen_string_literal: true
+# Tep::Server::Threaded -- a green thread per connection.
+#
+# The connection is a `Thread`. spinel's Thread is a green thread on an
+# M:N scheduler: every `recv` and `write` in sp_net parks the thread on
+# EAGAIN and frees its OS worker, `sleep` parks, and the timed waits
+# below park with a deadline (matz/spinel#4262). So a held-open
+# WebSocket costs one small stack, a slow subscriber stalls only its own
+# writer, and the workers run other connections' Ruby in parallel.
+#
+# This replaces Tep::Server::Scheduled, a fiber-per-connection server
+# over a Ruby poll loop. That design had a wall in C below it -- a
+# blocking write inside the net layer that no Ruby scheduler could see
+# -- and a poll set rebuilt every tick. Both now belong to the runtime's
+# monitor thread, which is the point of building on `Thread`.
+#
+# Client fds stay NON-BLOCKING: sp_net parks only on EAGAIN, so a
+# blocking fd would pin the OS worker in the syscall instead. Timed
+# waits go through one `IO.for_fd` wrapper per connection (a dup, closed
+# with the connection), because a raw fd has no `wait_readable`.
+#
+# OS WORKERS: the runtime's autodetected count, one per core; an operator
+# sets `SPINEL_WORKERS=N`. This server ran on ONE worker first (declared
+# on main.rb's first line, 14e80658 -> 1db97994) while the multi-worker
+# collector had two open gaps -- matz/spinel#4272, the boxed proc channel
+# `_sp_proc_poly_ret/_args` being per-worker TLS the stop-the-world
+# barrier never published, so a stale slot on an idle worker named an
+# object another worker's collection had freed; and the per-class pool
+# recycle's plain push under the PARALLEL sweep -- found with a 16-core
+# browser loop (4 of 7 runs dead in sp_StrArray_scan under the mark),
+# SPINEL_GC_VERIFY + GC_STRESS, and a TSan build. Both merged upstream
+# 2026-09-02 (PRs #4273, #4274). The declaration was lifted on that
+# runtime with the same loop: 10 of 10 runs alive, the process at 9 OS
+# threads under the browser's load (3 idle); the docs ledger
+# (docs/pipeline/runtime.md, "The threaded binary dies on more than one
+# OS worker") carries the evidence.
+#
+# AN fd NUMBER IS NOT A CONNECTION. The one symptom that survived the
+# collector fixes was ours: the ping thread and the broadcast fan-out
+# wrote to `fd` as an Integer, and a closed socket's number goes to the
+# next accept, so a write that "only fails when the fd is closed" landed
+# in a stranger's socket -- a ping frame ahead of an asset's HTTP
+# response, ahead of a new cable's 101, or interleaved with another
+# thread's frame. The traced loop showed it in one run (EOF on fd 40 at
+# trace line 138, `ping fd=40 r=0` at 184, the next welcome on 40 at
+# 185). Every write now goes through the connection's
+# Tep::WebSocket::Driver#write_frame under its lock, and this server
+# RETIRES the driver after the recv loop and BEFORE closing the fd
+# (write_response's upgrade branch). Hold an fd only through the object
+# that owns it. With that fix the loop is 10 of 10 green with no
+# handshake error; the unfixed tree wrote into a reused number 5 times
+# across 4 of its 10 runs (a traced ping after the socket's EOF, r=0).
+module Tep
+  class Server
+    class Threaded
+      # Max bytes accepted from a single request's start-line + headers.
+      # Bigger requests get 413; matches the blocking server's
+      # SPHTTP_BUFSIZE cap (64 KiB).
+      MAX_REQUEST_BYTES = 65535
+
+      # Idle keep-alive timeout between requests on the same connection.
+      KEEPALIVE_TIMEOUT = 30
+
+      attr_accessor :app
+
+      def initialize(app)
+        @app = app
+      end
+
+      def run(port, workers, quiet, unix = UnixListener.new(""))
+        sfd = Sock.sphttp_listen_on(Tep::APP.bind_host, port, workers > 1 ? 1 : 0)
+        if sfd < 0
+          $stderr.puts Tep.display_name + ": cannot bind to port " +
+                       port.to_s + " (already in use?)"
+          unix.close
+          exit(1)
+        end
+        if !quiet
+          puts Tep.display_name + " (" + RUBY_ENGINE +
+               ") listening on http://" + (Tep::APP.bind_host.empty? ? "0.0.0.0" : Tep::APP.bind_host) + ":" + port.to_s +
+               ", pid " + Sock.sphttp_getpid.to_s
+          puts "  one green thread per connection; OS workers: " +
+               Tep.os_workers_desc + "; processes: " +
+               Tep.processes_desc(workers)
+          $stdout.flush
+        end
+
+        # Install SIGTERM/SIGINT handlers BEFORE fork so children inherit
+        # them; the accept loop checks the term flag after every accept.
+        Sock.sphttp_install_term_handlers
+
+        # `--workers N` still preforks: each child is a threaded server
+        # of its own. One process is the shape the binary is measured
+        # in; the option stays for the operator who wants processes.
+        if workers > 1
+          pids = [0]
+          pids.pop
+          i = 0
+          while i < workers
+            pid = Sock.sphttp_fork
+            if pid == 0
+              Tep::Server::Threaded.run_worker(sfd, unix.unix_fd)
+              unix.close
+              Sock.sphttp_exit(0)   # same reason as the single-process exit below
+            end
+            pids.push(pid) if pid > 0
+            i += 1
+          end
+          Tep.reap_workers(pids)
+          if Sock.sphttp_shutdown_requested != 0
+            Tep.on_shutdown
+          end
+        else
+          Tep::Server::Threaded.run_worker(sfd, unix.unix_fd)
+          if Sock.sphttp_shutdown_requested != 0
+            Tep.on_shutdown
+          end
+          # Exit outright: spinel runs every remaining green thread to
+          # completion when main returns, and the connection threads are
+          # parked on sockets that may never speak again (a keep-alive
+          # waits 30s, an idle WebSocket 300s). A server asked to stop
+          # stops.
+          unix.close
+          Sock.sphttp_close(sfd)
+          Sock.sphttp_exit(0)
+        end
+        unix.close
+        Sock.sphttp_close(sfd)
+        Sock.sphttp_exit(0)
+      ensure
+        unix.close
+        Sock.sphttp_close(sfd) if sfd >= 0
+      end
+
+      # The accept loop, on the calling thread. A TIMED wait on the listen
+      # socket, one second at a time, so SIGTERM/SIGINT is noticed within
+      # a second even when no connection arrives: the signal handler only
+      # sets a flag, and a thread parked in a plain `accept` is never
+      # woken to read it -- the first threaded build ignored SIGTERM until
+      # the next connection came in. Then a non-blocking accept, which
+      # answers -1 for a spurious wake and is retried.
+      def self.run_worker(sfd, ufd = -1)
+        if ufd >= 0
+          unix_accept = Thread.new(ufd) { |fd| Tep::Server::Threaded.accept_loop(fd, "unix") }
+          Tep::Server::Threaded.accept_loop(sfd, "tcp")
+          unix_accept.join
+        else
+          Tep::Server::Threaded.accept_loop(sfd, "tcp")
+        end
+        0
+      end
+
+      def self.accept_loop(sfd, transport)
+        Sock.sphttp_set_nonblock(sfd)
+        lio = IO.for_fd(sfd, autoclose: false)
+        while true
+          if Sock.sphttp_shutdown_requested != 0
+            break
+          end
+          ready = lio.wait_readable(1)
+          if ready.nil?
+            next
+          end
+          client = Sock.sphttp_accept_nb(sfd)
+          if client < 0
+            next
+          end
+          Sock.sphttp_set_nonblock(client)
+          Thread.new(client) do |c|
+            Tep::Server::Threaded.handle_connection(c, transport)
+          end
+        end
+        lio.close
+        0
+      end
+
+      # Per-connection lifecycle: one wrapper for the timed waits, the
+      # keep-alive loop, then both the wrapper's dup and the fd close.
+      # Per-request work lives in handle_one so each keep-alive iteration
+      # gets its own GC scope (see Tep::Server#handle_one, 210a5f6).
+      #
+      # Both closes run however the connection ends. They used to sit
+      # after the loop, so anything that raised -- the wrapper's own
+      # dup(2) at the fd limit first among them -- ended the thread with
+      # the socket still open: at RLIMIT_NOFILE 1024 and 512 kept-alive
+      # connections (two fds each), every failed accept leaked one more
+      # (koduki/example-rails-aot measured fd 1023 left open after
+      # `dup(2) failed for fd 1023`). The exception still propagates, so
+      # the thread's failure stays as visible as before.
+      #
+      # The wrapper is taken outside the `ensure` so `io` stays an IO,
+      # not an IO-or-nil, in handle_one's signature; a failed dup closes
+      # the fd itself.
+      def self.handle_connection(client, transport = "tcp")
+        begin
+          io = IO.for_fd(client, autoclose: false)
+        rescue StandardError
+          Sock.sphttp_close(client)
+          raise
+        end
+        begin
+          input = InputBuffer.new
+          keep_going = true
+          while keep_going
+            keep_going = Tep::Server::Threaded.handle_one(client, io, input, transport)
+          end
+        ensure
+          io.close
+          Sock.sphttp_close(client)
+        end
+        0
+      end
+
+      # Process exactly one request on `client`. Returns true to keep the
+      # connection open for the next keep-alive request, false to close.
+      def self.handle_one(client, io, input = InputBuffer.new, transport = "tcp")
+        blob = Tep::Server::Threaded.read_request_blob(client, io, KEEPALIVE_TIMEOUT, input)
+        if blob.length == 0
+          return false
+        end
+        req = Parser.parse(blob, input)
+        if req == nil
+          Tep::Server::Threaded.send_simple(client, 400, "bad request")
+          return false
+        end
+        req.listener_transport = transport
+
+        # Before the drain, which is what held the bytes (Request#body_refusal).
+        refusal = req.body_refusal(Tep.max_body_bytes)
+        if refusal != 0
+          Tep::Server::Threaded.send_simple(client, refusal,
+            refusal == 413 ? "request body too large" : "bad request")
+          return false
+        end
+
+        return false unless req.consume_body_via_io(io, client)
+
+        res = Response.new
+        begin
+          Tep::APP.dispatch(req, res)
+        # Both names, as in the blocking server: a stubbed gem facade
+        # raises NotImplementedError, a ScriptError, which a bare
+        # `rescue` does not catch.
+        rescue StandardError, ScriptError => e
+          # One request's failure is not the connection's, and certainly
+          # not the process's: a thread that unwound here would take
+          # only itself down, but the client deserves the 500.
+          Tep.log_dispatch_error(req.verb, req.path, e)
+          Tep::Server::Threaded.send_simple(client, 500, "internal server error")
+          return false
+        end
+
+        # The writer returns the keep-alive decision it actually sends.
+        keep_alive = req.keep_alive? && !res.halted_close?
+        Tep::Server::Threaded.write_response(client, io, req, res, keep_alive, input)
+      end
+
+      # Request reader. Returns the accumulated blob once "\r\n\r\n" is
+      # seen, or "" on timeout / EOF / oversize. The timed wait parks the
+      # thread; a peer that closes wakes it (EOF reads as zero bytes).
+      def self.read_request_blob(fd, io, timeout_seconds, input = InputBuffer.new)
+        buf = input.take_pending_input
+        return buf if buf.include?("\r\n\r\n")
+        deadline = Time.now.to_i + timeout_seconds
+        while buf.bytesize < MAX_REQUEST_BYTES
+          remaining = deadline - Time.now.to_i
+          if remaining <= 0
+            return ""
+          end
+          ready = io.wait_readable(remaining)
+          if ready.nil?
+            return ""
+          end
+          chunk = Sock.sphttp_recv_some(fd, [4096, MAX_REQUEST_BYTES - buf.bytesize].min).b
+          if chunk.length == 0
+            return ""
+          end
+          buf << chunk
+          if buf.bytesize >= 4 && buf.include?("\r\n\r\n")
+            return buf
+          end
+        end
+        ""
+      end
+
+      # Body-shape mirror of Tep::Server#write_response.
+      def self.write_response(client, io, req, res, keep_alive, input = InputBuffer.new)
+        # WebSocket upgrade branch. Set by res.start_websocket in the
+        # user's handler after a successful Handshake.check. Writes the
+        # 101 Switching Protocols head, then hands the fd (and this
+        # connection's wait wrapper) to the driver and runs the recv
+        # loop, which returns when the connection closes.
+        if res.upgrading_ws
+          head = Tep::WebSocket::Handshake.build_response(
+            res.ws_accept_key, res.ws_driver.subprotocol)
+          Sock.sphttp_write_str(client, head)
+          res.ws_driver.set_fd(client)
+          conn = Tep::WebSocket::Connection.new(res.ws_driver, io)
+          # The recv loop is done with the socket. Retire the driver
+          # BEFORE the caller closes the fd: from here no ping thread or
+          # broadcast can write to a number the kernel is about to hand
+          # to the next accept (Tep::WebSocket::Driver#write_frame). An
+          # `ensure`, because handle_connection now closes the fd on the
+          # way out of a raise too, and an unretired driver would write
+          # into whatever socket reuses that number.
+          # Surplus after the upgrade headers is the first WebSocket
+          # frame when it shared the request's recv.
+          begin
+            conn.run(input.take_pending_input)
+          ensure
+            res.ws_driver.retire
+          end
+          return false
+        end
+
+        # Streaming branch -- chunked, Connection: close.
+        if res.streaming
+          res.headers["Transfer-Encoding"] = "chunked"
+          if !res.headers.key?("Content-Type")
+            res.headers["Content-Type"] = "text/event-stream"
+          end
+          reason = Tep.reason(res.status)
+          head = req.http_version + " " + res.status.to_s + " " + reason + "\r\n"
+          head << Tep.header_lines(res)
+          head << "Connection: close\r\n\r\n"
+          Sock.sphttp_write_str(client, head)
+          out = Tep::Stream.new(client)
+          res.streamer.pump(out)
+          Sock.sphttp_write_chunk_end(client)
+          return false
+        end
+
+        # Default Content-Type for inline-body responses.
+        if res.file_path.length == 0 && res.body.length > 0 && !res.headers.key?("Content-Type")
+          res.headers["Content-Type"] = "text/html; charset=utf-8"
+        end
+        Tep.maybe_gzip!(req, res)
+        reason = Tep.reason(res.status)
+        head = req.http_version + " " + res.status.to_s + " " + reason + "\r\n"
+        head << Tep.header_lines(res)
+        if keep_alive
+          head << "Connection: keep-alive\r\n"
+        else
+          head << "Connection: close\r\n"
+        end
+        if res.file_path.length > 0
+          fs = Sock.sphttp_filesize(res.file_path)
+          if fs < 0
+            Tep::Server::Threaded.send_simple(client, 404, "file not found")
+            return false
+          end
+          head << "Content-Length: " + fs.to_s + "\r\n\r\n"
+          Sock.sphttp_write_str(client, head)
+          Sock.sphttp_sendfile(client, res.file_path) unless req.verb == "HEAD"
+        else
+          # BYTES, both times: `length` counts characters, and
+          # `write_str` crosses the FFI as a NUL-terminated C string.
+          head << "Content-Length: " + res.body.bytesize.to_s + "\r\n\r\n"
+          Sock.sphttp_write_str(client, head)
+          # HEAD: the headers GET would send, Content-Length included, and
+          # no body (RFC 9110 9.3.2). A body here would be read by the
+          # client as the start of the NEXT response on a keep-alive socket.
+          if res.body.bytesize > 0 && req.verb != "HEAD"
+            Sock.sphttp_write_bytes(client, res.body, res.body.bytesize)
+          end
+        end
+        keep_alive
+      end
+
+      # bytesize, as write_response: a multibyte `msg` would otherwise
+      # announce fewer bytes than are written.
+      def self.send_simple(client, status, msg)
+        reason = Tep.reason(status)
+        head = "HTTP/1.0 " + status.to_s + " " + reason + "\r\n" +
+               "Content-Length: " + msg.bytesize.to_s + "\r\n" +
+               "Connection: close\r\n\r\n" + msg
+        Sock.sphttp_write_str(client, head)
+        0
+      end
+    end
+  end
+end

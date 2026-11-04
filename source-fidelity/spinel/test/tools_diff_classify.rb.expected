@@ -1,0 +1,15 @@
+compile-error -> 2
+link-error -> 2
+crash -> 3
+timeout -> 1
+timeout -> 1
+nondeterministic -> 1
+exception-diff -> 1
+output-diff -> 1
+output-diff -> 1
+same -> 0
+same -> 0
+crash -> 3
+crash -> 3
+timeout -> 1
+crash -> 3

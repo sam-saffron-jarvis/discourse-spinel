@@ -1,0 +1,968 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# rh — Roundhouse workflow runner. Subcommand-shaped CLI in front of
+# the per-target dev loops. Lives outside the Rust crate so Ruby is
+# the only prerequisite for the no-Rust onboarding paths
+# (`doctor`, `fetch`, `fixture`); Rust-dependent subcommands
+# (added later) shell out to the `roundhouse` binary via `cargo run`.
+#
+# Why Ruby: the audience is Rails developers (Ruby guaranteed), and
+# stdlib has everything needed — OptionParser, open-uri, Zlib,
+# Gem::Package::TarReader. No gem dependencies. Cross-platform.
+
+require 'optparse'
+require 'fileutils'
+require 'open3'
+require 'shellwords'
+require 'json'
+require 'etc'
+
+ROUNDHOUSE_ROOT = File.expand_path('..', __dir__)
+TARGETS = %w[spinel ruby jruby crystal csharp elixir go kotlin python rust swift typescript typescript-worker].freeze
+SITE_BASE = 'https://roundhouse-rb.dev'
+
+def main(argv)
+  cmd = argv.shift
+  case cmd
+  when 'doctor'    then cmd_doctor(argv)
+  when 'verify'    then cmd_verify(argv)
+  when 'fetch'     then cmd_fetch(argv)
+  when 'fixture'   then cmd_fixture(argv)
+  when 'transpile' then cmd_transpile(argv)
+  when 'dev'       then cmd_dev_test_run(argv, 'dev')
+  when 'test'      then cmd_dev_test_run(argv, 'test')
+  when 'run'       then cmd_dev_test_run(argv, 'run')
+  when 'clean'     then cmd_clean(argv)
+  when 'compare'   then cmd_compare(argv)
+  when 'bench'     then cmd_bench(argv)
+  when 'site'      then cmd_site(argv)
+  when '-h', '--help', nil
+    print_usage
+    0
+  when '-V', '--version'
+    puts "rh #{rh_version}"
+    0
+  else
+    warn "rh: unknown command '#{cmd}'"
+    warn ''
+    print_usage
+    1
+  end
+end
+
+def print_usage
+  puts <<~USAGE
+    Usage: bin/rh <command> [options]
+
+    Roundhouse workflow runner.
+
+    Onboarding (no Rust required):
+      doctor              Check installed prerequisites; show which subcommands work today.
+      fetch <target>      Download a pre-transpiled archive.
+      fixture [path]      Generate a Rails source fixture via `rails new`.
+
+    Build (requires Rust):
+      transpile <target>  Build the source fixture into build/transpiled-blog-<target>/.
+      dev <target>        Transpile, then start dev server (ruby only for now).
+      test <target>       Transpile, then run target's native tests (ruby only for now).
+      run <target>        Transpile, then run main (ruby only for now).
+      compare [<target>]  End-to-end Rails-vs-target HTTP compare (wraps scripts/compare).
+      verify             Local checks; --all runs the complete default suite concurrently.
+      bench [<target>...] HTTP throughput + RSS benchmark (wraps scripts/bench).
+      site                Build the full GitHub Pages site (all targets).
+
+    Cleanup:
+      clean <target>      rm -rf build/transpiled-blog-<target>/
+      clean fixture       rm -rf fixtures/real-blog/
+
+    Pass `--help` to any subcommand for its options.
+
+    Targets: #{TARGETS.join(', ')}
+  USAGE
+end
+
+def build_dir(target)
+  File.join(ROUNDHOUSE_ROOT, 'build', "transpiled-blog-#{target}")
+end
+
+def fixture_path
+  File.join(ROUNDHOUSE_ROOT, 'fixtures', 'real-blog')
+end
+
+def need_cargo!
+  return if version_of(probe('cargo', '--version'))
+  warn 'rh: cargo not installed (required for transpile/site).'
+  warn '  Install: https://rustup.rs'
+  warn '  (or run `bin/rh doctor` to see all prerequisites)'
+  exit 1
+end
+
+def need_fixture!
+  return if File.directory?(fixture_path)
+  warn "rh: fixture not found at #{fixture_path}"
+  warn '  Generate: bin/rh fixture'
+  exit 1
+end
+
+def validate_target!(target, allow_blog: false)
+  valid = allow_blog ? TARGETS + ['blog'] : TARGETS
+  return if valid.include?(target)
+  warn "rh: unknown target '#{target.inspect}'"
+  warn "  valid: #{valid.join(', ')}"
+  exit 1
+end
+
+def rh_version
+  cargo = File.join(ROUNDHOUSE_ROOT, 'Cargo.toml')
+  return 'unknown' unless File.exist?(cargo)
+  File.foreach(cargo) do |line|
+    return Regexp.last_match(1) if line =~ /^version\s*=\s*"([^"]+)"/
+  end
+  'unknown'
+end
+
+# ---------------------------------------------------------------------
+# Tool probes — Open3 + version regex. Returns the parsed version
+# string, or nil if the command isn't on PATH or fails.
+
+def probe(*cmd, allow_fail: false)
+  out, err, status = Open3.capture3(*cmd)
+  return "#{out}#{err}".strip if status.success? || allow_fail
+  nil
+rescue Errno::ENOENT, Errno::EACCES
+  nil
+end
+
+def version_of(output, re = /(\d+\.\d+(?:\.\d+)?)/)
+  return nil unless output
+  m = re.match(output)
+  m ? m[1] : nil
+end
+
+def requirement_met?(found, minimum)
+  found && (minimum.nil? || Gem::Version.new(found) >= Gem::Version.new(minimum))
+rescue ArgumentError
+  false
+end
+
+# Highest installed `rails` gem version satisfying a requirement string
+# (e.g. "~> 8.0.0"), as a concrete version usable with the `rails _X_`
+# selector. nil if none installed matches or the requirement is malformed.
+def resolve_rails_version(req)
+  requirement = Gem::Requirement.new(req)
+  Gem::Specification.find_all_by_name('rails')
+                    .map(&:version)
+                    .select { |v| requirement.satisfied_by?(v) }
+                    .max&.to_s
+rescue Gem::Requirement::BadRequirementError, ArgumentError
+  nil
+end
+
+# ---------------------------------------------------------------------
+# Subcommand: doctor
+
+DOCTOR_CHECKS = [
+  { key: :ruby,   label: 'Ruby',      unlocks: 'always (rh itself)',     min: File.read(File.join(ROUNDHOUSE_ROOT, '.ruby-version')).strip },
+  { key: :rust,   label: 'Rust',      unlocks: 'transpile, site, compare, verify' },
+  { key: :git,    label: 'Git',       unlocks: 'verify / verify --plan' },
+  { key: :python, label: 'Python 3',  unlocks: 'optional verify hosted-coverage preview' },
+  { key: :node,   label: 'Node',      unlocks: 'typescript target', min: '24' },
+  { key: :sqlite, label: 'SQLite',    unlocks: 'ruby/spinel/rust targets' },
+  { key: :rails,  label: 'Rails gem', unlocks: 'fixture' },
+  { key: :wrk,    label: 'wrk',       unlocks: 'bench' },
+].freeze
+
+def cmd_doctor(argv)
+  OptionParser.new do |o|
+    o.banner = 'Usage: bin/rh doctor'
+    o.separator ''
+    o.separator 'Check installed prerequisites; show which subcommands work today.'
+  end.parse!(argv)
+
+  versions = {
+    ruby:   RUBY_VERSION,
+    rust:   version_of(probe('cargo', '--version')),
+    git:    version_of(probe('git', '--version')),
+    python: version_of(probe('python3', '--version')),
+    node:   version_of(probe('node', '--version')),
+    sqlite: version_of(probe('sqlite3', '--version')),
+    rails:  version_of(probe('rails', '--version')),
+    # Debian and Ubuntu replace wrk's version string with their package
+    # version (`wrk debian/4.1.0-4build2`), so the token after the name
+    # does not start with a digit. `\S*?` skips that prefix; upstream's
+    # `wrk 4.2.0` still matches with nothing to skip. Without it, doctor
+    # reported wrk absent on the very platform whose install hint it had
+    # just printed.
+    wrk:    version_of(probe('wrk', '--version', allow_fail: true), /wrk\s+\S*?(\d+\.\d+(?:\.\d+)?)/),
+  }
+
+  puts 'Roundhouse environment check:'
+  puts ''
+  DOCTOR_CHECKS.each do |c|
+    v = versions[c[:key]]
+    old = v && !requirement_met?(v, c[:min])
+    mark = v && !old ? "\u2713" : "\u2717"
+    val = if v.nil?
+            'not found'
+          elsif old
+            "#{v} (< #{c[:min]})"
+          else
+            v
+          end
+    puts "  #{c[:label].ljust(10)} #{mark} #{val.ljust(14)}  #{c[:unlocks]}"
+  end
+
+  puts ''
+  available = ['doctor', 'fetch <target>', 'clean <target | fixture>']
+  available << 'verify --plan' if versions[:git]
+  available << 'verify' if versions[:git] && versions[:rust]
+  available << 'fixture' if versions[:rails]
+  if versions[:rust]
+    available << 'transpile <target>'
+    available << 'site'
+  end
+  available << 'compare [<target>]' if versions[:rust] && versions[:rails]
+  available << 'bench [<target>...]' if versions[:rust] && versions[:rails] && versions[:wrk]
+  if versions[:rust] && versions[:rails]
+    available << 'dev | test | run ruby'
+  end
+  puts 'Available now:'
+  available.each { |s| puts "  bin/rh #{s}" }
+
+  missing = DOCTOR_CHECKS.reject do |c|
+    [:ruby, :python].include?(c[:key]) || requirement_met?(versions[c[:key]], c[:min])
+  end
+  unless missing.empty?
+    puts ''
+    puts 'Install to unlock more:'
+    missing.each do |c|
+      hint = install_hint(c[:key])
+      puts "  #{c[:label].ljust(10)} \u2192 #{c[:unlocks]}#{hint ? "  (#{hint})" : ''}"
+    end
+  end
+
+  0
+end
+
+def install_hint(key)
+  case key
+  when :rust   then 'https://rustup.rs'
+  when :git    then 'https://git-scm.com'
+  when :python then 'https://www.python.org (optional for verify)'
+  when :node   then 'Node.js 24+ — https://nodejs.org or `brew install node`'
+  when :sqlite then 'macOS: preinstalled; Debian/Ubuntu: apt install libsqlite3-dev'
+  when :rails  then 'gem install rails'
+  when :wrk    then 'macOS: brew install wrk; Debian/Ubuntu: apt install wrk'
+  end
+end
+
+# ---------------------------------------------------------------------
+# Subcommand: verify — a foreground local check, not an Actions emulator.
+
+# Git hooks can export locations for another repository. Every verification
+# subprocess belongs to this checkout, without changing the caller's env.
+VERIFY_GIT_ENV = %w[GIT_DIR GIT_COMMON_DIR GIT_WORK_TREE GIT_INDEX_FILE
+  GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_PREFIX].to_h { |key| [key, nil] }.freeze
+
+def verify_capture(*command, input: '')
+  out, err, status = Open3.capture3(VERIFY_GIT_ENV, *command, stdin_data: input, chdir: ROUNDHOUSE_ROOT)
+  raise ArgumentError, "#{command.first}: #{err.strip}" unless status.success?
+  out
+end
+
+VERIFY_DISK_WARNING_BYTES = 5 * 1024**3
+# Invariant gates only. Filters name functions inside these two binaries
+# so the preset does not build the rest of the integration suite.
+VERIFY_CONTRACT = [
+  ['real_blog', %w[ingests_without_errors type_analysis_coverage]],
+  ['runtime_src_integration', %w[every_runtime_method_body_is_fully_typed]],
+].freeze
+
+# POSIX df is optional (e.g. native Windows). Measure filesystems, not
+# directory sizes; do not walk large caches or create a missing target dir.
+def verify_disk_space(locations, phase, json)
+  locations.to_h do |name, path|
+    sample = { path: path }
+    begin
+      existing = path
+      until File.exist?(existing)
+        parent = File.dirname(existing)
+        raise ArgumentError, 'no accessible parent directory' if parent == existing
+        existing = parent
+      end
+      sample[:filesystem_path] = existing
+      out, err, status = Open3.capture3({ 'LC_ALL' => 'C' }, 'df', '-P', '-k', existing)
+      raise ArgumentError, "df: #{err.strip}" unless status.success?
+      # Filesystem and mount names can contain spaces; sizes are KiB with -k.
+      row = out.lines.drop(1).last&.chomp&.match(/\A.+?\s+(\d+)\s+\d+\s+(-?\d+)\s+\d+%\s+.+\z/)
+      raise ArgumentError, 'unsupported df output' unless row
+      sample[:total_bytes] = row[1].to_i * 1024
+      sample[:available_bytes] = row[2].to_i * 1024
+      if sample[:available_bytes] < VERIFY_DISK_WARNING_BYTES
+        warn "rh verify: less than 5 GiB available #{phase} (#{name}: #{path}); warning only, no cleanup performed."
+      end
+      unless json
+        puts format('Disk %s (%s): %.2f GiB available / %.2f GiB total — %s',
+          phase, name, sample[:available_bytes].fdiv(1024**3), sample[:total_bytes].fdiv(1024**3), path)
+      end
+    rescue ArgumentError, SystemCallError => e
+      sample[:error] = e.message
+      puts "Disk #{phase} (#{name}): unavailable — #{e.message}" unless json
+    end
+    [name, sample]
+  end
+end
+
+def verify_known_suite!(name)
+  unless name.match?(/\A[A-Za-z0-9_-]+\z/) && File.file?(File.join(ROUNDHOUSE_ROOT, 'tests', "#{name}.rs"))
+    raise ArgumentError, "unknown test suite: #{name.inspect}"
+  end
+end
+
+def verify_exact_filters(command)
+  marker = command.index('--exact')
+  return [] unless marker
+  command[(marker + 1)..].take_while { |arg| !arg.start_with?('--') }
+end
+
+def cmd_verify(argv)
+  tests = []
+  toolchains = []
+  plan_only = json = ignored_tests = lib_tests = contract = all_tests = false
+  base = 'HEAD'
+  jobs = ENV.fetch('CARGO_BUILD_JOBS', Etc.nprocessors.to_s)
+  OptionParser.new do |o|
+    o.banner = 'Usage: bin/rh verify [--all | --test NAME] [--plan] [--base REF] [--contract] [--lib] [--ignored] [--toolchain TARGET] [--json]'
+    o.separator 'Build and run the selected integration suites. --lib runs the library suite after them.'
+    o.separator '--contract runs the zero-error and runtime-typing gates without the other integration binaries.'
+    o.separator '--all runs the complete default suite with cargo-nextest, then documentation tests.'
+    o.separator 'This is partial local verification, not the hosted CI floor, the commit bar, or merge approval.'
+    o.on('--plan', 'Read-only preview; no Cargo, installs, or test execution') { plan_only = true }
+    o.on('--all', 'Run all targets with cargo-nextest, then documentation tests; skips ignored tests') { all_tests = true }
+    o.on('--base REF', 'Compare the working tree with REF (default: HEAD)') { |v| base = v }
+    o.on('--test NAME', 'Integration test stem; repeatable; skips ignored tests by default') { |v| tests << v }
+    o.on('--contract', 'Run real_blog ingest/coverage gates and every_runtime_method_body_is_fully_typed') { contract = true }
+    o.on('--lib', 'Run the library suite after the selected integration suites') { lib_tests = true }
+    o.on('--ignored', 'Run only ignored tests in selected --test suites (not --lib or --contract)') { ignored_tests = true }
+    o.on('--toolchain TARGET', 'Run TARGET_toolchain with --ignored; repeatable') { |v| toolchains << v }
+    o.on('--jobs N', 'Cargo workers (default: CARGO_BUILD_JOBS or the machine processor count)') { |v| jobs = v }
+    o.on('--json', 'JSON report on stdout; child output on stderr') { json = true }
+  end.parse!(argv)
+  raise ArgumentError, "unexpected arguments: #{argv.join(' ')}" unless argv.empty?
+  raise ArgumentError, 'jobs must be a positive integer' unless jobs.match?(/\A[1-9]\d*\z/)
+  if all_tests && (!tests.empty? || !toolchains.empty? || ignored_tests || lib_tests || contract)
+    raise ArgumentError, '--all cannot be combined with --test, --toolchain, --ignored, --lib, or --contract'
+  end
+  raise ArgumentError, '--ignored requires at least one --test suite' if ignored_tests && tests.empty?
+  suites = tests.map { |name| [name, ignored_tests] } + toolchains.map { |name| ["#{name}_toolchain", true] }
+  suites.uniq.each { |name, _ignored| verify_known_suite!(name) }
+  VERIFY_CONTRACT.each { |name, _filters| verify_known_suite!(name) } if contract
+  if all_tests
+    commands = [
+      ['cargo', 'nextest', 'run', '--locked', '--lib', '--bins', '--test', 'all_tests',
+       '--no-fail-fast', '--ignore-default-filter'],
+      ['cargo', 'test', '--locked', '--doc']
+    ]
+  else
+    # One thread for every focused suite. Suites share SQLite or the
+    # process-global ingest::survey; do not drop the cap per suite.
+    commands = []
+    suites.uniq.each do |name, ignored|
+      command = ['cargo', 'test', '--locked', '--test', name, '--']
+      command << '--ignored' if ignored
+      commands << command + ['--test-threads=1']
+    end
+    if contract
+      VERIFY_CONTRACT.each do |name, filters|
+        commands << ['cargo', 'test', '--locked', '--test', name, '--', '--exact', *filters, '--test-threads=1']
+      end
+    end
+    commands << ['cargo', 'test', '--locked', '--lib', '--', '--test-threads=1'] if lib_tests
+    raise ArgumentError, 'select --test, --toolchain, --contract, --lib, or --all' if commands.empty? && !plan_only
+  end
+
+  head = verify_capture('git', 'rev-parse', 'HEAD').strip
+  base_sha = verify_capture('git', 'rev-parse', '--verify', '--end-of-options', "#{base}^{commit}").strip
+  unless verify_capture('git', 'diff', '--name-only', '--diff-filter=U', '-z').empty?
+    raise ArgumentError, 'resolve unmerged paths before verification'
+  end
+  changes = (verify_capture('git', 'diff', '--name-only', '--no-renames', '-z', base_sha, '--').split("\0") +
+    verify_capture('git', 'ls-files', '--others', '--exclude-standard', '-z').split("\0")).uniq.sort
+  # Import the repository's policy directly: no duplicated owner routing and
+  # no GitHub event, API lookup, reuse receipt, or bytecode-cache side effects.
+  policy = <<~PYTHON
+    import json, runpy, sys
+    policy = runpy.run_path(sys.argv[1])
+    print(json.dumps(policy['select'](json.load(sys.stdin))))
+  PYTHON
+  hosted = hosted_error = nil
+  begin
+    hosted = JSON.parse(verify_capture('python3', '-B', '-c', policy,
+      File.join(ROUNDHOUSE_ROOT, 'scripts', 'ci-plan.py'), input: JSON.generate(changes)))
+    unless hosted.is_a?(Hash) && hosted['jobs'].is_a?(Array)
+      raise ArgumentError, 'unsupported hosted coverage format'
+    end
+  rescue ArgumentError, SystemCallError, JSON::ParserError => e
+    hosted = nil
+    hosted_error = e.message
+  end
+  build_env = { 'CARGO_BUILD_JOBS' => jobs }
+  if all_tests
+    # Full verification defaults incremental on and still honors an explicit value.
+    build_env['CARGO_INCREMENTAL'] = ENV.fetch('CARGO_INCREMENTAL', '1')
+    build_env['ROUNDHOUSE_TEST_BUNDLE_ROOT'] = ROUNDHOUSE_ROOT
+  elsif ENV.key?('CARGO_INCREMENTAL')
+    # Focused runs do not force a cold build. CI cold builds stay on rust-cache.
+    build_env['CARGO_INCREMENTAL'] = ENV['CARGO_INCREMENTAL']
+  end
+  # Record caller-selected size/speed tradeoffs without inventing a profile
+  # or overriding Cargo configuration when these settings are absent.
+  %w[CARGO_PROFILE_DEV_DEBUG CARGO_PROFILE_TEST_DEBUG CARGO_PROFILE_DEV_STRIP CARGO_PROFILE_TEST_STRIP
+    CARGO_PROFILE_DEV_OPT_LEVEL CARGO_PROFILE_TEST_OPT_LEVEL].each do |key|
+    build_env[key] = ENV[key] if ENV.key?(key)
+  end
+  missing = %w[real-blog store].reject { |name| File.directory?(File.join(ROUNDHOUSE_ROOT, 'fixtures', name)) }
+  report = {
+    scope: "#{all_tests ? 'complete default suite; ignored tests excluded' : 'partial local verification'}; hosted coverage is informational, not executed",
+    head: head, base: base_sha, changes: changes, build_environment: build_env,
+    prerequisites: ['Pinned Rust via rust-toolchain.toml, Ruby and test gems; selected toolchains must be installed'] +
+      (all_tests ? ['cargo-nextest: cargo install cargo-nextest --locked'] : []),
+    missing_fixtures: missing, hosted_coverage: hosted, hosted_coverage_error: hosted_error,
+    checks: commands.map { |command| { command: command, status: 'not-run' } },
+    disk_space: { warning_threshold_bytes: VERIFY_DISK_WARNING_BYTES, before: nil, after: nil },
+    status: plan_only ? 'planned' : 'blocked'
+  }
+  unless json
+    puts "Local verification at #{head} (working tree included); not hosted CI."
+    puts(hosted ? "Hosted selection (not executed): #{hosted.fetch('jobs').join(', ')}" : "Hosted selection unavailable: #{hosted_error}")
+    puts "Missing fixtures: #{missing.join(', ')} — see bin/rh fixture and scripts/create-store" unless missing.empty?
+    commands.each { |command| puts "  #{command.shelljoin}" }
+  end
+  rc = 0
+  unless plan_only
+    lock_path = verify_capture('git', 'rev-parse', '--git-path', 'rh-verify.lock').strip
+    File.open(File.expand_path(lock_path, ROUNDHOUSE_ROOT), File::RDWR | File::CREAT, 0o600) do |lock|
+      unless lock.flock(File::LOCK_EX | File::LOCK_NB)
+        raise ArgumentError, 'another verify run owns this worktree; wait for it to finish'
+      end
+      locations = { workspace: ROUNDHOUSE_ROOT }
+      begin
+        # Cargo resolves CARGO_TARGET_DIR and .cargo/config.toml itself.
+        metadata = JSON.parse(verify_capture('cargo', 'metadata', '--format-version', '1', '--no-deps', '--offline', '--locked'))
+        raise ArgumentError, 'unsupported Cargo metadata format' unless metadata.is_a?(Hash)
+        target = metadata.fetch('target_directory')
+        raise ArgumentError, 'unsupported Cargo target directory' unless target.is_a?(String) && !target.empty?
+        locations[:cargo_target] = File.expand_path(target, ROUNDHOUSE_ROOT)
+      rescue ArgumentError, SystemCallError, JSON::ParserError, KeyError => e
+        report[:disk_space][:cargo_target_error] = e.message
+        puts "Cargo target disk location unavailable: #{e.message}" unless json
+      end
+      report[:disk_space][:before] = verify_disk_space(locations, 'before', json)
+      report[:status] = 'passed'
+      report[:checks].each do |check|
+        started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        begin
+          filters = verify_exact_filters(check[:command])
+          if filters.empty?
+            system(VERIFY_GIT_ENV.merge(build_env), *check[:command], chdir: ROUNDHOUSE_ROOT, out: $stderr, err: $stderr)
+            status = $?
+            rc = status.exitstatus || 128 + status.termsig
+          else
+            # An --exact contract filter that runs no test still exits 0.
+            # Require each named test in the harness output before passing.
+            stdout, stderr, status = Open3.capture3(VERIFY_GIT_ENV.merge(build_env), *check[:command], chdir: ROUNDHOUSE_ROOT)
+            $stderr.write(stdout)
+            $stderr.write(stderr)
+            rc = status.exitstatus || 128 + status.termsig
+            if rc.zero?
+              missing = filters.reject do |name|
+                line = /^test #{Regexp.escape(name)} \.\.\./
+                stdout.match?(line) || stderr.match?(line)
+              end
+              unless missing.empty?
+                warn "rh verify: contract filter matched no test: #{missing.join(', ')}"
+                rc = 1
+              end
+            end
+          end
+        rescue Errno::ENOENT => e
+          warn e.message
+          rc = 127
+        end
+        check[:seconds] = (Process.clock_gettime(Process::CLOCK_MONOTONIC) - started).round(3)
+        check[:exit] = rc
+        check[:status] = rc.zero? ? 'passed' : 'failed'
+        unless rc.zero?
+          report[:status] = 'failed'
+          break
+        end
+      end
+      report[:disk_space][:after] = verify_disk_space(locations, 'after', json)
+    end
+  end
+  puts(json ? JSON.pretty_generate(report) : "Local checks: #{report[:status]}; unexecuted hosted gates remain unverified.")
+  rc
+rescue OptionParser::ParseError, ArgumentError, SystemCallError, JSON::ParserError => e
+  warn "rh verify: #{e.message}"
+  2
+end
+
+# ---------------------------------------------------------------------
+# Subcommand: fetch
+#
+# Download a pre-transpiled archive from roundhouse-rb.dev/
+# and explode it into ./downloads/<target>/. Pure Ruby stdlib —
+# open-uri (follows redirects, handles HTTPS), Zlib::GzipReader,
+# Gem::Package::TarReader. No curl/wget/tar shell dep.
+
+def cmd_fetch(argv)
+  dest_root = File.join(ROUNDHOUSE_ROOT, 'downloads')
+  parser = OptionParser.new do |o|
+    o.banner = 'Usage: bin/rh fetch <target> [--out DIR]'
+    o.separator ''
+    o.separator "Download #{SITE_BASE}/browse/<target>.tgz and extract it."
+    o.separator "Default output: ./downloads/<target>/"
+    o.separator ''
+    o.separator "Targets: #{TARGETS.join(', ')}"
+    o.on('--out DIR', 'Output root (target name is appended)') { |v| dest_root = v }
+  end
+  parser.parse!(argv)
+
+  target = argv.shift
+  unless target
+    warn 'rh fetch: missing <target>'
+    warn parser.help
+    return 1
+  end
+  unless TARGETS.include?(target)
+    warn "rh fetch: unknown target '#{target}'"
+    warn "  valid: #{TARGETS.join(', ')}"
+    return 1
+  end
+
+  url = "#{SITE_BASE}/browse/#{target}.tgz"
+  dest = File.join(dest_root, target)
+  if File.exist?(dest)
+    warn "rh fetch: #{dest} already exists; remove it or pass --out elsewhere"
+    return 1
+  end
+
+  warn "rh fetch: downloading #{url}"
+  require 'open-uri'
+  require 'zlib'
+  require 'rubygems/package'
+
+  count = 0
+  begin
+    URI.open(url) do |io|
+      Zlib::GzipReader.wrap(io) do |gz|
+        Gem::Package::TarReader.new(gz) do |tar|
+          tar.each do |entry|
+            rel = entry.full_name.sub(%r{\A#{Regexp.escape(target)}/}, '')
+            next if rel.empty?
+            path = File.join(dest, rel)
+            if entry.directory?
+              FileUtils.mkdir_p(path)
+            elsif entry.file?
+              FileUtils.mkdir_p(File.dirname(path))
+              File.binwrite(path, entry.read)
+              count += 1
+            end
+          end
+        end
+      end
+    end
+  rescue OpenURI::HTTPError => e
+    warn "rh fetch: HTTP error: #{e.message}"
+    warn "  (was the archive ever published? check #{SITE_BASE}/browse/)"
+    return 1
+  rescue SocketError, Errno::ECONNREFUSED => e
+    warn "rh fetch: network error: #{e.message}"
+    return 1
+  end
+
+  puts "rh fetch: wrote #{count} files to #{dest}"
+  readme = File.join(dest, 'README.md')
+  puts "  next: see #{readme}" if File.exist?(readme)
+  0
+end
+
+# ---------------------------------------------------------------------
+# Subcommand: fixture
+#
+# Wrap scripts/create-blog — the bash script that runs `rails new` +
+# `rails generate scaffold` to produce a canonical Rails source app.
+# Required by transpile/site as the input application.
+
+def cmd_fixture(argv)
+  force = false
+  rails_req = nil
+  parser = OptionParser.new do |o|
+    o.banner = 'Usage: bin/rh fixture [path]'
+    o.separator ''
+    o.separator 'Generate a Rails source fixture (wraps scripts/create-blog).'
+    o.separator 'Default path: fixtures/real-blog'
+    o.separator ''
+    o.on('-f', '--force', 'Remove path first if it exists') { force = true }
+    o.on('--rails REQ', 'Pin the Rails version (e.g. "~> 8.0.0") for a',
+         'sibling fixture. Installs a matching rails gem if absent.') { |v| rails_req = v }
+  end
+  parser.parse!(argv)
+  path = argv.shift || 'fixtures/real-blog'
+
+  # `--rails REQ` pins the generator version (for an older-Rails sibling
+  # fixture, e.g. the JRuby baseline on Rails 8.0). Resolve REQ to a
+  # concrete installed version, installing one if none matches, and hand
+  # it to create-blog via RAILS_NEW_VERSION.
+  rails_env = {}
+  if rails_req
+    ver = resolve_rails_version(rails_req)
+    unless ver
+      warn "rh fixture: no installed Rails matches '#{rails_req}' — installing"
+      return 1 unless system('gem', 'install', 'rails', '-v', rails_req, '--no-document')
+      ver = resolve_rails_version(rails_req)
+    end
+    unless ver
+      warn "rh fixture: could not resolve a Rails version for '#{rails_req}'"
+      return 1
+    end
+    rails_env['RAILS_NEW_VERSION'] = ver
+  elsif version_of(probe('rails', '--version')).nil?
+    warn 'rh fixture: Rails gem not installed.'
+    warn '  Install: gem install rails'
+    warn '  (or run `bin/rh doctor` to see all prerequisites)'
+    return 1
+  end
+
+  if File.exist?(path)
+    if force
+      warn "rh fixture: removing existing #{path}"
+      FileUtils.rm_rf(path)
+    else
+      warn "rh fixture: #{path} already exists; pass -f to overwrite"
+      return 1
+    end
+  end
+
+  script = File.join(ROUNDHOUSE_ROOT, 'scripts', 'create-blog')
+  unless File.executable?(script)
+    warn "rh fixture: #{script} missing or not executable"
+    return 1
+  end
+
+  # `rails new <path>` creates parent dirs as needed, and create-blog
+  # does `cd "$APP_NAME"` so subsequent rails-generate steps run in
+  # the new app dir. Pass `path` straight through; `rails_env` carries
+  # RAILS_NEW_VERSION when `--rails` pinned the generator.
+  ok = system(rails_env, script, path)
+  return 1 unless ok
+
+  # Match the legacy `make real-blog` post-create steps: ensure gems
+  # are present, then migrate + seed the development DB so the
+  # transpiled-blog seed copy carries real content.
+  Dir.chdir(path) do
+    return 1 unless system('bundle', 'install', '--quiet')
+    return 1 unless system('bin/rails', 'db:prepare')
+  end
+  0
+end
+
+# ---------------------------------------------------------------------
+# Subcommand: transpile
+#
+# `cargo run --release --bin roundhouse -- --target <t> -o <out>
+# <fixture>` produces a runnable tree for <t>. Some targets need a
+# post-build step:
+#   - ruby:    seed the demo SQLite DB from real-blog's Rails-populated
+#              storage/development.sqlite3 (binary; can't ride along
+#              with the text-only emit).
+#   - crystal: build Tailwind CSS + stage turbo.min.js (see below).
+# (spinel needs none — its transport rides the auto-linked sp_net.)
+
+def cmd_transpile(argv)
+  OptionParser.new do |o|
+    o.banner = 'Usage: bin/rh transpile <target>'
+    o.separator ''
+    o.separator "Transpile fixtures/real-blog → build/transpiled-blog-<target>/."
+    o.separator ''
+    o.separator "Targets: #{TARGETS.join(', ')}"
+  end.parse!(argv)
+
+  target = argv.shift
+  unless target
+    warn 'rh transpile: missing <target>'
+    return 1
+  end
+  validate_target!(target)
+  need_fixture!
+  need_cargo!
+
+  out = build_dir(target)
+  FileUtils.rm_rf(out)
+  FileUtils.mkdir_p(File.dirname(out))
+
+  ok = system(
+    'cargo', 'run', '--release', '--quiet', '--bin', 'roundhouse', '--',
+    '--target', target, '-o', out, fixture_path
+  )
+  return 1 unless ok
+
+  case target
+  when 'ruby', 'jruby' then post_transpile_ruby(out)
+  when 'crystal'    then post_transpile_crystal(out)
+  when 'rust'       then post_transpile_rust(out)
+  when 'typescript' then post_transpile_typescript(out)
+  end
+  0
+end
+
+# Ruby target's post-build: seed the demo DB. main.rb's Schema.load!
+# is idempotent (CREATE TABLE IF NOT EXISTS), so the seed just gives
+# the app three articles + comments out of the box. `bin/rh clean
+# ruby` resets to seeded state.
+def post_transpile_ruby(out)
+  seed = File.join(fixture_path, 'storage', 'development.sqlite3')
+  return unless File.exist?(seed)
+  storage = File.join(out, 'storage')
+  FileUtils.mkdir_p(storage)
+  FileUtils.cp(seed, File.join(storage, 'development.sqlite3'))
+end
+
+# The spinel target needs no post-transpile step: the HTTP/WebSocket
+# transport rides spinel's built-in, auto-linked `sp_net` (matz/spinel#1466),
+# so there's no vendored C extension to compile or `@TEP_SPHTTP_O@` to
+# substitute — `make build` AOT-compiles the tree straight to a binary.
+
+# Crystal target's post-build: build Tailwind CSS and stage turbo.min.js
+# into static/assets/, mirroring what the Ruby target's Rakefile does
+# (compile via `npx @tailwindcss/cli`, copy turbo.min.js from the
+# turbo-rails gem dir). The Crystal runtime's HTTP server serves
+# `/assets/*` from `static/assets/` — see runtime/crystal/server.cr.
+#
+# Content glob for Tailwind is the transpiled `.cr` tree under
+# build/transpiled-blog-crystal/src/ — the same place HTML strings get
+# built into. `app/assets/tailwind.css` is a one-line `@import
+# "tailwindcss";` (same shape as the ruby scaffold's).
+def post_transpile_crystal(out)
+  build_assets(
+    out,
+    label: 'crystal',
+    content_globs: ['src/**/*.cr'],
+  )
+end
+
+# Rust target's post-build: same shape as crystal — emit Tailwind input,
+# compile via npx, copy turbo.min.js. The rust runtime serves
+# `static/assets/` via tower-http's ServeDir mounted on /assets/ in
+# runtime/rust/server.rs.
+def post_transpile_rust(out)
+  build_assets(
+    out,
+    label: 'rust',
+    content_globs: ['src/**/*.rs'],
+  )
+end
+
+# TypeScript target's post-build: same shape as crystal/rust. The TS
+# runtime serves `static/assets/` via an inline static-file handler
+# at the top of handleRequest (runtime/typescript/server.ts +
+# server-libsql.ts). Content glob scans the emitted `app/**/*.ts`
+# tree where view-rendering HTML strings live.
+def post_transpile_typescript(out)
+  build_assets(
+    out,
+    label: 'typescript',
+    content_globs: ['app/**/*.ts'],
+  )
+end
+
+# Shared asset-build helper. Emits app/assets/tailwind.css, compiles
+# Tailwind via npx, and copies turbo.min.js from the turbo-rails gem.
+# Warn-but-don't-fail on missing prereqs (npx, turbo-rails) so a
+# user without the asset toolchain still gets a transpiled tree —
+# they'll see unstyled pages instead of a broken transpile.
+def build_assets(out, label:, content_globs:)
+  static_assets = File.join(out, 'static', 'assets')
+  FileUtils.mkdir_p(static_assets)
+  app_assets = File.join(out, 'app', 'assets')
+  FileUtils.mkdir_p(app_assets)
+
+  tailwind_input = File.join(app_assets, 'tailwind.css')
+  File.write(tailwind_input, "@import \"tailwindcss\";\n")
+
+  # Tailwind v4 resolves `tailwindcss` from node_modules/ of the cwd,
+  # so install it locally (--no-save: don't add to a package.json).
+  # `.installed` stamp file means a re-transpile skips this step.
+  stamp = File.join(out, 'node_modules', '.installed')
+  unless File.exist?(stamp)
+    warn "rh transpile #{label}: installing tailwindcss (one-time, ~5s)"
+    unless system('npm', 'install', '--silent', '--no-save',
+                  'tailwindcss', '@tailwindcss/cli',
+                  chdir: out, out: File::NULL)
+      warn "rh transpile #{label}: npm install failed (Node/npm required); skipping assets"
+      return
+    end
+    FileUtils.mkdir_p(File.dirname(stamp))
+    FileUtils.touch(stamp)
+  end
+
+  tailwind_output = File.join(static_assets, 'tailwind.css')
+  npx_args = ['npx', '@tailwindcss/cli',
+              '--input', tailwind_input,
+              '--output', tailwind_output,
+              '--minify']
+  content_globs.each do |g|
+    npx_args << '--content' << File.join(out, g)
+  end
+
+  warn "rh transpile #{label}: building tailwind.css"
+  unless system(*npx_args, chdir: out, out: File::NULL)
+    warn "rh transpile #{label}: tailwind build failed; skipping assets"
+    return
+  end
+
+  # turbo.min.js — same resolution as the Ruby scaffold's Rakefile:
+  # ask Bundler-managed Ruby for the turbo-rails gem's dir, then copy
+  # the bundled minified file. Requires the fixture to have been
+  # bundled (bin/rh fixture does `bundle install`).
+  gem_dir = `cd #{fixture_path.shellescape} && bundle exec ruby -e 'puts Gem::Specification.find_by_name(%q(turbo-rails)).gem_dir' 2>/dev/null`.strip
+  if gem_dir.empty? || !File.directory?(gem_dir)
+    warn "rh transpile #{label}: turbo-rails gem not found; skipping turbo.min.js (cable client will fail to load in browser)"
+    return
+  end
+  turbo_src = File.join(gem_dir, 'app', 'assets', 'javascripts', 'turbo.min.js')
+  unless File.file?(turbo_src)
+    warn "rh transpile #{label}: #{turbo_src} missing; skipping turbo.min.js"
+    return
+  end
+  FileUtils.cp(turbo_src, File.join(static_assets, 'turbo.min.js'))
+end
+
+# ---------------------------------------------------------------------
+# Subcommand: dev / test / run
+#
+# Transpile-and-act. The emitted tree's inner Makefile / Rakefile owns
+# the action — bin/rh just cds in. Currently wired for the ruby target
+# (rake-driven); other targets either don't have a dev/test action yet
+# (spinel-AOT is build, not dev) or use their native runner directly
+# (cd build/transpiled-blog-rust && cargo run).
+
+def cmd_dev_test_run(argv, action)
+  OptionParser.new do |o|
+    o.banner = "Usage: bin/rh #{action} <target>"
+    o.separator ''
+    o.separator "Transpile <target>, then run `#{action}` in the emitted tree."
+    o.separator 'Currently wired for ruby; other targets use their native runner.'
+  end.parse!(argv)
+
+  target = argv.shift
+  unless target
+    warn "rh #{action}: missing <target>"
+    return 1
+  end
+  validate_target!(target)
+
+  rc = cmd_transpile([target])
+  return rc if rc != 0
+
+  out = build_dir(target)
+  case target
+  when 'ruby'
+    Dir.chdir(out) { system('rake', action) ? 0 : 1 }
+  else
+    warn "rh #{action}: target '#{target}' has no #{action} action yet."
+    warn "  emitted dir: #{out}"
+    warn "  see #{out}/README.md for the native command"
+    1
+  end
+end
+
+# ---------------------------------------------------------------------
+# Subcommand: clean
+
+def cmd_clean(argv)
+  OptionParser.new do |o|
+    o.banner = 'Usage: bin/rh clean <target | fixture>'
+    o.separator ''
+    o.separator "Remove build/transpiled-blog-<target>/, or fixtures/real-blog/ for `fixture`."
+    o.separator ''
+    o.separator "Targets: #{TARGETS.join(', ')}, fixture"
+  end.parse!(argv)
+
+  what = argv.shift
+  unless what
+    warn 'rh clean: missing <target | fixture>'
+    return 1
+  end
+
+  case what
+  when 'fixture'
+    if File.exist?(fixture_path)
+      FileUtils.rm_rf(fixture_path)
+      puts "rh clean: removed #{fixture_path}"
+    else
+      puts 'rh clean: fixture already absent'
+    end
+    0
+  else
+    validate_target!(what)
+    dir = build_dir(what)
+    if File.exist?(dir)
+      FileUtils.rm_rf(dir)
+      puts "rh clean: removed #{dir}"
+    else
+      puts "rh clean: #{dir} already absent"
+    end
+    0
+  end
+end
+
+# ---------------------------------------------------------------------
+# Subcommand: compare — delegate to scripts/compare with passthrough.
+
+def cmd_compare(argv)
+  script = File.join(ROUNDHOUSE_ROOT, 'scripts', 'compare')
+  unless File.executable?(script)
+    warn "rh compare: #{script} missing or not executable"
+    return 1
+  end
+  # Default target is typescript (matching the legacy `make compare`
+  # rule). With any args (including `--help`), pass through verbatim
+  # — scripts/compare has its own argument parser.
+  args = argv.empty? ? ['typescript'] : argv
+  exec(script, *args)
+end
+
+# ---------------------------------------------------------------------
+# Subcommand: bench — delegate to scripts/bench with passthrough.
+
+def cmd_bench(argv)
+  script = File.join(ROUNDHOUSE_ROOT, 'scripts', 'bench')
+  unless File.executable?(script)
+    warn "rh bench: #{script} missing or not executable"
+    return 1
+  end
+  exec(script, *argv)
+end
+
+# ---------------------------------------------------------------------
+# Subcommand: site — build the multi-target Pages site.
+
+def cmd_site(argv)
+  out = File.join(ROUNDHOUSE_ROOT, '_site')
+  OptionParser.new do |o|
+    o.banner = 'Usage: bin/rh site [--out DIR]'
+    o.separator ''
+    o.separator 'Build the multi-target archive site (all targets + landing-page assets).'
+    o.on('--out DIR', 'Output directory (default: _site)') { |v| out = v }
+  end.parse!(argv)
+  need_fixture!
+  need_cargo!
+  system(
+    'cargo', 'run', '--release', '--quiet', '--bin', 'roundhouse', '--',
+    '--site', '-o', out, fixture_path
+  ) ? 0 : 1
+end
+
+exit main(ARGV) if $PROGRAM_NAME == __FILE__

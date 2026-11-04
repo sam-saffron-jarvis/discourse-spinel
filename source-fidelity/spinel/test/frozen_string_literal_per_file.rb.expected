@@ -1,0 +1,5 @@
+true
+true
+true
+can't modify frozen String: "helper buf"
+can't modify frozen String: "plain"

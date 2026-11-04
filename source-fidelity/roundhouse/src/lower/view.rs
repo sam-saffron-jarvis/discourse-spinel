@@ -1,0 +1,1730 @@
+//! View-helper classifier.
+//!
+//! Shared recognition of the Rails view helpers that appear in
+//! ERB templates: `csrf_meta_tags` / `content_for` / `link_to` /
+//! `dom_id` / `stylesheet_link_tag` / etc. Every target emitter
+//! consumes this — the method name + arity match happens once, in
+//! one place, and each target writes a render-dispatch over
+//! `ViewHelperKind` with its own string-formatting conventions.
+//!
+//! Scope: only the bare `Send { recv: None, block: None }` shapes
+//! that appear inside `<%= ... %>` tags. Yield (`ExprNode::Yield`)
+//! and `content_for || "default"` (`ExprNode::BoolOp`) are
+//! different ExprNode variants and handled directly by each
+//! emitter — classifying them through here would widen the API for
+//! no shared logic.
+//!
+//! FormBuilder method calls (`form.label :title`) get a sibling
+//! classifier (`classify_form_builder_method`) since they have a
+//! different structural shape (recv is the form local).
+//!
+//! URL arguments that appear in the second position of `link_to`,
+//! `button_to`, and `form_with`'s `model:` get
+//! `classify_view_url_arg`. The classifier is identical across
+//! targets; emission differs.
+
+use crate::expr::{Expr, ExprNode, Literal};
+
+/// Numeric and formatted counts keep their label, not `count.to_i`:
+/// a delimited count must keep its commas. Ground ERB and app helpers
+/// to the String entry point before expression types are available.
+/// Rails' nil/false fallback remains outside this numeric/String seam;
+/// do not synthesize Ruby `||` into targets with different truthiness.
+pub(crate) fn pluralize_helper_call(count: Expr, word: Expr) -> Expr {
+    let span = count.span;
+    let mut label = Expr::new(span, ExprNode::Send {
+        recv: Some(count),
+        method: crate::ident::Symbol::from("to_s"),
+        args: vec![],
+        block: None,
+        parenthesized: false,
+    });
+    label.ty = Some(crate::ty::Ty::Str);
+    let mut call = Expr::new(span, ExprNode::Send {
+        recv: Some(Expr::new(span, ExprNode::Const {
+            path: vec![crate::ident::Symbol::from("Inflector")],
+        })),
+        method: crate::ident::Symbol::from("pluralize_formatted"),
+        args: vec![label, word],
+        block: None,
+        parenthesized: true,
+    });
+    call.ty = Some(crate::ty::Ty::Str);
+    call
+}
+
+/// A recognized Rails view helper, keyed by Ruby method name. The
+/// variant names mirror the surface method (snake_case),
+/// regardless of target naming conventions. Each variant carries
+/// the positional arg Exprs + optional opts hash as the raw IR —
+/// emitters pull out the bits they need.
+#[derive(Debug)]
+pub enum ViewHelperKind<'a> {
+    /// `<%= csrf_meta_tags %>` (or Rails' alias `csrf_meta_tag`) — no
+    /// args.
+    CsrfMetaTags,
+    /// `<%= csp_meta_tag %>` — no args.
+    CspMetaTag,
+    /// `<%= javascript_importmap_tags %>`, or with an explicit entry
+    /// point (`javascript_importmap_tags "user"` — lobsters' layout).
+    JavascriptImportmapTags { entry: Option<&'a Expr> },
+    /// `<%= turbo_stream_from "channel" %>` and the multi-streamable
+    /// form campfire writes (`turbo_stream_from room, :messages`). The
+    /// stream NAME is spelled by `lower::broadcasts::stream_name`,
+    /// which the model-side `broadcast_*_to` lowering shares — the two
+    /// sides must agree or the message goes nowhere.
+    TurboStreamFrom { streamables: &'a [Expr] },
+    /// `<%= dom_id(record [, prefix]) %>`.
+    DomId { record: &'a Expr, prefix: Option<&'a Expr> },
+    /// `render_attrs(hash)` — the attribute-hash helper the HAML and Slim
+    /// compilers emit for dynamic attributes (never written in ERB).
+    RenderAttrs { attrs: &'a Expr },
+    /// `haml_class(static, value)` — the HAML compiler's shortcut-class
+    /// merge helper (`.g{ class: k }`, see `src/haml.rs`'s `element`):
+    /// `static_classes` is the folded `.class` shortcuts, `value` the
+    /// hash `class:`'s own (scalar) value.
+    HamlClass { static_classes: &'a Expr, value: &'a Expr },
+    /// `<%= pluralize(count, "word") %>`.
+    Pluralize { count: &'a Expr, word: &'a Expr },
+    /// `<%= truncate(text [, opts]) %>`.
+    Truncate { text: &'a Expr, opts: Option<&'a Expr> },
+    /// `<%= word_wrap(text [, opts]) %>` — returns ordinary text, so
+    /// the lowering must escape the result before appending it.
+    WordWrap { text: &'a Expr, opts: Option<&'a Expr> },
+    /// `<%= stylesheet_link_tag :name [, opts] %>`.
+    StylesheetLinkTag { name: &'a Expr, opts: Option<&'a Expr> },
+    /// `<%= content_for(:slot) %>` (getter, no body).
+    ContentForGetter { slot: &'a str },
+    /// `<% content_for :slot, "body" %>` (statement-form setter).
+    ContentForSetter { slot: &'a str, body: &'a Expr },
+    /// `<%= link_to text, url [, opts] %>`.
+    LinkTo { text: &'a Expr, url: &'a Expr, opts: Option<&'a Expr> },
+    /// `<%= link_to_if cond, text, url [, opts] %>` — the link when the
+    /// condition holds, the escaped text alone otherwise.
+    LinkToIf { cond: &'a Expr, text: &'a Expr, url: &'a Expr, opts: Option<&'a Expr> },
+    /// `<%= button_to text, target [, opts] %>`.
+    ButtonTo { text: &'a Expr, target: &'a Expr, opts: Option<&'a Expr> },
+}
+
+/// A recognized `render ...` call inside an ERB view body. Each
+/// variant captures the IR shape; emitters pick naming, iteration
+/// syntax, and decide whether a Var/Ivar name resolves to a known
+/// renderable (via `ctx.is_local`, `known_models`, etc.) at
+/// emission time.
+#[derive(Debug)]
+pub enum RenderPartial<'a> {
+    /// `render @posts` / `render posts` — iterate a named
+    /// collection, calling a partial per element. `name` is the
+    /// collection's surface name (used by emitters to derive the
+    /// partial-fn name and any foreign-key/class lookups).
+    ///
+    /// `locals` is the trailing hash of `render @posts, flag: false`,
+    /// which Rails passes to every element render as its locals, as an
+    /// explicit `locals:` does for [`Self::CollectionNamed`]. The same
+    /// holds for [`Self::Record`], [`Self::Association`] and
+    /// [`Self::TypedCollection`].
+    Collection { collection: &'a Expr, name: &'a str, locals: Option<&'a [(Expr, Expr)]> },
+    /// `render @post` — render ONE record's partial. Rails picks
+    /// between this and [`Self::Collection`] at runtime, on whether the
+    /// argument answers `to_ary`; statically the discriminator is the
+    /// NAME's number, which is the same rule this lowering's ivar typer
+    /// (`view_to_library::ivar_ty`) already uses to decide `Array[T]`
+    /// vs `T` for the very same ivar.
+    ///
+    /// `name` is the record local's surface name; the partial is its
+    /// PLURAL directory plus its own singular (`@post` →
+    /// `Views::Posts.post(post)`), mirroring Rails'
+    /// `to_partial_path`. A record ivar not named after its model
+    /// (`@edit_user` → `Views::EditUsers.edit_user`) resolves to the
+    /// name's plural, the same convention every other name-directed
+    /// consumer in this lowering follows.
+    Record { record: &'a Expr, name: &'a str, locals: Option<&'a [(Expr, Expr)]> },
+    /// `render @post.comments` — iterate an association method on
+    /// a receiver Var/Ivar, calling a partial per element.
+    Association { receiver: &'a Expr, method: &'a str, locals: Option<&'a [(Expr, Expr)]> },
+    /// `render @author.posts.order(:title)` — any other call the
+    /// analyzer typed as a collection of a class. No name in the
+    /// expression says which partial it renders (`order` is not a
+    /// model), so `partial` is the element class's `to_partial_path`
+    /// (`posts/post`), as Rails picks it per record.
+    TypedCollection { collection: &'a Expr, partial: String, locals: Option<&'a [(Expr, Expr)]> },
+    /// `render "posts/post", post: @post` — call a named partial
+    /// with the first hash entry's value as its argument. When the
+    /// kwarg form carries an explicit `locals:` hash (`render partial:
+    /// "stories/listdetail", locals: { story: @story, single_story:
+    /// true }`), its entries ride in `locals` so the emitter can bind
+    /// the record by name and thread the remaining locals into the
+    /// partial's extra params; targets without that support ignore it
+    /// (the historical drop-extra-entries quirk).
+    Named {
+        partial: &'a str,
+        arg: Option<&'a Expr>,
+        locals: Option<&'a [(Expr, Expr)]>,
+    },
+    /// `render partial: "stories/listdetail", collection: stories, as:
+    /// :story` — the explicit-kwarg collection form: iterate `collection`,
+    /// calling the explicitly-named partial per element with the element
+    /// bound to the `as:` local (`as_name`; when absent the emitter
+    /// derives it from the partial's base name). Distinct from
+    /// `Collection` (bare `render coll`), which derives the partial name
+    /// from the collection's singular.
+    CollectionNamed {
+        collection: &'a Expr,
+        partial: &'a str,
+        as_name: Option<&'a str>,
+        /// An explicit `locals:` hash rides along: Rails passes it to
+        /// EVERY element render alongside the element itself
+        /// (`render partial: "rooms/opens/user", collection: users,
+        /// locals: { room: room }`), so the partial's non-record params
+        /// have to be bound per iteration like any named render's.
+        locals: Option<&'a [(Expr, Expr)]>,
+        /// `cached: true` — Rails' collection cache. The concatenated
+        /// partials are stored under one key (each element's
+        /// `cache_key_with_version`) so a warm campfire room page is
+        /// one `read_str`, not 40 fragment lookups.
+        cached: bool,
+        /// `cached: ->(item) { key }` — Rails' collection cache with a
+        /// callable key: each element's fragment is stored under the
+        /// key the lambda answers, and the collection is preloaded
+        /// first because the key may read associations (campfire's
+        /// `message_fragment_cache_key`). Any other non-true value (a
+        /// `{ key:, expires_in: }` hash) is not modeled and renders
+        /// uncached.
+        cached_key: Option<&'a Expr>,
+    },
+    /// `render partial: @above` — the partial NAME is a runtime value
+    /// (an ivar/local), not a literal, so it can't be resolved to one
+    /// `Views::X.method` statically. `name` is the scrutinee expression
+    /// (the Var/Ivar) and `ivar` its bare name; the emitter turns this
+    /// into a `case`-dispatch over the pool of name-string literals that
+    /// controllers assign to `@<ivar>` (see `dynamic_partial_pools`),
+    /// each arm calling the resolved partial with its threaded closure.
+    DynamicNamed { name: &'a Expr, ivar: &'a str },
+    /// `render layout: "rooms/layouts/new"[, locals: { … }] do … end` —
+    /// the block's rendered markup becomes the layout partial's `yield`.
+    ///
+    /// Rails' layout partials are ordinary partials that `yield`, and the
+    /// lowering already models that: a `_new.html.erb` under `layouts/`
+    /// takes its body as the dir-convention record arg (`def
+    /// self._new(layout, …)`) and `<%= yield %>` reads it. The only
+    /// missing half was the CALL — this variant is it. `block` is the
+    /// attached lambda; the emitter walks its body into a capture local
+    /// and passes that as the record.
+    LayoutBlock {
+        layout: &'a str,
+        locals: Option<&'a [(Expr, Expr)]>,
+        block: &'a Expr,
+    },
+    /// `render template: "stories/show"` — a full ACTION VIEW rendered
+    /// from another view (lobsters' new-story page previews the story).
+    /// Resolves through the same `(module, stem)` key space as
+    /// partials; the call passes the target's closure params only (an
+    /// action view has no record arg), which the render-graph fold
+    /// threads into the caller like any other edge.
+    Template { name: &'a str },
+}
+
+/// Recognize a `render ...` call inside an ERB view body. Returns
+/// `None` when the shape doesn't match any supported form, when
+/// there's a receiver, or when a one-arg Var/Ivar doesn't name a
+/// view-scope local (`is_local`).
+///
+/// A block is accepted for exactly ONE shape — `render layout: "…" do …
+/// end` (`LayoutBlock`), where the block IS the render's content. Every
+/// other block-form render still returns `None`: the block would be a
+/// Rails feature nothing here models, and saying so beats guessing.
+pub fn classify_render_partial<'a>(
+    recv: Option<&'a Expr>,
+    method: &str,
+    args: &'a [Expr],
+    block: Option<&'a Expr>,
+    is_local: &impl Fn(&str) -> bool,
+    is_options_ivar: &impl Fn(&str) -> bool,
+) -> Option<RenderPartial<'a>> {
+    if method != "render" || recv.is_some() {
+        return None;
+    }
+    if let Some(block) = block {
+        let [arg] = args else { return None };
+        let ExprNode::Hash { entries, .. } = &*arg.node else { return None };
+        return classify_render_layout(entries, block);
+    }
+    match args {
+        [arg] => match &*arg.node {
+            ExprNode::Var { name, .. } | ExprNode::Ivar { name }
+                if is_local(name.as_str()) =>
+            {
+                // A bare `render @x` is a COLLECTION render (`@articles.each
+                // { … }`) UNLESS controllers assign `@x` a partial-options
+                // value (`@above = {partial: "stories/subnav"}` or the bare
+                // string form) — then it's a dynamic partial whose name is
+                // only known at runtime, dispatched over the assigned pool.
+                if is_options_ivar(name.as_str()) {
+                    Some(RenderPartial::DynamicNamed {
+                        name: arg,
+                        ivar: name.as_str(),
+                    })
+                } else if crate::naming::singularize(name.as_str()) == name.as_str() {
+                    // A SINGULAR name renders one record. Rails decides
+                    // this at runtime (`to_ary`); the name is what a
+                    // static lowering has, and it is the same fact
+                    // `ivar_ty` reads to type the ivar. Left as a
+                    // Collection the emit was not merely different but
+                    // BROKEN: `render @message` became
+                    // `message.each { … Views::Message.message(m) }` —
+                    // `each` on a record, into a module (singular
+                    // `Views::Message`) that no partial ever defines.
+                    Some(RenderPartial::Record {
+                        record: arg,
+                        name: name.as_str(),
+                        locals: None,
+                    })
+                } else {
+                    Some(RenderPartial::Collection {
+                        collection: arg,
+                        name: name.as_str(),
+                        locals: None,
+                    })
+                }
+            }
+            ExprNode::Send {
+                recv: Some(r),
+                method: m,
+                args: sub_args,
+                ..
+            } if sub_args.is_empty()
+                && matches!(&*r.node, ExprNode::Var { .. } | ExprNode::Ivar { .. }) =>
+            {
+                Some(RenderPartial::Association {
+                    receiver: r,
+                    method: m.as_str(),
+                    locals: None,
+                })
+            }
+            // `render "layouts/lightbox"` — a named partial with NO
+            // locals. In a view a bare string is always a partial (the
+            // template form is controller-side, and no controller calls
+            // this classifier). The two-argument spelling below is the
+            // same shape WITH locals; only the hash-less one was missing,
+            // because both fixtures write `render "form", article: @a`.
+            //
+            // Unclassified it fell through to the generic helper
+            // rewriter, which bound the bare `render` to whatever app
+            // module happened to define a method by that name —
+            // campfire's layout emitted
+            // `Messages::AttachmentPresentation.render("layouts/lightbox")`.
+            ExprNode::Lit { value: Literal::Str { value } } => Some(RenderPartial::Named {
+                partial: value,
+                arg: None,
+                locals: None,
+            }),
+            // Explicit kwarg form: `render partial: "x/y", collection: c,
+            // as: :item` / `render partial: "x/y", item: rec`.
+            ExprNode::Hash { entries, .. } => classify_render_kwargs(entries),
+            // `render @author.posts.order(:title)`, `render
+            // @author.posts.published.limit(2)` — a chain longer than the
+            // one hop `Association` reads, or a call with arguments. Left
+            // unclassified, the bare `render` reached the emit and called
+            // a method no view module has. Only the analyzed type knows
+            // the records' class here.
+            ExprNode::Send { .. } => {
+                let Some(crate::ty::Ty::Class { id, .. }) =
+                    arg.ty.as_ref().and_then(|ty| ty.collection_elem())
+                else {
+                    return None;
+                };
+                Some(RenderPartial::TypedCollection {
+                    collection: arg,
+                    partial: model_partial_path(id.0.as_str()),
+                    locals: None,
+                })
+            }
+            _ => None,
+        },
+        [a, b] => {
+            let ExprNode::Hash { entries, .. } = &*b.node else {
+                return None;
+            };
+            let ExprNode::Lit { value: Literal::Str { value: partial } } = &*a.node else {
+                return classify_object_render_locals(a, entries, is_local, is_options_ivar);
+            };
+            // Shorthand locals (`render "comments/comment", :comment =>
+            // c, :show_story => true`): Rails treats the whole hash as
+            // locals, so it rides in `locals` for by-name binding —
+            // record via the singular-of-dir convention, the rest at
+            // their trailing extra-param positions. Dropping the
+            // non-first entries lost /comments' show_story and /s's
+            // show_tree_lines. `arg` stays for emitters that only
+            // consume the first-entry convention.
+            let arg = entries.first().map(|(_k, v)| v);
+            Some(RenderPartial::Named {
+                partial: partial.as_str(),
+                arg,
+                locals: Some(entries),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// `render @posts, flag: false` — for any first argument but a Hash,
+/// Rails renders it as `render partial: @posts, locals: { flag: false }`:
+/// the object's partial, once per element for a collection, with EVERY
+/// key of the hash a local (`as:` or `collection:` here are locals, not
+/// options). So the first argument classifies as it does alone, and the
+/// hash rides as its `locals`.
+///
+/// Only a literal hash with symbol keys is read. A `**opts` splat is a
+/// `merge` chain, not a Hash, and never gets here. An options ivar
+/// (`DynamicNamed`) stays unrecognized: Rails ignores the locals when
+/// its value is a Hash and uses them when it is a String, which a static
+/// lowering cannot tell apart.
+fn classify_object_render_locals<'a>(
+    object: &'a Expr,
+    entries: &'a [(Expr, Expr)],
+    is_local: &impl Fn(&str) -> bool,
+    is_options_ivar: &impl Fn(&str) -> bool,
+) -> Option<RenderPartial<'a>> {
+    if matches!(&*object.node, ExprNode::Hash { .. })
+        || !entries.iter().all(|(k, _)| matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { .. } }))
+    {
+        return None;
+    }
+    let locals = Some(entries);
+    match classify_render_partial(None, "render", std::slice::from_ref(object), None, is_local, is_options_ivar)? {
+        RenderPartial::Collection { collection, name, .. } => {
+            Some(RenderPartial::Collection { collection, name, locals })
+        }
+        RenderPartial::Record { record, name, .. } => Some(RenderPartial::Record { record, name, locals }),
+        RenderPartial::Association { receiver, method, .. } => {
+            Some(RenderPartial::Association { receiver, method, locals })
+        }
+        RenderPartial::TypedCollection { collection, partial, .. } => {
+            Some(RenderPartial::TypedCollection { collection, partial, locals })
+        }
+        _ => None,
+    }
+}
+
+/// A model's `to_partial_path`: its `model_name.collection` and its
+/// element, `Post` → `posts/post`, `Admin::Post` → `admin/posts/post`.
+fn model_partial_path(class_name: &str) -> String {
+    let segs: Vec<&str> = class_name.split("::").collect();
+    let (last, ns) = segs.split_last().expect("a class name");
+    let mut parts: Vec<String> = ns.iter().map(|s| crate::naming::snake_case(s)).collect();
+    parts.push(crate::naming::pluralize_snake(last));
+    parts.push(crate::naming::snake_case(last));
+    parts.join("/")
+}
+
+/// The formats a `render partial: "x", formats: [:xml, :html]` names, in
+/// order. Rails looks the partial up in exactly those formats for that
+/// render (`ActionView::Base#in_rendering_context`): they replace the
+/// lookup's (`LookupContext#with_prepended_formats`), so neither the
+/// rendering template's own format nor html follows them. A list with a
+/// runtime element is not one a static lowering can read.
+pub fn render_formats_option(args: &[Expr]) -> Option<Vec<&str>> {
+    let [arg] = args else { return None };
+    let ExprNode::Hash { entries, .. } = &*arg.node else { return None };
+    let (_, value) = entries.iter().find(|(k, _)| {
+        matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == "formats")
+    })?;
+    let elements = match &*value.node {
+        ExprNode::Array { elements, .. } => elements.as_slice(),
+        _ => std::slice::from_ref(value),
+    };
+    let formats = elements
+        .iter()
+        .map(|e| match &*e.node {
+            ExprNode::Lit { value: Literal::Sym { value } } => Some(value.as_str()),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    (!formats.is_empty()).then_some(formats)
+}
+
+/// `render layout: "<path>"[, locals: { … }] do … end` from its kwarg
+/// hash. A hash with no `layout:` key returns `None` — the block-form
+/// renders this lowering does not model stay unrecognized rather than
+/// being mistaken for the layout shape.
+fn classify_render_layout<'a>(
+    entries: &'a [(Expr, Expr)],
+    block: &'a Expr,
+) -> Option<RenderPartial<'a>> {
+    let mut layout: Option<&str> = None;
+    let mut locals: Option<&[(Expr, Expr)]> = None;
+    for (k, v) in entries {
+        let ExprNode::Lit { value: Literal::Sym { value: key } } = &*k.node else { continue };
+        match key.as_str() {
+            "layout" => {
+                let ExprNode::Lit { value: Literal::Str { value } } = &*v.node else {
+                    // A runtime layout name has no static partial to
+                    // resolve; unrecognized rather than guessed.
+                    return None;
+                };
+                layout = Some(value.as_str());
+            }
+            "locals" => {
+                if let ExprNode::Hash { entries: le, .. } = &*v.node {
+                    locals = Some(le);
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(RenderPartial::LayoutBlock { layout: layout?, locals, block })
+}
+
+/// Classify the explicit-kwarg render forms from the trailing kwarg
+/// hash: `render partial: "x/y", collection: c, as: :item`
+/// (→ `CollectionNamed`) or `render partial: "x/y", item: rec`
+/// (→ `Named`, with the first non-`partial` entry as the arg). A
+/// String-literal `partial:` gives `Named`/`CollectionNamed`; a bare
+/// ivar/local `partial:` (no `collection:`) gives `DynamicNamed` (pool
+/// dispatch); anything else returns `None`.
+fn classify_render_kwargs(entries: &[(Expr, Expr)]) -> Option<RenderPartial<'_>> {
+    let key_of = |k: &Expr| match &*k.node {
+        ExprNode::Lit { value: Literal::Sym { value } } => Some(value.as_str().to_string()),
+        _ => None,
+    };
+    let mut partial: Option<&str> = None;
+    let mut template: Option<&str> = None;
+    let mut dyn_partial: Option<(&Expr, &str)> = None;
+    let mut collection: Option<&Expr> = None;
+    let mut as_name: Option<&str> = None;
+    let mut first_local: Option<&Expr> = None;
+    let mut locals_entries: Option<&[(Expr, Expr)]> = None;
+    let mut cached = false;
+    let mut cached_key: Option<&Expr> = None;
+    for (k, v) in entries {
+        match key_of(k).as_deref() {
+            Some("partial") => match &*v.node {
+                ExprNode::Lit { value: Literal::Str { value } } => partial = Some(value.as_str()),
+                // `render partial: @above` / `render partial: some_local` —
+                // a runtime name. Captured for the DynamicNamed dispatch;
+                // resolved via the controller-assignment pool at emit time.
+                ExprNode::Var { name, .. } | ExprNode::Ivar { name } => {
+                    dyn_partial = Some((v, name.as_str()));
+                }
+                _ => return None,
+            },
+            Some("template") => {
+                if let ExprNode::Lit { value: Literal::Str { value } } = &*v.node {
+                    template = Some(value.as_str());
+                }
+            }
+            Some("collection") => collection = Some(v),
+            Some("as") => {
+                if let ExprNode::Lit { value: Literal::Sym { value } } = &*v.node {
+                    as_name = Some(value.as_str());
+                }
+            }
+            // Which formats the partial is looked up in, not a local
+            // (`render_formats_option`).
+            Some("formats") => {}
+            Some("cached") => match &*v.node {
+                ExprNode::Lit { value: Literal::Bool { value: true } } => cached = true,
+                ExprNode::Lambda { params, .. } if params.len() == 1 => cached_key = Some(v),
+                _ => {}
+            },
+            // An explicit `locals: {…}` hash — keep the entries so the
+            // emitter can bind record + extra locals by name.
+            Some("locals") => {
+                if let ExprNode::Hash { entries, .. } = &*v.node {
+                    locals_entries = Some(entries);
+                } else if first_local.is_none() {
+                    first_local = Some(v);
+                }
+            }
+            // A bare `name: rec` local — pass the value through as the
+            // single named-partial arg (Rails passes the record under its
+            // local name; positional binding handles it).
+            Some(_) => {
+                if first_local.is_none() {
+                    first_local = Some(v);
+                }
+            }
+            None => {}
+        }
+    }
+    let partial = match partial {
+        Some(p) => p,
+        None => {
+            // A full-template render (`render template: "stories/show"`).
+            if let Some(name) = template {
+                return Some(RenderPartial::Template { name });
+            }
+            // No literal partial name. A bare dynamic name (`render partial:
+            // @above`, no `collection:`) resolves via the pool dispatch; a
+            // dynamic collection form isn't modeled yet.
+            return match (dyn_partial, collection) {
+                (Some((name, ivar)), None) => Some(RenderPartial::DynamicNamed { name, ivar }),
+                _ => None,
+            };
+        }
+    };
+    if let Some(collection) = collection {
+        Some(RenderPartial::CollectionNamed {
+            collection,
+            partial,
+            as_name,
+            locals: locals_entries,
+            cached,
+            cached_key,
+        })
+    } else {
+        Some(RenderPartial::Named {
+            partial,
+            arg: first_local,
+            locals: locals_entries,
+        })
+    }
+}
+
+/// Recognize a bare `Send { recv: None, args, block: None }` as
+/// a Rails view helper. Returns `None` for unrecognized method
+/// names or arities that don't match any variant.
+/// One recognized `turbo_stream.<action>(...)` call in a
+/// `.turbo_stream.erb` template.
+pub struct TurboStreamCall<'a> {
+    /// `append`, `remove`, … — the `<turbo-stream action="…">` value.
+    pub action: &'a str,
+    /// What the action targets. A record here means "its dom_id".
+    pub target: &'a Expr,
+    /// The fragment's content. `None` for `remove`, which carries no
+    /// `<template>`.
+    pub content: Option<&'a Expr>,
+}
+
+/// Classify `turbo_stream.<action>(target[, content])`.
+///
+/// Unlike `classify_view_helper` this needs the RECEIVER: `turbo_stream`
+/// is a builder object, not a bare helper. Only the two positional
+/// spellings are recognized; the `partial:`/`collection:`/`locals:`
+/// option form and the block form are left alone (they need the partial
+/// machinery a `render` call site gets, and no fixture drives them yet).
+pub fn classify_turbo_stream_call<'a>(
+    recv: Option<&'a Expr>,
+    method: &'a str,
+    args: &'a [Expr],
+) -> Option<TurboStreamCall<'a>> {
+    let recv = recv?;
+    let is_builder = match &*recv.node {
+        ExprNode::Send { recv: None, method: m, args, block: None, .. } => {
+            m.as_str() == "turbo_stream" && args.is_empty()
+        }
+        ExprNode::Var { name, .. } => name.as_str() == "turbo_stream",
+        _ => false,
+    };
+    if !is_builder {
+        return None;
+    }
+    if !matches!(
+        method,
+        "append" | "prepend" | "replace" | "update" | "remove" | "before" | "after"
+    ) {
+        return None;
+    }
+    match args {
+        // `turbo_stream.remove @message` — target only, no template.
+        [target] if method == "remove" => Some(TurboStreamCall {
+            action: "remove",
+            target,
+            content: None,
+        }),
+        // `turbo_stream.append dom_id(...), @message`. A Hash second
+        // argument is the option form (`partial:`/`collection:`), which
+        // this doesn't handle.
+        [target, content] if !matches!(&*content.node, ExprNode::Hash { .. }) => {
+            Some(TurboStreamCall { action: method, target, content: Some(content) })
+        }
+        _ => None,
+    }
+}
+
+pub fn classify_view_helper<'a>(
+    method: &str,
+    args: &'a [Expr],
+) -> Option<ViewHelperKind<'a>> {
+    match (method, args.len()) {
+        ("csrf_meta_tags" | "csrf_meta_tag", 0) => Some(ViewHelperKind::CsrfMetaTags),
+        ("csp_meta_tag", 0) => Some(ViewHelperKind::CspMetaTag),
+        ("javascript_importmap_tags", 0) => {
+            Some(ViewHelperKind::JavascriptImportmapTags { entry: None })
+        }
+        ("javascript_importmap_tags", 1) => {
+            Some(ViewHelperKind::JavascriptImportmapTags { entry: Some(&args[0]) })
+        }
+        ("turbo_stream_from", n) if n >= 1 => {
+            Some(ViewHelperKind::TurboStreamFrom { streamables: args })
+        }
+        ("render_attrs", 1) => Some(ViewHelperKind::RenderAttrs { attrs: &args[0] }),
+        ("haml_class", 2) => Some(ViewHelperKind::HamlClass {
+            static_classes: &args[0],
+            value: &args[1],
+        }),
+        ("dom_id", 1) => Some(ViewHelperKind::DomId {
+            record: &args[0],
+            prefix: None,
+        }),
+        ("dom_id", 2) => Some(ViewHelperKind::DomId {
+            record: &args[0],
+            prefix: Some(&args[1]),
+        }),
+        ("pluralize", 2) => Some(ViewHelperKind::Pluralize {
+            count: &args[0],
+            word: &args[1],
+        }),
+        ("truncate", 1) => Some(ViewHelperKind::Truncate {
+            text: &args[0],
+            opts: None,
+        }),
+        ("truncate", 2) => Some(ViewHelperKind::Truncate {
+            text: &args[0],
+            opts: Some(&args[1]),
+        }),
+        ("word_wrap", 1) => Some(ViewHelperKind::WordWrap {
+            text: &args[0],
+            opts: None,
+        }),
+        ("word_wrap", 2) => Some(ViewHelperKind::WordWrap {
+            text: &args[0],
+            opts: Some(&args[1]),
+        }),
+        ("stylesheet_link_tag", 1) => Some(ViewHelperKind::StylesheetLinkTag {
+            name: &args[0],
+            opts: None,
+        }),
+        ("stylesheet_link_tag", 2) => Some(ViewHelperKind::StylesheetLinkTag {
+            name: &args[0],
+            opts: Some(&args[1]),
+        }),
+        ("content_for", 1) => {
+            let slot = extract_sym_or_str(&args[0])?;
+            Some(ViewHelperKind::ContentForGetter { slot })
+        }
+        ("content_for", 2) => {
+            let slot = extract_sym_or_str(&args[0])?;
+            Some(ViewHelperKind::ContentForSetter {
+                slot,
+                body: &args[1],
+            })
+        }
+        ("link_to", 2) => Some(ViewHelperKind::LinkTo {
+            text: &args[0],
+            url: &args[1],
+            opts: None,
+        }),
+        ("link_to", 3) => Some(ViewHelperKind::LinkTo {
+            text: &args[0],
+            url: &args[1],
+            opts: Some(&args[2]),
+        }),
+        ("link_to_if", 3) => Some(ViewHelperKind::LinkToIf {
+            cond: &args[0],
+            text: &args[1],
+            url: &args[2],
+            opts: None,
+        }),
+        ("link_to_if", 4) => Some(ViewHelperKind::LinkToIf {
+            cond: &args[0],
+            text: &args[1],
+            url: &args[2],
+            opts: Some(&args[3]),
+        }),
+        ("button_to", 2) => Some(ViewHelperKind::ButtonTo {
+            text: &args[0],
+            target: &args[1],
+            opts: None,
+        }),
+        ("button_to", 3) => Some(ViewHelperKind::ButtonTo {
+            text: &args[0],
+            target: &args[1],
+            opts: Some(&args[2]),
+        }),
+        _ => None,
+    }
+}
+
+/// Pull out a `:sym` or `"str"` literal's value as a `&str`. Used
+/// by the `content_for` slot-name extraction.
+pub(crate) fn extract_sym_or_str(e: &Expr) -> Option<&str> {
+    match &*e.node {
+        ExprNode::Lit { value: Literal::Sym { value } } => Some(value.as_str()),
+        ExprNode::Lit { value: Literal::Str { value } } => Some(value.as_str()),
+        _ => None,
+    }
+}
+
+// ── FormBuilder method classifier ──────────────────────────────
+
+/// A FormBuilder method call (`form.label`, `form.text_field`,
+/// `form.text_area`, `form.submit`). The recognized method set is
+/// the scaffold-relevant subset; emitters lower these to their
+/// target's FormBuilder API (camelCased in TS, snake_case in rust
+/// + python, etc.).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FormBuilderMethod {
+    Label,
+    TextField,
+    TextArea,
+    Submit,
+    PasswordField,
+    HiddenField,
+    CheckBox,
+    RadioButton,
+    Select,
+    Button,
+    UrlField,
+    EmailField,
+    /// `number_field` / `range_field` / `search_field` /
+    /// `telephone_field` (alias `phone_field`): Rails' `Tags::TextField`
+    /// subclasses, the same `<input>` under another `type`. The options
+    /// their `render` rewrites (`in:`/`within:` → `min`/`max`;
+    /// `autosave:`/`onsearch:`) are refused at analyze
+    /// (`unlowered_form_builder_calls`).
+    NumberField,
+    RangeField,
+    SearchField,
+    TelephoneField,
+    FileField,
+    RichTextArea,
+    /// `form.fields_for :settings, obj do |nested| … end` — Rails'
+    /// nested object-name scope. Unlike every sibling it renders no
+    /// markup of its own: it BINDS a second builder whose object name
+    /// is `parent[nested]` and whose fields render inside the parent
+    /// form. Block form only (see the blockless arm in form_builder.rs).
+    FieldsFor,
+}
+
+/// Method name for a view template stem. A digit-leading stem
+/// (`about/404.html.erb`) can't name a Ruby/most-target method — prefix
+/// `_` (`Views::About._404`). A `new` stem (stories/new.html.erb →
+/// `Views::Stories.new`) collides with the CONSTRUCTOR under spinel
+/// AOT — callers get instantiation semantics and the argument
+/// unification poisons every downstream param type (stories/show's
+/// `comments` param unified to Proc) — so it gets the same prefix.
+/// Def site (view_to_library), render call sites (controller
+/// rewrites), and the partial/template dispatch arms share this so
+/// they can't drift.
+/// Formats whose templates render through the ERB view path.
+///
+/// `html` is the default. `turbo_stream` joins it because a Turbo form
+/// submission negotiates `text/vnd.turbo-stream.html` and Rails renders
+/// `<action>.turbo_stream.erb` for it — same ERB, different response
+/// format. The `.text.erb` mailer variants stay out (analysis-only):
+/// nothing dispatches to them yet.
+pub fn renders_through_view_path(format: &str) -> bool {
+    // `svg` joins them: campfire renders a user's initials as an SVG
+    // avatar (`users/avatars/show.svg.erb`). The stem-collision worry
+    // that kept non-html ERB out is answered the same way — the lowered
+    // method carries the format suffix (`show_svg`) via
+    // `view_method_name_for`, so it sits BESIDE `show`.
+    //
+    // Paired with the ingest gate in `ingest::app`'s `walk_erb`: one
+    // decides whether the template is READ, this one whether it is
+    // EMITTED, and a format listed in only one of them is silently
+    // dropped somewhere in between.
+    // `rss` / `atom` / `xml`: feed templates (lobsters' `home/stories
+    // .rss.builder`), `<action>_rss` beside the html view. `xls` joins
+    // them: same Builder XML markup, an `.xls` extension so Excel opens
+    // the SpreadsheetML it produces.
+    // `json` / `js`: TEXT templates in those formats — campfire's PWA
+    // `manifest.json.erb` and its raw `service_worker.js` — as
+    // `<action>_json` / `<action>_js`. A jbuilder template is json too,
+    // but it is DSL, not text: `lowers_through_view_path` keeps it out.
+    // `pdf` / `csv` / `txt`: also TEXT templates in those formats — a
+    // PDF-renderer's HTML input, a `CSV.generate` body, a mailer's
+    // plaintext part — as `<action>_pdf` / `<action>_csv` /
+    // `<action>_txt`. Paired with the ingest gate in `ingest::app`'s
+    // `walk_erb` the same way `svg`/`json` are: a format admitted only
+    // here or only there is silently dropped in between.
+    // `css`: joins them the same way — a CSS responder with no html
+    // sibling (Mastodon's `custom_css#show`), as `<action>_css`.
+    // `text`: a mailer's plain-text part and its layout, as
+    // `<action>_text`, which `lower::mailer_templates` renders.
+    matches!(
+        format,
+        "html" | "turbo_stream" | "svg" | "rss" | "atom" | "xml" | "xls" | "json" | "js" | "pdf"
+            | "csv" | "txt" | "css" | "md" | "text"
+    )
+}
+
+/// Does this view lower to a view-path class? The one filter every
+/// emitter pairs its lowered classes with — `lower_views_to_library_
+/// classes` builds them from exactly this set, so a caller zipping
+/// views against classes must use it too.
+pub fn lowers_through_view_path(v: &crate::dialect::View) -> bool {
+    !v.analysis_only && !v.jbuilder && renders_through_view_path(v.format.as_str())
+}
+
+/// A view's output file stem: its name, format-qualified when it is not
+/// the html template — `comments/index.rss.builder` writes
+/// `comments/index_rss` BESIDE `comments/index`, the same answer the
+/// method name gives. With the bare name the two collided on one file
+/// and the feed overwrote the page.
+pub fn view_output_stem(v: &crate::dialect::View) -> String {
+    if v.format.as_str() == "html" {
+        v.name.as_str().to_string()
+    } else {
+        format!("{}_{}", v.name.as_str(), v.format.as_str())
+    }
+}
+
+/// The template a fragment key names (`articles/_note`), format-qualified
+/// when it is not the html one: `_note.turbo_stream.erb` keys under
+/// `articles/_note.turbo_stream`. Rails names it by its digest path,
+/// `articles/_note:<digest>`, and the digest is the variant's own source,
+/// so the html and turbo_stream fragments of one record never meet.
+/// Without a digest (`walker::cache_key_parts`) the format is what keeps
+/// them apart. The html template keeps the bare path its keys always had.
+pub fn fragment_template_path(path: &str, format: &str) -> String {
+    if format == "html" {
+        path.to_string()
+    } else {
+        format!("{path}.{format}")
+    }
+}
+
+/// The lowered method name for a view, format-qualified when the view
+/// is not the html one: `messages/create.turbo_stream.erb` becomes
+/// `create_turbo_stream`, sitting BESIDE `create` rather than colliding
+/// with it. Same shape jbuilder's `_json` variants already use, which is
+/// what answers the stem-collision objection that kept non-html ERB out
+/// of the view path.
+pub fn view_method_name_for(stem: &str, format: &str) -> crate::ident::Symbol {
+    if format == "html" {
+        return view_method_name(stem);
+    }
+    view_method_name(&format!("{stem}_{format}"))
+}
+
+pub fn view_method_name(stem: &str) -> crate::ident::Symbol {
+    // A template file name need not be an identifier (`shop-404.html.erb`).
+    let stem = &stem.replace(|c: char| !(c.is_alphanumeric() || c == '_'), "_");
+    if stem.chars().next().is_some_and(|c| c.is_ascii_digit()) || stem == "new" {
+        crate::ident::Symbol::from(format!("_{stem}"))
+    } else {
+        crate::ident::Symbol::from(stem.as_str())
+    }
+}
+
+/// Map a Ruby form method name to the lowered method kind. Rails
+/// accepts both `text_area` and `textarea` as aliases; fold them.
+pub fn classify_form_builder_method(method: &str) -> Option<FormBuilderMethod> {
+    match method {
+        "label" => Some(FormBuilderMethod::Label),
+        "text_field" => Some(FormBuilderMethod::TextField),
+        "text_area" | "textarea" => Some(FormBuilderMethod::TextArea),
+        "submit" => Some(FormBuilderMethod::Submit),
+        "password_field" => Some(FormBuilderMethod::PasswordField),
+        "hidden_field" => Some(FormBuilderMethod::HiddenField),
+        "check_box" | "checkbox" => Some(FormBuilderMethod::CheckBox),
+        "fields_for" => Some(FormBuilderMethod::FieldsFor),
+        "radio_button" => Some(FormBuilderMethod::RadioButton),
+        "select" => Some(FormBuilderMethod::Select),
+        "button" => Some(FormBuilderMethod::Button),
+        "url_field" => Some(FormBuilderMethod::UrlField),
+        "email_field" => Some(FormBuilderMethod::EmailField),
+        "number_field" => Some(FormBuilderMethod::NumberField),
+        "range_field" => Some(FormBuilderMethod::RangeField),
+        "search_field" => Some(FormBuilderMethod::SearchField),
+        "telephone_field" | "phone_field" => Some(FormBuilderMethod::TelephoneField),
+        // The INPUT TAG only. Receiving the upload is Active Storage,
+        // which is deferred by design — but rendering `<input
+        // type="file">` needs none of it, and without this the call
+        // survives into the emit as a literal `form.file_field(…)` with
+        // `form` unbound, taking the whole page down at render.
+        "file_field" => Some(FormBuilderMethod::FileField),
+        // Action Text's editor pair. Same story as `file_field`: the
+        // upload half is Active Storage and deferred, but the MARKUP
+        // needs none of it — and without this the call survives into
+        // the emit as a literal `form.rich_text_area(…)` with `form`
+        // unbound, which is a NameError on every render of the page.
+        "rich_text_area" | "rich_textarea" => Some(FormBuilderMethod::RichTextArea),
+        _ => None,
+    }
+}
+
+/// The builder methods Rails' default `field_error_proc` wraps in
+/// `<div class="field_with_errors">` when their field has errors: every
+/// control that goes through `Tags::Base#tag`, and the label. A hidden
+/// field, a button, the submit and Action Text's editor are not.
+pub fn wraps_field_errors(method: &str) -> bool {
+    classify_form_builder_method(method).is_some_and(FormBuilderMethod::wraps_field_errors)
+}
+
+impl FormBuilderMethod {
+    pub fn wraps_field_errors(self) -> bool {
+        matches!(
+            self,
+            FormBuilderMethod::Label
+                | FormBuilderMethod::TextField
+                | FormBuilderMethod::TextArea
+                | FormBuilderMethod::PasswordField
+                | FormBuilderMethod::CheckBox
+                | FormBuilderMethod::RadioButton
+                | FormBuilderMethod::Select
+                | FormBuilderMethod::UrlField
+                | FormBuilderMethod::EmailField
+                | FormBuilderMethod::NumberField
+                | FormBuilderMethod::RangeField
+                | FormBuilderMethod::SearchField
+                | FormBuilderMethod::TelephoneField
+                | FormBuilderMethod::FileField
+        )
+    }
+}
+
+/// Split a FormBuilder method's positional args into its two
+/// Rails-shaped halves: the field-name symbol and the trailing
+/// options hash. `form.text_field :title, class: "..."` yields
+/// `(Some("title"), Some(&[(class, "...")]))`; `form.submit` with
+/// no args yields `(None, None)`. Emitters format the opts pairs
+/// themselves — the IR walk is target-neutral.
+pub fn classify_form_builder_args(
+    args: &[Expr],
+) -> (Option<&str>, Option<&[(Expr, Expr)]>) {
+    if args.is_empty() {
+        return (None, None);
+    }
+    let (field, rest): (Option<&str>, &[Expr]) = match &*args[0].node {
+        ExprNode::Lit { value: Literal::Sym { value } } => (Some(value.as_str()), &args[1..]),
+        _ => (None, args),
+    };
+    let opts = rest.iter().find_map(|a| match &*a.node {
+        ExprNode::Hash { entries, .. } => Some(entries.as_slice()),
+        _ => None,
+    });
+    (field, opts)
+}
+
+// ── URL-arg classifier ─────────────────────────────────────────
+
+/// The URL position of `link_to` / `button_to` / `form_with(model:
+/// …)` can take several shapes. This enum names them so each
+/// target's URL-rendering logic can dispatch cleanly instead of
+/// pattern-matching the same Expr shapes six times.
+#[derive(Debug)]
+pub enum ViewUrlArg<'a> {
+    /// `"literal/path"` — a plain string.
+    Literal { value: &'a str },
+    /// `articles_path` / `new_article_path` / `edit_article_path
+    /// (article)` — a path-helper method call. `name` is the Ruby
+    /// method (still snake_case with the `_path` suffix).
+    PathHelper { name: &'a str, args: &'a [Expr] },
+    /// `@article` / bare `article` — a reference to a record. The
+    /// `name` is the local's identifier; emitters pair it with a
+    /// singularize-and-camelize step for the path helper.
+    RecordRef { name: &'a str },
+    /// `[@article, Comment.new]` — array form for nested resources.
+    /// `elements` is the raw element list; emitters classify each
+    /// element (recursively via RecordRef / association read).
+    NestedArray { elements: &'a [Expr] },
+    /// A view-scope LOCAL whose name ends `_path`/`_url` — it already
+    /// holds the url string, so there is nothing to resolve.
+    ///
+    /// Rails partials pass paths around as locals (campfire's
+    /// `rooms/_form` takes `type_change_path:` and hands it straight to
+    /// `link_to`), and the `_path` suffix rule above would otherwise
+    /// claim the name and emit a call to a route helper that does not
+    /// exist. The suffix is the whole reason to distinguish this from
+    /// `RecordRef`: a local named `article` is a record to route FOR, a
+    /// local named `article_path` is the route itself.
+    LocalUrl { name: &'a str },
+}
+
+/// Classify the URL-position arg of a nav helper. `is_local`
+/// checks whether a bare name is in the current view scope — used
+/// to distinguish a local-bound record from an unrelated Const or
+/// global call. Passed as a closure so callers don't have to
+/// export their `TsViewCtx` / `ViewEmitCtx` here.
+pub fn classify_view_url_arg<'a, F>(arg: &'a Expr, is_local: &F) -> Option<ViewUrlArg<'a>>
+where
+    F: Fn(&str) -> bool,
+{
+    match &*arg.node {
+        ExprNode::Lit { value: Literal::Str { value } } => {
+            Some(ViewUrlArg::Literal { value: value.as_str() })
+        }
+        // A LOCAL named `<x>_path` / `<x>_url` holds the url already —
+        // checked before the suffix rule below, which would otherwise
+        // rewrite the name to a route helper of the same spelling.
+        // (Prism parses a partial-scope local as an implicit-self Send,
+        // so both node shapes have to be tested.)
+        ExprNode::Var { name, .. } | ExprNode::Ivar { name }
+            if is_local_url_name(name.as_str()) && is_local(name.as_str()) =>
+        {
+            Some(ViewUrlArg::LocalUrl { name: name.as_str() })
+        }
+        ExprNode::Send { recv: None, method, args, block: None, .. }
+            if args.is_empty()
+                && is_local_url_name(method.as_str())
+                && is_local(method.as_str()) =>
+        {
+            Some(ViewUrlArg::LocalUrl { name: method.as_str() })
+        }
+        // Path helper: `articles_path()` / `article_path(x)` — any
+        // method ending in `_path`.
+        ExprNode::Send { recv: None, method, args, block: None, .. }
+            if method.as_str().ends_with("_path") =>
+        {
+            Some(ViewUrlArg::PathHelper { name: method.as_str(), args })
+        }
+        // Record ref — either Var/Ivar (regular local) or a bare
+        // no-arg Send (partial-scope local that Prism parsed as
+        // implicit-self method call before scope analysis).
+        ExprNode::Var { name, .. } | ExprNode::Ivar { name } if is_local(name.as_str()) => {
+            Some(ViewUrlArg::RecordRef { name: name.as_str() })
+        }
+        ExprNode::Send {
+            recv: None,
+            method,
+            args,
+            block: None,
+            ..
+        } if args.is_empty() && is_local(method.as_str()) => {
+            Some(ViewUrlArg::RecordRef { name: method.as_str() })
+        }
+        // Nested-resource array: `[parent, child]` or deeper.
+        ExprNode::Array { elements, .. } if elements.len() >= 2 => {
+            Some(ViewUrlArg::NestedArray { elements })
+        }
+        _ => None,
+    }
+}
+
+/// True for a name that reads as a url rather than a record — the
+/// `_path` / `_url` suffix Rails' own helpers use.
+fn is_local_url_name(name: &str) -> bool {
+    name.ends_with("_path") || name.ends_with("_url")
+}
+
+// ── Nested URL/form element classifier ────────────────────────
+
+/// One element of a `[parent, child]` array used in link_to /
+/// button_to / form_with's `model:` kwarg. Emitters compose these
+/// into a nested path-helper call and its positional id arguments.
+///
+/// The variants drop the distinction between Var/Ivar/partial-scope
+/// bare Send — all three are "local reference" from the emitter's
+/// perspective; the binding-kind differences matter to Ruby's
+/// parser but not to code generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NestedUrlElement<'a> {
+    /// Bare local record — `article`, `comment`, etc. The singular
+    /// name is the local's identifier; the id source is `{name}.id`.
+    DirectLocal { name: &'a str },
+    /// `owner.assoc` belongs-to read — `comment.article`. The
+    /// singular name is `assoc`; the id source is `{owner}.{assoc}_id`
+    /// (the foreign-key column on the owner).
+    Association { owner: &'a str, assoc: &'a str },
+}
+
+/// Classify one element of a nested-URL array. Returns None for
+/// element shapes we don't recognize (literals, complex chains).
+pub fn classify_nested_url_element<'a, F>(
+    el: &'a Expr,
+    is_local: &F,
+) -> Option<NestedUrlElement<'a>>
+where
+    F: Fn(&str) -> bool,
+{
+    match &*el.node {
+        ExprNode::Var { name, .. } | ExprNode::Ivar { name } if is_local(name.as_str()) => {
+            Some(NestedUrlElement::DirectLocal { name: name.as_str() })
+        }
+        ExprNode::Send {
+            recv: None,
+            method,
+            args,
+            block: None,
+            ..
+        } if args.is_empty() && is_local(method.as_str()) => {
+            Some(NestedUrlElement::DirectLocal { name: method.as_str() })
+        }
+        // `owner.assoc` — belongs_to read. `owner` is a local;
+        // `assoc` is the association name (singular).
+        ExprNode::Send { recv: Some(r), method, args, block: None, .. }
+            if args.is_empty() =>
+        {
+            let owner = match &*r.node {
+                ExprNode::Var { name, .. } | ExprNode::Ivar { name }
+                    if is_local(name.as_str()) =>
+                {
+                    Some(name.as_str())
+                }
+                ExprNode::Send {
+                    recv: None,
+                    method: m,
+                    args: ra,
+                    block: None,
+                    ..
+                } if ra.is_empty() && is_local(m.as_str()) => Some(m.as_str()),
+                _ => None,
+            }?;
+            Some(NestedUrlElement::Association {
+                owner,
+                assoc: method.as_str(),
+            })
+        }
+        _ => None,
+    }
+}
+
+// ── Errors-field predicate classifier ──────────────────────────
+
+/// `.errors[:field].none?` / `.errors[:field].any?` (and their
+/// aliases `.empty?` / `.present?`). The scaffold's class-array-hash
+/// pattern uses this shape to toggle validation-error styling on
+/// form inputs. Each emitter lowers to its target's equivalent of
+/// `fieldHasError(record.errors, "field")`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ErrorsFieldPredicate<'a> {
+    /// Local record holding the `errors` collection.
+    pub record: &'a str,
+    /// Field name the predicate is checking (snake_case).
+    pub field: String,
+    /// True when the predicate asserts "there IS an error"
+    /// (`.any?` / `.present?`); false for absence (`.none?` /
+    /// `.empty?`).
+    pub expect_present: bool,
+}
+
+/// Classify an expression as an errors-field predicate. Returns
+/// None for unrecognized shapes.
+pub fn classify_errors_field_predicate<'a, F>(
+    expr: &'a Expr,
+    is_local: &F,
+) -> Option<ErrorsFieldPredicate<'a>>
+where
+    F: Fn(&str) -> bool,
+{
+    let ExprNode::Send { recv: Some(outer), method: outer_method, args: outer_args, .. } = &*expr.node else {
+        return None;
+    };
+    if !outer_args.is_empty() {
+        return None;
+    }
+    let expect_present = match outer_method.as_str() {
+        "none?" | "empty?" => false,
+        "any?" | "present?" => true,
+        _ => return None,
+    };
+    // `outer.recv` should be `<record>.errors[:field]`. Match the
+    // `[]` send with a single symbol arg and recv of `.errors`.
+    let ExprNode::Send { recv: Some(errs_recv), method: brackets, args: idx_args, .. } = &*outer.node else {
+        return None;
+    };
+    if brackets.as_str() != "[]" || idx_args.len() != 1 {
+        return None;
+    }
+    let field = match &*idx_args[0].node {
+        ExprNode::Lit { value: Literal::Sym { value } } => value.as_str().to_string(),
+        ExprNode::Lit { value: Literal::Str { value } } => value.clone(),
+        _ => return None,
+    };
+    let ExprNode::Send { recv: Some(rec), method: errs_method, args: ra, .. } = &*errs_recv.node else {
+        return None;
+    };
+    if errs_method.as_str() != "errors" || !ra.is_empty() {
+        return None;
+    }
+    let record = match &*rec.node {
+        ExprNode::Var { name, .. } | ExprNode::Ivar { name } if is_local(name.as_str()) => {
+            name.as_str()
+        }
+        ExprNode::Send {
+            recv: None,
+            method,
+            args,
+            block: None,
+            ..
+        } if args.is_empty() && is_local(method.as_str()) => method.as_str(),
+        _ => return None,
+    };
+    Some(ErrorsFieldPredicate {
+        record,
+        field,
+        expect_present,
+    })
+}
+
+// ── class: value classifier ────────────────────────────────────
+
+/// The shape of a `class:` option value on link_to / button_to /
+/// form-field calls. Rails scaffolds use three common shapes:
+///   - A plain string (literal or interp).
+///   - `[base_string, {cond_class: cond_expr, …}]` where each
+///     `cond_expr` is a recognized errors-field predicate.
+///   - Anything else (dynamic), which emitters typically render as
+///     an empty class.
+///
+/// Emitters consume the structured form and produce their target's
+/// conditional-concatenation idiom.
+#[derive(Debug)]
+pub enum ClassValueShape<'a> {
+    /// Simple expression (literal string, interp, or other
+    /// simple-classifier-accepted shape). Emitters render via the
+    /// target's usual expr emitter.
+    Simple { expr: &'a Expr },
+    /// `[base, {cls: pred, …}]` — conditional-class decorations on
+    /// a base string. Order preserved from the source hash.
+    Conditional {
+        base: &'a Expr,
+        clauses: Vec<(String, ErrorsFieldPredicate<'a>)>,
+    },
+    /// Shape not recognized — emitters fall back to empty class.
+    Unknown,
+}
+
+/// Classify a `class:` value. `is_local` is threaded to the errors-
+/// field predicate classifier for each clause.
+pub fn classify_class_value<'a, F>(v: &'a Expr, is_local: &F) -> ClassValueShape<'a>
+where
+    F: Fn(&str) -> bool,
+{
+    // Array form: `[base_string, {cond_class: cond_expr, ...}]`.
+    if let ExprNode::Array { elements, .. } = &*v.node {
+        let Some(base) = elements.first() else {
+            return ClassValueShape::Unknown;
+        };
+        let mut clauses: Vec<(String, ErrorsFieldPredicate<'a>)> = Vec::new();
+        for el in elements.iter().skip(1) {
+            let ExprNode::Hash { entries, .. } = &*el.node else {
+                continue;
+            };
+            for (hk, hv) in entries {
+                let cls_text = match &*hk.node {
+                    ExprNode::Lit { value: Literal::Str { value } } => value.clone(),
+                    ExprNode::Lit { value: Literal::Sym { value } } => value.as_str().to_string(),
+                    _ => continue,
+                };
+                if let Some(pred) = classify_errors_field_predicate(hv, is_local) {
+                    clauses.push((cls_text, pred));
+                }
+            }
+        }
+        return ClassValueShape::Conditional { base, clauses };
+    }
+    // Anything else → delegate the simple-check to the emitter.
+    // The classifier can't know what "simple" means for each target
+    // (the simple-expr gate differs), so we just hand back the expr
+    // and let the emitter decide.
+    ClassValueShape::Simple { expr: v }
+}
+
+// ── Nested form_with child classifier ──────────────────────────
+
+/// The child element of a nested `form_with model: [parent, child]`.
+/// Determines both the record expression and the field-name prefix
+/// (`"comment"` → `comment[body]` for field names).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NestedFormChild<'a> {
+    /// `Class.new` — construct a fresh instance. Prefix is the
+    /// snake_case form of the class name.
+    ClassNew { class: &'a str },
+    /// Bare local or partial-scope Send — an existing record.
+    /// Prefix is the local's name (conventionally the singular
+    /// snake_case).
+    Local { name: &'a str },
+}
+
+impl NestedFormChild<'_> {
+    /// The field-name prefix Rails uses in the form's `name="…"`
+    /// attributes: `"comment"` for both `Comment.new` and a bare
+    /// `comment` local.
+    pub fn prefix(&self) -> String {
+        match self {
+            NestedFormChild::ClassNew { class } => crate::naming::snake_case(class),
+            NestedFormChild::Local { name } => (*name).to_string(),
+        }
+    }
+}
+
+/// Classify the child element of a nested form_with's `model:`
+/// array. Returns None for shapes we don't recognize.
+pub fn classify_nested_form_child(el: &Expr) -> Option<NestedFormChild<'_>> {
+    match &*el.node {
+        // `Class.new`.
+        ExprNode::Send { recv: Some(r), method, args, block: None, .. }
+            if method.as_str() == "new" && args.is_empty() =>
+        {
+            if let ExprNode::Const { path } = &*r.node {
+                if let Some(class) = path.last() {
+                    return Some(NestedFormChild::ClassNew { class: class.as_str() });
+                }
+            }
+            None
+        }
+        ExprNode::Var { name, .. } | ExprNode::Ivar { name } => {
+            Some(NestedFormChild::Local { name: name.as_str() })
+        }
+        ExprNode::Send {
+            recv: None,
+            method,
+            args,
+            block: None,
+            ..
+        } if args.is_empty() => Some(NestedFormChild::Local { name: method.as_str() }),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ident::Symbol;
+    use crate::span::Span;
+
+    fn sym(s: &str) -> Expr {
+        Expr::new(
+            Span::synthetic(),
+            ExprNode::Lit {
+                value: Literal::Sym {
+                    value: Symbol::from(s),
+                },
+            },
+        )
+    }
+
+    fn str_lit(s: &str) -> Expr {
+        Expr::new(
+            Span::synthetic(),
+            ExprNode::Lit {
+                value: Literal::Str { value: s.to_string() },
+            },
+        )
+    }
+
+    #[test]
+    fn classifies_csrf_meta_tags() {
+        let kind = classify_view_helper("csrf_meta_tags", &[]).unwrap();
+        assert!(matches!(kind, ViewHelperKind::CsrfMetaTags));
+    }
+
+    #[test]
+    fn classifies_csrf_meta_tag_alias() {
+        let kind = classify_view_helper("csrf_meta_tag", &[]).unwrap();
+        assert!(matches!(kind, ViewHelperKind::CsrfMetaTags));
+    }
+
+    #[test]
+    fn classifies_content_for_getter() {
+        let args = vec![sym("title")];
+        let kind = classify_view_helper("content_for", &args).unwrap();
+        match kind {
+            ViewHelperKind::ContentForGetter { slot } => assert_eq!(slot, "title"),
+            _ => panic!("expected ContentForGetter"),
+        }
+    }
+
+    #[test]
+    fn classifies_content_for_setter() {
+        let args = vec![sym("title"), str_lit("Articles")];
+        let kind = classify_view_helper("content_for", &args).unwrap();
+        assert!(matches!(
+            kind,
+            ViewHelperKind::ContentForSetter { slot: "title", .. }
+        ));
+    }
+
+    #[test]
+    fn dom_id_arity_distinguishes_prefix() {
+        let one_args = vec![str_lit("x")];
+        let one = classify_view_helper("dom_id", &one_args).unwrap();
+        assert!(matches!(
+            one,
+            ViewHelperKind::DomId { prefix: None, .. }
+        ));
+        let two_args = vec![str_lit("x"), sym("n")];
+        let two = classify_view_helper("dom_id", &two_args).unwrap();
+        assert!(matches!(
+            two,
+            ViewHelperKind::DomId { prefix: Some(_), .. }
+        ));
+    }
+
+    #[test]
+    fn link_to_three_arg_captures_opts() {
+        let args = vec![str_lit("Show"), str_lit("/articles/1"), sym("cls")];
+        assert!(matches!(
+            classify_view_helper("link_to", &args),
+            Some(ViewHelperKind::LinkTo { opts: Some(_), .. })
+        ));
+    }
+
+    #[test]
+    fn word_wrap_keeps_options_for_the_shared_runtime_helper() {
+        let args = vec![str_lit("one two"), sym("options")];
+        assert!(matches!(
+            classify_view_helper("word_wrap", &args),
+            Some(ViewHelperKind::WordWrap { opts: Some(_), .. })
+        ));
+    }
+
+    #[test]
+    fn unknown_method_returns_none() {
+        assert!(classify_view_helper("not_a_helper", &[]).is_none());
+    }
+
+    #[test]
+    fn form_builder_method_aliases() {
+        assert_eq!(
+            classify_form_builder_method("text_area"),
+            Some(FormBuilderMethod::TextArea)
+        );
+        assert_eq!(
+            classify_form_builder_method("textarea"),
+            Some(FormBuilderMethod::TextArea)
+        );
+        assert_eq!(classify_form_builder_method("unknown"), None);
+    }
+
+    #[test]
+    fn url_arg_literal() {
+        let arg = str_lit("/articles");
+        let kind = classify_view_url_arg(&arg, &|_: &str| false).unwrap();
+        match kind {
+            ViewUrlArg::Literal { value } => assert_eq!(value, "/articles"),
+            _ => panic!("expected Literal"),
+        }
+    }
+
+    #[test]
+    fn url_arg_path_helper() {
+        let arg = Expr::new(
+            Span::synthetic(),
+            ExprNode::Send {
+                recv: None,
+                method: Symbol::from("articles_path"),
+                args: vec![],
+                block: None,
+                parenthesized: false,
+            },
+        );
+        match classify_view_url_arg(&arg, &|_: &str| false).unwrap() {
+            ViewUrlArg::PathHelper { name, args } => {
+                assert_eq!(name, "articles_path");
+                assert!(args.is_empty());
+            }
+            _ => panic!("expected PathHelper"),
+        }
+    }
+
+    #[test]
+    fn url_arg_record_ref_respects_is_local() {
+        let arg = Expr::new(
+            Span::synthetic(),
+            ExprNode::Var {
+                id: crate::ident::VarId(0),
+                name: Symbol::from("article"),
+            },
+        );
+        assert!(classify_view_url_arg(&arg, &|n: &str| n == "article").is_some());
+        assert!(classify_view_url_arg(&arg, &|_: &str| false).is_none());
+    }
+
+    fn var(name: &str) -> Expr {
+        Expr::new(
+            Span::synthetic(),
+            ExprNode::Var {
+                id: crate::ident::VarId(0),
+                name: Symbol::from(name),
+            },
+        )
+    }
+
+    fn send(recv: Option<Expr>, method: &str, args: Vec<Expr>) -> Expr {
+        Expr::new(
+            Span::synthetic(),
+            ExprNode::Send {
+                recv,
+                method: Symbol::from(method),
+                args,
+                block: None,
+                parenthesized: false,
+            },
+        )
+    }
+
+    #[test]
+    fn nested_element_direct_local() {
+        let el = var("comment");
+        let k = classify_nested_url_element(&el, &|n: &str| n == "comment").unwrap();
+        assert_eq!(k, NestedUrlElement::DirectLocal { name: "comment" });
+    }
+
+    #[test]
+    fn nested_element_association() {
+        // `comment.article` — owner is a local, method is assoc.
+        let el = send(Some(var("comment")), "article", vec![]);
+        let k = classify_nested_url_element(&el, &|n: &str| n == "comment").unwrap();
+        assert_eq!(
+            k,
+            NestedUrlElement::Association {
+                owner: "comment",
+                assoc: "article",
+            }
+        );
+    }
+
+    #[test]
+    fn errors_field_predicate_none() {
+        // `article.errors[:title].none?`
+        let errors = send(Some(var("article")), "errors", vec![]);
+        let indexed = send(Some(errors), "[]", vec![sym("title")]);
+        let pred_expr = send(Some(indexed), "none?", vec![]);
+        let pred = classify_errors_field_predicate(&pred_expr, &|n: &str| n == "article").unwrap();
+        assert_eq!(pred.record, "article");
+        assert_eq!(pred.field, "title");
+        assert!(!pred.expect_present);
+    }
+
+    #[test]
+    fn errors_field_predicate_any() {
+        let errors = send(Some(var("article")), "errors", vec![]);
+        let indexed = send(Some(errors), "[]", vec![sym("body")]);
+        let pred_expr = send(Some(indexed), "any?", vec![]);
+        let pred = classify_errors_field_predicate(&pred_expr, &|n: &str| n == "article").unwrap();
+        assert!(pred.expect_present);
+    }
+
+    #[test]
+    fn nested_form_child_class_new() {
+        let comment_class = Expr::new(
+            Span::synthetic(),
+            ExprNode::Const {
+                path: vec![Symbol::from("Comment")],
+            },
+        );
+        let el = send(Some(comment_class), "new", vec![]);
+        let k = classify_nested_form_child(&el).unwrap();
+        assert_eq!(k, NestedFormChild::ClassNew { class: "Comment" });
+        assert_eq!(k.prefix(), "comment");
+    }
+
+    #[test]
+    fn nested_form_child_bare_local() {
+        let el = var("comment");
+        let k = classify_nested_form_child(&el).unwrap();
+        assert_eq!(k, NestedFormChild::Local { name: "comment" });
+        assert_eq!(k.prefix(), "comment");
+    }
+
+    fn hash(entries: Vec<(Expr, Expr)>) -> Expr {
+        Expr::new(Span::synthetic(), ExprNode::Hash { entries, kwargs: true })
+    }
+
+    #[test]
+    fn render_singular_ivar_is_a_record_render() {
+        // `render @message` renders ONE record. Read as a Collection it
+        // emitted `message.each { … Views::Message.message(m) }` — an
+        // `each` on a record, into a singular module no partial defines.
+        let args = vec![var("message")];
+        let rp =
+            classify_render_partial(None, "render", &args, None, &|_| true, &|_| false).unwrap();
+        match rp {
+            RenderPartial::Record { name, .. } => assert_eq!(name, "message"),
+            other => panic!("expected Record, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn render_plural_ivar_is_still_a_collection() {
+        let args = vec![var("messages")];
+        let rp =
+            classify_render_partial(None, "render", &args, None, &|_| true, &|_| false).unwrap();
+        match rp {
+            RenderPartial::Collection { name, .. } => assert_eq!(name, "messages"),
+            other => panic!("expected Collection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn render_options_ivar_still_wins_over_the_record_arm() {
+        // An options ivar (`@above = { partial: "stories/subnav" }`) is
+        // singular-named too; the dynamic dispatch must keep priority.
+        let args = vec![var("above")];
+        let rp =
+            classify_render_partial(None, "render", &args, None, &|_| true, &|n| n == "above")
+                .unwrap();
+        assert!(matches!(rp, RenderPartial::DynamicNamed { ivar: "above", .. }));
+    }
+
+    #[test]
+    fn render_bare_string_is_a_named_partial() {
+        // `render "layouts/lightbox"` — a partial with NO locals. Both
+        // fixtures write the two-argument form (`render "form", article:
+        // @a`), so the hash-less spelling had no arm and fell through to
+        // the generic helper rewriter, which bound the bare `render` to
+        // whatever app module defined a method by that name.
+        let args = vec![str_lit("layouts/lightbox")];
+        let rp =
+            classify_render_partial(None, "render", &args, None, &|_| true, &|_| false).unwrap();
+        match rp {
+            RenderPartial::Named { partial, arg, locals } => {
+                assert_eq!(partial, "layouts/lightbox");
+                assert!(arg.is_none() && locals.is_none());
+            }
+            other => panic!("expected Named, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn render_partial_dynamic_name_classifies_as_dynamic_named() {
+        // `render partial: above` — a runtime name (Var/Ivar).
+        let args = vec![hash(vec![(sym("partial"), var("above"))])];
+        let rp = classify_render_partial(None, "render", &args, None, &|_| true, &|_| false).unwrap();
+        match rp {
+            RenderPartial::DynamicNamed { ivar, .. } => assert_eq!(ivar, "above"),
+            other => panic!("expected DynamicNamed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn render_partial_literal_name_stays_named_not_dynamic() {
+        // `render partial: "stories/subnav"` — a literal name resolves
+        // statically; must NOT become the dynamic dispatch.
+        let args = vec![hash(vec![(sym("partial"), str_lit("stories/subnav"))])];
+        let rp = classify_render_partial(None, "render", &args, None, &|_| true, &|_| false).unwrap();
+        assert!(matches!(rp, RenderPartial::Named { partial: "stories/subnav", .. }));
+    }
+
+    #[test]
+    fn render_partial_dynamic_name_with_collection_is_unsupported() {
+        // A dynamic name paired with `collection:` isn't modeled — the pool
+        // dispatch only covers the bare `partial: @x` form.
+        let args = vec![hash(vec![
+            (sym("partial"), var("above")),
+            (sym("collection"), var("stories")),
+        ])];
+        assert!(classify_render_partial(None, "render", &args, None, &|_| true, &|_| false).is_none());
+    }
+
+    #[test]
+    fn render_bare_ivar_is_collection_unless_options_ivar() {
+        // `render @articles` with no options-pool entry → Collection.
+        let args = vec![var("articles")];
+        let rp = classify_render_partial(None, "render", &args, None, &|_| true, &|_| false).unwrap();
+        assert!(matches!(rp, RenderPartial::Collection { name: "articles", .. }));
+
+        // `render @above` where `@above` is a known partial-options ivar
+        // (`@above = {partial: "stories/subnav"}` in a controller) →
+        // DynamicNamed pool dispatch, not a `.each` collection render.
+        let args = vec![var("above")];
+        let rp = classify_render_partial(
+            None,
+            "render",
+            &args,
+            None,
+            &|_| true,
+            &|n| n == "above",
+        )
+        .unwrap();
+        match rp {
+            RenderPartial::DynamicNamed { ivar, .. } => assert_eq!(ivar, "above"),
+            other => panic!("expected DynamicNamed, got {other:?}"),
+        }
+    }
+}

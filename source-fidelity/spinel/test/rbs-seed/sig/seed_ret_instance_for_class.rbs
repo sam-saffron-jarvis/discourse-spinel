@@ -1,0 +1,4 @@
+class SrcSearch
+  def one_model: () -> SrcStory
+  def searched_model: () -> (SrcComment | SrcStory)
+end

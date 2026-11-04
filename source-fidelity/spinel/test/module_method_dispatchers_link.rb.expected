@@ -1,0 +1,7 @@
+new: [nil, nil]
+pattern_h: "hash  "
+new: [nil, nil]
+pattern: "hash  "
+[3, 4]
+[1, 2]
+[3, 4]

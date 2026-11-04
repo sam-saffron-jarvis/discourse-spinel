@@ -1,0 +1,256 @@
+//! Survey mode: gather all ingest errors instead of failing on the
+//! first one.
+//!
+//! By default the ingester is fail-fast — `IngestError` aborts the
+//! whole pipeline at the first unsupported construct. That's correct
+//! for CI and for targeted "what's the next thing to fix" feedback,
+//! but it's a poor fit for *scope-estimation* work: each rebuild +
+//! rerun reveals one gap at a time, and N gaps cost N cycles.
+//!
+//! Survey mode flips the polarity. When active, [`ingest_expr`]
+//! intercepts its own `Err` returns: records the error here and
+//! substitutes a [`Literal::Nil`] placeholder so the parent ingester
+//! keeps going. A single run produces a deduplicated punch list of
+//! every distinct gap across the app — feeding triage decisions
+//! about batch-fix opportunities, stub candidates, and total scope.
+//!
+//! Toggle: `roundhouse-check --continue` or
+//! `ROUNDHOUSE_INGEST_SURVEY=1`. Default is off; the strict path is
+//! unchanged when the flag isn't set.
+//!
+//! State lives in a thread-local so concurrent tests don't bleed —
+//! the flag only affects the calling thread.
+
+use std::cell::RefCell;
+
+use super::{IngestError, IngestResult};
+
+thread_local! {
+    static SURVEY_STATE: RefCell<Option<Vec<IngestError>>> = const { RefCell::new(None) };
+}
+
+/// Activate survey mode for the current thread. Subsequent
+/// `ingest_expr` failures record into the per-thread collector and
+/// return a placeholder Expr instead of aborting. Calling again
+/// resets the collector.
+pub fn activate() {
+    SURVEY_STATE.with(|s| *s.borrow_mut() = Some(Vec::new()));
+}
+
+/// True when survey mode is active on the calling thread.
+pub fn is_active() -> bool {
+    SURVEY_STATE.with(|s| s.borrow().is_some())
+}
+
+/// Probe with the same strict/survey parsing semantics, without publishing
+/// duplicate errors. Preserve all entries recorded before the probe.
+pub(super) fn without_recording<T>(f: impl FnOnce() -> T) -> T {
+    let length = SURVEY_STATE.with(|s| s.borrow().as_ref().map(Vec::len));
+    let result = f();
+    if let Some(length) = length {
+        SURVEY_STATE.with(|s| s.borrow_mut().as_mut().unwrap().truncate(length));
+    }
+    result
+}
+
+/// How many errors are recorded so far, for `rewind`.
+pub(super) fn mark() -> Option<usize> {
+    SURVEY_STATE.with(|s| s.borrow().as_ref().map(Vec::len))
+}
+
+/// Forget what was recorded since `mark`: an ingest pass that is run again.
+pub(super) fn rewind(mark: Option<usize>) {
+    if let Some(length) = mark {
+        SURVEY_STATE.with(|s| s.borrow_mut().as_mut().map(|buf| buf.truncate(length)));
+    }
+}
+
+/// Record `err` when survey mode is active and continue. Strict mode
+/// returns it, so a ledgered gap never becomes a silent success and
+/// never claims the construct is supported.
+pub(super) fn continue_or_fail(err: IngestError) -> IngestResult<()> {
+    if is_active() {
+        record(&err);
+        Ok(())
+    } else {
+        Err(err)
+    }
+}
+
+/// Push an ingest error into the per-thread collector. No-op if
+/// survey mode isn't active (so callers can record unconditionally).
+pub fn record(err: &IngestError) {
+    SURVEY_STATE.with(|s| {
+        if let Some(buf) = s.borrow_mut().as_mut() {
+            // IngestError doesn't implement Clone (std::io::Error has
+            // no clone), but every variant we care about does — flatten
+            // to a string-shaped Unsupported so the collector entries
+            // are uniform and Clone-able by downstream printers.
+            buf.push(IngestError::Unsupported {
+                file: err_file(err).to_string(),
+                message: err_message(err).to_string(),
+            });
+        }
+    });
+}
+
+/// Errors recorded so far, without draining survey mode.
+pub fn recorded() -> Vec<String> {
+    SURVEY_STATE.with(|s| {
+        s.borrow()
+            .as_ref()
+            .map(|errors| errors.iter().map(|err| err.to_string()).collect())
+            .unwrap_or_default()
+    })
+}
+
+/// Drain the collector and deactivate survey mode. Returns every
+/// error captured during the active window in record order.
+pub fn drain() -> Vec<IngestError> {
+    SURVEY_STATE.with(|s| s.borrow_mut().take().unwrap_or_default())
+}
+
+fn err_file(err: &IngestError) -> &str {
+    match err {
+        IngestError::Io(_) => "<io>",
+        IngestError::Parse { file, .. } | IngestError::Unsupported { file, .. } => file,
+    }
+}
+
+fn err_message(err: &IngestError) -> String {
+    match err {
+        IngestError::Io(e) => format!("io error: {e}"),
+        IngestError::Parse { message, .. } => format!("parse error: {message}"),
+        IngestError::Unsupported { message, .. } => message.clone(),
+    }
+}
+
+/// Survey-aware error gate for per-file ingest. In survey mode,
+/// records the error and returns `Ok(None)` so the caller can skip
+/// the file. In strict mode, propagates.
+///
+/// Used by [`ingest_app_with_vfs`] to wrap each per-file call so a
+/// single failed file (e.g., routes.rb with an unsupported DSL form)
+/// doesn't abort the survey before later files get walked.
+pub fn unwrap_or_record<T>(result: super::IngestResult<T>) -> super::IngestResult<Option<T>> {
+    match result {
+        Ok(v) => Ok(Some(v)),
+        Err(err) if is_active() => {
+            record(&err);
+            Ok(None)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Record a synthesized re-ingest's parse failure as a survey gap.
+///
+/// A lowering pass that expands a macro (`delegate`, `on_subscribe`,
+/// …) into real methods does so by rendering Ruby source and running
+/// it back through ingest. Prism is error-recovering, so a bug in that
+/// rendering doesn't fail the re-ingest outright — it silently hands
+/// back a malformed AST alongside parse diagnostics. Left alone, those
+/// diagnostics would render against whatever real file happens to
+/// share their `FileId` (see [`super::sources`]'s module doc); a
+/// synthesis failure is roundhouse's gap, not the app's, so it belongs
+/// on the survey ledger instead.
+///
+/// Call with the diagnostics collected by the caller's OWN
+/// `prism::scope` around the re-ingest (never the outer one that spans
+/// the whole app) — that is what keeps them from also leaking into the
+/// app's parse-error count. `what` names the construct being
+/// synthesized (e.g. `` "delegate forwarder for `behavior=`" ``);
+/// `file` is the real declaring file when the caller has it at hand,
+/// or the pass's own `"<label>"` otherwise — either way this never
+/// resolves through `App::sources`, so it can't misattribute.
+pub fn record_synthesis_failure(
+    file: impl Into<String>,
+    what: &str,
+    diags: &[crate::diagnostic::Diagnostic],
+) {
+    let message = match diags.first() {
+        Some(d) => format!("{what} could not be synthesized: {}", d.message),
+        None => format!("{what} could not be synthesized"),
+    };
+    record(&IngestError::Unsupported { file: file.into(), message });
+}
+
+/// Bucket key for aggregation: the message prefix up to the first `(`
+/// (which truncates the Prism-node-Debug repr's pointer-bearing
+/// payload). Used by the punch-list printer to dedupe "ConstantWriteNode
+/// at FOO" + "ConstantWriteNode at BAR" into a single grouped entry.
+/// Render the deduplicated punch list for a drained survey: one bucket
+/// per distinct gap kind, biggest first, with up to four example files
+/// each and a collapsed tail.
+///
+/// Lives here rather than in a binary because BOTH front ends print it —
+/// `roundhouse-check --continue` and `roundhouse --survey`. Returns the
+/// text instead of printing it so the caller owns the stream and the
+/// surrounding blank lines.
+pub fn render_report(errors: &[IngestError]) -> String {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::fmt::Write;
+
+    let mut buckets: BTreeMap<String, Vec<&IngestError>> = BTreeMap::new();
+    for err in errors {
+        buckets.entry(bucket_key(err)).or_default().push(err);
+    }
+    let mut sorted: Vec<(&String, &Vec<&IngestError>)> = buckets.iter().collect();
+    sorted.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.cmp(b.0)));
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "── Survey: {} ingest gap(s), {} distinct kind(s) ──",
+        errors.len(),
+        sorted.len(),
+    );
+    for (key, items) in sorted {
+        let _ = writeln!(out, "  [{}×] {}", items.len(), key);
+        // Show up to 4 file locations per bucket; collapse the tail.
+        let mut shown = BTreeSet::new();
+        for err in items.iter().take(64) {
+            if let IngestError::Unsupported { file, .. } | IngestError::Parse { file, .. } = err {
+                shown.insert(file.clone());
+            }
+        }
+        let mut files: Vec<_> = shown.into_iter().collect();
+        files.sort();
+        for f in files.iter().take(4) {
+            let _ = writeln!(out, "        {f}");
+        }
+        if files.len() > 4 {
+            let _ = writeln!(out, "        … and {} more file(s)", files.len() - 4);
+        }
+    }
+    out
+}
+
+pub fn bucket_key(err: &IngestError) -> String {
+    let msg = err_message(err);
+    let trimmed = msg.split('(').next().unwrap_or(&msg);
+    // Strip trailing whitespace introduced by the split + truncate to
+    // a reasonable display width.
+    // By CHARACTERS, not bytes: a byte slice through a multi-byte
+    // character panics, and the ledger lines carry em dashes.
+    let key = trimmed.trim_end();
+    key.chars().take(120).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The key is the first 120 CHARACTERS: a byte slice through a
+    /// multi-byte character panicked on the first ledger line whose em
+    /// dash straddled the cut.
+    #[test]
+    fn bucket_key_cuts_on_a_character_boundary() {
+        let pad = "x".repeat(119);
+        let err = IngestError::Unsupported {
+            file: "a.rb".into(),
+            message: format!("{pad}— tail"),
+        };
+        assert_eq!(bucket_key(&err), format!("{pad}—"));
+    }
+}

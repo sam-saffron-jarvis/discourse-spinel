@@ -1,0 +1,800 @@
+//! Synthesize the `process_action(action_name)` dispatcher: conditionally
+//! invoke before-action filters and case-dispatch to per-action methods.
+
+use crate::dialect::{AccessorKind, Action, Filter, MethodDef, MethodReceiver, Param};
+use crate::effect::EffectSet;
+use crate::expr::{Arm, ArrayStyle, Expr, ExprNode, Literal, Pattern, RescueClause};
+use crate::ident::{Symbol, VarId};
+use crate::span::Span;
+use crate::ty::Ty;
+
+use super::rewrites;
+use super::util::method_name_for_action;
+
+/// A statement in the synthesized before_action preamble — the filter
+/// chain that runs ahead of the case dispatch. `Call` invokes a filter
+/// method defined on this controller or an ancestor (`authenticate_user`
+/// on ApplicationController firing for every subclass action); `Block`
+/// inlines a block-form filter's body (`before_action { @page = page }`).
+/// `Lead` is not a filter: an always-on head of `process_action`
+/// (ParamsWrapper) that Rails runs outside the callback chain.
+/// `halt_check` appends `return if performed?` after the statement —
+/// Rails' halting semantics: a filter that renders or redirects skips
+/// the action. It's set only when the filter body can respond, so
+/// pure-assignment filters add no dispatch noise (and filter-free
+/// controllers emit byte-identical dispatchers).
+pub(super) enum PreambleStmt {
+    Call { filter: Filter, halt_check: bool },
+    Block {
+        body: Expr,
+        only: Vec<Symbol>,
+        except: Vec<Symbol>,
+        /// Same guard vocabulary a Symbol-target filter carries on
+        /// `Filter` — a lambda-target filter (`before_action -> { … },
+        /// if: :x` / `unless: -> { … }`) needs the same `if:`/`unless:`
+        /// a named one does; see `cond_from_guards`.
+        if_cond: Option<Symbol>,
+        unless_cond: Option<Symbol>,
+        if_cond_expr: Option<Expr>,
+        unless_cond_expr: Option<Expr>,
+        halt_check: bool,
+    },
+    /// Always-on head of `process_action` — not a before_action.
+    Lead { body: Expr },
+}
+
+/// Build the `process_action(action_name)` dispatcher:
+///
+/// ```ruby
+/// def process_action(action_name)
+///   authenticate_user
+///   require_logged_in_user if [:hidden, :saved].include?(action_name)
+///   return if performed?
+///   case action_name
+///   when :index then index
+///   when :new then new_action
+///   ...
+///   end
+/// end
+/// ```
+///
+/// The preamble is the before_action chain (inherited filters first,
+/// then this controller's own, declaration order); same-controller
+/// filters whose targets are private methods are instead inlined into
+/// the action bodies upstream (`inline_before_filters`) and don't
+/// appear here.
+/// `publics` is this controller's OWN public actions; `inherited` names
+/// the ones it reaches only through its parent. Both get a dispatch
+/// arm, only the former gets a method.
+/// One `rescue_from` declaration: the exception classes it names and
+/// the body that handles them.
+pub(super) struct RescueHandler {
+    pub classes: Vec<Expr>,
+    pub body: Expr,
+}
+
+/// The around and after filters that fire for this controller, each
+/// already narrowed by any `skip_*` that names it.
+#[derive(Default)]
+pub(super) struct WrapFilters {
+    /// Declaration order, inherited first — the first is OUTERMOST
+    /// (ActiveSupport runs arounds in the order they were set).
+    pub around: Vec<Filter>,
+    /// Declaration order; emitted REVERSED, since ActiveSupport runs
+    /// after callbacks in reverse (`callbacks.rb`: "then runs the after
+    /// callbacks in reverse order"). Named targets and block-form
+    /// (`after_action only: [...] do … end`) alike.
+    pub after: Vec<PreambleStmt>,
+}
+
+/// The dispatcher's parameter in a controller that reads `action_name`.
+const ROUTED_ACTION: &str = "routed_action";
+
+/// The expressions that the dispatcher runs in its own body: the filter
+/// blocks and lambdas, the `if:`/`unless:` lambdas, and the
+/// `rescue_from` handlers. Filter methods and actions are not here,
+/// because they run as methods of their own.
+pub(super) fn dispatcher_bodies<'a>(
+    preamble: &'a [PreambleStmt],
+    wraps: &'a WrapFilters,
+    rescues: &'a [RescueHandler],
+) -> Vec<&'a Expr> {
+    let filter_guards =
+        |f: &'a Filter| [&f.if_cond_expr, &f.unless_cond_expr].into_iter().flatten();
+    let mut out: Vec<&Expr> = Vec::new();
+    for stmt in preamble.iter().chain(&wraps.after) {
+        match stmt {
+            PreambleStmt::Call { filter, .. } => out.extend(filter_guards(filter)),
+            PreambleStmt::Block { body, if_cond_expr, unless_cond_expr, .. } => {
+                out.push(body);
+                out.extend([if_cond_expr, unless_cond_expr].into_iter().flatten());
+            }
+            PreambleStmt::Lead { body } => out.push(body),
+        }
+    }
+    out.extend(wraps.around.iter().flat_map(filter_guards));
+    out.extend(rescues.iter().map(|h| &h.body));
+    out
+}
+
+pub(super) fn synthesize_process_action(
+    preamble: &[PreambleStmt],
+    publics: &[Action],
+    inherited: &[Symbol],
+    enclosing_class: Symbol,
+    deferred_tails: &crate::det::HashMap<Symbol, Expr>,
+    rescues: &[RescueHandler],
+    wraps: &WrapFilters,
+    reads_action_name: bool,
+    missing: &[Symbol],
+) -> MethodDef {
+    let mut stmts: Vec<Expr> = Vec::new();
+
+    // Rails' `action_name` is controller state, not a dispatcher local.
+    // Only a controller that reads it gets this call. The Rust emitter
+    // adds `assign_action_name` only to a controller that calls it, so
+    // the other controllers emit as before. That controller also gets
+    // a different parameter name. A filter body runs inside
+    // this method, so a parameter named `action_name` would hide the
+    // String reader from a bare `action_name` in the body.
+    let param = if reads_action_name { ROUTED_ACTION } else { "action_name" };
+    if reads_action_name {
+        // Explicit `self` so Rust emits `self.assign_action_name(...)`
+        // against the shim's `&mut self` method (a receiverless Send
+        // becomes a bare function call). Also feeds `mutates_self`
+        // propagation so `process_action` is not classified static.
+        stmts.push(syn(ExprNode::Send {
+            recv: Some(syn(ExprNode::SelfRef)),
+            method: Symbol::from("assign_action_name"),
+            args: vec![var_ref(param)],
+            block: None,
+            parenthesized: true,
+        }));
+    }
+
+    // A route naming an action this controller does not define (no
+    // method here or on an ancestor, no template) is Rails'
+    // `AbstractController::ActionNotFound`, raised by `process` BEFORE
+    // the callback chain and outside `rescue_from`;
+    // `ActionDispatch::ExceptionWrapper` answers 404. Without this the
+    // `case` below falls through and the request answers 200 with an
+    // empty body. Only controllers with such a route get the guard;
+    // every other dispatcher is unchanged.
+    let not_found_guard = (!missing.is_empty()).then(|| {
+        let raise = syn(ExprNode::Send {
+            recv: None,
+            method: Symbol::from("raise"),
+            args: vec![
+                syn(ExprNode::Const {
+                    path: vec![Symbol::from("AbstractController"), Symbol::from("ActionNotFound")],
+                }),
+                syn(ExprNode::StringInterp {
+                    parts: vec![
+                        crate::expr::InterpPart::Text { value: "The action '".to_string() },
+                        crate::expr::InterpPart::Expr { expr: var_ref(param) },
+                        crate::expr::InterpPart::Text {
+                            value: format!("' could not be found for {}", enclosing_class.as_str()),
+                        },
+                    ],
+                }),
+            ],
+            block: None,
+            parenthesized: false,
+        });
+        syn(ExprNode::If {
+            cond: include_check(missing, &[], param),
+            then_branch: raise,
+            else_branch: empty_seq(),
+        })
+    });
+
+    for p in preamble {
+        let (stmt, halt_check) = match p {
+            PreambleStmt::Call { filter, halt_check } => {
+                (filter_dispatch_stmt(filter, param), *halt_check)
+            }
+            PreambleStmt::Block {
+                body,
+                only,
+                except,
+                if_cond,
+                unless_cond,
+                if_cond_expr,
+                unless_cond_expr,
+                halt_check,
+            } => {
+                let stmt = match cond_from_guards(
+                    only,
+                    except,
+                    if_cond,
+                    unless_cond,
+                    if_cond_expr,
+                    unless_cond_expr,
+                    param,
+                ) {
+                    Some(cond) => syn(ExprNode::If {
+                        cond,
+                        then_branch: body.clone(),
+                        else_branch: empty_seq(),
+                    }),
+                    None => body.clone(),
+                };
+                (stmt, *halt_check)
+            }
+            PreambleStmt::Lead { body } => (body.clone(), false),
+        };
+        stmts.push(stmt);
+        if halt_check {
+            stmts.push(halt_if_performed());
+        }
+    }
+
+    if !publics.is_empty() || !inherited.is_empty() {
+        // `around_action :m` — `m` runs the action by yielding, so the
+        // dispatch becomes the block it is handed. Under the filter's
+        // own guards; where they fail, the action runs unwrapped, which
+        // is what Rails' skipped callback does. lobsters'
+        // `track_story_reads` loads the story and the read ribbon the
+        // story page renders, then bumps the ribbon after it.
+        let mut dispatch = case_dispatch(publics, inherited, deferred_tails, param);
+        for f in wraps.around.iter().rev() {
+            let wrapped = syn(ExprNode::Send {
+                recv: None,
+                method: f.target.clone(),
+                args: vec![],
+                block: Some(syn(ExprNode::Lambda { extra_params: Vec::new(),
+                    params: vec![],
+                    rest_param: None,
+                    block_param: None,
+                    body: dispatch.clone(),
+                    block_style: crate::expr::BlockStyle::Do,
+                })),
+                parenthesized: false,
+            });
+            dispatch = match filter_cond(f, param) {
+                Some(cond) => syn(ExprNode::If { cond, then_branch: wrapped, else_branch: dispatch }),
+                None => wrapped,
+            };
+        }
+        stmts.push(dispatch);
+        // `after_action :m` — after the action returns (a halted chain
+        // returned above; an action that raised is in the rescue).
+        for a in wraps.after.iter().rev() {
+            stmts.push(match a {
+                PreambleStmt::Call { filter, .. } => filter_dispatch_stmt(filter, param),
+                PreambleStmt::Block {
+                    body,
+                    only,
+                    except,
+                    if_cond,
+                    unless_cond,
+                    if_cond_expr,
+                    unless_cond_expr,
+                    ..
+                } => match cond_from_guards(
+                    only,
+                    except,
+                    if_cond,
+                    unless_cond,
+                    if_cond_expr,
+                    unless_cond_expr,
+                    param,
+                ) {
+                    Some(cond) => syn(ExprNode::If {
+                        cond,
+                        then_branch: body.clone(),
+                        else_branch: empty_seq(),
+                    }),
+                    None => body.clone(),
+                },
+                // `Lead` is preamble-only; after filters never carry one.
+                PreambleStmt::Lead { body } => body.clone(),
+            });
+        }
+        // Rails writes the CSP header in middleware, after the
+        // controller — including an around_action that served a cached
+        // page and did not yield. Only a chain that narrowed (or
+        // consulted) `content_security_policy` pays for the call;
+        // `write_header` no-ops when the request has no policy.
+        if chain_mentions_csp(preamble, wraps) {
+            stmts.push(csp_header_stmt());
+        }
+    }
+
+    let mut body = match stmts.len() {
+        0 => syn(ExprNode::Seq { exprs: vec![] }),
+        1 => stmts.into_iter().next().unwrap(),
+        _ => syn(ExprNode::Seq { exprs: stmts }),
+    };
+    // `rescue_from` wraps the WHOLE dispatcher, filters included —
+    // Rails registers the handlers on `process_action`, so a filter that
+    // raises is caught exactly as an action that raises is.
+    //
+    // LAST DECLARED WINS, which is Rails' order: its `rescue_with_handler`
+    // walks the registry in reverse. Ruby matches `rescue` clauses in
+    // source order, so the clauses are emitted reversed.
+    if !rescues.is_empty() {
+        let exc = Symbol::from("__rescued");
+        let mut clauses: Vec<RescueClause> = rescues
+            .iter()
+            .rev()
+            .map(|h| RescueClause {
+                classes: h.classes.clone(),
+                binding: Some(exc.clone()),
+                body: h.body.clone(),
+            })
+            .collect();
+        clauses.extend(cause_fallback_clause(rescues, &exc));
+        body = syn(ExprNode::BeginRescue {
+            body,
+            rescues: clauses,
+            else_branch: None,
+            ensure: None,
+            implicit: false,
+        });
+    }
+
+    if let Some(guard) = not_found_guard {
+        body = syn(ExprNode::Seq { exprs: vec![guard, body] });
+    }
+
+    // Whole-cloth synthesis — attribute the dispatcher scaffolding to
+    // the controller's source via its first public action (same file).
+    // The per-arm dispatch Sends built in `case_dispatch` carry their
+    // own action's span and win over this coarser stamp.
+    if let Some(first) = publics.first() {
+        body.inherit_span(first.body.span);
+    }
+
+    // Action bodies already run `rewrite_request_format` through
+    // `lower_action_body`. Everything *spliced into* this dispatcher —
+    // filter `if:`/`unless:` lambdas, block-form filter bodies
+    // (`before_action -> { … }`), and `rescue_from` handlers — skips
+    // that pipeline. One pass over the finished body closes the class
+    // of gap (map_expr walks If / Seq / Lambda / BeginRescue). The
+    // transform is idempotent on already-rewritten action-arm Sends.
+    body = rewrites::rewrite_request_format(&body);
+    // `params` the same way, and for the same reason. Rails runs a block
+    // or lambda filter, an `if:`/`unless:` lambda and a `rescue_from`
+    // block with `instance_exec` on the controller, so `params` there is
+    // the Parameters the action reads. Left raw, `params[:id]` was a
+    // Symbol-keyed read on the String-keyed `@params` Hash and answered
+    // nil: `Widget.find(nil)` became a 404, and `head :forbidden if
+    // params[:deny] == "1"` never fired (rubys/roundhouse#998). The
+    // action arms are already rewritten and carry `@params`, which the
+    // pass leaves alone.
+    body = rewrites::rewrite_params(&body);
+
+    let param_sym = Symbol::from(param);
+    MethodDef {
+        visibility: crate::dialect::MethodVisibility::Public,
+        unsupported_formals: None,
+        has_anonymous_block: false,
+        name_span: crate::span::Span::synthetic(),
+        name: Symbol::from("process_action"),
+        receiver: MethodReceiver::Instance,
+        params: vec![Param::positional(param_sym.clone())],
+        body,
+        // process_action dispatches to the named action and returns
+        // whatever it returns; concretely each action body terminates
+        // in render/redirect (returns Nil), so dispatch returns Nil.
+        signature: Some(crate::lower::typing::fn_sig(
+            vec![(param_sym, Ty::Sym)],
+            Ty::Nil,
+        )),
+        effects: EffectSet::default(),
+        enclosing_class: Some(enclosing_class),
+        kind: AccessorKind::Method,
+        is_async: false,
+        // True when the dispatcher writes `action_name` via the shim.
+        mutates_self: reads_action_name,
+        block_param: None,
+    }
+}
+
+/// Rails' `rescue_with_handler` falls back to the exception's `cause`
+/// (then the cause's cause) when no handler names the exception
+/// itself, and calls the handler it finds with that cause. An error
+/// raised inside a `rescue` gets the rescued one as its cause, so a
+/// handler for the original error still answers:
+///
+/// ```ruby
+/// rescue StandardError => __unhandled
+///   __rescued = __unhandled.cause
+///   until __rescued.nil? || __rescued.is_a?(A) || __rescued.is_a?(B)
+///     __rescued = __rescued.cause
+///   end
+///   if __rescued.is_a?(B) then <B's handler>   # last declared wins
+///   elsif __rescued.is_a?(A) then <A's handler>
+///   else raise __unhandled
+///   end
+/// ```
+///
+/// After the per-class clauses, so an exception a handler names is
+/// still caught by its own clause first. `StandardError`, not Rails'
+/// `Exception`: what an app wraps and re-raises is an application
+/// error. No clause when a handler already covers every
+/// `StandardError` (the fallback could never run).
+fn cause_fallback_clause(rescues: &[RescueHandler], exc: &Symbol) -> Option<RescueClause> {
+    let catch_all = rescues.iter().flat_map(|h| h.classes.iter()).any(|c| {
+        matches!(&*c.node, ExprNode::Const { path }
+            if path.len() == 1 && matches!(path[0].as_str(), "StandardError" | "Exception"))
+    });
+    if catch_all {
+        return None;
+    }
+    let unhandled = "__unhandled";
+    let rescued = || var_ref(exc.as_str());
+    let cause_of = |recv: Expr| {
+        syn(ExprNode::Send { recv: Some(recv), method: Symbol::from("cause"), args: vec![], block: None, parenthesized: false })
+    };
+    let assign_rescued = |value: Expr| {
+        syn(ExprNode::Assign {
+            target: crate::expr::LValue::Var { id: VarId(0), name: exc.clone() },
+            value,
+        })
+    };
+    let is_a = |class: &Expr| {
+        syn(ExprNode::Send {
+            recv: Some(rescued()),
+            method: Symbol::from("is_a?"),
+            args: vec![class.clone()],
+            block: None,
+            parenthesized: true,
+        })
+    };
+    let or = |left: Expr, right: Expr| {
+        syn(ExprNode::BoolOp { op: crate::expr::BoolOpKind::Or, surface: Default::default(), left, right })
+    };
+    let matches_any = |classes: &[Expr]| {
+        let mut tests = classes.iter().map(is_a);
+        let first = tests.next().expect("a rescue_from names at least one class");
+        tests.fold(first, or)
+    };
+    let all_classes: Vec<Expr> = rescues.iter().flat_map(|h| h.classes.iter().cloned()).collect();
+    let nil_check = syn(ExprNode::Send {
+        recv: Some(rescued()),
+        method: Symbol::from("nil?"),
+        args: vec![],
+        block: None,
+        parenthesized: false,
+    });
+    let walk = syn(ExprNode::While {
+        cond: or(nil_check, matches_any(&all_classes)),
+        body: assign_rescued(cause_of(rescued())),
+        until_form: true,
+    });
+    let reraise = syn(ExprNode::Send {
+        recv: None,
+        method: Symbol::from("raise"),
+        args: vec![var_ref(unhandled)],
+        block: None,
+        parenthesized: false,
+    });
+    let dispatch = rescues.iter().fold(reraise, |else_branch, h| {
+        syn(ExprNode::If { cond: matches_any(&h.classes), then_branch: h.body.clone(), else_branch })
+    });
+    Some(RescueClause {
+        classes: vec![syn(ExprNode::Const { path: vec![Symbol::from("StandardError")] })],
+        binding: Some(Symbol::from(unhandled)),
+        body: syn(ExprNode::Seq {
+            exprs: vec![assign_rescued(cause_of(var_ref(unhandled))), walk, dispatch],
+        }),
+    })
+}
+
+/// `return if performed?` — the halting check after a filter that can
+/// render or redirect.
+/// `return if performed?` — Rails' halting semantics, as one statement.
+/// Shared with `inline_before_filters`, which needs the same guard
+/// after a filter body it prepended into an action.
+pub(super) fn halt_if_performed() -> Expr {
+    let performed = syn(ExprNode::Send {
+        recv: None,
+        method: Symbol::from("performed?"),
+        args: vec![],
+        block: None,
+        parenthesized: false,
+    });
+    syn(ExprNode::If {
+        cond: performed,
+        then_branch: syn(ExprNode::Return {
+            value: syn(ExprNode::Lit { value: Literal::Nil }),
+        }),
+        else_branch: empty_seq(),
+    })
+}
+
+/// `set_X if [:a, :b, ...].include?(action_name)` — or unconditionally
+/// (no filter `only:` / `except:`) just `set_X`. `param` names the
+/// dispatcher parameter that holds the action Symbol.
+fn filter_dispatch_stmt(f: &Filter, param: &str) -> Expr {
+    let target_call = syn(ExprNode::Send {
+        recv: None,
+        method: f.target.clone(),
+        args: vec![],
+        block: None,
+        parenthesized: false,
+    });
+    match filter_cond(f, param) {
+        Some(cond) => syn(ExprNode::If {
+            cond,
+            then_branch: target_call,
+            else_branch: empty_seq(),
+        }),
+        None => target_call,
+    }
+}
+
+/// The guard a filter runs under, `None` when it always runs.
+fn filter_cond(f: &Filter, param: &str) -> Option<Expr> {
+    cond_from_guards(
+        &f.only,
+        &f.except,
+        &f.if_cond,
+        &f.unless_cond,
+        &f.if_cond_expr,
+        &f.unless_cond_expr,
+        param,
+    )
+}
+
+/// The guard vocabulary a filter target runs under — shared between a
+/// Symbol-target `Filter` (`filter_cond`, above) and a lambda-target
+/// `PreambleStmt::Block` (`synthesize_process_action`), since Rails
+/// gives both the same `only:`/`except:`/`if:`/`unless:` options.
+/// `None` when the filter always runs.
+///
+/// Guard conjunction, in Rails' own order: the only/except action
+/// check, then the `if:` / `unless:` conditions in BOTH spellings.
+///
+/// The lambda spelling has been enforced since lobsters gated
+/// dev-only filters with `if: -> { Rails.env.development? }`. The
+/// SYMBOL spelling was carried and not enforced, which is a filter
+/// that runs when Rails would have skipped it — campfire's
+/// `before_action :reject_banned_ip, unless: :safe_request?` meant
+/// every GET from a banned IP got a 429 where the app allows it, and
+/// `block_banned_requests_test` said so in as many words: `expected
+/// response :success, got status=429`.
+///
+/// A symbol guard is a zero-arg predicate on the controller — the
+/// same self-send the filter target itself is — so it builds the
+/// same shape the lambda branch builds from a body expression. If
+/// the predicate does not resolve, that is a real gap surfacing at
+/// the call Rails also makes, not a new one.
+fn cond_from_guards(
+    only: &[Symbol],
+    except: &[Symbol],
+    if_cond: &Option<Symbol>,
+    unless_cond: &Option<Symbol>,
+    if_cond_expr: &Option<Expr>,
+    unless_cond_expr: &Option<Expr>,
+    param: &str,
+) -> Option<Expr> {
+    let mut conds: Vec<Expr> = Vec::new();
+    if !(only.is_empty() && except.is_empty()) {
+        conds.push(include_check(only, except, param));
+    }
+    let predicate = |name: &Symbol| {
+        syn(ExprNode::Send {
+            recv: None,
+            method: name.clone(),
+            args: vec![],
+            block: None,
+            parenthesized: false,
+        })
+    };
+    let negate = |e: Expr| {
+        syn(ExprNode::Send {
+            recv: Some(e),
+            method: Symbol::from("!"),
+            args: vec![],
+            block: None,
+            parenthesized: false,
+        })
+    };
+    if let Some(name) = if_cond {
+        conds.push(predicate(name));
+    }
+    if let Some(name) = unless_cond {
+        conds.push(negate(predicate(name)));
+    }
+    // `request.format.<pred>?` in these exprs is rewritten once over
+    // the finished `process_action` body in `synthesize_process_action`
+    // (same helper action bodies get via `lower_action_body`). Do not
+    // re-apply here — that would special-case only the guard combiner
+    // and leave block-form filter / rescue bodies still raw.
+    if let Some(c) = if_cond_expr {
+        conds.push(c.clone());
+    }
+    if let Some(c) = unless_cond_expr {
+        conds.push(negate(c.clone()));
+    }
+    conds.into_iter().reduce(|l, r| {
+        syn(ExprNode::BoolOp {
+            op: crate::expr::BoolOpKind::And,
+            surface: crate::expr::BoolOpSurface::Symbol,
+            left: l,
+            right: r,
+        })
+    })
+}
+
+/// `[:a, :b].include?(action_name)` — or for `except:`,
+/// `![:a, :b].include?(action_name)` (we pass the list through `not`
+/// upstream; this helper just builds the include? form).
+fn include_check(only: &[Symbol], except: &[Symbol], param: &str) -> Expr {
+    let (syms, negate) = if !only.is_empty() {
+        (only, false)
+    } else {
+        (except, true)
+    };
+    let array = syn(ExprNode::Array {
+        elements: syms.iter().map(|s| sym_lit(s.as_str())).collect(),
+        style: ArrayStyle::Brackets,
+    });
+    let include = syn(ExprNode::Send {
+        recv: Some(array),
+        method: Symbol::from("include?"),
+        args: vec![var_ref(param)],
+        block: None,
+        parenthesized: true,
+    });
+    if negate {
+        syn(ExprNode::Send {
+            recv: Some(include),
+            method: Symbol::from("!"),
+            args: vec![],
+            block: None,
+            parenthesized: false,
+        })
+    } else {
+        include
+    }
+}
+
+/// `case action_name; when :foo then foo; ...; end` — one arm per
+/// public action. The `:new` action dispatches to `new_action` (Ruby
+/// `def new` would shadow `Object#new`).
+///
+/// INHERITED actions get an arm too, and that is not a nicety. Rails
+/// dispatches an action a controller reaches only through its parent —
+/// campfire's `Rooms::DirectsController < RoomsController` defines
+/// new/create/edit and inherits `destroy`, overriding just `room_scope`
+/// and `ensure_can_administer` to widen who may run it. With no arm the
+/// dispatcher fell off the end of the `case` and answered 200 with no
+/// body, so `destroy only allowed for all room users` saw neither the
+/// redirect nor the deleted row.
+///
+/// The preamble above already knew: `build_filter_preamble` emits
+/// `set_room if [:show, :destroy].include?(action_name)` in that very
+/// method. Two halves of one dispatcher disagreeing about which actions
+/// exist is the shape of the bug.
+///
+/// An inherited arm needs no method here — Ruby finds the parent's, and
+/// re-emitting it on the subclass would shadow an override rather than
+/// use it.
+fn case_dispatch(
+    publics: &[Action],
+    inherited: &[Symbol],
+    deferred_tails: &crate::det::HashMap<Symbol, Expr>,
+    param: &str,
+) -> Expr {
+    // The default render for an action whose body must not carry it —
+    // see `actions_reached_by_super`. Already lowered: it was
+    // synthesized into the body, rode every rewrite there (the render
+    // rewrite above all, which is what binds `render :create` to
+    // `Views::Messages.create_turbo_stream(@message, …)`), and was split
+    // back off. Emitted INSIDE the arm rather than after the whole
+    // `case`, so only the deferred action changes shape.
+    let arm_for = |action_name: &str, span: Option<crate::span::Span>| {
+        let method_name = method_name_for_action(action_name);
+        let mut dispatch = syn(ExprNode::Send {
+            recv: None,
+            method: Symbol::from(method_name),
+            args: vec![],
+            block: None,
+            parenthesized: false,
+        });
+        // Each dispatch Send attributes to the action it invokes.
+        if let Some(span) = span {
+            dispatch.inherit_span(span);
+        }
+        Arm {
+            pattern: Pattern::Lit {
+                value: Literal::Sym { value: Symbol::from(action_name) },
+            },
+            guard: None,
+            body: dispatch,
+        }
+    };
+    let mut arms: Vec<Arm> = publics
+        .iter()
+        .map(|a| {
+            let mut arm = arm_for(a.name.as_str(), Some(a.body.span));
+            if let Some(tail) = deferred_tails.get(&a.name).cloned() {
+                arm.body = syn(ExprNode::Seq { exprs: vec![arm.body, tail] });
+            }
+            arm
+        })
+        .collect();
+    arms.extend(inherited.iter().map(|n| arm_for(n.as_str(), None)));
+    syn(ExprNode::Case {
+        scrutinee: var_ref(param),
+        arms,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Synthetic-Expr helpers — every node a synthesized span and default
+// effects/ty so the rest of the pipeline doesn't choke on them.
+// ---------------------------------------------------------------------------
+
+fn chain_mentions_csp(preamble: &[PreambleStmt], wraps: &WrapFilters) -> bool {
+    preamble.iter().chain(&wraps.after).any(|stmt| match stmt {
+        PreambleStmt::Block { body, if_cond_expr, unless_cond_expr, .. } => {
+            expr_calls(body, "content_security_policy")
+                || if_cond_expr.as_ref().is_some_and(|e| expr_calls(e, "content_security_policy"))
+                || unless_cond_expr
+                    .as_ref()
+                    .is_some_and(|e| expr_calls(e, "content_security_policy"))
+        }
+        PreambleStmt::Call { filter, .. } => {
+            filter.if_cond_expr.as_ref().is_some_and(|e| expr_calls(e, "content_security_policy"))
+                || filter
+                    .unless_cond_expr
+                    .as_ref()
+                    .is_some_and(|e| expr_calls(e, "content_security_policy"))
+        }
+        PreambleStmt::Lead { body } => expr_calls(body, "content_security_policy"),
+    })
+}
+
+pub(super) fn expr_calls(expr: &Expr, name: &str) -> bool {
+    let mut found = false;
+    fn walk(e: &Expr, name: &str, found: &mut bool) {
+        if *found {
+            return;
+        }
+        if let ExprNode::Send { method, .. } = &*e.node {
+            if method.as_str() == name {
+                *found = true;
+                return;
+            }
+        }
+        e.node.for_each_child(&mut |child| walk(child, name, found));
+    }
+    walk(expr, name, &mut found);
+    found
+}
+
+fn csp_header_stmt() -> Expr {
+    syn(ExprNode::Send {
+        recv: Some(syn(ExprNode::Const {
+            path: vec![Symbol::from("ActionDispatch"), Symbol::from("ContentSecurityPolicy")],
+        })),
+        method: Symbol::from("write_header"),
+        args: vec![syn(ExprNode::SelfRef)],
+        block: None,
+        parenthesized: true,
+    })
+}
+
+fn syn(node: ExprNode) -> Expr {
+    Expr::new(Span::synthetic(), node)
+}
+
+fn sym_lit(s: &str) -> Expr {
+    syn(ExprNode::Lit { value: Literal::Sym { value: Symbol::from(s) } })
+}
+
+fn var_ref(name: &str) -> Expr {
+    syn(ExprNode::Var {
+        id: VarId(0),
+        name: Symbol::from(name),
+    })
+}
+
+fn empty_seq() -> Expr {
+    syn(ExprNode::Seq { exprs: vec![] })
+}

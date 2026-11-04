@@ -1,0 +1,17 @@
+"wrong number of arguments (given 0, expected 1)"
+"wrong number of arguments (given 2, expected 1)"
+5
+"wrong number of arguments (given 2, expected 1)"
+4
+"unknown keyword: :j"
+3
+"wrong number of arguments (given 3, expected 1..2)"
+"wrong number of arguments (given 0, expected 1+)"
+[1, [2, 3]]
+"missing keyword: :k"
+3
+"wrong number of arguments (given 2, expected 1)"
+[1, {z: 2}]
+[1, 2, {z: 3}]
+[1, 5, {q: 6}]
+[1, 1, {}]

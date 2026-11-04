@@ -1,0 +1,18 @@
+NoMethodError: undefined method '>' for nil
+NoMethodError: undefined method '<=' for nil
+ArgumentError: comparison of Integer with nil failed
+ArgumentError: comparison of Integer with nil failed
+nil
+nil
+NoMethodError: undefined method 'between?' for nil
+NoMethodError: undefined method 'clamp' for nil
+NoMethodError: undefined method '>' for nil
+NoMethodError: undefined method '<' for nil
+ArgumentError: comparison of Float with nil failed
+nil
+false
+true
+true
+3
+NoMethodError: undefined method '>' for nil
+false

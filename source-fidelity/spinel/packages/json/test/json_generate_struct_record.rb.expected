@@ -1,0 +1,4 @@
+"#<struct Rec id=1, name=\"alice\">"
+"#<struct Rec id=2, name=\"bob\">"
+"#<struct Rec id=nil, name=nil>"
+"#<struct Esc text=\"a\\\"b\\nc\\td\">"

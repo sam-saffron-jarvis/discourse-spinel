@@ -1,0 +1,4 @@
+11
+1
+10
+[[:fetch], [:read], [:fetch], [:fetch], [:fetch], [:read], [:fetch], [:read], [:fetch], [:read], [:fetch, 0, 7], [:read], [:fetch], [:read], [:read], [:fetch], [:read], [:fetch], [:read, 1, 7], [:fetch], [:read], [:fetch, 0], [:read, 1]]

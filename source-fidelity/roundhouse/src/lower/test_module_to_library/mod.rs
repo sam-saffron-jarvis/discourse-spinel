@@ -1,0 +1,1260 @@
+//! Lower a `TestModule` (one Ruby test file's `class XTest < Y` shape)
+//! into a `LibraryClass` whose `methods` are one `def test_<snake>; …;
+//! end` per `test "description" do … end` block. Output flows through
+//! the universal walker like every other lowered class.
+//!
+//! The `test "name" do … end` macro form is just sugar for `def
+//! test_<sanitized name>`, so the lowering is mostly mechanical:
+//! sanitize the name, wrap the block body as a method body, tag the
+//! kind as `Method`.
+
+pub mod inline_assertions;
+
+use crate::det::HashMap;
+
+use crate::analyze::ClassInfo;
+use crate::dialect::{
+    AccessorKind, Fixture, LibraryClass, MethodDef, MethodReceiver, Model, Test, TestModule,
+};
+use crate::effect::EffectSet;
+use crate::expr::{Expr, ExprNode};
+use crate::ident::{ClassId, Symbol};
+use crate::span::Span;
+use crate::ty::Ty;
+
+/// One lowered test module: the test class itself plus any classes
+/// that were declared inline inside its body. Inner classes are
+/// scoped to the test file in Ruby; per-target emission keeps them
+/// co-located (e.g. TS hoists them to file scope above the lowered
+/// test class). For test files with no inline classes (the typical
+/// Rails app pattern), `inner_classes` is empty.
+#[derive(Clone, Debug)]
+pub struct LoweredTestModule {
+    pub test_class: LibraryClass,
+    pub inner_classes: Vec<LibraryClass>,
+    /// Class-body constant assignments captured by `ingest_test_file`.
+    /// Per-target emit hoists them to file scope (TS: `const NAME =
+    /// <value>`) so test methods can reference them by bare name.
+    pub constants: Vec<(crate::ident::Symbol, crate::expr::Expr)>,
+}
+
+/// A test body's `x_url(…)` as the Ruby family answers it:
+/// `ActionView::ViewHelpers.url_for_path(x_path(…))`, the same seam a
+/// jbuilder `_url` goes through. In a Rails integration test both are
+/// absolute on the session's host (`http://www.example.com/…`), and
+/// campfire's bot API tests compare the two
+/// (`assert_equal room_message_url(@room, m), json["url"]`). The Ruby
+/// family's `url_for_path` reads the origin the test harness sets from
+/// its session (`host!`, `https!`), so the test side matches the view.
+///
+/// Only the Ruby emitter calls this. The strict targets' harnesses
+/// model no session host and their jbuilder answers the path, so their
+/// test bodies keep the path the shared lowering gives them, and the
+/// two sides agree there too. The inner `x_path(…)` is left bare for
+/// `rewrite_route_helpers` to namespace and id-project as usual. A test
+/// class's own `*_url` helper shadows the route helper and is left
+/// alone.
+pub fn ruby_family_absolute_test_urls(modules: &[TestModule]) -> Vec<TestModule> {
+    modules
+        .iter()
+        .map(|tm| {
+            let shadows: crate::det::HashSet<Symbol> =
+                tm.helpers.iter().map(|h| h.name.clone()).chain(tm.included_module_methods().cloned()).collect();
+            let rewrite = |e: &Expr| absolute_test_url(e, &shadows);
+            let mut tm = tm.clone();
+            for t in &mut tm.tests {
+                t.body = rewrite(&t.body);
+            }
+            tm.setup = tm.setup.as_ref().map(rewrite);
+            for h in &mut tm.helpers {
+                h.body = rewrite(&h.body);
+            }
+            tm
+        })
+        .collect()
+}
+
+fn absolute_test_url(expr: &Expr, shadows: &crate::det::HashSet<Symbol>) -> Expr {
+    crate::lower::controller_to_library::util::map_expr(expr, &|e| match &*e.node {
+        ExprNode::Send { recv: None, method, args, block, parenthesized }
+            if method.as_str().ends_with("_url") && !shadows.contains(method) =>
+        {
+            let stem = method.as_str().strip_suffix("_url").unwrap_or_default();
+            let path_call = Expr::new(
+                e.span,
+                ExprNode::Send {
+                    recv: None,
+                    method: Symbol::from(format!("{stem}_path")),
+                    args: args.iter().map(|a| absolute_test_url(a, shadows)).collect(),
+                    block: block.as_ref().map(|b| absolute_test_url(b, shadows)),
+                    parenthesized: *parenthesized,
+                },
+            );
+            Some(Expr::new(
+                e.span,
+                ExprNode::Send {
+                    recv: Some(Expr::new(
+                        e.span,
+                        ExprNode::Const {
+                            path: vec![Symbol::from("ActionView"), Symbol::from("ViewHelpers")],
+                        },
+                    )),
+                    method: Symbol::from("url_for_path"),
+                    args: vec![path_call],
+                    block: None,
+                    parenthesized: true,
+                },
+            ))
+        }
+        _ => None,
+    })
+}
+
+/// Bulk entry. Lower every test module against a shared class
+/// registry (typically the merged map from model + view + controller
+/// lowerings) so test bodies dispatch on real receivers — `@article
+/// .title` resolves to Article's title accessor, `Comment.where(…)`
+/// resolves to the model's class methods.
+///
+/// Backwards-compatible flat-shape entry that drops inner classes;
+/// callers that need them invoke `lower_test_modules_with_inner`.
+pub fn lower_test_modules_to_library_classes(
+    test_modules: &[TestModule],
+    fixtures: &[Fixture],
+    models: &[Model],
+    extras: Vec<(ClassId, ClassInfo)>,
+    route_id_segments: &crate::det::HashMap<String, Vec<bool>>,
+    direct_helpers: &crate::det::HashSet<String>,
+) -> Vec<LibraryClass> {
+    lower_test_modules_with_inner(test_modules, fixtures, models, extras, route_id_segments, direct_helpers)
+        .into_iter()
+        .map(|m| m.test_class)
+        .collect()
+}
+
+/// Same as `lower_test_modules_to_library_classes` but preserves
+/// inner classes (`class Validatable; ... end` declared inside the
+/// test class body) alongside their owning test class. Used by
+/// targets that hoist them to file scope rather than dropping them.
+pub fn lower_test_modules_with_inner(
+    test_modules: &[TestModule],
+    fixtures: &[Fixture],
+    models: &[Model],
+    extras: Vec<(ClassId, ClassInfo)>,
+    // Which route-helper segments are id-shaped, so a record argument
+    // projects to `.id` only where an id is what the segment holds —
+    // `crate::lower::routes::helper_id_segments`.
+    route_id_segments: &crate::det::HashMap<String, Vec<bool>>,
+    // The app's `direct` helpers (`crate::lower::routes::direct_helper_names`),
+    // whose options reach them as written.
+    direct_helpers: &crate::det::HashSet<String>,
+) -> Vec<LoweredTestModule> {
+    lower_test_modules_with_inner_opts(test_modules, fixtures, models, extras, route_id_segments, direct_helpers, false)
+}
+
+/// `lower_test_modules_with_inner`, with `owner_objects` for the Ruby
+/// family: an association constructor hands its owner OBJECT to the
+/// automatic inverse (see `rewrite_assoc_create_with_models_in_place`).
+pub fn lower_test_modules_with_inner_opts(
+    test_modules: &[TestModule],
+    fixtures: &[Fixture],
+    models: &[Model],
+    extras: Vec<(ClassId, ClassInfo)>,
+    route_id_segments: &crate::det::HashMap<String, Vec<bool>>,
+    direct_helpers: &crate::det::HashSet<String>,
+    owner_objects: bool,
+) -> Vec<LoweredTestModule> {
+    let mut classes: HashMap<ClassId, ClassInfo> = HashMap::default();
+    for (id, info) in extras {
+        classes.insert(id, info);
+    }
+    // A standalone test body has no Ruby source index. Register every
+    // app model under its exact name so class-method dispatch resolves
+    // even when the caller omits it from `extras`. Preserve real entries.
+    for model in models {
+        classes.entry(model.name.clone()).or_default();
+    }
+    // Same framework stubs the view + controller lowerers register —
+    // RouteHelpers, ViewHelpers, Inflector, etc. Test bodies dispatch
+    // on these via bare-name (`articles_url`) AND via Const
+    // (`RouteHelpers.articles_url`). The mixin loop below copies the
+    // RouteHelpers entries into each test class's instance_methods so
+    // bare-name dispatch resolves.
+    crate::lower::view_to_library::insert_framework_stubs(&mut classes);
+    // Stdlib exceptions (`StandardError`, `ActiveRecord::RecordNotFound`, …)
+    // so retyping test bodies keeps `CLASS_OBJECT_VALUE` on those Const
+    // refs — otherwise `Child < Parent` collapses to Incompatible and
+    // TS/Kotlin/Swift framework `errors_test` throw at emit.
+    crate::analyze::register_stdlib_classes(&mut classes);
+    insert_minitest_test_baseline(&mut classes);
+    insert_cookie_jar_baseline(&mut classes);
+
+    // Inner classes (e.g. `class Validatable; include
+    // ActiveRecord::Validations; end` inside ValidationsTest) need
+    // to register in the typing registry BEFORE test bodies are
+    // typed so `Validatable.new` resolves. Each inner class also
+    // carries an inferred `new -> Self` constructor so the
+    // typer sees `Validatable.new()` returning a Validatable.
+    let inner_classes_per_module: Vec<Vec<LibraryClass>> = test_modules
+        .iter()
+        .map(|tm| tm.inner_classes.clone())
+        .collect();
+    for inner in inner_classes_per_module.iter().flatten() {
+        let mut info = crate::lower::class_info_from_library_class(inner);
+        // Inherit the parent's instance surface. `class TestController <
+        // ActionController::Base` declared inside a test file is ingested
+        // as a plain LibraryClass — none of the controller lowering runs
+        // — so without this the registry knows only the three actions the
+        // stand-in declares, and both `@controller.session` at a test
+        // call site and a bare `render(...)` inside the stand-in's own
+        // body dispatch against nothing. The parent is already in
+        // `classes`: each target's test-emit branch seeds `extras` from
+        // `app.rbs_signatures`, which carries every framework `.rbs`.
+        inherit_parent_surface(&mut info, inner.parent.as_ref(), &classes);
+        // Synthesize `new() -> Self` if the inner class doesn't
+        // explicitly declare one. Ruby's class-level `.new` is
+        // implicit; without registering it the typer leaves
+        // `Validatable.new` Untyped and downstream method dispatch
+        // (`@subject.validates_presence_of(...)`) drops through.
+        let new_sym = Symbol::from("new");
+        if !info.class_methods.contains_key(&new_sym) {
+            info.class_methods.insert(
+                new_sym.clone(),
+                crate::lower::typing::fn_sig(
+                    vec![],
+                    Ty::Class { id: inner.name.clone(), args: Vec::new().into() },
+                ),
+            );
+            info.class_method_kinds
+                .entry(new_sym)
+                .or_insert(AccessorKind::Method);
+        }
+        classes.insert(inner.name.clone(), info);
+    }
+
+    // Fixture helpers — Rails mixes in `<table_name>(name: Sym) ->
+    // Class(<Model>)` on every test class. Self-describing: derive
+    // from app.fixtures + app.models so the registry knows what
+    // `articles(:one)` returns.
+    let fixture_helpers: Vec<_> = fixtures.iter()
+        .map(|fixture| (fixture.name.clone(), fixture.accessor_signature(models)))
+        .collect();
+
+    // Rewrite fixture calls — `articles(:one)` → `ArticlesFixtures.one()` —
+    // so each call lands at concrete dispatch instead of relying on a
+    // runtime fixture-lookup helper. Done before typing so the body-typer
+    // sees the rewritten Const-receiver Sends.
+    let fixture_names: Vec<crate::ident::Symbol> =
+        fixtures.iter().map(|f| f.name.clone()).collect();
+    let mut out: Vec<LoweredTestModule> = Vec::new();
+    let mut all_lcs: Vec<LibraryClass> = test_modules
+        .iter()
+        .map(|tm| build_library_class(tm, route_id_segments))
+        .map(|mut lc| {
+            for m in &mut lc.methods {
+                m.body = crate::lower::rewrite_fixture_calls(&m.body, &fixture_names);
+            }
+            lc
+        })
+        .collect();
+
+    // Self-info for each test class — its own test_* methods +
+    // setup. Lets dispatch on `self` resolve when one test method
+    // calls a setup helper (or when frameworks evolve to support
+    // shared utility methods).
+    for (idx, lc) in all_lcs.iter().enumerate() {
+        let mut info = ClassInfo::default();
+        for m in &lc.methods {
+            if let Some(sig) = &m.signature {
+                info.instance_methods.insert(m.name.clone(), sig.clone());
+                info.instance_method_kinds.insert(m.name.clone(), m.kind);
+            }
+        }
+        // Spliced test-helper constants (DnsTestHelper → WEB_PUSH_…) so
+        // `type_method_body` can seed ConstScope and Value qualify keeps
+        // the bare name rather than re-expanding to the helper module.
+        for (name, _) in &test_modules[idx].constants {
+            info.constants.entry(name.clone()).or_insert(Ty::Untyped);
+        }
+        // Inherit Minitest::Test assertion methods so `self.assert(...)`
+        // dispatch resolves through the registry.
+        for (name, sig) in MINITEST_INSTANCE_METHODS.iter() {
+            let sym = Symbol::from(*name);
+            info.instance_methods.entry(sym.clone()).or_insert_with(|| sig());
+            info.instance_method_kinds
+                .entry(sym)
+                .or_insert(minitest_kind(name));
+        }
+        // Mix in fixture helpers — `articles(:one)` returns Article.
+        for (helper_name, sig) in &fixture_helpers {
+            info.instance_methods.entry(helper_name.clone()).or_insert_with(|| sig.clone());
+            info.instance_method_kinds
+                .entry(helper_name.clone())
+                .or_insert(AccessorKind::Method);
+        }
+        // Mix in route helpers — Rails makes `articles_url`,
+        // `article_path`, etc. available on every test class via
+        // include AbstractController::Routing::UrlFor. Pull from
+        // the RouteHelpers stub registered by the view lowerer.
+        if let Some(rh) = classes.get(&ClassId(Symbol::from("RouteHelpers"))) {
+            for (helper_name, sig) in &rh.class_methods {
+                info.instance_methods
+                    .entry(helper_name.clone())
+                    .or_insert_with(|| sig.clone());
+                info.instance_method_kinds
+                    .entry(helper_name.clone())
+                    .or_insert(AccessorKind::Method);
+            }
+        }
+        classes.insert(lc.name.clone(), info);
+    }
+
+    let empty_ivars: HashMap<Symbol, Ty> = HashMap::default();
+
+    // Type inner-class methods first — they may reference each other
+    // and need their bodies typed for downstream emit. `type_inner_class`
+    // infers ivar bindings and synthesizes method signatures (ingest
+    // leaves both empty for inline test stand-ins) so the per-target
+    // emit — the spinel `.rbs` sidecar especially — carries real types
+    // instead of falling back to `untyped`. No fixture-call rewrite
+    // (inner classes are framework-test stand-ins, not Rails models).
+    // Across every module, not per module: an included test helper is
+    // carried into each test that includes it, and its `.rbs` sidecar is
+    // one file by class name, so every copy has to declare the same thing.
+    let passed = keyword_args_passed(test_modules);
+    let mut typed_inner_per_module: Vec<Vec<LibraryClass>> = inner_classes_per_module
+        .into_iter()
+        .map(|inners| {
+            inners
+                .into_iter()
+                .map(|mut inner| {
+                    type_inner_class(&mut inner, &classes, &passed);
+                    inner
+                })
+                .collect()
+        })
+        .collect();
+
+    // A spliced helper with no declared signature was typed `-> nil` in
+    // `test_module_to_library`, and the registry above copied that in,
+    // so `self.parsed_cookies.signed[:session_token]` typed nil at the
+    // receiver and every read behind it was left to dispatch — `[]` on
+    // a boxed value, which a strict target refuses at runtime. The type
+    // is on the body once the body is typed: campfire's
+    // `SessionTestHelper#parsed_cookies` is one line,
+    // `ActionDispatch::Cookies::CookieJar.build(request, cookies.to_hash)`.
+    // Lift it the way `type_inner_class` lifts an inner stand-in's
+    // return, and BEFORE the test bodies are typed against the
+    // registry. A body the typer cannot name keeps the nil default
+    // rather than gaining `untyped`; a test method is never a helper.
+    let synthesized_per_module: Vec<crate::det::HashSet<Symbol>> = test_modules
+        .iter()
+        .map(|tm| {
+            tm.helpers
+                .iter()
+                .filter(|h| h.signature.is_none())
+                .map(|h| h.name.clone())
+                .collect()
+        })
+        .collect();
+    let mut lifted_sigs_per_module = vec![false; all_lcs.len()];
+    for (idx, lc) in all_lcs.iter_mut().enumerate() {
+        let synthesized = &synthesized_per_module[idx];
+        if synthesized.is_empty() {
+            continue;
+        }
+        let mut lifted: Vec<(Symbol, Ty)> = Vec::new();
+        for method in &mut lc.methods {
+            if !synthesized.contains(&method.name) {
+                continue;
+            }
+            crate::lower::typing::type_method_body(method, &classes, &empty_ivars);
+            let Some(body_ty) = method.body.ty.clone() else { continue };
+            if matches!(body_ty, Ty::Untyped | Ty::Nil) {
+                continue;
+            }
+            if let Some(Ty::Fn { ret, .. }) = &mut method.signature {
+                *ret = std::sync::Arc::new(body_ty);
+            }
+            if let Some(sig) = &method.signature {
+                lifted.push((method.name.clone(), sig.clone()));
+            }
+        }
+        lifted_sigs_per_module[idx] = !lifted.is_empty();
+        if let Some(info) = classes.get_mut(&lc.name) {
+            for (name, sig) in lifted {
+                info.instance_methods.insert(name, sig);
+            }
+        }
+    }
+
+    // The blank-predicate grounding this registry finally makes
+    // possible — see `blank::ground_body`. Built once, outside the
+    // per-method loop.
+    let blank_defs = crate::lower::blank::AppDefinitions::from_class_registry(&classes);
+
+    for (idx, mut lc) in all_lcs.into_iter().enumerate() {
+        let synthesized = &synthesized_per_module[idx];
+        let lifted_sigs = lifted_sigs_per_module[idx];
+        for method in &mut lc.methods {
+            // Helpers with no declared signature were typed in the lift
+            // pass above, before sibling returns were in the registry.
+            // Retype them once those signatures exist. Skip the extra
+            // type only when this module lifted nothing.
+            if !synthesized.contains(&method.name) || lifted_sigs {
+                crate::lower::typing::type_method_body(method, &classes, &empty_ivars);
+            }
+            // Harvest from this first typed pass, before the rewrites.
+            // Assoc-create / route-id / assert / blank / header rewrites
+            // do not introduce ivar assignments, so the map is the same
+            // as harvesting after them — and one follow-up type then
+            // covers both rewritten nodes and ivar reads. Without the
+            // ivar seed, `@messages = ….to_a` binds nothing and
+            // `@messages.third` is a read off an untyped ivar.
+            let mut ivars: HashMap<Symbol, Ty> = HashMap::default();
+            crate::analyze::extract_ivar_assignments(&method.body, &mut ivars);
+            ivars.retain(|_, ty| !ty.is_unknown());
+            // Has-many `.create` / `.build` rewrite needs the parent
+            // expression's class type — must run AFTER the typer.
+            // Statement-shape pass (no outer Assign) so it pairs with
+            // tests that just call `article.comments.create(...)` for
+            // its side effect. Re-type after the rewrite so the
+            // freshly-synthesized Sends/Hash entries get a `ty` —
+            // `lowered_real_blog_typing_residual` enforces a
+            // 0-untyped ceiling.
+            let mut rewritten = crate::lower::seeds_to_library::
+                rewrite_assoc_create_with_models_in_place(&mut method.body, models, owner_objects);
+            // A record standing where a route helper wants an id.
+            // Type-directed, so it must be here and not back where the
+            // `RouteHelpers.` receiver was added: at THAT point a test
+            // body's `room_path(rooms(:watercooler))` still held a bare
+            // fixture call, and `room_path(users(:david).rooms.original)`
+            // a chain — neither is a shape the receiver-adding pass can
+            // recognize, and both asserted a redirect to
+            // `/rooms/#<Room:0x000000012339eda0>`.
+            rewritten |= crate::lower::controller_to_library::rewrites::
+                project_route_helper_ids_in_place(&mut method.body, direct_helpers);
+            // Inline assert_*/refute_* sends — replaces vacuous
+            // Minitest dispatch with real `raise` so spinel's
+            // assertion-correctness signal is non-fake. See
+            // project_spinel_assertions_vacuous.md for context.
+            // Cross-target by design: each target's emit renders
+            // ExprNode::Raise as its native halt-with-message (Ruby
+            // `raise`, Crystal `raise`, TS `throw`, …) — see the
+            // issue's "Cross-target benefits" table.
+            rewritten |= inline_assertions::inline_assertions_in_place(&mut method.body, &|name| {
+                test_modules[idx].defines_instance_method(test_modules, name)
+            });
+            // Ground `blank?`/`present?`/`presence` by receiver type,
+            // AFTER the assertion inlining that wraps them in a `raise
+            // … if !(…)` and BEFORE the re-type that stamps the result.
+            // campfire's `sign_in` ends `assert
+            // cookies[:session_token].present?` and reaches ~20
+            // controller test files; on a strict target the dynamic
+            // send is `undefined method 'present?' for an instance of
+            // String` and takes every test behind it.
+            rewritten |= crate::lower::blank::ground_body(&mut method.body, &blank_defs);
+            rewritten |= lowercase_header_reads(&mut method.body);
+            if rewritten || !ivars.is_empty() {
+                crate::lower::typing::type_method_body(method, &classes, &ivars);
+            }
+            // `second`…`fifth` on a typed Array — type-directed, so
+            // here and not in the pre-typing pass over `app.test_modules`.
+            let mut ordinal = crate::lower::array_ordinal::rewrite_body(&mut method.body);
+            // `squish` on a typed String receiver — type-directed for
+            // the same reason, and after the ordinal rewrite for no
+            // reason but that the two are one re-type apart.
+            ordinal |= crate::lower::enumerable_ext::rewrite_body(&mut method.body);
+            if ordinal {
+                crate::lower::typing::type_method_body(method, &classes, &ivars);
+            }
+        }
+        out.push(LoweredTestModule {
+            test_class: lc,
+            inner_classes: std::mem::take(&mut typed_inner_per_module[idx]),
+            constants: test_modules[idx].constants.clone(),
+        });
+    }
+    out
+}
+
+/// Body-type an inner (test stand-in) class, inferring ivar bindings
+/// and synthesizing method signatures.
+///
+/// Inner classes (`class Article < ActiveRecord::Base` declared inside
+/// a framework test file) arrive from ingest with no method signatures
+/// and no ivar typing, so a naive single-pass `type_method_body` leaves
+/// every `@ivar` read as a fresh type variable and every method's
+/// return type unknown. Downstream that surfaces as `untyped` in the
+/// spinel `.rbs` sidecar — enough to compile, but not real type info.
+/// Three passes close the gap:
+///
+///   1. Seed a provisional signature on every signature-less method
+///      (params typed from their default expressions), then body-type
+///      with empty ivars so RHS values (`@title = title`) acquire a
+///      `ty`.
+///   2. Harvest ivar types from the typed bodies — direct `@x = v`
+///      assignments plus `self.x = v` setter calls (the latter carries
+///      the inherited AR primary-key `id`, set via `self.id = id`).
+///   3. If any ivar was harvested, re-type every body with those
+///      bindings (so `@id`/`@title` reads resolve to Integer/String).
+///      Then lift the inferred body type into each synthesized
+///      signature's return slot. `initialize` is pinned to a nil (void)
+///      return rather than the type of its last assignment. Skip the
+///      retype when harvest found nothing — pass 1 already typed
+///      against empty ivars.
+/// Copy a parent class's instance surface onto `info` for every name
+/// the subclass doesn't declare itself. Only the names are inherited —
+/// an override keeps its own entry, which `type_inner_class` then pins
+/// to the parent's *signature*.
+fn inherit_parent_surface(
+    info: &mut ClassInfo,
+    parent: Option<&ClassId>,
+    classes: &HashMap<ClassId, ClassInfo>,
+) {
+    let Some(pinfo) = parent.and_then(|p| classes.get(p)) else { return };
+    for (name, sig) in &pinfo.instance_methods {
+        info.instance_methods.entry(name.clone()).or_insert_with(|| sig.clone());
+    }
+    for (name, kind) in &pinfo.instance_method_kinds {
+        info.instance_method_kinds.entry(name.clone()).or_insert(*kind);
+    }
+}
+
+/// Take the parent signature's TYPES but this definition's parameter
+/// NAMES. The framework `.rbs` names its parameters for documentation
+/// (`def []: (String name) -> …`); the stand-in's body refers to its own
+/// (`def [](field)`), and any emitter that renders a parameter list from
+/// the signature rather than from `MethodDef.params` would otherwise
+/// declare `name` and leave the body reading an unbound `field`.
+fn adopt_param_names(ty: Ty, params: &[crate::dialect::Param]) -> Ty {
+    let Ty::Fn { params: sig_params, block, ret, effects } = ty else { return ty };
+    let renamed = sig_params
+        .into_iter()
+        .zip(params)
+        .map(|(sp, p)| crate::ty::Param { name: p.name.clone(), ..sp })
+        .collect();
+    Ty::Fn { params: renamed, block, ret, effects }
+}
+
+fn type_inner_class(
+    inner: &mut LibraryClass,
+    classes: &HashMap<ClassId, ClassInfo>,
+    passed: &HashMap<(Symbol, Symbol), Vec<Expr>>,
+) {
+    let empty_ivars: HashMap<Symbol, Ty> = HashMap::default();
+
+    // An override has to keep the shape it overrides. `def
+    // process_action(action_name)` in a `< ActionController::Base`
+    // stand-in carries no annotation, so the params-only synthesis below
+    // would infer `(untyped) -> untyped` — which every statically-typed
+    // target then emits as a method that overrides nothing (Kotlin
+    // `Any?`, Swift `Any?`) while the `case action_name.to_sym` inside
+    // has no String to match against. Take the parent's declared
+    // signature instead; param NAMES still come from this definition
+    // (emit zips `m.params` against the signature positionally), so the
+    // RBS's `_action_name` doesn't leak into the body.
+    // A parent signature may name its receiver (`-> instance`); the
+    // receiver is this inner class, so substitute on adoption rather
+    // than emit a self type as a declaration.
+    let self_ty = Ty::Class { id: inner.name.clone(), args: Vec::new().into() };
+    let parent_methods: HashMap<Symbol, Ty> = inner
+        .parent
+        .as_ref()
+        .and_then(|p| classes.get(p))
+        .map(|i| {
+            i.instance_methods
+                .iter()
+                .map(|(name, ty)| (name.clone(), ty.subst_self(&self_ty)))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Pass 1 — provisional signatures (so params bind from defaults) +
+    // first typing. Track which methods we synthesized so pass 3 only
+    // refines those, never clobbering a signature ingest supplied or one
+    // adopted from the parent.
+    let synthesized: Vec<bool> = inner
+        .methods
+        .iter_mut()
+        .map(|method| {
+            if method.signature.is_some() {
+                crate::lower::typing::type_method_body(method, classes, &empty_ivars);
+                return false;
+            }
+            // Only a same-arity, non-constructor definition is an
+            // override of the parent's shape. `initialize` is excluded on
+            // principle (Ruby constructors aren't a dispatch contract),
+            // and the arity guard keeps a stand-in that merely REUSES a
+            // framework method's name — `Article#initialize(attrs)` next
+            // to `ActiveRecord::Base#initialize`'s three — from
+            // inheriting a signature its own body contradicts.
+            let inherited = parent_methods
+                .get(&method.name)
+                .filter(|_| method.name.as_str() != "initialize")
+                .filter(|ty| {
+                    matches!(ty, Ty::Fn { params, .. } if params.len() == method.params.len())
+                })
+                .cloned()
+                .map(|ty| adopt_param_names(ty, &method.params));
+            let adopted = inherited.is_some();
+            method.signature = inherited
+                .or_else(|| {
+                    Some(signature_from_params(&method.name, &method.params, classes, passed, Ty::Untyped))
+                });
+            crate::lower::typing::type_method_body(method, classes, &empty_ivars);
+            !adopted
+        })
+        .collect();
+
+    // Pass 2 — harvest ivar bindings across all method bodies, but skip
+    // writer methods (`title=`, `[]=`). A writer's `@x = value` body is
+    // definitionally circular — `value` is whatever the attribute type
+    // is — and with an unannotated param it only widens the ivar to
+    // `untyped`. The attribute's real type comes from `initialize` and
+    // direct assignments, which the non-writer methods carry.
+    let mut ivars: HashMap<Symbol, Ty> = HashMap::default();
+    for method in &inner.methods {
+        if method.name.as_str().ends_with('=') {
+            continue;
+        }
+        crate::analyze::extract_ivar_assignments(&method.body, &mut ivars);
+        collect_self_setter_ivars(&method.body, &mut ivars);
+    }
+
+    // Pass 3 — re-type with ivars, then lift return types into the
+    // signatures we synthesized in pass 1. Skip the retype when harvest
+    // found nothing: pass 1 already typed against empty ivars.
+    for (method, was_synthesized) in inner.methods.iter_mut().zip(synthesized) {
+        if !ivars.is_empty() {
+            crate::lower::typing::type_method_body(method, classes, &ivars);
+        }
+        if !was_synthesized {
+            continue;
+        }
+        // An attribute writer (`title=(value)`) takes the attribute's
+        // own type and conventionally returns it. Pin its param + return
+        // to the harvested ivar type so the field isn't widened to
+        // `untyped` (which would force spinel to box it and contradict
+        // the `String` getter). `initialize` returns nil (void); every
+        // other method returns its inferred body type.
+        let writer_ivar = method
+            .name
+            .as_str()
+            .strip_suffix('=')
+            .and_then(|a| ivars.get(&Symbol::from(a)))
+            .cloned();
+        if let Some(ivar_ty) = writer_ivar {
+            if let Some(Ty::Fn { params, ret, .. }) = &mut method.signature {
+                if let Some(first) = params.first_mut() {
+                    first.ty = ivar_ty.clone().into();
+                }
+                *ret = std::sync::Arc::new(ivar_ty);
+            }
+        } else if let Some(Ty::Fn { ret, .. }) = &mut method.signature {
+            *ret = std::sync::Arc::new(if method.name.as_str() == "initialize" {
+                Ty::Nil
+            } else {
+                method.body.ty.clone().unwrap_or(Ty::Untyped)
+            });
+        }
+    }
+}
+
+/// Build a `Ty::Fn` signature for a method from its positional params.
+/// Params with a default render as optional (`?T name`) and take their
+/// type from the default expression; defaultless params are required
+/// and `untyped` (the inner stand-ins don't annotate). `ret` is the
+/// caller-supplied return type.
+fn signature_from_params(
+    method: &Symbol,
+    params: &[crate::dialect::Param],
+    classes: &HashMap<ClassId, ClassInfo>,
+    passed: &HashMap<(Symbol, Symbol), Vec<Expr>>,
+    ret: Ty,
+) -> Ty {
+    use crate::ty::Param as TyParam;
+    let ty_params: Vec<TyParam> = params
+        .iter()
+        .map(|p| {
+            // A REST parameter's declared type is its ELEMENT type, and
+            // it never has a default — typing it from one would be
+            // typing the wrong thing. Everything else takes its default's
+            // type when it has one.
+            let mut ty = match &p.default {
+                Some(d) if !p.rest => ty_of_expr(d, classes),
+                _ => Ty::Untyped,
+            };
+            // A keyword also takes what the module's own calls pass for
+            // it: campfire's push-service `Server#hung_up?(within: 5)` is
+            // called `hung_up?(within: 0.1)`, and an `Integer` from the
+            // default alone was a declaration spinel then refused the
+            // Float against. Only a value that types standalone (a
+            // literal) is read; anything else leaves the default's type.
+            // A keyword ingest flattened to a positional
+            // (`from_keyword`) is still passed by name at the call.
+            if (p.keyword || p.from_keyword) && !p.rest && !matches!(ty, Ty::Untyped) {
+                for value in passed.get(&(method.clone(), p.name.clone())).into_iter().flatten() {
+                    let seen = ty_of_expr(value, classes);
+                    if !matches!(seen, Ty::Untyped | Ty::Var { .. }) {
+                        ty = crate::analyze::union_of(ty, seen);
+                    }
+                }
+            }
+            TyParam { name: p.name.clone(), ty: ty.into(), kind: p.ty_kind() }
+        })
+        .collect();
+    Ty::Fn {
+        params: ty_params.into(),
+        block: None,
+        ret: std::sync::Arc::new(ret),
+        effects: EffectSet::pure(),
+    }
+}
+
+/// The literal keyword arguments the test modules' own code passes, by
+/// (method name, keyword): `hung_up?(within: 0.1)` files `0.1` under
+/// `(hung_up?, within)`. Tests, setup, helpers and the inner classes'
+/// own bodies are read; receivers are not resolved, so a name shared by
+/// two inner classes collects both callers' values.
+fn keyword_args_passed(modules: &[TestModule]) -> HashMap<(Symbol, Symbol), Vec<Expr>> {
+    fn walk(e: &Expr, out: &mut HashMap<(Symbol, Symbol), Vec<Expr>>) {
+        if let ExprNode::Send { method, args, .. } = &*e.node {
+            if let Some(last) = args.last() {
+                if let ExprNode::Hash { entries, kwargs: true } = &*last.node {
+                    for (k, v) in entries {
+                        if let ExprNode::Lit { value: crate::expr::Literal::Sym { value } } = &*k.node {
+                            out.entry((method.clone(), value.clone())).or_default().push(v.clone());
+                        }
+                    }
+                }
+            }
+        }
+        e.node.for_each_child(&mut |c| walk(c, out));
+    }
+    let mut out = HashMap::default();
+    for tm in modules {
+        for t in &tm.tests {
+            walk(&t.body, &mut out);
+        }
+        if let Some(setup) = &tm.setup {
+            walk(setup, &mut out);
+        }
+        for h in &tm.helpers {
+            walk(&h.body, &mut out);
+        }
+        for inner in &tm.inner_classes {
+            for m in &inner.methods {
+                walk(&m.body, &mut out);
+            }
+        }
+    }
+    out
+}
+
+/// Type a standalone expression (e.g. a parameter default) against the
+/// class registry, returning its inferred type.
+fn ty_of_expr(e: &Expr, classes: &HashMap<ClassId, ClassInfo>) -> Ty {
+    let typer = crate::analyze::BodyTyper::new(classes);
+    let ctx = crate::analyze::Ctx::default();
+    let mut clone = e.clone();
+    typer.analyze_expr(&mut clone, &ctx);
+    clone.ty.unwrap_or(Ty::Untyped)
+}
+
+/// Harvest `self.x = v` setter calls from a method body as ivar
+/// bindings (`@x : typeof(v)`). Complements
+/// `analyze::extract_ivar_assignments`, which only sees direct `@x = v`
+/// writes — the AR primary key is assigned via `self.id = id` in the
+/// stand-in's `initialize`, so it would otherwise stay untyped. Shallow
+/// scan of the body's top-level statements, which is where constructor
+/// setter calls live; bodies are typed before this runs so `v.ty` is
+/// populated.
+fn collect_self_setter_ivars(body: &Expr, out: &mut HashMap<Symbol, Ty>) {
+    let stmts: &[Expr] = match &*body.node {
+        ExprNode::Seq { exprs } => exprs,
+        _ => std::slice::from_ref(body),
+    };
+    for s in stmts {
+        if let ExprNode::Send { recv: Some(recv), method, args, .. } = &*s.node {
+            if matches!(&*recv.node, ExprNode::SelfRef)
+                && method.as_str().ends_with('=')
+                && args.len() == 1
+            {
+                if let Some(ty) = &args[0].ty {
+                    let name = Symbol::from(method.as_str().trim_end_matches('='));
+                    let merged = match out.remove(&name) {
+                        Some(prev) => crate::analyze::union_of(prev, ty.clone()),
+                        None => ty.clone(),
+                    };
+                    out.insert(name, merged);
+                }
+            }
+        }
+    }
+}
+
+/// Single-module entry point — kept for tests/probes. For whole-app
+/// emit, prefer the bulk entry which threads a shared registry.
+pub fn lower_test_module_to_library_class(
+    tm: &TestModule,
+    route_id_segments: &crate::det::HashMap<String, Vec<bool>>,
+) -> LibraryClass {
+    build_library_class(tm, route_id_segments)
+}
+
+fn build_library_class(
+    tm: &TestModule,
+    route_id_segments: &crate::det::HashMap<String, Vec<bool>>,
+) -> LibraryClass {
+    // Inline setup body at the start of every test method. The
+    // body-typer's Seq walk picks up `@article = articles(:one)` and
+    // propagates the type to downstream reads. Self-describing IR —
+    // the assignment is materialized at every call site, just like
+    // controller before-action filter inlining (ticket 8).
+    // A test class's own `*_path` / `*_url` helpers shadow the route
+    // helpers of the same name — same rule the controller lowering
+    // applies to its ancestry.
+    let helper_shadows: crate::det::HashSet<Symbol> = tm
+        .helpers
+        .iter()
+        .map(|h| h.name.clone())
+        .chain(tm.included_module_methods().cloned())
+        .filter(|n| n.as_str().ends_with("_path") || n.as_str().ends_with("_url"))
+        .collect();
+    let mut methods: Vec<MethodDef> = tm
+        .tests
+        .iter()
+        .map(|t| {
+            test_to_method_def(&tm.name, t, tm.setup.as_ref(), &helper_shadows, route_id_segments)
+        })
+        .collect();
+    // Helpers (non-test, non-setup `def` items in the test class
+    // body — e.g. `setup_adapter_with_stub_row`) lower as ordinary
+    // instance methods on the test class so test bodies can dispatch
+    // on them via `self.<helper>(...)`. Default-typed to nil return
+    // when the ingest pipeline didn't attach a signature.
+    for h in &tm.helpers {
+        let mut m = h.clone();
+        // Same route-helper namespacing the test methods get in
+        // `test_to_method_def`. A helper body reaches `session_url`
+        // exactly the way a test body does — campfire's spliced
+        // `SessionTestHelper#sign_in` posts to it — and without the
+        // rewrite the bare Send self-injects to `self.session_url`,
+        // which the test class does not carry.
+        m.body = crate::lower::controller_to_library::rewrites::rewrite_route_helpers(
+            &m.body,
+            &helper_shadows,
+            route_id_segments,
+        );
+        if m.signature.is_none() {
+            // KIND-AWARE, via `Param::ty_kind`. `fn_sig` makes every
+            // param Required, which is right for the synthesized stubs
+            // it was written for and wrong for a test's own helper:
+            // campfire writes `def ensure_messages_present(*messages,
+            // count: 1)` and this declared
+            // `(untyped messages, untyped count)`. spinel typed the
+            // parameter poly from that, while its own codegen read the
+            // `def` and passed a `sp_PolyArray *` — eleven C errors
+            // across four test binaries, and the `.rb` beside the
+            // `.rbs` said `*messages` the whole time.
+            let ty_params: Vec<crate::ty::Param> = m
+                .params
+                .iter()
+                .map(|p| crate::ty::Param {
+                    name: p.name.clone(),
+                    ty: Ty::Untyped.into(),
+                    kind: p.ty_kind(),
+                })
+                .collect();
+            m.signature = Some(Ty::Fn {
+                params: ty_params.into(),
+                block: None,
+                ret: std::sync::Arc::new(Ty::Nil),
+                effects: crate::effect::EffectSet::pure(),
+            });
+        }
+        m.enclosing_class = Some(tm.name.0.clone());
+        methods.push(m);
+    }
+    LibraryClass {
+        name: tm.name.clone(),
+        is_module: false,
+        parent: tm.parent.clone(),
+        parent_span: Default::default(),
+        includes: tm.includes.clone(),
+        include_spans: Vec::new(),
+        methods,
+        nullable_columns: Vec::new(),
+        origin: None,
+        constants: Vec::new(),
+        conditional_definitions: Vec::new(),
+        unknown_calls: Vec::new(),
+        class_ivar_initializers: Vec::new(),
+    }
+}
+
+/// Convert one `test "<name>" do …; end` block into `def
+/// test_<snake_name>; <setup_body>; …; end`. The optional setup
+/// argument — when present — gets prepended to the test body so
+/// every test method is self-contained (no out-of-band setup
+/// dependency, no double-call risk vs runtime auto-discovery).
+fn test_to_method_def(
+    owner: &ClassId,
+    t: &Test,
+    setup: Option<&Expr>,
+    shadows: &crate::det::HashSet<Symbol>,
+    route_id_segments: &crate::det::HashMap<String, Vec<bool>>,
+) -> MethodDef {
+    let snake = sanitize_test_name(&t.name);
+    let method_name = Symbol::from(format!("test_{snake}"));
+    let raw_body = match setup {
+        None => t.body.clone(),
+        Some(s) => prepend_setup(s, &t.body),
+    };
+    // Bare `articles_url(@article)` / `article_path(...)` calls in
+    // a test body need the `RouteHelpers.` namespace prefix — same
+    // rewrite controller bodies get. Without it, the bare-Send
+    // self-injection in the emitter turns these into
+    // `this.articles_url(...)`, which fails tsc since the test
+    // class doesn't carry route helpers as instance methods.
+    let body = crate::lower::controller_to_library::rewrites::rewrite_route_helpers(
+        &raw_body,
+        shadows,
+        route_id_segments,
+    );
+    MethodDef {
+        visibility: crate::dialect::MethodVisibility::Public,
+        unsupported_formals: None,
+        has_anonymous_block: false,
+        name_span: crate::span::Span::synthetic(),
+        name: method_name,
+        receiver: MethodReceiver::Instance,
+        params: Vec::new(),
+        body,
+        signature: Some(crate::lower::typing::fn_sig(vec![], Ty::Nil)),
+        effects: EffectSet::default(),
+        enclosing_class: Some(owner.0.clone()),
+        kind: AccessorKind::Method,
+        is_async: false,
+            mutates_self: false,
+            block_param: None,
+    }
+}
+
+/// Concatenate setup statements + test body statements into one Seq.
+/// Both sides are flattened (Seq-of-stmts → just the stmts) so the
+/// resulting body has no nested Seqs that would block ivar
+/// propagation through the typer's Seq walker (same reason
+/// controller_to_library has flatten_seqs).
+fn prepend_setup(setup: &Expr, body: &Expr) -> Expr {
+    let mut stmts: Vec<Expr> = match &*setup.node {
+        ExprNode::Seq { exprs } => exprs.clone(),
+        _ => vec![setup.clone()],
+    };
+    match &*body.node {
+        ExprNode::Seq { exprs } => stmts.extend(exprs.iter().cloned()),
+        _ => stmts.push(body.clone()),
+    }
+    Expr::new(Span::synthetic(), ExprNode::Seq { exprs: stmts })
+}
+
+/// `"creates an article with valid attributes"` →
+/// `"creates_an_article_with_valid_attributes"`.
+fn sanitize_test_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut prev_underscore = false;
+    for c in name.chars() {
+        if c.is_alphanumeric() {
+            for lower in c.to_lowercase() {
+                out.push(lower);
+            }
+            prev_underscore = false;
+        } else if !prev_underscore && !out.is_empty() {
+            out.push('_');
+            prev_underscore = true;
+        }
+    }
+    while out.ends_with('_') {
+        out.pop();
+    }
+    out
+}
+
+/// Minitest::Test + ActiveSupport::TestCase + ActionDispatch::Integration-
+/// Test instance methods every test body may call — assertions,
+/// refutations, fixture/HTTP/response helpers. Loose signatures
+/// (Untyped args) but concrete returns; lets the typer resolve
+/// `self.assert(...)`, `self.get(url)`, `self.assert_response(...)`
+/// dispatch through the registry. Combined here because Rails
+/// fixtures don't separate them at the dispatch level — every test
+/// class can reach all of these via the inheritance chain.
+type SigBuilder = fn() -> Ty;
+const MINITEST_INSTANCE_METHODS: &[(&str, SigBuilder)] = &[
+    // Core Minitest assertions.
+    ("assert", || fn_sig_one(Ty::Untyped, Ty::Nil)),
+    ("assert_equal", || fn_sig_two(Ty::Untyped, Ty::Untyped, Ty::Nil)),
+    ("assert_not", || fn_sig_one(Ty::Untyped, Ty::Nil)),
+    ("assert_not_equal", || fn_sig_two(Ty::Untyped, Ty::Untyped, Ty::Nil)),
+    ("assert_nil", || fn_sig_one(Ty::Untyped, Ty::Nil)),
+    ("assert_not_nil", || fn_sig_one(Ty::Untyped, Ty::Nil)),
+    ("assert_includes", || fn_sig_two(Ty::Untyped, Ty::Untyped, Ty::Nil)),
+    ("assert_match", || fn_sig_two(Ty::Untyped, Ty::Untyped, Ty::Nil)),
+    ("assert_no_match", || fn_sig_two(Ty::Untyped, Ty::Untyped, Ty::Nil)),
+    ("assert_raises", || fn_sig_one(Ty::Untyped, Ty::Untyped)),
+    // Test::Unit's spelling of the same assertion, which Rails aliases.
+    ("assert_raise", || fn_sig_one(Ty::Untyped, Ty::Untyped)),
+    // Minitest's throw/catch assertion — answers the thrown value.
+    ("assert_throws", || fn_sig_one(Ty::Untyped, Ty::Untyped)),
+    ("assert_difference", || fn_sig_one(Ty::Untyped, Ty::Untyped)),
+    // ActionCable::Channel::TestCase / Connection::TestCase — the
+    // harness in runtime/spinel/test/test_helper.rb. `subscribe` is
+    // rewritten to `subscribe_to` by `lower::cable_test_case`;
+    // `subscription`/`connection` are the objects it built.
+    ("stub_connection", || fn_sig_one(Ty::Untyped, Ty::Nil)),
+    ("subscribe_to", || crate::lower::typing::fn_sig(
+        vec![(Symbol::from("channel"), Ty::Str), (Symbol::from("keys"), Ty::Untyped), (Symbol::from("values"), Ty::Untyped)],
+        Ty::Nil,
+    )),
+    ("subscription", || crate::lower::typing::fn_sig(vec![], Ty::Untyped)),
+    ("unsubscribe", || crate::lower::typing::fn_sig(vec![], Ty::Nil)),
+    ("assert_has_stream", || fn_sig_one(Ty::Untyped, Ty::Nil)),
+    ("connect", || crate::lower::typing::fn_sig(vec![], Ty::Nil)),
+    ("connection", || crate::lower::typing::fn_sig(vec![], Ty::Untyped)),
+    ("assert_reject_connection", || crate::lower::typing::fn_sig(vec![], Ty::Nil)),
+    ("assert_no_difference", || fn_sig_one(Ty::Untyped, Ty::Untyped)),
+    ("refute", || fn_sig_one(Ty::Untyped, Ty::Nil)),
+    ("refute_equal", || fn_sig_two(Ty::Untyped, Ty::Untyped, Ty::Nil)),
+    ("refute_nil", || fn_sig_one(Ty::Untyped, Ty::Nil)),
+    ("skip", || fn_sig_one(Ty::Str, Ty::Nil)),
+    ("flunk", || fn_sig_one(Ty::Str, Ty::Nil)),
+    // ActionDispatch::IntegrationTest HTTP verbs — each takes a URL
+    // (and possibly opts) and dispatches through the test rack stack.
+    // Return Nil; sets `response`/`@response` ivars for downstream
+    // assertions.
+    ("get", || fn_sig_one(Ty::Untyped, Ty::Nil)),
+    ("post", || fn_sig_one(Ty::Untyped, Ty::Nil)),
+    ("put", || fn_sig_one(Ty::Untyped, Ty::Nil)),
+    ("patch", || fn_sig_one(Ty::Untyped, Ty::Nil)),
+    ("delete", || fn_sig_one(Ty::Untyped, Ty::Nil)),
+    ("head", || fn_sig_one(Ty::Untyped, Ty::Nil)),
+    // A second browser (`ActionDispatch::Integration::Session`), for a
+    // test that asks a question as another client; the verbs above
+    // are then sent to it.
+    ("open_session", || crate::lower::typing::fn_sig(vec![], Ty::Untyped)),
+    // Response assertions.
+    ("assert_response", || fn_sig_one(Ty::Untyped, Ty::Nil)),
+    ("assert_redirected_to", || fn_sig_one(Ty::Untyped, Ty::Nil)),
+    ("assert_select", || fn_sig_one(Ty::Untyped, Ty::Nil)),
+    ("assert_template", || fn_sig_one(Ty::Untyped, Ty::Nil)),
+    // Response accessors.
+    ("response", || crate::lower::typing::fn_sig(vec![], Ty::Untyped)),
+    ("request", || crate::lower::typing::fn_sig(vec![], Ty::Untyped)),
+    ("session", || crate::lower::typing::fn_sig(vec![], Ty::Untyped)),
+    // NOT Untyped, unlike its neighbours: `cookies[k]` is the receiver
+    // of campfire's `assert cookies[:session_token].present?`, which
+    // `sign_in` runs on the way into roughly twenty controller test
+    // files. Untyped there is not a missing convenience — `lower::blank`
+    // grounds by receiver type, so an untyped jar left every one of
+    // those sites a dynamic `present?` send, which CRuby's overlay
+    // serves and a strict target cannot: `undefined method 'present?'
+    // for an instance of String`, 82 of the spinel suite lane's 288
+    // tests, inside the helper that gates every authenticated request.
+    ("cookies", || crate::lower::typing::fn_sig(vec![], cookie_jar_ty())),
+    ("flash", || crate::lower::typing::fn_sig(vec![], Ty::Untyped)),
+];
+
+/// `response` is a reader: every test runtime keeps it as a field (TypeScript's `response: any`, Python's `TestResponse`), so a call to it fails.
+fn minitest_kind(name: &str) -> AccessorKind {
+    if name == "response" { AccessorKind::AttributeReader } else { AccessorKind::Method }
+}
+
+fn fn_sig_one(p: Ty, ret: Ty) -> Ty {
+    crate::lower::typing::fn_sig(vec![(Symbol::from("arg"), p)], ret)
+}
+
+fn fn_sig_two(a: Ty, b: Ty, ret: Ty) -> Ty {
+    crate::lower::typing::fn_sig(
+        vec![(Symbol::from("a"), a), (Symbol::from("b"), b)],
+        ret,
+    )
+}
+
+/// The jar `cookies` answers with, and the signed view over it.
+///
+/// THE TYPES ARE READ OFF THE RUNTIME'S OWN CONTRACT, not invented
+/// here: `runtime/ruby/action_controller/cookies.rbs` is the authority
+/// and this table restates the surface campfire's tests touch (`[]`,
+/// `[]=`, `signed`, `to_hash`). Restated rather than ingested because
+/// `app.rbs_signatures` carries the APP's `sig/**/*.rbs` and the
+/// façade contracts — the framework runtime's own sidecars have never
+/// fed app analysis, which is the general gap this closes one class
+/// of. If that changes, delete this table rather than let two
+/// descriptions of one class drift.
+///
+/// `[]` answers a non-nullable `Str` DELIBERATELY, and it is the whole
+/// point of the entry: the runtime returns `""` for a missing cookie
+/// (see the note on `CookieJar#[]`), so `present?` grounds to the
+/// String form and a signed-out jar reads blank rather than raising.
+/// The SIGNED jar really is nullable — verification can fail — so it
+/// answers `Str | Nil` and grounds through the union arm instead.
+fn cookie_jar_ty() -> Ty {
+    Ty::Class { id: ClassId(Symbol::from("ActionController::CookieJar")), args: vec![].into() }
+}
+
+fn permanent_cookie_jar_ty() -> Ty {
+    Ty::Class { id: ClassId(Symbol::from("ActionController::PermanentCookieJar")), args: vec![].into() }
+}
+
+fn signed_cookie_jar_ty() -> Ty {
+    Ty::Class { id: ClassId(Symbol::from("ActionController::SignedCookieJar")), args: vec![].into() }
+}
+
+fn insert_cookie_jar_baseline(classes: &mut HashMap<ClassId, ClassInfo>) {
+    use crate::lower::typing::fn_sig;
+    let str_hash_arg = || Ty::Hash { key: std::sync::Arc::new(Ty::Str), value: std::sync::Arc::new(Ty::Str) };
+    let str_hash = str_hash_arg();
+    let key = || (Symbol::from("key"), Ty::Untyped);
+    let value = || (Symbol::from("value"), Ty::Untyped);
+
+    let mut jar = ClassInfo::default();
+    for (name, sig) in [
+        ("[]", fn_sig(vec![key()], Ty::Str)),
+        ("[]=", fn_sig(vec![key(), value()], Ty::Str)),
+        ("raw", fn_sig(vec![key()], Ty::Str)),
+        ("raw_set", fn_sig(vec![key(), value()], Ty::Str)),
+        ("delete", fn_sig(vec![key()], Ty::Str)),
+        ("permanent", fn_sig(vec![], permanent_cookie_jar_ty())),
+        ("signed", fn_sig(vec![], signed_cookie_jar_ty())),
+        ("pending", fn_sig(vec![], str_hash.clone())),
+        ("to_h", fn_sig(vec![], str_hash.clone())),
+        ("to_hash", fn_sig(vec![], str_hash)),
+    ] {
+        let sym = Symbol::from(name);
+        jar.instance_methods.insert(sym.clone(), sig);
+        jar.instance_method_kinds.insert(sym, AccessorKind::Method);
+    }
+
+    let mut signed = ClassInfo::default();
+    for (name, sig) in [
+        // Nullable where the unsigned jar is not: an unverifiable
+        // cookie answers nil, which is what campfire's
+        // `Session.find_signed(cookies.signed[:session_token])` is
+        // written against.
+        ("[]", fn_sig(vec![key()], Ty::Union { variants: vec![Ty::Str, Ty::Nil].into() })),
+        ("[]=", fn_sig(vec![key(), value()], Ty::Untyped)),
+        ("delete", fn_sig(vec![key()], Ty::Str)),
+        ("permanent", fn_sig(vec![], signed_cookie_jar_ty())),
+    ] {
+        let sym = Symbol::from(name);
+        signed.instance_methods.insert(sym.clone(), sig);
+        signed.instance_method_kinds.insert(sym, AccessorKind::Method);
+    }
+
+    // Qualified and bare, the way `insert_minitest_test_baseline`
+    // registers both spellings: a test body reaches these through the
+    // `cookies` reader, but a Const path (`ActionController::CookieJar
+    // .new`) appears in the emitted harness itself.
+    classes.insert(ClassId(Symbol::from("ActionController::CookieJar")), jar.clone());
+    classes.insert(ClassId(Symbol::from("CookieJar")), jar);
+
+    // The builder, under the path Rails puts it at: campfire's
+    // `parsed_cookies` is `ActionDispatch::Cookies::CookieJar.build(
+    // request, cookies.to_hash)` (cookies.rb carries that alias for the
+    // runtime). Without this entry the helper's body has no type and
+    // the lift above keeps its nil default.
+    let mut builder = ClassInfo::default();
+    let build = Symbol::from("build");
+    builder.class_methods.insert(
+        build.clone(),
+        fn_sig(
+            vec![(Symbol::from("request"), Ty::Untyped), (Symbol::from("cookies"), str_hash_arg())],
+            cookie_jar_ty(),
+        ),
+    );
+    builder.class_method_kinds.insert(build, AccessorKind::Method);
+    classes.insert(ClassId(Symbol::from("ActionDispatch::Cookies::CookieJar")), builder);
+    classes.insert(
+        ClassId(Symbol::from("ActionController::SignedCookieJar")),
+        signed.clone(),
+    );
+    classes.insert(ClassId(Symbol::from("SignedCookieJar")), signed);
+
+    // `cookies.permanent`: the unsigned jar's surface, writes expiring.
+    let mut permanent = ClassInfo::default();
+    for (name, sig) in [
+        ("[]", fn_sig(vec![key()], Ty::Str)),
+        ("[]=", fn_sig(vec![key(), value()], Ty::Str)),
+        ("delete", fn_sig(vec![key()], Ty::Str)),
+        ("signed", fn_sig(vec![], signed_cookie_jar_ty())),
+    ] {
+        let sym = Symbol::from(name);
+        permanent.instance_methods.insert(sym.clone(), sig);
+        permanent.instance_method_kinds.insert(sym, AccessorKind::Method);
+    }
+    classes.insert(
+        ClassId(Symbol::from("ActionController::PermanentCookieJar")),
+        permanent.clone(),
+    );
+    classes.insert(ClassId(Symbol::from("PermanentCookieJar")), permanent);
+}
+
+/// Insert a `Minitest::Test` ClassInfo entry — the parent of every
+/// test class. The test classes themselves register their inherited
+/// methods into their own ClassInfo above; this stub is for callers
+/// that look up `Minitest::Test` directly (e.g. via `Const { path:
+/// [Minitest, Test] }`).
+fn insert_minitest_test_baseline(classes: &mut HashMap<ClassId, ClassInfo>) {
+    let mut info = ClassInfo::default();
+    for (name, sig) in MINITEST_INSTANCE_METHODS.iter() {
+        let sym = Symbol::from(*name);
+        info.instance_methods.insert(sym.clone(), sig());
+        info.instance_method_kinds.insert(sym, minitest_kind(name));
+    }
+    classes.insert(
+        ClassId(Symbol::from("Minitest::Test")),
+        info.clone(),
+    );
+    // Last-segment alias for the typer's Const-path resolver.
+    classes.insert(ClassId(Symbol::from("Test")), info.clone());
+    // ActiveSupport::TestCase is the Rails-shape parent (extends
+    // Minitest::Test under the hood); register the same surface.
+    classes.insert(ClassId(Symbol::from("ActiveSupport::TestCase")), info.clone());
+    classes.insert(ClassId(Symbol::from("TestCase")), info);
+}
+
+/// `response.headers["X-Total-Count"]` → `response.headers["x-total-count"]`.
+///
+/// Rails' `response.headers` is case-insensitive (Rack 3's `Headers`);
+/// the harness's is a plain Hash keyed the way Rack normalizes —
+/// lowercase — so a test reading a header by its wire spelling got
+/// nil. Lowercasing a LITERAL key at a `.headers[…]` read is exact:
+/// the lookup Rails performs is the same for every spelling. Reads
+/// only, and only in test bodies; the controller's own
+/// `headers["X-Thing"] = …` writes are the app's.
+fn lowercase_header_reads(expr: &mut Expr) -> bool {
+    let mut changed = false;
+    expr.node.for_each_child_mut(&mut |c| {
+        if lowercase_header_reads(c) {
+            changed = true;
+        }
+    });
+    let ExprNode::Send { recv: Some(recv), method, args, block: None, .. } = &mut *expr.node else {
+        return changed;
+    };
+    if method.as_str() != "[]" || args.len() != 1 {
+        return changed;
+    }
+    let ExprNode::Send { method: inner, args: inner_args, .. } = &*recv.node else { return changed };
+    if inner.as_str() != "headers" || !inner_args.is_empty() {
+        return changed;
+    }
+    if let ExprNode::Lit { value: crate::expr::Literal::Str { value } } = &mut *args[0].node {
+        let lower = value.to_ascii_lowercase();
+        if lower != *value {
+            *value = lower;
+            return true;
+        }
+    }
+    changed
+}

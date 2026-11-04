@@ -1,0 +1,19 @@
+8
+6
+22
+[5, nil]
+[2, nil]
+[ArgumentError, "wrong number of arguments (given 1, expected 2)"]
+[ArgumentError, "wrong number of arguments (given 1, expected 2)"]
+1
+4
+10
+true
+[ArgumentError, "wrong number of arguments (given 0, expected 1)"]
+[ArgumentError, "wrong number of arguments (given 2, expected 1)"]
+[ArgumentError, "wrong number of arguments (given 0, expected 1)"]
+11
+[TypeError, "callable object is expected"]
+[TypeError, "callable object is expected"]
+[TypeError, "callable object is expected"]
+[:recv, :arg]

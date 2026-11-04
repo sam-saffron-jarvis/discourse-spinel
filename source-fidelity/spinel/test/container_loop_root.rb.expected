@@ -1,0 +1,23 @@
+each_line local seen=300 bad=0
+each_line temp seen=300 bad=0
+each_line chomp seen=300 bad=0
+each_line sep seen=300 bad=0
+each_char local seen=300 bad=0
+each_char temp seen=300 bad=0
+each_byte temp seen=300 bad=0
+each_grapheme_cluster temp seen=300 bad=0
+each_char returns the receiver len=300 head=ccc
+each_line returns the receiver len=1391 head=L1
+Hash#each temp seen=40 bad=0
+Hash#each_pair temp seen=40 bad=0
+Hash#each solo param seen=40 bad=0
+each_cons temp seen=298 bad=0
+each_slice temp seen=100 bad=0
+each_index temp seen=300 bad=0
+cycle temp seen=600 bad=0
+"L1\n"
+3
+"c"
+"boom"
+"k1"
+after early exits seen=300

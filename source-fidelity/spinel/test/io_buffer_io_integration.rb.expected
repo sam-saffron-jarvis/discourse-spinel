@@ -1,0 +1,51 @@
+16
+"hello"
+11
+"hellos is a"
+10
+" of bytes\na file"
+0
+0
+37
+8
+"world"
+0
+0
+8
+2
+7
+"BCDEFGHHGH!"
+"B"
+4
+"CDEF"
+"GHHGH!"
+[10, "pipe bytes", false]
+0
+true
+false
+4
+5
+5
+"sock!"
+"Buffer is not writable!"
+"wrong argument type Integer (expected IO)"
+"Specified offset+length is bigger than the buffer size!"
+"closed stream"
+20
+true
+true
+true
+"mapped"
+"Buffer is not writable!"
+"Cannot resize mapped file buffer!"
+"file"
+"file"
+109
+false
+true
+"MAPPED file contents"
+true
+false
+"private"
+true
+"MAPPED file contents"

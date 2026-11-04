@@ -1,0 +1,12 @@
+"U2VuZA==" => "Send"
+"U2Vu" => "Sen"
+"QQ==" => "A"
+"" => ""
+"U2VuZA==\n" => AE: invalid base64
+"U2V" => AE: invalid base64
+"U2VuZA" => AE: invalid base64
+"QQ" => AE: invalid base64
+"AB!C" => AE: invalid base64
+"abcd\nefgh" => AE: invalid base64
+"  U2Vu" => AE: invalid base64
+"Send"

@@ -1,0 +1,11 @@
+a/b
+true
+false
+true
+[false, false, false]
+joined 3
+[false, false, false]
+[false, false, false]
+true
+false
+NoMethodError

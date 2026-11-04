@@ -32,3 +32,7 @@ The complete original notices and licence are preserved in:
 These are accompanying publication notices. The existing bundled JavaScript and
 MiniProfiler MIT licence have not been edited. All other dependency notices in
 `NOTICE.md`, `vendor/`, source references and emoji attribution files remain.
+
+## November4 source-fidelity snapshot components
+
+The source snapshots under `source-fidelity/` retain their own notices and licensing. Roundhouse is dual MIT/Apache-2.0 (`roundhouse/LICENSE-MIT`, `roundhouse/LICENSE-APACHE`); Spinel retains `spinel/LICENSE` and the licenses/notices accompanying its packages and tests. Discourse-derived copied inputs retain GPL-2.0-or-later notices and `fidelity/LICENSE.txt`. Upstream included sources, fixtures and package notices are preserved. The repository layout does not relicense these components, and this is not a binary distribution. Exact source heads and working-tree contents are recorded in `source-fidelity/SNAPSHOT.json`.

@@ -1,0 +1,113 @@
+0
+0
+121
+121
+"x50"
+"v50"
+121
+121
+50
+100
+121
+"x50"
+"v50"
+122
+122
+"x50"
+100
+5
+5
+"x58"
+"x59"
+"v59"
+122
+122
+"x50"
+"v50"
+10
+10
+"x55"
+"v55"
+10
+9
+"v59"
+"a51"
+10
+9
+"v59"
+"a51"
+10
+10
+10
+10
+0
+120
+"x59"
+"v59"
+0
+0
+0
+receiver 1
+key 1
+receiver 2
+key 2
+value 1
+value 2
+{1 => 1, 2 => 2}
+key 0
+key 1
+value 3
+value 4
+[3, 4]
+object 1
+object 2
+value 5
+value 6
+"5"
+"6"
+2
+key 0
+value 9
+value 10
+value 11
+[[9, 10], nil]
+11
+0
+[0, 0, 7]
+61
+60
+3
+61
+0
+61
+60
+61
+60
+61
+60
+61
+60
+0
+0
+receiver 1
+key 1
+value 1
+value 2
+{[1] => 1}
+2
+1
+5
+[0, 0, 0, 2]
+["d", "b", "c", "a"]
+["d", "c", "b", "a"]
+key 7
+value 7
+value 8
+FrozenError
+{"a" => 1}
+nil
+FrozenError
+"a"
+nil
+FrozenError
+"b"

@@ -1,0 +1,16 @@
+[TypeError, "coerce must return [x, y]", Array]
+true
+1344
+[Refused, "no such rate", Array]
+true
+[NoMethodError, "undefined method 'div' for an instance of Complex"]
+[NoMethodError, "undefined method 'div' for an instance of Complex"]
+[NoMethodError, "undefined method 'div' for an instance of Complex"]
+[NoMethodError, "undefined method 'div' for an instance of Complex"]
+[NoMethodError, "undefined method 'div' for an instance of Complex"]
+[NoMethodError, "undefined method 'div' for an instance of Complex"]
+[NoMethodError, "undefined method 'div' for an instance of Complex"]
+[NoMethodError, "undefined method 'div' for an instance of Complex"]
+8
+[NameError, "uninitialized constant NoSuchRateTable"]
+[0, 200]

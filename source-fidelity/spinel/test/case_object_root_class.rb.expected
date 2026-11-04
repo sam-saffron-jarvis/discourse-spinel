@@ -1,0 +1,13 @@
+object
+basic
+kernel
+bound Shape
+true
+when object
+when kernel
+when basic
+bare basic
+bare when basic
+bare other
+bare when other
+shape

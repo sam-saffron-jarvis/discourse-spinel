@@ -1,0 +1,7 @@
+true
+true
+false
+true
+nil
+true
+undefined method 'errno' for an instance of RuntimeError

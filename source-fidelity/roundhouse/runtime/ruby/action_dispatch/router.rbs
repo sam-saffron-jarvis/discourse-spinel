@@ -1,0 +1,160 @@
+# Path router: matches (method, path) against a typed route table
+# and resolves to (controller, action, path_params).
+module ActionDispatch
+  module Router
+    # One typed entry in the route table. `verb` (not `method`) to
+    # avoid shadowing Ruby's `Object#method` reflection method.
+    class Route
+      def verb: () -> String
+      def pattern: () -> String
+      def controller: () -> Symbol
+      def action: () -> Symbol
+      def req_format: () -> Symbol?
+      def int_params: () -> String
+      def seg_constraints: () -> String
+      # The pattern split on "/" once at construction, so a `Router.match`
+      # table walk never re-splits it per request.
+      def pattern_parts: () -> Array[String]
+      # Precomputed for `Router.admits`: the segment count, whether a
+      # segment is a `*glob`, and the first segment when it is a
+      # plain literal ("" when it is dynamic).
+      def part_count: () -> Integer
+      def globbed: () -> bool
+      def lead: () -> String
+
+      def initialize: (String verb, String pattern, Symbol controller, Symbol action, ?Symbol? req_format, ?String int_params, ?String seg_constraints) -> void
+    end
+
+    # Successful match result: the resolved controller + action symbols
+    # plus the path parameters extracted from the URL pattern.
+    class MatchResult
+      def controller: () -> Symbol
+      def action: () -> Symbol
+      def path_params: () -> Hash[String, String]
+      def req_format: () -> Symbol?
+
+      def initialize: (Symbol controller, Symbol action, Hash[String, String] path_params, ?Symbol? req_format) -> void
+    end
+
+    # Match a request against the route table. Returns a MatchResult
+    # on success; nil otherwise.
+    #
+    # Absolute `::ActionDispatch::Router::Route` (not bare or partially
+    # qualified): the RBS class-ref resolver's drop-innermost-segment
+    # heuristic mishandles nested classes, and the ingest path registers
+    # the class under its fully-qualified name. The absolute form bypasses
+    # both lookups and matches the registry exactly.
+    def self.match: (
+      String method,
+      String path,
+      Array[::ActionDispatch::Router::Route] table
+    ) -> ::ActionDispatch::Router::MatchResult?
+
+    # One table scan for a literal path, with the format extension the
+    # request carried (`.turbo_stream` stripped off the last segment by
+    # `match`) — the empty string when the path carried none. A match
+    # puts it in `path_params["format"]`. `unpeeled` is the literal-path
+    # retry after a registered extension matched nothing stripped.
+    def self.match_path: (
+      String method,
+      String path,
+      Array[::ActionDispatch::Router::Route] table,
+      String format,
+      bool unpeeled
+    ) -> ::ActionDispatch::Router::MatchResult?
+
+    # One pass of the table for one (already upcased) verb over the
+    # already-split path; `match_path` makes a second, GET, pass for HEAD.
+    def self.scan_routes: (
+      String method_upcase,
+      Array[String] path_parts,
+      Array[::ActionDispatch::Router::Route] table,
+      String format,
+      bool unpeeled
+    ) -> ::ActionDispatch::Router::MatchResult?
+
+    # Does `route` hold its `(.:format)` to a requirement and end in a
+    # param segment (which the `unpeeled` retry would bind the dot into)?
+    def self.format_held_param_tail: (::ActionDispatch::Router::Route route) -> bool
+
+    # Whether a path of `count` segments whose first segment is `lead` can
+    # match `route` at all (segment count, `*glob` tail, leading literal);
+    # `match_parts` decides the rest.
+    def self.admits: (::ActionDispatch::Router::Route route, Integer count, String lead) -> bool
+
+    # Is `ext` one of Rails' registered format extensions?
+    def self.format_extension: (String ext) -> bool
+
+    # Match a path against a `:name`-segment pattern. Returns a
+    # `Hash[String, String]` of captured params (URL segments are
+    # always strings), or nil if no match. `int_params` is the route's
+    # space-joined digit-only constraint list — a constrained segment
+    # that isn't all digits makes the pattern a non-match.
+    def self.match_pattern: (
+      String pattern,
+      String path,
+      ?String int_params,
+      ?String seg_constraints
+    ) -> Hash[String, String]?
+
+    # The same segment loop over already-split parts — what `Router.match`
+    # calls with the route's precomputed `pattern_parts`, so a table walk
+    # allocates no segment arrays per candidate.
+    def self.literals_match: (Array[String] pattern_parts, Array[String] path_parts, Integer glob, Integer extra) -> bool
+    def self.glob_rest: (Array[String] path_parts, Integer from, Integer stop) -> String
+    def self.glob_index: (Array[String] pattern_parts) -> Integer
+    def self.param_prefix_length: (String segment) -> Integer
+    def self.match_parts: (
+      Array[String] pattern_parts,
+      Array[String] path_parts,
+      ?String int_params,
+      ?String format,
+      ?String seg_constraints
+    ) -> Hash[String, String]?
+
+    def self.decode_captures: (Hash[String, String] params) -> Hash[String, String]
+    def self.capture_pairs: (Hash[String, String] params) -> Array[String]
+    def self.capture_part: (Array[String] pairs, Integer index) -> String
+    def self.decode_capture: (String value) -> String
+    def self.utf8_width: (Integer byte) -> Integer
+    def self.utf8_character: (Array[Integer] bytes, Integer from, Integer first, Integer width) -> String
+    def self.percent_bytes: (Array[Integer] bytes) -> Array[Integer]
+    def self.percent_advance: (Integer byte) -> Integer
+    def self.percent_byte: (Array[Integer] bytes, Integer at) -> Integer
+    def self.capture_byte: (Array[Integer] bytes, Integer index) -> Integer
+    def self.hex_digit: (Integer byte) -> Integer
+
+    # Digit-only (`Integer` matcher / `constraints: /\d+/`) param
+    # enforcement — is `name` in the route's space-joined constraint
+    # list? A constrained non-digit segment makes the route a non-match.
+    def self.int_constrained: (
+      String int_params,
+      String name
+    ) -> bool
+
+    def self.digits_only: (String s) -> bool
+
+    # Segment-pattern enforcement for every OTHER (non-digit-class)
+    # `constraints:` requirement — see the .rb's module-level comment
+    # on `Route#seg_constraints` and `segment_pattern.rs` for the
+    # encoding and the supported subset.
+    def self.length_prefix_content_start: (String s, Integer at) -> Integer
+    def self.length_prefix_value: (String s, Integer at, Integer content_start) -> Integer
+    def self.segment_pattern_for: (String seg_constraints, String name) -> String
+    def self.segment_pattern_char_in_class: (String c, String neg, String any, String set) -> bool
+    def self.segment_pattern_literal_match: (String quant, String text, String value, Integer start) -> Integer
+    def self.segment_pattern_class_match: (String quant, String neg, String any, String set, String value, Integer start) -> Integer
+    def self.segment_pattern_item_match: (String tag, String quant, String neg, String any, String text, String value, Integer start) -> Integer
+    def self.segment_pattern_match: (String pattern, String value) -> bool
+    def self.segment_pattern_alt_match: (String pattern, String value) -> bool
+    def self.segment_pattern_seq_match: (String pattern, String value) -> bool
+
+    # A decoded capture path-escaped again, as Rails fills a routing
+    # redirect's `%{name}`; see the .rb. Byte-oriented after UTF-8 decode.
+    def self.escape_path: (String s) -> String
+    def self.printable: () -> String
+    def self.path_byte_ok: (Integer b) -> bool
+    def self.percent_escape_byte: (Integer b) -> String
+    def self.hex_char: (Integer n) -> String
+  end
+end

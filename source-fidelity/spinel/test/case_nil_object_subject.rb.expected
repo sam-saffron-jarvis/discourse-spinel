@@ -1,0 +1,46 @@
+other
+other
+nil
+nilclass
+object
+shape-or-nil
+other
+other
+other
+other
+when-nil
+when-nilclass
+when-root
+stmt-other
+stmt-in-nil
+other
+expr-nilclass
+false
+true
+false
+false
+keys 5
+array 5 6
+other
+other
+when-shape
+other
+other
+shape
+other
+other
+other
+nil
+other
+other
+array 1 2
+hash 1
+object
+when-kernel
+basic
+other
+other
+bare
+other
+other
+when-se

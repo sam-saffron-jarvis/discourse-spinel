@@ -1,0 +1,12 @@
+ok
+true
+4
+false
+nil
+"ab"
+1
+1
+[:set, :set, "ab", :set]
+"[2, 4]"
+"[2, 4]"
+nil

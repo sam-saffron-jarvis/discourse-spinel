@@ -1,0 +1,220 @@
+//! `pluck` on rows the pipeline already materialized.
+//!
+//! `pluck(:col)` is a Relation terminal: Rails turns it into
+//! `SELECT col FROM …` and answers an Array of that column's values.
+//! Two roots reach that treatment here — a model CONST
+//! (`Rooms::Open.pluck(:id)`, seeded onto a Relation by
+//! `lower::scope_chain`) and a Const-rooted chain
+//! (`Room.where(…).pluck(:id)`, folded to SQL by `lower::arel`).
+//!
+//! AN ASSOCIATION READER IS NEITHER, and campfire has one:
+//!
+//! ```ruby
+//! room.memberships.pluck(:user_id).each { |id| ... }   # Message::Broadcasts
+//! ```
+//!
+//! `Room#memberships` is a lowered reader that answers a hydrated
+//! `Array[Membership]`, and `Array` has no `pluck` — `undefined method
+//! 'pluck' for an instance of Array`, a 500 on every `POST
+//! /rooms/:id/messages` in a served app. (The broadcast is not lost: the
+//! `after_create_commit` that fans the turbo-stream out runs before this
+//! line, so the message reaches subscribers and the request that made it
+//! then fails. The suite never sees it — under the test adapter the job
+//! that reaches this line is enqueued rather than run.)
+//!
+//! So: expand it into the projection it is.
+//!
+//! ```ruby
+//! room.memberships.map { |__pluck| __pluck.user_id }
+//! ```
+//!
+//! WHAT THIS IS NOT. It is not the SQL that Rails writes. Lifting an
+//! association-rooted chain into a `SELECT user_id FROM memberships
+//! WHERE room_id = ?` is the association-proxy work that
+//! `project_relation_specialization_design_call` already scopes, and
+//! this pass is deliberately not a down payment on it — a half-built
+//! chain root that handles `pluck` and nothing else is worse than none,
+//! because the next terminal to arrive looks supported until it is not.
+//!
+//! WHAT IT COSTS is therefore honest and small: the reader hydrates
+//! every row of the association, which is what it ALREADY does today —
+//! the projection is the only new work. Rails reads one column; we read
+//! the row and then take the column. Ledgered.
+//!
+//! THE GUARD IS THE ASSOCIATION KIND, and it took two wrong answers to
+//! get there. A plain `has_many` reader hydrates and answers an Array;
+//! a `has_many :through` answers an `ActiveRecord::Relation` over a
+//! joins chain, which HAS `pluck` and whose `pluck` is a single-column
+//! SELECT. Both are spelled `owner.name`.
+//!
+//! * NOT the chain's innermost receiver. `Current.user.rooms.directs`
+//!   bottoms out at a `Const` and is nothing to do with arel.
+//! * NOT `Ty::Array`, which looks exactly like the discriminator and is
+//!   not: the analyzer types a `:through` reader `Array[Room]` as well,
+//!   because the type is its approximation of "a collection" and
+//!   conflates precisely the two shapes this pass must separate.
+//!   Gating on it rewrote a Relation's SELECT into a whole-row
+//!   hydrate — the opposite of the fix, and a test caught it.
+//!
+//! So: rewrite when the reader's name is declared by a plain
+//! `has_many`/`has_one` on EVERY model that declares one. A name that
+//! is plain on one model and `:through` on another is left alone rather
+//! than guessed at. A stated `Relation` or model `Class` on the
+//! receiver short-circuits first, and a `Const` root stays a backstop.
+//!
+//! It leaves the cases where the receiver is a SCOPE on an association
+//! (`room.users.without(x).pluck(:name)`) exactly as they are. Those
+//! need to know what the scope answers, which is the association-proxy
+//! question again.
+//!
+//! ONLY `pluck`. `ids` has the same shape and no failing call site;
+//! adding it would be a second untested arm, and the pass that grows one
+//! for a case nothing exercises is the pass that acquires its next bug.
+//!
+//! TEST BODIES too. campfire's `RoomsControllerTest` plucks member ids
+//! before `destroy` so it can assert the enqueued job's args — same
+//! `room.memberships.pluck(:user_id)` shape. That surface lives only on
+//! the fused test walk (`fused::apply_fused_context_rewrites` →
+//! [`rewrite_node`]); this standalone entry covers hook bodies for
+//! direct callers. Do not re-add a second `for_each_test_body` here.
+
+use crate::app::App;
+use crate::expr::{BlockStyle, Expr, ExprNode};
+use crate::ident::Symbol;
+
+pub fn apply_assoc_pluck_lowering(app: &mut App) {
+    let materialized = materialized_assoc_names(app);
+    // Hooks only — test bodies are single-sourced through the fused
+    // context walk so surfaces cannot drift.
+    super::for_each_hook_body(app, &mut |e| rewrite(e, &materialized));
+}
+
+/// Association names whose reader answers a MATERIALIZED Array on every
+/// model that declares one.
+///
+/// A plain `has_many` / `has_one` lowers to a reader that runs the
+/// query and hydrates; a `has_many :through` (and HABTM) lowers to an
+/// `ActiveRecord::Relation` over a joins chain. The name is the only
+/// handle available when the receiver has no type, so a name that is
+/// plain on one model and `:through` on another is EXCLUDED rather than
+/// guessed at — being wrong in the Relation direction costs a
+/// single-column SELECT, and this pass is not worth that.
+pub(crate) fn materialized_assoc_names(app: &App) -> crate::det::HashSet<Symbol> {
+    use crate::lower::model_associations::AssocKind;
+    let mut plain = crate::det::HashSet::default();
+    let mut relational = crate::det::HashSet::default();
+    for edge in crate::lower::model_associations::compute_association_graph(app) {
+        // `through` is carried as a FIELD as well as a kind, and the
+        // graph does not always spell the kind `HasManyThrough` — a
+        // `has_many :rooms, through: :memberships` arrives as `HasMany`
+        // with `through: Some(:memberships)`. Reading the kind alone
+        // put it in the plain set and rewrote a Relation's `pluck`.
+        if edge.through.is_some() {
+            relational.insert(edge.name.clone());
+            continue;
+        }
+        match edge.kind {
+            AssocKind::HasMany | AssocKind::HasOne => {
+                plain.insert(edge.name.clone());
+            }
+            AssocKind::HasManyThrough | AssocKind::HasAndBelongsToMany => {
+                relational.insert(edge.name.clone());
+            }
+            AssocKind::BelongsTo => {}
+        }
+    }
+    plain.retain(|n| !relational.contains(n));
+    plain
+}
+
+fn rewrite(expr: &mut Expr, materialized: &crate::det::HashSet<Symbol>) {
+    expr.node.for_each_child_mut(&mut |c| rewrite(c, materialized));
+    rewrite_node(expr, materialized);
+}
+
+pub(crate) fn rewrite_node(expr: &mut Expr, materialized: &crate::det::HashSet<Symbol>) {
+    let ExprNode::Send { recv: Some(recv), method, args, block, .. } = &*expr.node else { return };
+    let Some(cols) = crate::analyze::assoc_pluck::reader_columns(recv, method, args, block.as_ref(), materialized) else { return };
+    let span = expr.span;
+    let var = Symbol::from("__pluck");
+    // The row a block sees is the receiver's element; one column's
+    // value is the element of what `pluck` answered.
+    let row_ty = match &recv.ty {
+        Some(crate::ty::Ty::Array { elem }) => Some((**elem).clone()),
+        _ => None,
+    };
+    let col_types = match (&expr.ty, cols.len()) {
+        (Some(crate::ty::Ty::Array { elem }), 1) => vec![Some((**elem).clone())],
+        (Some(crate::ty::Ty::Array { elem }), _) => match elem.as_ref() {
+            crate::ty::Ty::Tuple { elems } => elems.iter().cloned().map(Some).collect(),
+            _ => vec![None; cols.len()],
+        },
+        _ => vec![None; cols.len()],
+    };
+    let read = |(index, col): (usize, &Symbol)| {
+        let mut row = Expr::new(
+            span,
+            ExprNode::Var { id: crate::ident::VarId(0), name: var.clone() },
+        );
+        row.ty = row_ty.clone();
+        let mut send = Expr::new(
+            span,
+            ExprNode::Send {
+                recv: Some(row),
+                method: col.clone(),
+                args: vec![],
+                block: None,
+                parenthesized: false,
+            },
+        );
+        send.ty = col_types.get(index).cloned().flatten();
+        send
+    };
+    // Rails answers an Array of VALUES for one column and an Array of
+    // Arrays for several, and a caller that indexes the result is
+    // reading one or the other. The single-column form is the whole of
+    // the corpus; the multi-column arm is here because getting it wrong
+    // would be silent.
+    let mut body = if cols.len() == 1 {
+        read((0, &cols[0]))
+    } else {
+        Expr::new(
+            span,
+            ExprNode::Array {
+                elements: cols.iter().enumerate().map(read).collect(),
+                style: Default::default(),
+            },
+        )
+    };
+    body.ty = match &expr.ty {
+        Some(crate::ty::Ty::Array { elem }) => Some(elem.as_ref().clone()),
+        _ => None,
+    };
+
+    let block = Expr::new(
+        span,
+        ExprNode::Lambda { extra_params: Vec::new(),
+            params: vec![var],
+            rest_param: None,
+            block_param: None,
+            body,
+            block_style: BlockStyle::Brace,
+        },
+    );
+    let recv = recv.clone();
+    // The projection answers what `pluck` answered, and the analyzer
+    // already typed that: keep it, or a typed receiver (`comments` in
+    // the model that declares it) leaves an untyped `map` behind.
+    let ty = expr.ty.clone();
+    *expr = Expr::new(
+        span,
+        ExprNode::Send {
+            recv: Some(recv),
+            method: Symbol::from("map"),
+            args: vec![],
+            block: Some(block),
+            parenthesized: false,
+        },
+    );
+    expr.ty = ty;
+}

@@ -1,0 +1,4 @@
+[:nil, :nil, :nil, false]
+[:seven, :integer, :match, true]
+[:other, :other, :other, false]
+[:other, :other, :other, false]

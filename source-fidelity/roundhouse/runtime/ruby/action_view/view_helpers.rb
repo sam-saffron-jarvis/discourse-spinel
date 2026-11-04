@@ -1,0 +1,1526 @@
+# frozen_string_literal: true
+# View helpers — module functions invoked from Views::* render methods.
+#
+# Surface tracks what real-blog actually uses (cf. fixtures/real-blog/
+# app/views/**/*.html.erb): link_to, button_to, dom_id, the content_for
+# slot store, turbo_stream_from, truncate, pluralize (delegated to
+# Inflector), plus four form_with macro-inline primitives
+# (csrf_token_hidden_input, method_override_input, optional_value_attr,
+# escape_or_empty). form_with itself + the FormBuilder class are
+# retired: the lowerer macro-expands `<%= form_with ... do |form| ... %>`
+# and `form.label`/`form.text_field`/`form.text_area`/`form.submit`
+# at lower time into direct HTML accumulation, so no runtime
+# FormBuilder dispatch survives in lowered output.
+#
+# Polymorphic dispatch (e.g., link_to "Edit", @article → article_path)
+# is the lowerer's job, not the runtime's. Call sites pass explicit
+# paths — `link_to "Edit", RouteHelpers.article_path(article.id)`.
+# This keeps the runtime small and free of class-name-keyed dispatch.
+module ActionView
+  module ViewHelpers
+    # ── slot store (content_for / yield) ─────────────────────────────
+    #
+    # Module-level state. In CRuby this is a single shared hash; in a
+    # multi-request server a real implementation would scope this per
+    # request. For the spinel-blog specimen (single-threaded by spinel
+    # constraint anyway), module state is fine.
+    #
+    # `ActionView::Slots` (see action_view/slots.rb) is the value
+    # object the lowerer migration will thread per-request; the
+    # module-level store here remains the call surface during
+    # migration so existing transpiled call sites in
+    # TS/Crystal/Rust/Go/Spinel keep working.
+    @slots = {}
+    @broadcast_rendering = false
+
+    def self.reset_slots!
+      @slots = {}
+      # Per-request self-healing for the broadcast-render flag: a render
+      # that raised inside `broadcast_render` (which has no `ensure` —
+      # see its comment) must not leave a LATER request's forms
+      # token-less. Every lane's dispatch entry runs this first.
+      @broadcast_rendering = false
+    end
+
+    # The DEPOSIT form of `content_for` (its getter pair is
+    # `content_for_get`) — and it APPENDS, because that is what Rails
+    # does: `content_for(:slot, value)` runs `@view_flow.append` unless
+    # the caller passes `flush: true`, and `provide` — what turbo's
+    # DriveHelper family calls — is `append!` with no flush option at
+    # all.
+    #
+    # Overwriting cost campfire's rooms/show its `turbo-cache-control`
+    # meta: the page wraps `<% content_for :head do %>` around a
+    # `<%= turbo_exempts_page_from_preview %>`, so the outer deposit
+    # landed on top of the inner one and the directive vanished. Every
+    # page that fills one slot from two places had the same hole.
+    #
+    # The prior value is read into a LOCAL first. Inlining it as
+    # `@slots[slot] = get_slot(slot) + value` reads the same store
+    # inside its own write, and rust2 transpiles this file to a
+    # thread-local `RefCell`: the read's `borrow()` lands inside the
+    # write's live `borrow_mut()` and every view render panics with
+    # "RefCell already mutably borrowed". Ruby doesn't care; the
+    # strict targets do.
+    def self.content_for_set(slot, value)
+      prior = get_slot(slot)
+      @slots[slot] = prior + value
+      nil
+    end
+
+    def self.content_for_get(slot)
+      # `fetch(slot, nil)` (which the Crystal emit lowers to
+      # `@@slots[slot]?`) — Ruby Hash#[] returns nil for missing
+      # keys, but Crystal's strict Hash#[] raises KeyError. Same
+      # cross-target nil-safe pattern used elsewhere.
+      @slots.fetch(slot, nil)
+    end
+
+    # Rails' `content_for?(:slot)` — has the slot been populated?
+    # (Layout conditionals: `<% if content_for? :subnav %>`.)
+    # Composed from `get_slot` (missing slot → ""), NOT a local
+    # `fetch(slot, nil)` + nil-check: the nilable-local shape broke two
+    # strict transpiles (Swift didn't narrow `String?` across `||`;
+    # go2 mangled the slots read into an undefined identifier), while
+    # get_slot's `|| ""` idiom is already proven on every target.
+    def self.content_for?(slot)
+      !get_slot(slot).empty?
+    end
+
+    def self.get_slot(slot)
+      @slots[slot] || ""
+    end
+
+    def self.get_yield
+      @slots[:__body__] || ""
+    end
+
+    def self.set_yield(content)
+      @slots[:__body__] = content
+      nil
+    end
+  
+    # ── escaping / formatting ────────────────────────────────────────
+  
+    # Hand-rolled to drop the `cgi` stdlib dependency (which spinel
+    # doesn't ship). Matches CGI.escapeHTML semantics: replaces `&`,
+    # `<`, `>`, `"`, and `'`. The `'` mapping uses `&#39;` (numeric)
+    # rather than `&apos;` (named) — same convention as CGI.escapeHTML
+    # in CRuby, so test assertions written against the prior behavior
+    # keep passing.
+    HTML_ESCAPES = {
+      "&" => "&amp;",
+      "<" => "&lt;",
+      ">" => "&gt;",
+      '"' => "&quot;",
+      "'" => "&#39;",
+    }.freeze
+  
+    HTML_ESCAPE_PATTERN = /[&<>"']/.freeze
+  
+    # Monomorphic String. Skip gsub when already safe (ERB::Util).
+    # Probe with `include?`, not `match?(re)` — Rust/Python have no
+    # portable match? emit.
+    #
+    # A safe input is answered as a fresh String (`+ ""`). Returning
+    # `s` kept the caller's handle; Spinel's share analysis then
+    # refused ERB sites that pass `filename.to_s` / `extension` into
+    # the escape (campfire's `active_storage/blobs/_blob`, #9258):
+    # the same characters can still be appended under another name.
+    # The escape's job is text for embedding, not a shared buffer.
+    def self.html_escape(s)
+      return s + "" unless s.include?("&") || s.include?("<") || s.include?(">") || s.include?("\"") || s.include?("'")
+      s.gsub(HTML_ESCAPE_PATTERN, HTML_ESCAPES)
+    end
+
+    # Builder's text escape (`XmlBase#_escape`): `&`, `<`, `>` only — a
+    # quote stays literal in element text, which is where Builder and
+    # HTML part ways. A `.builder` template's runtime text goes through
+    # this (`crate::builder`), marked safe so the HTML escape does not
+    # run on top of it.
+    BUILDER_TEXT_ESCAPES = {
+      "&" => "&amp;",
+      "<" => "&lt;",
+      ">" => "&gt;",
+    }.freeze
+
+    BUILDER_TEXT_PATTERN = /[&<>]/.freeze
+
+    def self.builder_text(s)
+      return s + "" unless s.include?("&") || s.include?("<") || s.include?(">")
+      s.gsub(BUILDER_TEXT_PATTERN, BUILDER_TEXT_ESCAPES)
+    end
+
+    # Builder's attribute escape (`_escape_attribute`): the text escape
+    # plus `"`, newline and carriage return.
+    BUILDER_ATTR_ESCAPES = {
+      "&" => "&amp;",
+      "<" => "&lt;",
+      ">" => "&gt;",
+      '"' => "&quot;",
+      "\n" => "&#10;",
+      "\r" => "&#13;",
+    }.freeze
+
+    BUILDER_ATTR_PATTERN = /[&<>"\n\r]/.freeze
+
+    def self.builder_attr(s)
+      return s + "" unless s.include?("&") || s.include?("<") || s.include?(">") || s.include?("\"") || s.include?("\n") || s.include?("\r")
+      s.gsub(BUILDER_ATTR_PATTERN, BUILDER_ATTR_ESCAPES)
+    end
+
+    # Rails' `h` — an ALIAS of `html_escape`, not a second escape. One
+    # implementation, because the CRuby overlay replaces `html_escape`
+    # with an html_safe-aware version and a separately-defined `h` would
+    # quietly keep escaping what Rails passes through.
+    #
+    # `to_s` first, as Rails does: the argument is routinely a value
+    # object rather than a String — campfire's `h(ContentFilters
+    # ::TextMessagePresentationFilters.apply(message.body.body))` hands
+    # it an `ActionText::Content`, whose `to_s` is the markup and is
+    # marked safe on the overlay so this call passes it through.
+    def self.h(value)
+      html_escape(value.to_s)
+    end
+
+    # One attribute of a `tag.*` / `content_tag` call whose value is known
+    # only at run time, as Rails' `tag_options` renders it: ` key="value"`,
+    # escaped, or nothing at all when the value is nil. A call, so the
+    # value expression runs once (`lower::view_to_library::attr_parts`,
+    # `push_escaped_attr`); an inline `nil?` guard ran it twice. Same
+    # shape as `to_query_value`, which the strict targets already compile.
+    def self.tag_attr(key, value)
+      value.nil? ? "" : " #{key}=\"#{html_escape(value.to_s)}\""
+    end
+
+    # Percent-encoding for a QUERY-STRING VALUE — what Rails' `url_for`
+    # applies to the options it turns into a query (`?v=…&size=…`), and
+    # what the generated `direct` URL helpers call.
+    #
+    # Same hand-rolled shape as `html_escape` above and for the same
+    # reason: spinel ships no `cgi`, and a gsub-with-hash transpiles to
+    # every target while a block-form gsub does not.
+    #
+    # ONE PASS, deliberately: this runs per generated URL helper call,
+    # and campfire's `fresh_user_avatar_path` fires once per message row
+    # and per sidebar entry — hundreds of times on a busy room render.
+    # A chain of single-character `gsub`s would be that many full scans
+    # and intermediate Strings per call.
+    #
+    # LIMIT, stated because it is invisible at the call site: the table
+    # covers ASCII. A non-ASCII value passes through unencoded, where
+    # Rails emits per-BYTE escapes (`ä` → `%C3%A4`) — correct for every
+    # value the corpus builds (timestamps, integers, tokens), wrong for a
+    # UTF-8 one, which needs a byte walk this substitution cannot express.
+    # Table + pattern MEASURED against Rails 8.1: `Hash#to_query` runs
+    # each value through `CGI.escape`, which keeps only `A-Za-z0-9.-_~`,
+    # renders space as `+` (NOT `%20` — that is `ERB::Util.url_encode`,
+    # a different helper), and percent-encodes the rest.
+    URL_ESCAPES = {
+      " " => "+",   "!" => "%21", "\"" => "%22", "#" => "%23",
+      "$" => "%24", "%" => "%25", "&" => "%26", "'" => "%27",
+      "(" => "%28", ")" => "%29", "*" => "%2A", "+" => "%2B",
+      "," => "%2C", "/" => "%2F", ":" => "%3A", ";" => "%3B",
+      "<" => "%3C", "=" => "%3D", ">" => "%3E", "?" => "%3F",
+      "@" => "%40", "[" => "%5B", "\\" => "%5C", "]" => "%5D",
+      "^" => "%5E", "`" => "%60", "{" => "%7B", "|" => "%7C",
+      "}" => "%7D", "\r" => "%0D", "\n" => "%0A", "\0" => "%00",
+    }.freeze
+
+    URL_ESCAPE_PATTERN = /[\x00\r\n !"\#$%&'()*+,\/:;<=>?@\[\\\]^`{|}]/.freeze
+
+    # ERB::Util.url_encode, a view's `u(x)`: every byte but the unreserved
+    # ones (A-Z a-z 0-9 _ . ~ -) as `%XX`, uppercase, so a space is `%20`
+    # and a multibyte character is its UTF-8 bytes. Not `url_encode`
+    # below, which is CGI.escape (`+` for a space) for query strings.
+    # Concat, not `<<`, as in render_attrs: `out << s` lowers as `.add` /
+    # write-into-`&str` on Kotlin/C#/Rust/Python/Elixir.
+    def self.erb_url_encode(s)
+      # Not `b.chr` / `format("%%%02X", b)`, nor a constant table, `bytes.each` or `str[i]`: no strict target answers the first two, Rust reads a constant through a lock, a block's byte as `&mut` and indexes no `str` by an Integer.
+      hex = "0123456789ABCDEF"
+      printable = " !\"\#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+      bytes = s.bytes
+      out = ""
+      i = 0
+      while i < bytes.length
+        b = erb_url_byte(bytes, i)
+        if (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) ||
+           b == 45 || b == 46 || b == 95 || b == 126
+          out = out + printable[b - 32, 1].to_s
+        else
+          out = out + "%" + hex[b / 16, 1].to_s + hex[b % 16, 1].to_s
+        end
+        i += 1
+      end
+      out
+    end
+
+    # Not `bytes[i]` inline, nor `bytes[i] || 0`: the inline read types as Integer | nil, which Elixir refuses arithmetic on, and Rust's Vec<i64> has no `unwrap_or`.
+    def self.erb_url_byte(bytes, i)
+      raise ArgumentError, "erb_url_byte: index outside the bytes" if i < 0 || i >= bytes.length
+      bytes[i]
+    end
+
+    # Same include? probe as html_escape (no portable match? emit).
+    def self.url_encode(s)
+      return s unless needs_url_escape?(s)
+      s.gsub(URL_ESCAPE_PATTERN, URL_ESCAPES)
+    end
+
+    # `Hash#to_query` — the query string a route helper renders for its
+    # leftover options and for an explicit `params:` (activesupport's
+    # `core_ext/object/to_query.rb`, in shape): each value renders to
+    # ONE string through `to_query_value`, and `&` joins them. Every key
+    # and value goes through the SAME `url_encode` (CGI.escape) the
+    # named query keys use.
+    #
+    # THIS FILE RENDERS SCALARS, IN INSERTION ORDER. A value here is
+    # `to_s`'d, which is what every target's `query_suffix` did before
+    # this existed and what their routers can read back. The rest of
+    # Rails' rendering — a Hash as `outer[inner]`, an Array as `key[]`,
+    # the strings at each level SORTED — is the bracket grammar the ruby
+    # family's router parses (`CgiIo.parse_form_into`) and nobody else's
+    # does; `runtime/spinel/hash_to_query.rb` reopens both methods below
+    # for the two lanes that can use it. A poly walk over untyped values
+    # and an `Array#sort` are not shapes every strict target's emit
+    # answers, and this seam keeps them off those trees.
+    # A view's `<% cache key do %>` reads and writes its fragment through
+    # these two (`lower::view_to_library::walker`, `emit_cached_fragment`):
+    # `nil` from the read is a miss, and the write answers what it stored.
+    # The non-Ruby targets have no shared cache runtime, so this fallback
+    # always misses and lets the rendered fragment recompute. The ruby
+    # family and spinel reopen both (runtime/spinel/action_controller_fragment_caching.rb)
+    # to go through the controller as Rails' CacheHelper does —
+    # `perform_caching`, `combined_fragment_cache_key`, `cache_store`.
+    def self.fragment_read(_key)
+      nil
+    end
+
+    def self.fragment_write(_key, value, _ttl)
+      value
+    end
+
+    # A `<% cache record do %>` block, keyed as Rails' CacheHelper keys
+    # it: `[template, record]`, combined by the controller
+    # (`lower::view_to_library::walker`, `emit_cached_fragment`). Here
+    # caching is off; the ruby family and spinel reopen both.
+    def self.fragment_read_record(_template, _record)
+      nil
+    end
+
+    def self.fragment_write_record(_template, _record, value, _ttl)
+      value
+    end
+
+    # A `render collection:, cached: ->(item) { key }` reads and writes
+    # each element's fragment through these four
+    # (`lower::view_to_library::partial`, `wrap_keyed_cached_collection`).
+    # Here caching is off, so the lowering takes its uncached branch;
+    # the ruby family and spinel reopen them with the controller's
+    # `perform_caching`, `combined_fragment_cache_key` and `cache_store`.
+    def self.collection_caching?
+      false
+    end
+
+    def self.collection_fragment_key(partial, _key)
+      partial
+    end
+
+    def self.collection_fragment_read(_name)
+      nil
+    end
+
+    def self.collection_fragment_write(_name, value)
+      value
+    end
+
+    # Every element's fragment in one lookup, as Rails' collection
+    # renderer asks its `collection_cache.read_multi`: the hits in the
+    # order of `names`, `nil` for a miss.
+    def self.collection_fragment_read_multi(names)
+      names.map { |name| ActionView::ViewHelpers.collection_fragment_read(name) }
+    end
+
+    # Told once a cached collection has rendered: the partial's template
+    # (`app/views/messages/_message.html.erb`) and what the store
+    # answered for each element. Rails reports the same facts as its
+    # `render_collection.action_view` event; nothing listens here, and
+    # the ruby family's test support reports them.
+    def self.collection_rendered(_identifier, _hits)
+      nil
+    end
+
+    # A jbuilder template wrapped in `json.cache! key do … end` reads and
+    # writes its JSON through these (`lower::jbuilder_to_library`,
+    # `walk_cached_template`). Caching is off here, so the lowering
+    # renders the block; the ruby family and spinel reopen them with the
+    # controller and Jbuilder's own `_read_fragment_cache` /
+    # `_write_fragment_cache`.
+    def self.jbuilder_caching?
+      false
+    end
+
+    def self.jbuilder_cache_key(template, _key)
+      template
+    end
+
+    def self.jbuilder_fragment_read(_key)
+      nil
+    end
+
+    def self.jbuilder_fragment_write(_key, value)
+      value
+    end
+
+    def self.to_query(params)
+      to_query_pairs(params, "")
+    end
+
+    # `NilClass#to_query` is the bare key, no `=`.
+    def self.to_query_value(name, value)
+      value.nil? ? url_encode(name) : "#{url_encode(name)}=#{url_encode(value.to_s)}"
+    end
+
+    # The scalar rendering is INLINED here rather than a call to
+    # `to_query_value`: a Hash `each` block's value is a borrowed
+    # reference on the rust emit, and handing it to a by-value untyped
+    # parameter does not compile there (`expected Value, found &Value`).
+    # Both arms are INTERPOLATIONS, the nil one included: a self-send
+    # inside a Hash `each` block is not stamped by the typer, and the
+    # decl-site emitters declare `pairs` from what is pushed into it —
+    # an interpolation is a String to every one of them. The reopen
+    # that renders nesting replaces this method whole.
+    def self.to_query_pairs(params, namespace)
+      pairs = []
+      params.each do |key, value|
+        name = namespace.empty? ? key.to_s : "#{namespace}[#{key.to_s}]"
+        pairs << (value.nil? ? "#{url_encode(name)}" : "#{url_encode(name)}=#{url_encode(value.to_s)}")
+      end
+      pairs.join("&")
+    end
+
+    # The SECOND url encoding. `URL_ESCAPES` above is `CGI.escape` —
+    # FORM encoding, what `Hash#to_query` runs, where a space is `+`. A
+    # `mailto:` URI is a URI COMPONENT, which Rails encodes with
+    # `ERB::Util.url_encode`: the same table with the space as `%20`.
+    # Written out rather than derived from `URL_ESCAPES` because a
+    # constant built by `merge` is not a shape the strict emitters
+    # lower. The KEY SET is identical, so `URL_ESCAPE_PATTERN` drives
+    # both — only the values differ.
+    URI_ESCAPES = {
+      " " => "%20", "!" => "%21", "\"" => "%22", "#" => "%23",
+      "$" => "%24", "%" => "%25", "&" => "%26", "'" => "%27",
+      "(" => "%28", ")" => "%29", "*" => "%2A", "+" => "%2B",
+      "," => "%2C", "/" => "%2F", ":" => "%3A", ";" => "%3B",
+      "<" => "%3C", "=" => "%3D", ">" => "%3E", "?" => "%3F",
+      "@" => "%40", "[" => "%5B", "\\" => "%5C", "]" => "%5D",
+      "^" => "%5E", "`" => "%60", "{" => "%7B", "|" => "%7C",
+      "}" => "%7D", "\r" => "%0D", "\n" => "%0A", "\0" => "%00",
+    }.freeze
+
+    # `URL_ESCAPE_PATTERN` minus the `@`, for `mail_to`'s address.
+    # Rails spells that encoding `url_encode(addr).gsub("%40", "@")` —
+    # a pattern that never matches `@` says the same thing in one pass,
+    # and a two-string `gsub` is not a shape the strict emitters lower
+    # (C# reads `x.gsub(a, b)` as the regex+table form and emits
+    # `"+".Replace(x, …)`, which compiles nowhere).
+    MAILTO_ESCAPE_PATTERN = /[ !"\#$%&'()*+,\/:;<=>?\[\\\]^`{|}]/.freeze
+
+    # The URL a view's `<x>_url` route helper answers, given its path.
+    # Rails answers it absolute, on the request's scheme and host
+    # (`http://www.example.com/articles/1.json`). This universal body
+    # answers the PATH: a strict target's view has no request in scope
+    # (neither `ActionController::Current` nor `Rails.application`
+    # reaches those runtimes), and a path is what a client resolves
+    # against the page it came from. The ruby family reopens it in
+    # `view_helpers_ext.rb` over the request, so the lanes that know the
+    # host render what Rails renders. jbuilder's `json.url
+    # article_url(…)` is the caller (`jbuilder_to_library`).
+    def self.url_for_path(path)
+      path
+    end
+
+    # Monomorphic, like `url_encode`.
+    def self.url_encode_component(s)
+      return s unless needs_url_escape?(s)
+      s.gsub(URL_ESCAPE_PATTERN, URI_ESCAPES)
+    end
+
+    def self.url_encode_mailto_address(s)
+      return s unless needs_mailto_escape?(s)
+      s.gsub(MAILTO_ESCAPE_PATTERN, URI_ESCAPES)
+    end
+
+    # True when URL_ESCAPE_PATTERN would match. include?, not match?.
+    def self.needs_url_escape?(s)
+      s.include?(" ") || s.include?("!") || s.include?("\"") || s.include?("#") ||
+        s.include?("$") || s.include?("%") || s.include?("&") || s.include?("'") ||
+        s.include?("(") || s.include?(")") || s.include?("*") || s.include?("+") ||
+        s.include?(",") || s.include?("/") || s.include?(":") || s.include?(";") ||
+        s.include?("<") || s.include?("=") || s.include?(">") || s.include?("?") ||
+        s.include?("@") || s.include?("[") || s.include?("\\") || s.include?("]") ||
+        s.include?("^") || s.include?("`") || s.include?("{") || s.include?("|") ||
+        s.include?("}") || s.include?("\r") || s.include?("\n") || s.include?("\0")
+    end
+
+    # Like `needs_url_escape?` but without `@` — `MAILTO_ESCAPE_PATTERN`.
+    def self.needs_mailto_escape?(s)
+      s.include?(" ") || s.include?("!") || s.include?("\"") || s.include?("#") ||
+        s.include?("$") || s.include?("%") || s.include?("&") || s.include?("'") ||
+        s.include?("(") || s.include?(")") || s.include?("*") || s.include?("+") ||
+        s.include?(",") || s.include?("/") || s.include?(":") || s.include?(";") ||
+        s.include?("<") || s.include?("=") || s.include?(">") || s.include?("?") ||
+        s.include?("[") || s.include?("\\") || s.include?("]") ||
+        s.include?("^") || s.include?("`") || s.include?("{") || s.include?("|") ||
+        s.include?("}")
+    end
+
+    # `separator:` cuts at the last occurrence of `separator` at or
+    # before the omission-adjusted cutoff, so a truncated string doesn't
+    # split mid-word — ActiveSupport's `String#truncate`
+    # (active_support/core_ext/string/filters.rb) algorithm, read off
+    # the installed gem and confirmed against Rails 8.1.4's own output
+    # (rubys/roundhouse#812). `omission:` alone (no separator) is
+    # unchanged from before.
+    def self.truncate(s, length: 30, omission: "...", separator: nil)
+      return s if s.length <= length
+      cutoff = length - omission.length
+      return omission if cutoff <= 0
+      unless separator.nil?
+        found = rindex_at_or_before(s, separator, cutoff)
+        cutoff = found if found >= 0
+      end
+      "#{s[0, cutoff]}#{omission}"
+    end
+
+    # Not `s.rindex(sub, pos)`, which no strict target's runtime answers, and -1 rather than nil, which Go and C# do not narrow from a local.
+    def self.rindex_at_or_before(s, sub, pos)
+      i = s.length - sub.length
+      i = pos if pos < i
+      while i >= 0
+        return i if s[i, sub.length] == sub
+        i -= 1
+      end
+      -1
+    end
+
+    # Rails 8.1.4's ActionView::TextHelper#word_wrap for positive widths.
+    # Wraps at whitespace/newline boundaries and leaves an unbroken word
+    # longer than `line_width` intact. Rails' zero/negative-width behavior
+    # is inconsistent (RegexpError or nil), so reject those values rather
+    # than weakening this helper's String return contract.
+    #
+    # Portable subset for strict-target emit: no Regexp, no `break`/`next`
+    # (TS), no nested `while` (Elixir while→recursion is single-loop only),
+    # character access via `s[i, 1]` / `s[i, n]` (Rust), concat with `+`
+    # (owned String). Outer scan and break search are explicit recursion.
+    def self.word_wrap(text, line_width: 80, break_sequence: "\n")
+      raise ArgumentError, "line_width must be positive" if line_width <= 0
+      return "" if text.empty?
+      word_wrap_finish(
+        word_wrap_scan(text, line_width, break_sequence, "", 0, text.length),
+        break_sequence
+      )
+    end
+
+    def self.word_wrap_finish(out, break_sequence)
+      bl = break_sequence.length
+      if bl > 0 && out.length >= bl && out[out.length - bl, bl] == break_sequence
+        out[0, out.length - bl]
+      else
+        out
+      end
+    end
+
+    def self.word_wrap_scan(text, line_width, break_sequence, out, i, n)
+      return out if i >= n
+      if text[i, 1] == "\n"
+        word_wrap_scan(text, line_width, break_sequence, out + break_sequence, i + 1, n)
+      else
+        max_end = i + line_width
+        max_end = n if max_end > n
+        word_wrap_find_break(text, line_width, break_sequence, out, i, n, i + 1, max_end, -1, -1)
+      end
+    end
+
+    # Break search: Integer indices stay method params (Elixir `-` / TS
+    # scoping). A newline ends the window immediately — Rails'
+    # `.{1,N}` never crosses `\n`, so a later space must not replace it.
+    def self.word_wrap_find_break(text, line_width, break_sequence, out, i, n, j, max_end, best_j, best_next)
+      if j > max_end
+        if best_j < 0
+          word_wrap_hard(text, line_width, break_sequence, out, i, n)
+        else
+          word_wrap_scan(
+            text,
+            line_width,
+            break_sequence,
+            out + text[i, best_j - i] + break_sequence,
+            best_next,
+            n
+          )
+        end
+      else
+        if j >= n
+          word_wrap_find_break(text, line_width, break_sequence, out, i, n, j + 1, max_end, j, n)
+        else
+          if text[j, 1] == "\n"
+            # No temps: TS emit only hoists some assigned locals. Advance
+            # one newline; scan re-enters for further `\n`s.
+            word_wrap_scan(
+              text,
+              line_width,
+              break_sequence,
+              out + text[i, j - i] + break_sequence,
+              j + 1,
+              n
+            )
+          else
+            if text[j, 1] == " " || text[j, 1] == "\t" || text[j, 1] == "\r" || text[j, 1] == "\f" || text[j, 1] == "\v"
+              word_wrap_find_break(
+                text,
+                line_width,
+                break_sequence,
+                out,
+                i,
+                n,
+                j + 1,
+                max_end,
+                j,
+                word_wrap_ws_next(text, j, n)
+              )
+            else
+              word_wrap_find_break(text, line_width, break_sequence, out, i, n, j + 1, max_end, best_j, best_next)
+            end
+          end
+        end
+      end
+    end
+
+    def self.word_wrap_skip_nl(text, r, n)
+      return r if r >= n
+      return r if text[r, 1] != "\n"
+      word_wrap_skip_nl(text, r + 1, n)
+    end
+
+    def self.word_wrap_skip_ws(text, k, n)
+      return k if k >= n
+      w = text[k, 1]
+      return k unless w == " " || w == "\t" || w == "\r" || w == "\f" || w == "\v"
+      word_wrap_skip_ws(text, k + 1, n)
+    end
+
+    # Index after whitespace at `k`, consuming one trailing newline.
+    def self.word_wrap_ws_next(text, k, n)
+      word_wrap_after_ws(text, word_wrap_skip_ws(text, k, n), n)
+    end
+
+    def self.word_wrap_after_ws(text, k2, n)
+      return k2 + 1 if k2 < n && text[k2, 1] == "\n"
+      k2
+    end
+
+    def self.word_wrap_word_end(text, j, n)
+      return j if j >= n
+      w = text[j, 1]
+      return j if w == "\n" || w == " " || w == "\t" || w == "\r" || w == "\f" || w == "\v"
+      word_wrap_word_end(text, j + 1, n)
+    end
+
+    def self.word_wrap_hard(text, line_width, break_sequence, out, i, n)
+      word_wrap_hard_at(
+        text,
+        line_width,
+        break_sequence,
+        out,
+        i,
+        n,
+        word_wrap_hard_end(text, i, n)
+      )
+    end
+
+    def self.word_wrap_hard_end(text, i, n)
+      j = word_wrap_word_end(text, i, n)
+      return i + 1 if j == i
+      j
+    end
+
+    def self.word_wrap_hard_at(text, line_width, break_sequence, out, i, n, j)
+      out2 = out + text[i, j - i]
+      if j < n
+        word_wrap_hard_cont(text, line_width, break_sequence, out2, j, n, text[j, 1])
+      else
+        word_wrap_scan(text, line_width, break_sequence, out2, j, n)
+      end
+    end
+
+    def self.word_wrap_hard_cont(text, line_width, break_sequence, out2, j, n, w)
+      if w == " " || w == "\t" || w == "\r" || w == "\f" || w == "\v"
+        word_wrap_scan(
+          text,
+          line_width,
+          break_sequence,
+          out2 + break_sequence,
+          word_wrap_ws_next(text, j, n),
+          n
+        )
+      else
+        if w == "\n"
+          word_wrap_scan(text, line_width, break_sequence, out2 + break_sequence, j + 1, n)
+        else
+          word_wrap_scan(text, line_width, break_sequence, out2, j, n)
+        end
+      end
+    end
+
+    # ── DOM helpers ──────────────────────────────────────────────────
+
+    # Monomorphic: param typed `ActiveRecord::Base`. Was previously a
+    # String|Base union dispatched via `prefix.is_a?(String)`; real-blog
+    # only ever calls it with a record, so the String branch is
+    # contracted away. Callers needing the explicit-prefix form spell it
+    # out directly: `"article_#{id}"`.
+    #
+    # The per-model class name (`"article"`, `"comment"`) reaches dom_id
+    # via `record.dom_prefix` — an instance method synthesized per-model
+    # by the lowerer. Replaces the previous `record.class.name.downcase`
+    # runtime introspection; the synthesizer knows the model name at
+    # transpile time so no compiler has to chase the reflection chain.
+    def self.dom_id(record, suffix = nil)
+      # Explicit parens on `record.dom_prefix()` — TS emit collapses
+      # parens-less zero-arg sends to attr-reader-shaped property access
+      # (`record.dom_prefix` returns the function reference, not the
+      # string). The synthesized method's AccessorKind doesn't yet
+      # thread to the Send-emit; parens are the cheap forcing function.
+      # An UNSAVED record has no id to name it by. Rails answers
+      # `new_article`; ours would have said `article_0`, because the
+      # runtime seeds `@id = 0` as the unsaved sentinel (see
+      # `ActiveRecord::Base#initialize`). Branching on `persisted?`
+      # rather than on the id is also what `form_with` already does for
+      # its action — the sentinel is deliberately never the thing that
+      # answers "is this saved".
+      # Explicit parens on `persisted?()` for the same reason
+      # `dom_prefix()` above carries them: the TS emit collapses a
+      # parens-less zero-arg send to attr-reader-shaped property access,
+      # so `record.persisted?` rendered `record.is_persisted` — the
+      # METHOD, uncalled. `!<function reference>` is always false, so
+      # this branch never ran under TypeScript and every record looked
+      # persisted. A silent wrong answer, not a crash.
+      if !record.persisted?()
+        if suffix.nil?
+          "new_#{record.dom_prefix()}"
+        else
+          # MEASURED against Rails 8.1, not assumed: the suffix REPLACES
+          # `new` rather than stacking with it. Rails' `dom_id` falls
+          # through to `dom_class(record, prefix || NEW)` when there is
+          # no id, so `dom_id(Article.new, :comments_count)` is
+          # `comments_count_article` — not `comments_count_new_article`,
+          # which is what this branch said before the oracle run.
+          "#{suffix}_#{record.dom_prefix()}"
+        end
+      elsif suffix.nil?
+        # `dom_id(article)` -> "article_3". `dom_record_key()`, not
+        # `record.id`: Rails derives the identity half from
+        # `record.to_key.join("_")`, which a model may override —
+        # campfire's `Message#to_key` answers `[client_message_id]`,
+        # and matching that is what lets Turbo's append REPLACE the
+        # sender's optimistic echo (same dom id) instead of standing a
+        # duplicate row beside it. The lowerer synthesizes the method
+        # per model (`push_dom_record_key_method`): `@id.to_s` by
+        # default, the model's own `to_key.join("_")` when it defines
+        # one. Parens for the same TS-emit reason as `dom_prefix()`.
+        "#{record.dom_prefix()}_#{record.dom_record_key()}"
+      else
+        # `dom_id(article, :comments_count)` -> "comments_count_article_3"
+        # (Rails order: suffix BEFORE model name in the resulting id.)
+        "#{suffix}_#{record.dom_prefix()}_#{record.dom_record_key()}"
+      end
+    end
+  
+    # Rails' `dom_class(record, prefix = nil)`: the model's singular
+    # (`dom_prefix()`), with the prefix joined ahead of it by `_`. The same
+    # `dom_prefix()` that `dom_id` composes from, so the two cannot drift.
+    def self.dom_class(record, prefix = nil)
+      if prefix.nil?
+        record.dom_prefix()
+      else
+        "#{prefix}_#{record.dom_prefix()}"
+      end
+    end
+
+    # ── HTML element helpers ─────────────────────────────────────────
+
+    # Frozen empty default so no-opts helpers do not allocate a Hash.
+    # Methods that delete keys dup first.
+    EMPTY_HTML_OPTS = {}.freeze
+
+    def self.link_to(text, href, opts = EMPTY_HTML_OPTS)
+      # `opts.to_h` is a no-op on Ruby Hash and NamedTuple→Hash on
+      # Crystal. Do not gate `opts.is_a?(Hash)`: Rust emit maps that
+      # to `HashMap#is_object`, which does not exist.
+      #
+      # Html options first, href last (Rails). An explicit `href:` in
+      # opts wins. Append href as text: merging `{ href: … }` in
+      # argument position types as a NamedTuple / `[String: String]`
+      # on strict targets.
+      given = opts.to_h
+      attrs = render_attrs(given)
+      attrs = attrs + " href=\"" + html_escape(href) + "\"" unless given.key?(:href)
+      "<a#{attrs}>#{html_escape(text)}</a>"
+    end
+
+    # Rails' `link_to_if(condition, name, url, html_options)`: the link
+    # when the condition holds, the escaped name alone otherwise (the
+    # block form, which renders something else in the else case, is not
+    # modelled — no caller in the corpus passes one). campfire's
+    # link-preview partial links a title only when the preview kept an
+    # href, which its `web_url` drops for anything that is not a web URL
+    # on another host.
+    def self.link_to_if(condition, text, href, opts = EMPTY_HTML_OPTS)
+      return link_to(text, href, opts) if condition
+      html_escape(text.to_s)
+    end
+
+    # Rails' `mail_to` — a `mailto:` anchor. `mail_to(addr)` labels the
+    # link with the address itself; `mail_to(addr, name)` labels it with
+    # `name`. campfire's user page renders the bare form.
+    #
+    # MEASURED against Rails 8.1, not assumed:
+    #  * the address in the href is url-encoded with `%40` put back as
+    #    `@` (`a<b>@x.com` -> `mailto:a%3Cb%3E@x.com`);
+    #  * the LABEL is the RAW address html-escaped, not that encoding;
+    #  * `cc:`/`bcc:`/`body:`/`subject:`/`reply_to:` are LIFTED OUT of
+    #    the html options into the href's query string, IN THAT ORDER,
+    #    and `reply_to` becomes the `reply-to` mail header. Leaving them
+    #    in would render `subject="…"` as an attribute on the `<a>` —
+    #    the silent kind of wrong, so the lift is not optional.
+    #
+    # Both encodings are `ERB::Util.url_encode`, NOT the `CGI.escape`
+    # that `url_encode` above does — see `URI_ESCAPES` for the one
+    # character the two disagree on.
+    # One mail header appended to a `mailto:` query string. Monomorphic
+    # — three Strings in, one out: the CALLER does the nil test, so the
+    # gradual `opts` value never crosses a call boundary. That is not
+    # style. `opts.fetch(:cc, nil)` types as `Option<Value>` in Rust,
+    # which is fine bound to a local and tested with `.nil?` (what
+    # `button_to` beside it does) and an E0308 the moment it is passed
+    # to a parameter declared `untyped`.
+    def self.mail_query_append(query, header, value)
+      separator = query.empty? ? "?" : "&"
+      "#{query}#{separator}#{header}=#{url_encode_component(value)}"
+    end
+
+    # `name` defaults to `""`, not `nil`, and an EMPTY name falls back
+    # to the address — which is Rails' own rule (`name.presence ||
+    # email_address`), and monomorphic where a `String?` would make the
+    # label a union the strict targets each narrow differently.
+    #
+    # The five headers are unrolled rather than walked over a constant
+    # list because a `next` inside an `each` is not a shape the Rust
+    # emitter lowers, and the `delete`s are separate statements because
+    # a `delete` USED AS A VALUE types as `Option<Value>` there too.
+    def self.mail_to(email, name = "", opts = EMPTY_HTML_OPTS)
+      cc = opts.fetch(:cc, nil)
+      bcc = opts.fetch(:bcc, nil)
+      body = opts.fetch(:body, nil)
+      subject = opts.fetch(:subject, nil)
+      reply_to = opts.fetch(:reply_to, nil)
+      query = ""
+      query = mail_query_append(query, "cc", cc.to_s) unless cc.nil?
+      query = mail_query_append(query, "bcc", bcc.to_s) unless bcc.nil?
+      query = mail_query_append(query, "body", body.to_s) unless body.nil?
+      query = mail_query_append(query, "subject", subject.to_s) unless subject.nil?
+      query = mail_query_append(query, "reply-to", reply_to.to_s) unless reply_to.nil?
+      html_opts = opts.to_h.dup
+      html_opts.delete(:cc)
+      html_opts.delete(:bcc)
+      html_opts.delete(:body)
+      html_opts.delete(:subject)
+      html_opts.delete(:reply_to)
+      href = "mailto:#{url_encode_mailto_address(email)}#{query}"
+      attrs = render_attrs({ href: href }.merge(html_opts))
+      label = name.empty? ? email : name
+      "<a#{attrs}>#{html_escape(label)}</a>"
+    end
+
+    # `link_to raw("Page 2 &gt;&gt;"), url` — the html_safe-text form.
+    # There's no safe-buffer type in the transpiled runtime, so the
+    # Ruby emit path rewrites `link_to(raw(x), ...)` to this variant,
+    # which skips the label escape Rails would skip for a safe buffer.
+    def self.link_to_raw(text, href, opts = EMPTY_HTML_OPTS)
+      attrs = render_attrs({ href: href }.merge(opts.to_h))
+      "<a#{attrs}>#{text}</a>"
+    end
+
+    # Rails' `raw` marks a string html_safe; with no safe-buffer type
+    # the value passes through (escape-exemption is decided at the
+    # call-site rewrite layer — see `link_to_raw` and the emit-path
+    # html_escape unwrap). `to_s` matches Rails: `raw(nil)` renders "".
+    def self.raw(value)
+      value.to_s
+    end
+
+    # Rails' `safe_join` concatenates an array of fragments, escaping
+    # each one that is not already html_safe. With no safe-buffer type
+    # the parts arrive already-rendered (every producer in an emitted
+    # tree is a lowered tag expansion), so this is the join Rails does
+    # and nothing else — MEASURED: `safe_join(["<a>", "<b>"])` is
+    # `<a><b>`, an empty separator, not a space.
+    def self.safe_join(parts, separator = "")
+      parts.join(separator)
+    end
+  
+    def self.button_to(text, href, opts = EMPTY_HTML_OPTS)
+      # Use `.fetch(k, nil)` instead of bare `opts[:k]`: Ruby's Hash#[]
+      # returns nil for missing keys, but Crystal's strict Hash#[]
+      # raises KeyError. fetch-with-default produces nil-on-missing in
+      # both. Same Ruby semantics, target-portable shape.
+      method = opts.fetch(:method, nil)
+      form_class = opts.fetch(:form_class, nil)
+      # `opts.to_h.dup` rather than `opts.dup`: kwargs call sites
+      # (`button_to "X", "/y", method: :delete`) lift to NamedTuple
+      # in Crystal; NamedTuple has `dup` (no-op since immutable) but
+      # no `delete`. Convert to Hash first.
+      inner_opts = opts.to_h.dup
+      inner_opts.delete(:method)
+      inner_opts.delete(:form_class)
+      # `.to_h` makes form_attrs a Hash (Ruby no-op; Crystal converts
+       # the NamedTuple literal). Subsequent `[:class] = ...` mutation
+      # would fail on Crystal's immutable NamedTuple.
+      form_attrs = { action: href, method: "post" }.to_h
+      # Rails' `button_to` defaults the form class to `button_to` when
+      # the caller doesn't pass one — match that so the cross-target
+      # compare sees the same `class` attribute set.
+      # `.to_s` narrows the `opts[k]` union (Hash/Symbol/String/...)
+      # to String for strict-typed targets. Ruby `String#to_s` is a no-op;
+      # `||` short-circuits before `.to_s` runs on a real String value.
+      form_attrs[:class] = (form_class || "button_to").to_s
+      button_attrs = render_attrs({ type: "submit" }.merge(inner_opts))
+      method_input = if !method.nil? && method.to_s != "post"
+                       %(<input type="hidden" name="_method" value="#{method}">)
+                     else
+                       ""
+                     end
+      # Rails appends a CSRF authenticity_token hidden input AFTER the
+      # button; value via form_authenticity_token like the other csrf
+      # emitters. Keeps the element in the DOM tree at the same
+      # position Rails puts it.
+      # Through the one choke point, so the broadcast-render omission
+      # above covers button_to forms too.
+      auth_token_input = csrf_token_hidden_input
+      %(<form#{render_attrs(form_attrs)}>#{method_input}<button#{button_attrs}>#{html_escape(text)}</button>#{auth_token_input}</form>)
+    end
+  
+    # ── Asset / meta tag helpers (stubs for now) ─────────────────────
+    # Full implementations require an asset manifest + importmap config.
+    # The shapes here match what the layout consumes; iteration ≥3 will
+    # fill them in when the Phase-1 lowerer surfaces the asset metadata.
+  
+    # Two `<meta>` tags joined by `\n`, matching Rails' tag-helper output
+    # shape — Rails renders them on separate lines with the second tag's
+    # leading indent stripped. Compare drops both metas via ignore rule;
+    # the inter-element newline survives the drop and contributes to the
+    # merged whitespace text content. (Without the newline, head-content
+    # diff appears against Rails for purely formatting reasons.) The
+    # `authenticity_token` value is the form-field name; the token value
+    # is empty here because spinel-blog doesn't sign sessions.
+    def self.csrf_meta_tags
+      return "" if ActionController.forgery_switched_off
+      %(<meta name="csrf-param" content="authenticity_token" />\n<meta name="csrf-token" content="#{html_escape(form_authenticity_token)}" />)
+    end
+
+    # The per-request CSRF token every csrf-emitting helper
+    # (csrf_meta_tags / csrf_token_hidden_input / button_to) reads.
+    # Session-backed and lazy: a page with no form does not grow a
+    # session. Empty when no controller is parked (unit helpers, or a
+    # target whose dispatcher does not assign Current.controller).
+    def self.form_authenticity_token
+      ActionController.masked_authenticity_token
+    end
+  
+    # Empty when no policy is configured. The ruby family reopens this
+    # in `view_helpers_ext.rb` and emits the meta tag Rails'
+    # `csp_meta_tag` emits once `Rails.application.content_security_policy`
+    # is set (the object a request duplicates). Strict targets have no
+    # request in a view helper, so they stay empty — the same split as
+    # `url_for_path`.
+    def self.csp_meta_tag
+      ""
+    end
+  
+    def self.stylesheet_link_tag(name, opts = EMPTY_HTML_OPTS)
+      href = digested_asset_path("#{name}.css")
+      attrs = render_attrs({ rel: "stylesheet", href: href }.merge(opts.to_h))
+      "<link#{attrs}>"
+    end
+
+    # `<script src>` include for a JS source. The source resolves through
+    # the same emitted asset table as `image_path`.
+    # Absolute paths and URLs pass verbatim. Rails takes a Symbol source
+    # too, and a value can hold one, so the source becomes a String here.
+    def self.javascript_include_tag(source, opts = EMPTY_HTML_OPTS)
+      source_s = source.to_s
+      name = source_s.include?(".") ? source_s : "#{source_s}.js"
+      src = name.start_with?("/") || name.include?("://") ? name : digested_asset_path(name)
+      attrs = render_attrs({ src: src }.merge(opts.to_h))
+      "<script#{attrs}></script>"
+    end
+
+    # Asset path for an image source. `skip_pipeline: true` (and any
+    # already-absolute or protocol-relative source) returns the source
+    # verbatim, since neither belongs to the emitted logical-asset table.
+    def self.image_path(source, skip_pipeline: false)
+      return source if skip_pipeline
+      return source if source.start_with?("/")
+      return source if source.include?("://")
+      digested_asset_path(source)
+    end
+
+    # `asset_path` — the GENERAL one. In Rails `image_path` is
+    # `asset_path(source, type: :image)`; Propshaft uses a logical name
+    # independent of the asset type.
+    #
+    # campfire reaches it for the /sounds/*.mp3 a `/play` message
+    # renders — `asset_path(sound.asset_path)` inside
+    # `MessagesHelper#message_sound_presentation`, where the argument is
+    # the sound's own file name and not an image at all.
+    def self.asset_path(source, skip_pipeline: false)
+      return source if skip_pipeline
+      return source if source.start_with?("/")
+      return source if source.include?("://")
+      digested_asset_path(source)
+    end
+
+    def self.digested_asset_path(source)
+      "/assets/#{source}"
+    end
+
+    # `url_for` STRING case — identity passthrough (Rails: a String
+    # url_for argument is already a URL). Record arguments resolve at
+    # COMPILE time (route_helperize's model-gated lowering emits the
+    # persisted?/path-helper form), so the typed runtime only ever
+    # sees strings; the CRuby overlay shadows this with its
+    # polymorphic `is_a?` version for any residual dynamic site.
+    def self.url_for(target)
+      target
+    end
+
+
+    # `image_url` — Rails' absolute-URL variant of `image_path`. With no
+    # asset host configured (the benchmark shape) Rails emits the same
+    # path `image_path` produces, so this mirrors it. Inlined rather
+    # than delegating: forwarding `skip_pipeline:` would transpile to a
+    # positional Map on strict targets (the kwarg-forwarding trap).
+    def self.image_url(source, skip_pipeline: false)
+      return source if skip_pipeline
+      return source if source.start_with?("/")
+      return source if source.include?("://")
+      digested_asset_path(source)
+    end
+
+    # `path_to_javascript "application"` → the asset path for a JS source.
+    # Rails appends the `.js` extension when the source carries none, then
+    # prefixes the asset path (undigested here, per the `image_path` note —
+    # lobsters has no manifest). Absolute paths and URLs pass verbatim.
+    # `javascript_path` is the same helper under its non-`path_to_` name.
+    def self.path_to_javascript(source, skip_pipeline: false)
+      return source if skip_pipeline
+      return source if source.start_with?("/")
+      return source if source.include?("://")
+      name = source.include?(".") ? source : "#{source}.js"
+      digested_asset_path(name)
+    end
+
+    # Alias of `path_to_javascript`. Inlined rather than delegating, so no
+    # keyword argument is forwarded — a `skip_pipeline: skip_pipeline` call
+    # transpiles to a positional `Map` on strict targets (kotlin/swift),
+    # which mismatches the `Boolean` parameter.
+    def self.javascript_path(source, skip_pipeline: false)
+      return source if skip_pipeline
+      return source if source.start_with?("/")
+      return source if source.include?("://")
+      name = source.include?(".") ? source : "#{source}.js"
+      digested_asset_path(name)
+    end
+
+    # `<img>` tag for a source path + attribute opts. The source flows
+    # through `image_path` (verbatim for absolute/skip-pipeline avatars),
+    # alongside the caller's attrs (srcset/class/alt/...).
+    #
+    # `size:` is EXPANDED, not passed through. Rails turns `size: "16x16"`
+    # into `width="16" height="16"`, and a bare `size: "16"` into a square,
+    # so merging it verbatim ships a `size=` attribute that no browser
+    # reads and no Rails render contains. Attribute order mirrors Rails'
+    # own assembly — caller opts, then src, then width/height last.
+    #
+    # Built as a fresh hash rather than merge-then-delete: the typed
+    # runtime has no untyped-hash mutation, and the strict targets have no
+    # destructuring, so the split lands through explicit indexing rather
+    # than `w, h = size.split("x")`.
+    def self.image_tag(source, opts = EMPTY_HTML_OPTS)
+      attrs = {}
+      size = nil
+      opts.to_h.each do |k, v|
+        if k == :size
+          size = v
+        else
+          attrs[k] = v
+        end
+      end
+      attrs[:src] = image_path(source)
+      if !size.nil?
+        parts = size.to_s.split("x")
+        attrs[:width] = parts[0]
+        attrs[:height] = parts.length > 1 ? parts[1] : parts[0]
+      end
+      "<img#{render_attrs(attrs)}>"
+    end
+
+    # `content_tag :span, text, title: "..."` → `<span title="...">text</span>`.
+    # Content is escaped (Rails escapes unless the caller passes an
+    # html_safe buffer; lowered call sites pass plain strings). Attrs
+    # flow through `render_attrs` like the other tag helpers. The
+    # content default is nil, NOT "" — `content` is untyped, which
+    # lands as C# `object`, and C# rejects any non-null default on a
+    # reference-typed parameter (CS1763); `to_s` maps nil → "".
+    def self.content_tag(name, content = nil, opts = EMPTY_HTML_OPTS)
+      n = name.to_s
+      "<#{n}#{render_attrs(opts.to_h)}>#{html_escape(content.to_s)}</#{n}>"
+    end
+
+    # Emit the importmap script + per-pin modulepreload hints + a
+    # module-script that imports the entry point. Mirrors Rails'
+    # `javascript_importmap_tags` shape so the cross-target comparison
+    # harness sees equivalent head structure.
+    #
+    # `pins` is the frozen array Roundhouse emits to `config/importmap.rb`
+    # as `Importmap::PINS` (one `{ name:, path: }` hash per pin in the
+    # source `config/importmap.rb`). When pins is nil/empty — the case
+    # for the hand-written standalone specimen, before Roundhouse ingests
+    # an importmap — fall back to a Turbo-only shape so the fixture stays
+    # runnable on its own.
+    def self.javascript_importmap_tags(pins = nil, entry = "application")
+      # Lines joined by `\n` only (no indent) — matches Rails' helper
+      # output where each preload link / bootstrap script is flush left
+      # in the source. The first line lands at the layout's source-indent
+      # column; subsequent lines start at column 0.
+      #
+      # The importmap-script's JSON is pretty-printed with 2-space indent
+      # to match Rails' `:pretty` JSON output. Both sides are semantically
+      # identical; the text comparison checks character-for-character.
+      # Build the JSON via string concatenation (rather than `%(...)` with
+      # `\n` escapes + `#{var}` interpolation): the TS transpiler renders
+      # the latter as a template literal that bakes the Ruby source-line
+      # indent into the output, breaking byte-for-byte parity with Rails'
+      # pretty-printed importmap. Concat-form transpiles to a flat string
+      # with `\n` escapes and matches Rails exactly.
+      if pins.nil? || pins.empty?
+        json = "{\n  \"imports\": {\n    \"@hotwired/turbo\": \"/assets/turbo.min.js\"\n  }\n}"
+        return %(<script type="importmap" data-turbo-track="reload">) + json + %(</script>) +
+          "\n" +
+          %(<link rel="modulepreload" href="/assets/turbo.min.js">) +
+          "\n" +
+          %(<script type="module">import "@hotwired/turbo"</script>)
+      end
+      import_lines = pins.map { |p| "    \"#{p[:name]}\": \"#{p[:path]}\"" }.join(",\n")
+      json = "{\n  \"imports\": {\n" + import_lines + "\n  }\n}"
+      parts = []
+      parts << %(<script type="importmap" data-turbo-track="reload">) + json + %(</script>)
+      pins.each do |p|
+        parts << %(<link rel="modulepreload" href="#{p[:path]}">)
+      end
+      parts << %(<script type="module">import "#{entry}"</script>)
+      parts.join("\n")
+    end
+  
+    # Matches Rails' `turbo_stream_from` byte-output: the stream name
+    # travels through `signed-stream-name` as `signed_stream_name`
+    # below spells it, and the channel that will be asked for it is
+    # named beside it.
+    # `channel` is the class the SUBSCRIBER will name in its identifier,
+    # and it is load-bearing rather than decorative. turbo-rails 2.0.16:
+    #
+    #   attributes[:channel] = attributes[:channel]&.to_s || "Turbo::StreamsChannel"
+    #
+    # An app that writes `turbo_stream_from @room, :messages, channel:
+    # "RoomMessagesChannel"` is routing the subscription AWAY from the
+    # stock channel on purpose — campfire prepends a guard onto
+    # Turbo::StreamsChannel that REFUSES its `:messages` streams, so the
+    # custom channel is the only door onto them. Hardcoding the stock
+    # channel here did not merely lose an attribute: it told the client
+    # to knock on the door the app had nailed shut.
+    #
+    # Always passed, never defaulted in this signature — the caller is
+    # the lowering, which knows the answer, and an omitted optional
+    # parameter is its own hazard on the strict targets.
+    def self.turbo_stream_from(stream, channel)
+      %(<turbo-cable-stream-source channel="#{channel}" signed-stream-name="#{signed_stream_name(stream)}"></turbo-cable-stream-source>)
+    end
+
+    # The attribute's value: base64 of the JSON-serialized name, which
+    # is the payload half of what Rails' `Turbo.signed_stream_verifier
+    # .generate` writes, under a suffix that says whether it is signed.
+    #
+    # `--unsigned` HERE, for the targets with no `MessageVerifier` to
+    # sign with (docs/pipeline/runtime.md, "A Turbo stream name is not
+    # signed"). The ruby family reopens this in
+    # runtime/spinel/turbo_streams.rb to write Rails' own HMAC suffix,
+    # so on those lanes the value verifies under a real Rails and a
+    # spelled name is refused. One writer per tree either way: this is
+    # the only method that spells the suffix, and the reader
+    # (`Turbo::Streams::StreamName.verified`) lives beside the reopen.
+    def self.signed_stream_name(stream)
+      Base64.strict_encode64(JSON.generate(stream)) + "--unsigned"
+    end
+  
+    # ── form_with primitives ─────────────────────────────────────────
+    # Small typed-scalar helpers callable from macro-inlined form_with
+    # expansions. Centralizes semantics that may evolve (real signed
+    # tokens, CSP nonces) so they live in one runtime file rather than
+    # being baked into every form_with call site at lower time.
+
+    # Rails injects an authenticity_token hidden input as the first
+    # child of every form_with-rendered form (after the optional
+    # _method override). The value rides `form_authenticity_token` —
+    # empty on targets without a token generator (the compare harness
+    # blanks the attribute anyway), real on CRuby where the overlay
+    # supplies a session-backed token (the lobsters benchmark scrapes
+    # it off GET /login and POSTs it back).
+    # Omitted entirely inside a broadcast render, matching Rails: a
+    # turbo broadcast renders through a session-less renderer, where
+    # `protect_against_forgery?` is false and `form_with` writes no
+    # token input. Our broadcast renders run INSIDE the triggering
+    # request (in-process after_commit), so the session — and a token —
+    # would otherwise be at hand; the flag is what says "this render's
+    # output is for OTHER sessions' pages". Found as a per-form byte
+    # divergence in every broadcast frame by scripts/campfire-compare.
+    def self.csrf_token_hidden_input
+      # `== true`, not truthiness: what an UNSET module var reads as
+      # is target-dependent (elixir's process-dictionary default was a
+      # truthy `%{}`, which stripped this input from every page render
+      # on that lane). The explicit comparison is false for every
+      # target's unset shape and for `false` alike.
+      return "" if @broadcast_rendering == true
+      return "" if ActionController.forgery_switched_off
+      return "" if token_fields_omitted?
+      %(<input type="hidden" name="authenticity_token" value="#{html_escape(form_authenticity_token)}">)
+    end
+
+    # Strict non-Ruby targets do not emit Rails::Application. The Ruby
+    # family and Spinel override this with the app-specific test setting.
+    def self.token_fields_omitted?
+      false
+    end
+
+    # Bracket a broadcast partial render (the lowered
+    # `Broadcasts.<action>(html: …)` sites generate the pair):
+    #
+    #   ViewHelpers.broadcast_render(ViewHelpers.begin_broadcast_render,
+    #                                Views::Messages.message(self))
+    #
+    # TWO PLAIN CALLS, NOT A BLOCK OR A PROC — the load-bearing part is
+    # left-to-right argument evaluation, which every target this file
+    # transpiles to guarantees: the first argument SETS the flag, so the
+    # render (the second argument) evaluates with it up, and the outer
+    # call clears it and answers the html. The other spellings were
+    # each written and backed out: a BLOCK dissolves on the AOT lane
+    # when it captures into a heap poly proc (matz/spinel#4245), and a
+    # `^() -> String` proc ARGUMENT needs a `.call` + function-type arm
+    # in every one of the nine target emitters this file must lower
+    # through — a wide toll for one flag toggle.
+    #
+    # NO `ensure`, also deliberately. A raise inside the render leaves
+    # the flag set for the REMAINDER of that one request only;
+    # `reset_slots!` — every lane's per-request dispatch entry — clears
+    # it, so nothing leaks into later requests. (Statement-position
+    # begin/ensure is likewise a construct half the targets have no
+    # arm for.)
+    # The namespace a `<% cache %>` key sits under, so a fragment
+    # rendered FOR A BROADCAST and one rendered for a request can never
+    # be served for each other.
+    #
+    # They are not interchangeable, and the difference is exactly the
+    # thing `csrf_token_hidden_input` branches on two methods up: a
+    # broadcast render omits the authenticity_token input because its
+    # output is for OTHER sessions' pages. Cache them together and the
+    # first render of a message decides for all of them — a request
+    # warms the entry and every subscriber gets the warming session's
+    # token, or a broadcast warms it and the page that posted the
+    # message renders a form without one. Rails has this hazard and
+    # lives with it (its cached fragment encodes render history, which
+    # is the one divergence scripts/campfire-compare forgives by name);
+    # separating the namespaces costs one prefix and removes it.
+    #
+    # A prefix rather than a flag consulted inside `Rails::Cache`,
+    # because this is a VIEW-layer distinction and the store should not
+    # have to know about it — and because a namespace lets broadcasts
+    # keep a cache of their own instead of forgoing one.
+    def self.cache_scope
+      return "broadcast/" if @broadcast_rendering == true
+      ""
+    end
+
+    def self.begin_broadcast_render
+      @broadcast_rendering = true
+      ""
+    end
+
+    def self.broadcast_render(_armed, html)
+      @broadcast_rendering = false
+      html
+    end
+
+    # Rails emits `<input type="hidden" name="_method" value="patch">`
+    # for forms whose semantic method is PATCH/PUT/DELETE (form's HTML
+    # `method` attribute stays "post"; the server routes off _method).
+    # Returns the empty string for get/post — the inline macro emits
+    # this unconditionally and relies on the empty-string case being a
+    # no-op concat.
+    def self.method_override_input(method)
+      method_str = method.to_s
+      if method_str == "get" || method_str == "post"
+        ""
+      else
+        %(<input type="hidden" name="_method" value="#{method_str}">)
+      end
+    end
+
+    # Rails' `form_with`, BLOCKLESS ONLY.
+    #
+    # This is the FALLBACK that keeps the macro-inline total. The view
+    # walker expands `form_with` at lower time and that is still the
+    # path every template takes; what it cannot reach is a `form_with`
+    # written inside an `app/helpers/` MODULE, where the options are a
+    # runtime value (campfire's `FormsHelper#auto_submit_form_with`
+    # forwards `attributes.merge(data: data)`) and there is no
+    # accumulator to splice statements into. Unqualified, that call was
+    # a bare name nothing in the tree defines: spinel dropped the
+    # helper's whole body and the LINKER failed on the caller's
+    # reference to it — `undefined symbol
+    # _sp_FormsHelper_s_auto_submit_form_with`. Same hole, and same
+    # answer, as `polymorphic_url` and `content_tag` beside it.
+    #
+    # NO BLOCK FORM. `form_with … do |form|` yields a FormBuilder bound
+    # to a model, which is exactly the thing the macro-inline exists to
+    # resolve statically; a runtime FormBuilder would need the model's
+    # column types at run time. A helper that forwards a block gets the
+    # blockless form's markup and the block is not called — recorded in
+    # docs/pipeline/runtime.md rather than silently approximated.
+    #
+    # ATTRIBUTE ORDER IS RAILS': the caller's own options first, then
+    # `action`, `accept-charset`, `method` — which is what
+    # `html_options_for_form_with` builds and what the compare oracle
+    # would read. `action` is OMITTED when no `url:` is given; Rails
+    # puts the current request path there, and a form with no action
+    # posts to the current URL, so the behaviour matches and the bytes
+    # do not (the divergence is in docs/pipeline/runtime.md).
+    #
+    # The keys deleted below are the ones Rails consumes rather than
+    # renders. Deleting from a `to_h.dup` — never assigning into it —
+    # is the same target-portable shape `button_to` above uses: a
+    # literal Symbol key written into a hash derived from an untyped
+    # one is what the strict emitters reject.
+    def self.form_with(opts = EMPTY_HTML_OPTS)
+      attrs = opts.to_h.dup
+      attrs.delete(:method)
+      attrs.delete(:url)
+      attrs.delete(:model)
+      attrs.delete(:scope)
+      attrs.delete(:format)
+      attrs.delete(:builder)
+      url = opts.fetch(:url, nil)
+      action = url.nil? ? "" : %( action="#{html_escape(url.to_s)}")
+      # Stringify at this boundary: `opts.fetch` is Hash[Symbol, untyped]
+      # and a gradual Value must not cross into `method_override_input`'s
+      # `String | Symbol` param (rust `&str`). Same shape as `mail_to`.
+      method = opts.fetch(:method, :post)
+      %(<form#{render_attrs(attrs)}#{action} accept-charset="UTF-8" method="post">) +
+        method_override_input(method.to_s) +
+        csrf_token_hidden_input +
+        "</form>"
+    end
+
+    # Rails' `text_field` (and field helpers) omits the `value`
+    # attribute entirely when the record's value is nil or an empty
+    # string — only emits ` value="<escaped>"` when there's content.
+    # Wraps the nil-or-empty check + html_escape so the macro-inline
+    # form.text_field expansion calls one typed helper instead of
+    # reconstructing the conditional at each call site.
+    def self.optional_value_attr(value)
+      if value.nil? || value.to_s.empty?
+        ""
+      else
+        %( value="#{html_escape(value.to_s)}")
+      end
+    end
+
+    # Inverse of `html_escape`'s nil-discipline: returns html_escape
+    # on the value when present, empty string when nil. Used by the
+    # macro-inline `form.text_area` expansion for the textarea body
+    # — Rails renders an empty body when the attribute is nil rather
+    # than the literal "null" / "nil". Keeping the conditional in
+    # one runtime function avoids re-emitting the nil-check at every
+    # call site.
+    def self.escape_or_empty(value)
+      if value.nil?
+        ""
+      else
+        html_escape(value.to_s)
+      end
+    end
+
+    # ── attribute rendering ──────────────────────────────────────────
+    # Public so FormBuilder can call them; not the user-facing surface.
+  
+    # Render an HTML attribute list. Hash-valued attrs (`data: { turbo_confirm:
+    # "..." }`, `aria: { labelledby: "..." }`) flatten with a kebab-prefixed
+    # key — so `data: { turbo_confirm: "x" }` emits `data-turbo-confirm="x"`,
+    # matching Rails ActionView's tag helper. Underscores in the inner key
+    # become hyphens (turbo_confirm → turbo-confirm). Non-hash values render
+    # as-is via html_escape.
+    # Render an HTML attribute hash as ` name="val"` pairs. Accepts
+    # Symbol-or-String keys uniformly via `k.to_s` at the iteration
+    # boundary — callers pass Symbol-keyed `opts` straight through
+    # without an upfront stringify pass. Nested hashes (`data: {
+    # turbo_confirm: ... }`) render as `data-turbo-confirm="…"`;
+    # underscores in the inner key map to hyphens to match Rails'
+    # tag-helper convention.
+    # A nil value means NO attribute, spelled `unless …nil?` around each
+    # body rather than `next if …nil?`: the kotlin emitter stubs `next`
+    # inside a `forEach` lambda as an EMPTY statement (`/* TODO Next */`,
+    # `return@forEach` never emitted), so a nil value fell through and
+    # rendered `checked="checked"`. The wrap is the one control shape
+    # every lane compiles. (`active_record/connection.rb` still carries
+    # a `next unless` — the same kotlin gap sits latent there.)
+    def self.render_attrs(attrs)
+      return "" if attrs.empty?
+      # Concat, not `<<`: `out << s` lowers as `.add` / write-into-`&str`
+      # on Kotlin/C#/Rust/Python/Elixir. Same shape as `sanitize_to_id`.
+      out = ""
+      attrs.each do |k, v|
+        # The name bindings sit ABOVE the nil guards on purpose: the
+        # TypeScript emitter declares a local where it is FIRST
+        # assigned, and a first assignment inside the `unless` came out
+        # as a bare (undeclared) assignment — to `name`, which in DOM
+        # scope is a const global (TS2588), and to an `inner_name` the
+        # sibling lines then couldn't find (TS2304).
+        name = k.to_s
+        unless v.nil?
+          if v.is_a?(Hash)
+            v.each do |inner_k, inner_v|
+              inner_name = inner_k.to_s.tr("_", "-")
+              unless inner_v.nil?
+                # Coerce untyped Hash values to String before
+                # html_escape; html_escape's contract is
+                # `(String) -> String` and the untyped values flowing
+                # through Hash[String, untyped] need explicit
+                # stringification.
+                out = out + " #{name}-#{inner_name}=\"#{html_escape(inner_v.to_s)}\""
+              end
+            end
+          elsif boolean_attr?(name)
+            # A boolean attribute's mere presence is its value — Rails
+            # renders `hidden: true` as `hidden="hidden"` and OMITS a
+            # falsy one entirely, because `disabled="false"` still
+            # reads as disabled to a browser. Any other value (Rails:
+            # any truthy value) also renders as `name="name"`. The
+            # check is `v.to_s == "false"` — not `v == false`, which
+            # C# refuses (no `object == bool` operator), and not
+            # truthiness, which not every emitter can ask of an untyped
+            # Hash value; `.to_s` on `v` is what the branch below
+            # already does on every lane. The one divergence: a literal
+            # String "false" handed to a boolean attribute renders in
+            # Rails (truthy) and is omitted here — no corpus site
+            # writes one, and literal sites lower through the
+            # compile-time loops, not this method.
+            out = out + " #{name}=\"#{name}\"" unless v.to_s == "false"
+          else
+            out = out + " #{name}=\"#{html_escape(attr_value_text(name, v))}\""
+          end
+        end
+      end
+      out
+    end
+
+    # The TEXT of one attribute value, before escaping: `to_s` here,
+    # which is every scalar. Rails does more for an Array value — it
+    # joins with spaces, and a `class:` Array is its conditional form
+    # (`[ "direct", unread: membership.unread? ]`: Strings as they are,
+    # a Hash's keys by truthiness) — and campfire's `link_to_room`
+    # forwards exactly that through `**attributes` to `render_attrs`,
+    # where no compile-time loop can collapse it. That walk over an
+    # untyped Array is not a shape every strict emitter answers (an
+    # `is_a?(Array)` arm here red the Rust, C# and Elixir lanes on one
+    # push), so it lives in runtime/spinel/attr_value_text.rb, a
+    # reopen of THIS method required by both ruby-family boots — the
+    # same split `to_query_value` makes for `Hash#to_query`.
+    def self.attr_value_text(name, v)
+      v.to_s
+    end
+
+    # The HAML compiler's shortcut-class merge (`src/haml.rs`'s
+    # `element`): `.g{ class: k }` folds the `.g` shortcut and the hash
+    # `class:` value together, matching Haml 7.5.1's own runtime
+    # semantics rather than dropping one side. `static_classes` is the
+    # folded `.class` shortcuts, already space-joined, in source order;
+    # `value` is the hash `class:`'s own (scalar) value — an Array
+    # LITERAL `class:` value is chained one element at a time by the
+    # compiler instead (each element is its own `haml_class` call), so
+    # this method only ever sees a scalar.
+    #
+    # Semantics (MEASURED against Haml 7.5.1): nil, false and ""
+    # leave `static_classes` alone — Haml never renders a bare
+    # `class=""` when a shortcut class is present. Otherwise the value
+    # is stringified and split on whitespace, and each token is
+    # appended unless already present (first occurrence wins — a
+    # shortcut class a dynamic value repeats does not duplicate).
+    # Escaping stays in `render_attrs`/`attr_value_text`, which already
+    # escapes the merged String exactly once.
+    def self.haml_class(static_classes, value)
+      text = value.to_s
+      return static_classes if value.nil? || text == "false" || text == ""
+      tokens = static_classes.split(" ")
+      text.split(" ").each do |tok|
+        tokens << tok unless tokens.include?(tok)
+      end
+      tokens.join(" ")
+    end
+
+    # Rails ActionView's `BOOLEAN_ATTRIBUTES`, verbatim — the attributes
+    # whose presence alone is the value. The compile-time attribute
+    # loops carry the same list in `attr_parts::is_boolean_attr`, and
+    # the two must not drift.
+    #
+    # The SHAPE is the story: one `||` chain of `String == literal`,
+    # because a runtime construct must be spellable by the weakest of
+    # the nine target emitters and every richer spelling lost a lane. A
+    # `case` has no TypeScript arm; an Array constant mis-types on rust
+    # (`&str == str`, E0277) and go (`[]interface{}` vs
+    # `slices.Contains`) and throws on kotlin; a String CONSTANT
+    # receiver lowers as a TYPE on rust (`BOOLEAN_ATTRIBUTES::contains`)
+    # and as `object` on C# (CS1929); a `" a" \` continuation is a
+    # StringInterp the rust const emitter declines; and `include?` with
+    # a String-typed ARGUMENT loses rust again (bridged `contains`
+    # passes the arg unborrowed — `String: Pattern` E0277). String
+    # equality against a literal is the one comparison every lane
+    # already spells.
+    def self.boolean_attr?(name)
+      name == "allowfullscreen" || name == "allowpaymentrequest" ||
+        name == "async" || name == "autofocus" || name == "autoplay" ||
+        name == "checked" || name == "compact" || name == "controls" ||
+        name == "declare" || name == "default" || name == "defaultchecked" ||
+        name == "defaultmuted" || name == "defaultselected" || name == "defer" ||
+        name == "disabled" || name == "enabled" || name == "formnovalidate" ||
+        name == "hidden" || name == "indeterminate" || name == "inert" ||
+        name == "ismap" || name == "itemscope" || name == "loop" ||
+        name == "multiple" || name == "muted" || name == "nohref" ||
+        name == "nomodule" || name == "noresize" || name == "noshade" ||
+        name == "novalidate" || name == "nowrap" || name == "open" ||
+        name == "pauseonexit" || name == "playsinline" || name == "pubdate" ||
+        name == "readonly" || name == "required" || name == "reversed" ||
+        name == "scoped" || name == "seamless" || name == "selected" ||
+        name == "sortable" || name == "truespeed" || name == "typemustmatch" ||
+        name == "visible"
+    end
+  end
+end

@@ -1,0 +1,520 @@
+{
+  "_comment": [
+    "Curated root causes for scripts/campfire-suite. Unpassed tests are clustered",
+    "mechanically by failure message; this file is what turns a cluster into a",
+    "named todo with an owner. Rules are tried in order; FIRST MATCH WINS, so the",
+    "specific ones sit above the general ones.",
+    "",
+    "`match` keys on the failure MESSAGE. A rule may add `match_test`, keyed on the",
+    "test identifier, and then both have to hold — which is the only way to name a",
+    "SILENT divergence, since every wrong answer reads as the same assertion failure.",
+    "",
+    "The unit is an UNPASSED TEST, not a FAIL line: a file that dies at load",
+    "contributes its whole count against its load error. See the header of",
+    "scripts/campfire-suite-summary.",
+    "",
+    "Counts churn — 130 unpassed is a shadow. Causes are the worklist, so they",
+    "carry stable slugs you can still discuss forty commits later.",
+    "",
+    "owner:",
+    "  compiler — roundhouse modeling debt. Ours to fix.",
+    "  app      — a campfire idiom that could change upstream. Only ever a",
+    "             plain-Rails change that stands on its own merits under stock",
+    "             Rails; the port never asks for app-side divergence.",
+    "  gem      — a gem whose surface we shim, or one deliberately out of scope.",
+    "  spinel   — upstream spinel.",
+    "  harness  — this harness's own gap, not the emit's.",
+    "  subset   — the test reaches for dynamic Ruby no compiled target has",
+    "             (a per-object `extend`, `define_method`, `eval`). Nobody",
+    "             can act: not a todo, named so it is not triaged twice, and",
+    "             left out of the who-can-act line.",
+    "  unknown  — the cluster is real, its root cause is not yet known.",
+    "",
+    "THE TAIL IS FLAT. Nothing here blocks more than a handful of tests, and the",
+    "clusters are shapes of wall rather than single fixes — following ONE test",
+    "down its chain has repeatedly beaten ranking the clusters, because a fix",
+    "usually exposes the next wall rather than greening a file. Read the ranking",
+    "as a map of what KINDS of thing are missing, not as a queue.",
+    "",
+    "A rule matching zero tests is reported too: the cause may be cleared, or its",
+    "A rule matching zero tests is reported too, in one of three ways: cleared (it carries `at_zero` saying so, and stays as a regression tripwire), held at zero by a stub (`stubbed`), or unexplained — which means the cause may be cleared, or its message may have moved and the count is now quietly understating."
+  ],
+  "causes": [
+    {
+      "slug": "deferred-preload-timing",
+      "title": "A relation's `includes` run when a record first reads one, not at load — `assert_no_queries` after `to_a` sees the preload",
+      "owner": "compiler",
+      "match": "expected 0 queries, got \\d+",
+      "match_test": "MessageTest#test_presentation_associations_load_together",
+      "note": "`Message.where(...).with_presentation.to_a`, then `assert_no_queries { … every presentation association … }`. Rails runs the preloads inside `to_a`. The ruby family used to defer them until the first association read, so the same nine batched queries landed inside the block.",
+      "at_zero": "load_records runs includes unless skip_preloading!. message_test is 10/10 on Campfire 11d3fb9, and the page-preload sibling still leaves unrendered rows unloaded. The rule stays as a regression tripwire."
+    },
+    {
+      "slug": "ar-database-tasks",
+      "title": "`ActiveRecord::Tasks::DatabaseTasks` — schema/prepare/migrate repair surface",
+      "owner": "compiler",
+      "match": "uninitialized constant ActiveRecord::Tasks",
+      "note": "campfire's `Room::MessagesCountTasksTest` and the rake prepend reach `ActiveRecord::Tasks::DatabaseTasks` to repair SQLite trigger-kept `rooms.messages_count` across development/test DBs. The constant is absent from the emit, so the whole file is 0/4. Shared AR tasks facade — not Campfire-only once modeled."
+    },
+    {
+      "slug": "nokogiri-css-class",
+      "title": "Nokogiri CSS class matcher in controller asserts (`css-class(@class,…)`)",
+      "owner": "compiler",
+      "match": "nokogiri-builtin:css-class",
+      "note": "`Messages::BoostsControllerTest` asserts a quick-boost control via a CSS class XPath that the emitted Nokogiri/assert path rejects (`Invalid expression: … css-class(@class,…)`). Harness/XML assert surface shared by any controller test using the same matcher.",
+      "at_zero": "served by loading ruby-vips after boot so Nokogiri keeps the libxml that accepts `*:` and css-class(). messages_helper_test is 17/17, messages_boosts_controller_test is 5/5, and rooms_refreshes_controller_test is 1/1 on Campfire 11d3fb9. The rule stays as a regression tripwire."
+    },
+    {
+      "slug": "action-view-base-missing",
+      "title": "`ActionView::Base` unnamed in fragment/cache tests",
+      "owner": "compiler",
+      "match": "uninitialized constant ActionView::Base",
+      "note": "`FragmentRenderingTest#test_message_controls_survive_creator_edits…` names `ActionView::Base` (cache lookup / fragment store identity). The constant is not on the emit; sibling fragment fails share the same file's cache story.",
+      "at_zero": "served by the ActionView::Base#form_with peel (b513fa665): fragment_rendering_test is 9/9 on Campfire 11d3fb9. The rule stays as a regression tripwire."
+    },
+    {
+      "slug": "native-validators-304",
+      "title": "Conditional GET keeps native validators (`304 Not Modified`)",
+      "owner": "compiler",
+      "match": "expected response :not_modified",
+      "match_test": "CachedResponsesTest#",
+      "note": "`fresh_when` / `stale?` landed earlier; this remaining case wants native ETag/Last-Modified validators on a cached response so a conditional request answers 304. Shared AC response-cache edge.",
+      "at_zero": "served with #829; rule stays as a regression tripwire."
+    },
+    {
+      "slug": "fragment-cache-identity",
+      "title": "Fragment / collection cache identity and bounded store",
+      "owner": "compiler",
+      "match": ".",
+      "match_test": "FragmentRenderingTest#",
+      "note": "Five fails in one file: `assert_same` on the bounded MemoryStore, jbuilder HTML token state, detached-broadcast `to_html` on nil, cross-room content-validated hits, plus the `ActionView::Base` constant (also matched above when that message wins). Shared view/cache runtime — largest file-green opportunity on the tip suite.",
+      "at_zero": "fragment_rendering_test is 9/9 on Campfire 11d3fb9 after ActionView::Base#form_with (b513fa665). The rule stays as a regression tripwire."
+    },
+    {
+      "slug": "message-creation-tx",
+      "title": "Message create transaction — FTS index / unread / outer rollback",
+      "owner": "compiler",
+      "match": ".",
+      "match_test": "(Message::CreationTest|MessageCreationCommitTest|Message::SearchableTest)#",
+      "note": "Creation commit ordering, failed index/unread rollback, outer rollback restoring counter/jobs, and searchable reindex word replace. High density if one AR transaction / after_create_commit seam is wrong.",
+      "at_zero": "served by d5bbeaaaa (transactional saves, deferred commit callbacks, automatic inverses) on 448bfea2e; the three files measure 15/15 (was 10/15, five fails, on 61a8f105f). The rule stays as a regression tripwire."
+    },
+    {
+      "slug": "sqlite-wal-checkpoint",
+      "title": "SQLite WAL auto-checkpoint / test-thread policy",
+      "owner": "compiler",
+      "match": ".",
+      "match_test": "SqliteWalCheckpointTest#",
+      "note": "File is mostly green (13/15); remaining: disable WAL auto-checkpoint so commits do not fsync on the writer, and do not start a background thread in test by default. Shared adapter knobs."
+    },
+    {
+      "slug": "record-cache-admit",
+      "title": "RecordCache budget / epoch / open-transaction admit rules",
+      "owner": "compiler",
+      "match": ".",
+      "match_test": "RecordCacheTest#test_disabled_budget_missing_epoch",
+      "note": "One fail beside a mostly-green cache file: disabled budget, missing epoch, and open transactions must always query and never admit. Shared MemoryStore/RecordCache policy."
+    },
+    {
+      "slug": "sidebar-cached-direct-sort",
+      "title": "Cached direct room still sorts by latest message when already unread",
+      "owner": "compiler",
+      "match": ".",
+      "match_test": "Users::SidebarsControllerTest#test_a_cached_direct_that_is_already_unread",
+      "note": "Silent DOM divergence: expected `data-sorted-list-number` for a cached unread direct. Peel after cache/304 work."
+    },
+    {
+      "slug": "room-destroy-batching",
+      "title": "Room destroy — per-message txs and member connection reset broadcast",
+      "owner": "compiler",
+      "match": ".",
+      "match_test": "RoomTest#(test_a_room_destroyed_later|test_each_message_is_destroyed_in_its_own_transaction)",
+      "note": "`assert_broadcast_on` for connection reset after late destroy, and per-message destroy transaction interleaving. Shared cable recording + destroy batching.",
+      "at_zero": "served by the room-destroy peel (6e3405f50): a non-joinable fixture transaction opens a savepoint per destroy, and room_test is 11/11. `use_transactional_tests = false` still COMMITs. The rule stays as a regression tripwire."
+    },
+    {
+      "slug": "messages-caching-fixture-txn",
+      "title": "Cached message page still queries while the fixture transaction is open",
+      "owner": "compiler",
+      "match": "expected no query matching /action_text_rich_texts",
+      "match_test": "MessagesCachingTest#test_cached_pages_skip_presentation_queries",
+      "note": "room_test's fixture transaction BEGINs around the example. Campfire turns response caching off while `FragmentCache.transaction_open?` is true, so the second GET of the watercooler runs the presentation queries the test forbids.",
+      "at_zero": "The fixture frame is hidden from `transaction_open?`, and an uncommitted write moves the observer's data_version, so the cached page is dropped when the example edits a message. messages_caching_test is 4/4. The rule stays as a regression tripwire."
+    },
+    {
+      "slug": "presentation-preload-introspection",
+      "title": "`ActionText::RichText#embeds` — a presentation-preload test walks the rich text's attached blobs",
+      "owner": "compiler",
+      "match": "undefined method 'embeds' for an instance of ActionText::RichText",
+      "match_test": "MessageTest#test_presentation_",
+      "note": "campfire 2393f01 (2026-10-05) added two `MessageTest` cases for `Message.with_presentation` and `Message::Pagination::Page#preload_associations`. The second (`association(:rich_text_body).loaded?` before and after a page preloads only the rendered rows) passes since `association(:name).loaded?` lowers onto each association's flat `<name>_loaded?` reader. The first walks `message.body.embeds` under `assert_no_queries`. Served 2026-10-09: the synthesized `ActionText::RichText` declares `has_many_attached :embeds` and fills it after save from the blobs its body's attachment nodes name (Rails' `before_save`, run after the insert because an attachment row needs the id); `with_rich_text_<attr>_and_embeds` preloads `{ rich_text_<attr>: :embeds_attachments }`, and the has_many-attached batch installs the rows it found, so `embeds.each` asks nothing. That test's remaining failure is `deferred-preload-timing`.",
+      "at_zero": "served 2026-10-09 (`embeds` modeled and preloaded). associations_load_together is cleared with deferred-preload-timing. The rule stays as a regression tripwire."
+    },
+    {
+      "slug": "turbo-signed-stream-name",
+      "title": "`Turbo::StreamsChannel.signed_stream_name` and `Turbo.signed_stream_verifier` — minting the name a subscriber sends",
+      "owner": "compiler",
+      "match": "undefined method '(signed_stream_name|signed_stream_verifier)' for (class|module) Turbo",
+      "note": "campfire's `RoomMessagesChannelTest` subscribes the way the browser does — with `Turbo::StreamsChannel.signed_stream_name([room, :messages])` — and one test hands the channel the VERIFIED (unsigned) name to prove it is refused. The runtime has the constant (`turbo-streams-channel`, closed) and the view-side `turbo_stream_from` that signs a name for the page; the class-level mint and the verifier the test reaches for are not on it. Six of the eight room-messages tests stop here, before `stub_connection`. Served 2026-09-22, and the signing came with it: `Turbo::Streams::StreamName.signed`/`verified` are Rails' `MessageVerifier` over the gem's salt (bytes pinned against campfire's Rails in runtime/spinel/test/turbo_streams_test.rb), `turbo_stream_from` writes the signed name on the ruby family, and a spelled or `--unsigned` name is refused at the channel. `lower::cable_test_case` spells `signed_stream_name([room, :messages])` as the signer over `\"#{room.to_gid_param}:messages\"`; `Turbo.signed_stream_verifier` is a real object.",
+      "at_zero": "served 2026-09-22 (room_messages_channel_test 6/6 + the stock-channel pair 2/2); the rule stays as a regression tripwire."
+    },
+    {
+      "slug": "web-push-pinned-delivery",
+      "title": "Proving which address web-push delivery connects to — campfire's `PersistentRequest` prepend over a real `WebPush::Request`",
+      "owner": "compiler",
+      "match": ".",
+      "match_test": "WebPush::PersistentRequestTest#",
+      "note": "campfire's `WebPush::PersistentRequest` (config/initializers/web_push.rb, prepended into the gem's `Request`) pins delivery to the `endpoint_ip:` Push::Subscription resolved and ignores an egress proxy, so a rebind between resolution and delivery cannot reopen the SSRF. The two tests put `TCPSocket.expects(:open)` rows on the endpoint host (`never`) and the pinned IP (`throws`) around a `payload_send` with an empty message.\n\nSERVED ON THE RUBY LANE 2026-09-22 by making delivery REAL, not by teaching the tests: (1) the stub slot's alias over the gem's `payload_send` was guarded by `respond_to?` inside `class << self`, which asks the singleton class and never held — every unstubbed delivery on the CRuby tree raised `web-push is not installed` with the gem loaded; (2) the module is DEFINED in the initializer that prepends it, and nothing ingested it, so the mixin was dropped with the guard. Both fixed; the tests now run the real gem with the app's own prepend, and fail at the unpinned `TCPSocket.open` with the prepend removed.\n\nTHE SPINEL LANE runs the same prepend over a PORT of the gem (runtime/spinel/web_push.rb + web_push_crypto.rb over spinel's openssl package; the crypto is byte-identical to the gem, tests/spinel_web_push_crypto.rs). Two upstream gaps held it, both closed 2026-09-22: matz/spinel#4815 (`Net::HTTP.new(host, port, nil)`, campfire's explicit no-proxy argument, refused by a two-argument constructor) and matz/spinel#4816 (a user class defining a String builtin's name — openssl's `Buffering#getbyte` — dropped the builtin from poly dispatch, and every `GET /` on the binary 500'd; the port was held out of spinel trees for the hours between). On spinel 7cdf4824 both tests pass, and fail at the unpinned connect with the prepend removed.",
+      "at_zero": "served 2026-09-22 on both lanes (web_push_persistent_request_test 2/2 ruby and spinel, through campfire's own PersistentRequest over the real gem / the port); the rule stays as a regression tripwire."
+    },
+    {
+      "slug": "cable-test-case",
+      "title": "`ActionCable::Channel::TestCase` / `Connection::TestCase` — parents with no harness behind them",
+      "owner": "compiler",
+      "match": "undefined method '(stub_connection|subscribe|subscription|unsubscribe|assert_has_stream(_for)?|connect|cookies|assert_reject_connection|disconnect)' for an instance of ",
+      "note": "campfire's test/channels — four files, twenty tests — were never in this tally until 2026-09-20: the ingest read only test/models and test/controllers. Both parents now exist in the emitted test_helper so the files load, and every test under them fails on its first call into a harness that is not there: `stub_connection`, `subscribe`, `subscription.confirmed?/rejected?/streams`, `assert_has_stream(_for)`, `unsubscribe` for a channel; `cookies.signed`, `connect`, `connection`, `assert_reject_connection` for a connection; and `ActionCable.server.pubsub.broadcasts(stream)` behind those, which wants a RECORDING pubsub the way Rails' test adapter is one. The channels themselves are emitted and run (the cable walk drives them); what is missing is Rails' way of building one without a socket. tests/spinel_cable_channel.rb's header says why this matters: until these are green, the conformance number says nothing about the cable lane. Served 2026-09-22: the harness is in test_helper.rb (`Channel::TestCase#stub_connection`/`subscribe_to`/`subscription`/`unsubscribe`/`assert_has_stream`, `Connection::TestCase#cookies`/`connect`/`connection`/`assert_reject_connection`), built on the SAME generated factories the server resolves a frame through (`ActionCable::Channel.build` / `Connection.build`, moved from cable.rb into action_cable.rb so a test binary needs no transport), and `lower::cable_test_case` writes the channel's name into `subscribe`/`assert_has_stream_for` the way Rails resolves it at run time. The recording pubsub was already there. 20/20 on the ruby lane.",
+      "at_zero": "served 2026-09-22 (test/channels 20/20 on the ruby lane); the rule stays as a regression tripwire for a harness method going missing."
+    },
+    {
+      "slug": "view-test-case",
+      "title": "`ActionView::TestCase` — `view` with the app's helpers on it",
+      "owner": "compiler",
+      "match": "undefined local variable or method 'view' for an instance of \\S*Test\\b|undefined method '\\w+' for unknown",
+      "note": "campfire's test/helpers, never in the tally before 2026-09-20. `MessagesHelperTest` calls `view.message_presentation(message)`: Rails' ActionView::TestCase hands the test a view object with every app helper mixed in. The parent now exists so the file loads; `view` does not. ContentFiltersTest, in the same directory, is 8 of 14 without it, because it calls the filters directly. On the compiled lane `view` is an unresolved self-send, so the message names the METHOD called on it instead — `undefined method 'message_presentation' for unknown` — and this rule is pinned to helper tests (`match_test`) so that wording cannot swallow an unrelated nil receiver elsewhere. Served 2026-09-22: `lower::view_test_case` binds `view.<m>` through the app's own `helper_method_index` — the flat union Rails' include order produces, which is Rails' rule rather than the test class's name. messages_helper 3/3.",
+      "match_test": "HelperTest#",
+      "at_zero": "served 2026-09-22 (messages_helper_test 3/3); the rule stays as the tripwire for a `view` call no helper defines, which is ActionView::Base's own surface and still unmodeled."
+    },
+    {
+      "slug": "uri-parse-conformance",
+      "title": "`URI.parse` on the compiled lane is a `://` splitter, not RFC 3986 — and it never raises `InvalidURIError`",
+      "owner": "spinel",
+      "match": "assert_nil failed",
+      "match_test": "OpengraphEmbedTest#test_drops_a_link_and_an_image_that_aren_t_web_urls",
+      "note": "campfire's `ActionText::Attachment::OpengraphEmbed.web_url` is\n\n    parsed = URI.parse(value)\n    value if parsed.is_a?(URI::HTTP) && elsewhere?(parsed.host)\n  rescue URI::InvalidURIError\n    nil\n\nso a link in a message body survives only if Ruby's own parser accepts it AND it names another host. spinel's uri package (packages/uri/uri.rb) splits on `://` and NEVER raises `InvalidURIError` — the class is defined and nothing constructs it — so the rescue that is campfire's actual defense cannot fire. Measured against ruby 4.0:\n\n  \"http://exa mple.com/ \"  ruby: raises InvalidURIError   spinel: URI::HTTP host=\"exa mple.com\"\n  \"javascript:alert(1)\"    ruby: Generic host=nil          spinel: Generic host=\"javascript:alert(1)\"\n  \"https:/rooms/1\"         ruby: URI::HTTPS host=nil       spinel: Generic host=\"https:\"\n  \"//example.com/x.png\"    ruby: Generic host=\"example.com\" spinel: Generic host=\"\"\n\nOnly the first flips this test: a host with a SPACE in it passes `named_host?` (it has a dot and a `com` ending), so the URL reads as elsewhere and is kept where Rails drops it. The ruby lane is 8/8 on the same emit — this is the compiler's, not the emit's, which is the whole reason the two lanes are run against one source.\n\nSERVED UPSTREAM THE SAME DAY. matz/spinel#4806 merged as 5df6202a (a guard at the top of `URI.parse` plus a CRuby-diffed test), and matz layered fd49be64 on top correcting it in four places the whole-string scan got wrong: the QUERY takes any ASCII including the unwise set (`?filter=a|b` must parse, and rejecting it would break a URL a Rails app builds on purpose), `[`/`]` are legal only inside an authority's IPv6 literal, and a non-ASCII byte is rejected everywhere. On spinel fd49be64 this file is 8/8 — the same emit that was 7/8 an hour earlier and 0/8 never-linked before that.\n\nSTILL OPEN, and the rule stays for them: the three divergences the PR tabled are one root cause — `parse` splits on `://` rather than the RFC's `scheme \":\" hier-part`, so `javascript:alert(1)` answers host `\"javascript:alert(1)\"` where ruby answers nil, `https:/rooms/1` is Generic where ruby says HTTPS, and `//example.com/x.png` loses its host. matz asked for them as one targeted commit rather than a parser rewrite; none flips a campfire assertion today, which is why they are a tripwire here rather than a blocker.",
+      "at_zero": "the space case served upstream 2026-09-22 (matz/spinel#4806 + fd49be64); the rule stays as the tripwire for the colon-form divergences still open in the same parser, and for the guard itself being loosened again."
+    },
+    {
+      "slug": "rails-test-support-classes",
+      "title": "A Rails support class a test constructs by name — `ActionDispatch::TestRequest`, `ActiveSupport::Logger`",
+      "owner": "compiler",
+      "match": "uninitialized constant (ActionDispatch::TestRequest|ActiveSupport::Logger|ActiveSupport::TaggedLogging)|opengraph_embed_test\\.rb:\\d+: unsupported call: node \\d+ \\(CallNode `set`\\) recv=ConstantReadNode|super: no superclass method 'call' for an instance of \\w*Formatter|undefined method 'formatter=' for an instance of Rails::Logger",
+      "note": "`Current.set request: ActionDispatch::TestRequest.create(\"HTTP_HOST\" => …)` is how the opengraph-embed test names this Campfire's own host; `ActiveSupport::Logger.new(io)` wrapped in `TaggedLogging` is how the log-scrubbing test reproduces production's logger stack. Neither is app code, and neither exists in the emit. The compiled lane reports the same two sites earlier and differently. The opengraph-embed line is `Current.set request: ActionDispatch::TestRequest.create(...) do ... end`, and spinel refuses the CALL (`CallNode `set`` on the `Current` constant, a block-taking class method the runtime's CurrentAttributes does not declare) before it reaches the constant inside it — the whole file, 8 tests. The log-scrubbing formatter is `class LogScrubbingFormatter < ActiveSupport::Logger::SimpleFormatter` with `def call(...) = super`: the runtime has the parent by name and not its `call`, so five tests hit `super: no superclass method 'call'` and the sixth `Logger#formatter=`. Both are the same debt this rule names — Rails' own logger and request stand-ins — so both spellings live here. HALF SERVED 2026-09-22: `runtime/ruby/logger.rb` is Ruby's `Logger::Formatter` (the `super` campfire's formatter needs) plus `ActiveSupport::Logger`/`TaggedLogging`, line format pinned against ruby-minted bytes — log_scrubbing 6/6 on the ruby lane. `ActionDispatch::TestRequest` + `Current.set` (the opengraph-embed file) is the other half and is open. SERVED 2026-09-22, both halves. `ActionDispatch::TestRequest.create(env)` lands ONCE PER REQUEST SHAPE rather than in the shared harness, because the two ruby-family trees run genuinely different Request classes: the spinel tree's is accessor-backed, so `create` maps the env keys that class models and keeps the rest in `env`; the CRuby overlay's IS env-backed, so `create` is its constructor and every key stays readable. `Current.set(k: v) { … }` is a LOWERING (`lower::current_set`), not a runtime method: it expands to save / assign / begin-ensure-restore over the accessors `ingest::current_attributes` already flattens a Current into, which is Rails' semantics including the exception safety — and a generated `set` would have needed one signature covering every subset of attributes a caller might name. opengraph-embed 8/8.",
+      "at_zero": "served 2026-09-22 (opengraph-embed 8/8, log_scrubbing 6/6); the rule stays as the tripwire for the next Rails test stand-in the corpus reaches for, and names the three it has needed so far."
+    },
+    {
+      "slug": "kwargs-splat-forwarding",
+      "title": "A test-local helper forwarding `**attributes` to a keyword-only callee",
+      "owner": "compiler",
+      "match": "wrong number of arguments \\(given 1, expected 0; required keywords: ",
+      "note": "`def embed_from(**attributes) = attachment_for(**attributes).attachable` — the caller's keywords splatted through to a `(href:, url:, filename: …, caption: …)` signature. The emit lowers `**attributes` to a positional Hash and the callee still wants keywords, so every one of the eight opengraph-embed tests trips here before it reaches the subject. Sibling of `test-helper-kwarg-defaults`, which filled the SKIPPED slots; this is the splat. Served 2026-09-21: `lower::kwsplat` now resolves a receiverless call in a test class against the class's own helpers and reads an optional keyword with its literal default in hand (`filename: attributes.fetch(:filename, \"Title\")`). Behind it in the same file: a content-type attachable is now `Attachment#attachable`'s first read (`Content.content_type_attachable`, generated), `ApplicationController.render partial: attachment.to_partial_path, locals: { k: attachment }` lowers to `Content.render_attachment(attachment)`, and `link_to` puts the html options before `href` as Rails does. 7/8; the last is `rails-test-support-classes`.",
+      "at_zero": "served 2026-09-21 (opengraph-embed 7/8, the eighth is `ActionDispatch::TestRequest`); the rule stays as a regression tripwire."
+    },
+    {
+      "slug": "actiontext-fragment-mutation",
+      "title": "`ActionText::Fragment#update` / `Node#inner_html=` — rewriting a parsed body in place",
+      "owner": "compiler",
+      "match": "undefined method '(update|replace)' for an instance of ActionText::Fragment|undefined method 'inner_html=' for an instance of ActionText::Node|(refute_equal|assert_match) failed",
+      "match_test": "ContentFiltersTest#test_(entire_message_contains_an_unfurled_url|unfurled_tweet)",
+      "note": "campfire's `RemoveSoloUnfurledLinkText` (`fragment.replace(\"div\") { |n| n.inner_html = … }`) and `StyleUnfurledTwitterAvatars` (`fragment.update { |source| source.at_css(\"div\")[\"class\"] = … }`) are the two filters that MUTATE the parsed fragment rather than read it. The runtime's Fragment answers `find_all`, `to_html` and `to_plain_text` — the read side the sanitizer needed — and none of the write side, so one of them raises and the other is skipped (`applicable?` is answered, `apply` never lands), which is the `refute_equal failed` a solo unfurled URL reads as: the body came back unchanged. Served 2026-09-21: `Node` is open tag + inner + close tag and takes `inner_html=` and `[]=` (an attribute spliced into the open tag as spelled); `Fragment#update` yields a copy whose `css`/`at_css` bind nodes for write-through. The same pass found `to_plain_text` giving an attachment's CAPTION regardless of attachable and descending into its children — Rails asks the attachable (`attachable_plain_text_representation`: \"\" for an opengraph embed, \"@name\" for a mention, \"[filename]\" for a blob) and replaces the whole node — so `applicable?` never matched; `Content.attachment_plain_text` is now generated per app beside `render_attachment`. content_filters 12/14, the two left are `assert_not_same` and `squish`.",
+      "at_zero": "served 2026-09-21 (Node writes, `Fragment#update`/`at_css`/`css`, and Rails' attachable-driven plain text; content_filters 12/14); the rule stays as a regression tripwire."
+    },
+    {
+      "slug": "activesupport-string-core-ext",
+      "title": "An ActiveSupport String core extension — `squish`",
+      "owner": "compiler",
+      "match": "undefined method '(squish|squish!|truncate_words|remove)' for an instance of String",
+      "note": "`<<~HTML.squish` in a test body. `blank?`/`present?`/`truncate` landed as the corpus called them; this is the next one it did. `squish` served 2026-09-22: `ActiveSupport.squish` in the shared runtime (a character scan, not Rails' regex — `%`/regex gsub is not a shape every target lowers), grounded by receiver type in a typed test body. Measured byte-for-byte against Rails on six inputs.",
+      "at_zero": "`squish` served 2026-09-22; the rule stays as the tripwire, and names the three String core exts (`squish!`, `truncate_words`, `remove`) the corpus has not asked for yet."
+    },
+    {
+      "slug": "ipaddr-octets-on-stdlib",
+      "title": "The surfguard port calls `IPAddr#octets`, which only the runtime's own IPAddr has",
+      "owner": "compiler",
+      "match": "undefined method 'octets' for an instance of IPAddr",
+      "note": "runtime/ruby/surfguard.rb reads the embedded IPv4 of a NAT64 / SIIT address through `IPAddr#octets` — a method runtime/ruby/ipaddr.rb defines and Ruby's stdlib `ipaddr` does not. The ruby family runs on the stdlib one, so on that lane `private_ip?(\"64:ff9b::a9fe:a9fe\")` RAISES rather than answering true: the guard fails closed (a NoMethodError, not a pass-through), but it fails, and the three NAT64/SIIT tests say so. Twenty-one of the twenty-four guard tests pass. Served 2026-09-21: the ruby family's `runtime/ipaddr.rb` is the stdlib's class with the port's `octets` reopened onto it (`project::IPADDR_STDLIB`, `hton.bytes`), so `octets` is the one surface runtime code may assume of an IPAddr on every lane — `to_i` was never an option, the port avoids the 128-bit integer on purpose. Guard file 24/24.",
+      "at_zero": "served 2026-09-21 (guard 24/24 on the ruby lane); the rule stays as the tripwire for a runtime IPAddr method the stdlib facade does not mirror."
+    },
+    {
+      "slug": "vips-image-construction",
+      "title": "`Vips::Image.black(8, 8).add(128).cast(\"uchar\").write_to_buffer(\".png\")` — building a pixel image in code, on the compiled lane",
+      "owner": "gem",
+      "match": "undefined method '(write_to_buffer|add|cast|black)' for unknown",
+      "match_test": "VipsLoaderPolicyTest#",
+      "note": "The loader-policy test does not ship fixture images; it MAKES one per format with libvips' arithmetic API and writes it to a buffer with the format's suffix. That chain (`Image.black(8, 8).add(128).cast(\"uchar\").write_to_buffer(\".png\")`) used to stop the compiled lane because spinel-ruby-vips had no live VipsImage handle. The package now provides those methods, so every test in the file reaches the policy question.\n\nTHE CONSTRUCTION WALL IS DOWN. A later suite that still fails this file is asking find_load, not asking for black/add/cast — see `vips-policy-not-applied-in-tests`.",
+      "at_zero": "served 2026-10-05: spinel-ruby-vips grew Image.black / #add / #cast / write_to_buffer, so the policy file reaches find_load instead of stopping on unknown. Remaining find_load nils on libvips 8.14 are vips-policy-not-applied-in-tests, not this construction wall."
+    },
+    {
+      "slug": "tempfile-stdlib",
+      "title": "`Tempfile.create(%w[loader_probe .img], binmode: true) do |file| … end` — a stdlib class the compiled lane has no port of",
+      "owner": "compiler",
+      "match": "uninitialized constant Tempfile",
+      "note": "The loader-policy test writes each probe to a temp file because `Vips.vips_foreign_find_load` takes a PATH. The ruby family has Ruby's `tempfile`; the compiled lane has no such constant, so the twelve tests that hand the helper literal bytes (and so get past `vips-image-construction`) stop here instead. Same arrangement `ipaddr` and `zlib` took: a port under runtime/ruby for the targets with no stdlib to bind to, swapped for the real one on the CRuby/JRuby trees. SERVED 2026-09-22: `runtime/ruby/tempfile.rb` ports the block form, the ipaddr/zlib arrangement (CRuby and JRuby take Ruby's own). It bought ZERO tests, and that is the honest reading rather than a disappointment: the same file was behind TWO walls, and clearing the second revealed the first. The vips file now reaches `Vips::Image.black(8, 8)` and stops there — `vips-image-construction`, which is the cause that actually holds those seventeen tests.",
+      "at_zero": "served 2026-09-22; the rule stays as the tripwire for the next caller that reaches for a temp file, and for the port's one real difference from Ruby's — it opens by name where Ruby opens O_EXCL and retries."
+    },
+    {
+      "slug": "vips-policy-not-applied-in-tests",
+      "title": "find_load on libvips 8.14 still names a blocked Magick/Svg loader after the app's Vips.block_untrusted policy is applied",
+      "owner": "compiler",
+      "match": "assert_(nil|match) failed",
+      "match_test": "VipsLoaderPolicyTest#test_denies_",
+      "note": "campfire's config/initializers/vips.rb (`Vips.block_untrusted(true)`, `Vips.block(\"VipsForeignLoadOpenslide\", true)`) is lifted at ingest onto the Application reopen and applied at the bottom of runtime/active_storage_processor.rb, at load, once — which is what the initializer does.\n\nTHAT HALF WAS SERVED 2026-09-22 (boot order). The remaining four fails on the compiled lane were a different question: `vips_foreign_find_load` on libvips 8.14 still RETURNS `VipsForeignLoadMagickFile` / `VipsForeignLoadSvgFile` after `vips_block_untrusted_set(TRUE)`, even though `Image.new_from_file` / magickload / svgload raise \"operation is blocked\". 8.15+ skips BLOCKED classes in `vips_foreign_map`, so find_load answers nil. Direct `openslideload` etc. were already refused (those tests pass). The processor wraps find_load through `VipsExt.sp_vips_find_load` (not wrapping the Ruby method in place: that re-enters on the spinel package) and hides Magick/Svg/Pdf/… prefixes plus any class `Vips.block` named.\n\nThe wrap is the Rails-app contract, not a Campfire rewrite: any initializer that sets that policy is entitled to the same find_load answer load would give.",
+      "at_zero": "served 2026-10-05: the processor wraps Vips.vips_foreign_find_load through VipsExt so a blocked loader is not selected (8.15+ already skips BLOCKED classes in vips_foreign_map; 8.14 does not). 15/15 on this orb's libvips 8.14.1 after the wrap, two skips for loaders the host never built."
+    },
+    {
+      "slug": "test-harness-surface",
+      "title": "The emitted test base class is missing Rails' test surface",
+      "owner": "compiler",
+      "match": "undefined method '(file_fixture|fixture_file_upload|assert[a-z_]*|response|parsed_body|skip)' for an instance of \\S*Test\\b|unsupported call: node \\d+ \\(CallNode `(file_fixture|fixture_file_upload|assert[a-z_]*|response|parsed_body|skip)`\\) recv=-",
+      "note": "Not the app's code failing — the scaffolding around it. `file_fixture` and `fixture_file_upload` read from test/fixtures/files, `response` is the integration-test response object, and the bare `assert` family comes from Minitest itself. Every one of these is a method the emitted TestBase would have to answer before the assertion behind it is even reached, so this cluster hides an unknown number of further walls. `skip` joined the list on 2026-09-20 with test/lib: `VipsLoaderPolicyTest` skips a loader libvips was not built with. ON THE COMPILED LANE the same gap reads differently: a receiverless call the harness does not define is a spinel COMPILE error — `unsupported call: node N (CallNode `assert_not_same`) recv=-` — and it takes the whole file, so the count is the file's, not the test's (content_filters, 14, at `assert_not_same`). Same cause, second spelling, matched here so the two lanes rank it as one thing. `assert_not_same`/`assert_same`/`refute_same` served 2026-09-22 (inlined to `equal?`, Ruby's identity predicate; spinel answers it on a heap object) — content_filters 14/14 on the ruby lane. What is left under this rule is ONE test: `skip` in campfire's vips policy test, which Minitest uses to say the local libvips has no `niftiload` to block. The harness has no `skip`, and adding one honestly means the shim reporting it and the tally taking it out of BOTH numerator and denominator — a skipped test is not a passing one. `skip` served 2026-09-22, and it had to be a THIRD outcome rather than a lenient second: the shim prints `SKIP <Class>#<test>: <why>` and the tally takes it out of BOTH numerator and denominator. The discriminator that forced it: the same emit scored 16 of 17 on a mac and 15 of 17 on the Linux runner, because how many formats the local libvips compiled in is a property of the HOST. Counting a skip as failed made a host difference read as a transpiler gap; counting it passed would claim a check that never ran.",
+      "at_zero": "served 2026-09-22; the rule stays as the tripwire for the next harness method the corpus reaches for — `file_fixture`, `fixture_file_upload`, `response`, `parsed_body` and the bare `assert` family are all named in the match because each hides an unknown number of assertions behind it."
+    },
+    {
+      "slug": "attachable-partials-not-rendered",
+      "title": "A link-preview attachment node is served bare, not rendered through `_opengraph_embed`",
+      "owner": "compiler",
+      "match": "assert(_no)?_match failed",
+      "match_test": "RoomsControllerTest#test_show_renders_(a_link_preview|an_unfurled_link_preview)",
+      "note": "Rails renders every `<action-text-attachment>` in a stored body through the attachable's partial before serving it, and only then hands the body to `auto_link`, whose default-list sanitize strips the outer tag but keeps the rendered children. `Content#to_s` now does that for sgid attachables — an @mention reaches the page as `users/_mention` on both lanes (it used to be served as nothing: the ruby lane's `auto_link` stripped the bare tag with nothing inside, spinel's served an element a browser draws as nothing) — through the generated `Content.render_attachment`, one arm per attachable model naming a partial. A link preview is the OTHER dispatch in campfire's `from_node` reopen: not an sgid but the content-type `application/vnd.actiontext.opengraph-embed`, built by `OpengraphEmbed.from_node` with `web_url` dropping a non-web `href`/`url` (these tests: `javascript:`, `data:`, this Campfire's own host), rendered through `action_text/attachables/_opengraph_embed` where `Free cookies` is the filename and the `<img>` its image. That arm is not generated yet, and the emitted partial is not callable as emitted: Rails names its local after `model_name.element` (`opengraph_embed`), the view lowering named it after the directory (`attachable`), and `caption` reads through the Attachment's delegation to the node. Both lanes' sanitizers DO drop the `javascript:` href (verified on each lane's filter-chain output) — `data:image/svg` survives only because `web_url` never ran.",
+      "at_zero": "both halves landed: sgid attachables through the generated `Content.render_attachment` (fe2ce576), content-type attachables through their own `from_node` with the partial's local named `model_name.element` and `caption` delegated back through the node, plus the shared `auto_link` running Rails' body pass so the outer node is stripped around the partial on every lane; ruby 294/300, spinel 292/300. The rule stays as the tripwire for an attachment node reaching the page bare again."
+    },
+    {
+      "slug": "test-helper-kwarg-defaults",
+      "title": "A test-local helper with keyword defaults, called with a subset of its keywords",
+      "owner": "compiler",
+      "match": "(URI should be a String, Regexp, Addressable::Template, a callable object, or respond to #to_str\\. Got: Hash|unexpected end of input)",
+      "match_test": "UnfurlLinksControllerTest#test_create_strips_markup_from_the_title_and_description",
+      "note": "`def stub_successful_request(url: \"https://www.example.com/\", title: \"Hey!\", description: \"desc..\")` called as `stub_successful_request title: \"…\", description: \"…\"`: the caller's keywords arrive as one Hash in the first positional slot, so `url` IS the hash and WebMock (ruby) refuses it while the compiled lane stubs nothing and the controller answers an empty body (`unexpected end of input` from the test's `JSON.parse`). The other callers pass no keywords and take every default, which is why the helper worked until 977cbcd added this test. Keyword parameters with defaults on a test-module method need the same call-site fill-in the app-side lowering does. Served 2026-09-19: `lower::helper_kwargs` fills a skipped slot with the parameter's own default when that default is context-free (a literal, a constant, an array or hash of those) — the value Ruby binds — and still declines a default that reads the callee's context.",
+      "at_zero": "the skipped-slot fill landed 2026-09-19 (unfurl 7/7 both lanes); the rule stays as a regression tripwire."
+    },
+    {
+      "slug": "direct-uploads-not-served",
+      "title": "Active Storage's direct-upload controllers are not mounted, so their guard cannot be asserted",
+      "owner": "compiler",
+      "match": "(active_storage_authentication_test\\.rb:|undefined method 'rails_direct_uploads_path'|uninitialized constant ActiveStorage::Current|undefined method 'count' for class ActiveStorage::Blob)",
+      "note": "Upstream 79eb9a5 (#267) requires a Campfire session on `ActiveStorage::DirectUploadsController` and the disk service's PUT — framework controllers campfire never calls (it uploads through MessagesController) but which Rails mounts on every app. The four tests drive those routes (`rails_direct_uploads_path`, `ActiveStorage::Blob.count`, `ActiveStorage::Current`) and expect 401 for an anonymous caller and 200 for a signed-in one. This emit mounts neither endpoint, so an anonymous caller gets a 404 rather than a 401: guarded by absence, which satisfies the intent and fails the assertion. DEFERRED rather than declined — serving the direct-upload endpoints only to guard them is not a feature anyone asked for, and the honest fix, if the routes ever land, is to land the guard with them. On spinel the file does not link (`Blob.count` on a class the runtime types differently), so all four count against the build. Served 2026-09-20, guard and routes together: the ruby family's `ActiveStorage::Routes` mounts `POST /rails/active_storage/direct_uploads` (`DirectUploadsController#create` — `Blob.create_before_direct_upload!` and Rails' JSON with the signed PUT url) and `PUT /rails/active_storage/disk/:encoded_token` (`DiskController#update` — content type, length and MD5 checksum held to the token, 204/422/404 as Rails answers); `Blob#url` is Rails' service url, absolute through `ActiveStorage::Current.url_options`, which the engine controllers set from the request. The guard is the initializer's own two lines: `lower::module_mixins` keeps a `before_action` onto a runtime controller carrying the `initializer_filters` seam when a kept mixin supplies the method, and boot.rb's generated reopen redefines the seam. `Digest::MD5.base64digest` is spinel's own since 00e00631 (matz/spinel#4631, same day).",
+      "at_zero": "served 2026-09-20 (4/4 both lanes; with the generated filter reopens deleted the anonymous POST creates a blob and the anonymous PUT is not a 401, so the guard is what the tests see); the rule stays as a regression tripwire."
+    },
+    {
+      "slug": "mocha-stub-raises",
+      "title": "mocha's `.raises` on a class-method stub",
+      "owner": "compiler",
+      "match": "undefined method 'raises' for unknown",
+      "note": "`ActionCable.server.stubs(:remote_connections).raises(RuntimeError.new(\"cable down\"))` (upstream 9dd19d0's sessions test): the MochaBridge shapes answer `stubs(...).returns(v)` on a served row or a class; `.raises(e)` is the same slot with a raise in the arm, not a value. Served 2026-09-19: the chain parser accepts a `Const.reader` head, the table has a row for `ActionCable.server`/`remote_connections`, and both `ActionCable::Server` definitions carry the raise slot; the ruby family's replay resolves a reader head too.",
+      "at_zero": "served 2026-09-19 (sessions 9/10 spinel, 10/10 ruby); the rule stays as a regression tripwire."
+    },
+    {
+      "slug": "mocha-bare-mock",
+      "title": "mocha's bare `mock` — an anonymous expectation object",
+      "owner": "compiler",
+      "match": "undefined local variable or method 'mock'",
+      "note": "`mock` with no receiver builds an anonymous Mocha::Mock the test then hands to the code under test (upstream 9dd19d0's sessions test: `remote_connections = mock; remote_connections.expects(:disconnect).with(reconnect: true)`, then a second `mock.tap { |m| m.expects(:where)… }` returned from `ActionCable.server.stubs(:remote_connections)`). A strict target has no anonymous object to build, but the graph is closed: read whole it is a PATH through the value the stubbed method answers — `where(current_user: u)` then `disconnect(reconnect: r)`, once. Served 2026-09-20: `lower::mocha::lower_mock_graphs` reads the body's mocks and their expectations and folds a graph a row's `mock_path` spells into one slot call (`ActionCable.server.expect_remote_connections_where_disconnect(1, users(:david), true)`); the runtime's own `RemoteConnections#where` / `RemoteConnection#disconnect` admit only those arguments and count the leaf, verified at teardown. A graph the path does not spell is left as written and goes to the bridge.",
+      "at_zero": "served 2026-09-20 (sessions 10/10 both lanes; a no-op `disconnect` fails the test with `expected 1 time(s), got 0`); the rule stays as a regression tripwire."
+    },
+    {
+      "slug": "proc-call-lost",
+      "title": "A user `call` with more required params than a poly `.call` site supplies drops the site's Proc arm — spinel#4529",
+      "owner": "spinel",
+      "match": "(undefined method 'call' for an instance of Proc|assert_difference failed: expected -2, got 0)",
+      "match_test": "(Opengraph::FetchTest|Push::SubscriptionTest|Room::PushTest)#",
+      "note": "All four passed on campfire 94a48aac and went red on 977cbcd in files upstream did not touch. Bisected on the emitted tree: the trigger is the new `LogScrubbingFormatter < Logger::Formatter` (upstream ef147d1, bot-key log redaction) and its one method, `call(severity, time, progname, message)`. spinel's pure-callable fast path for a poly `.call` steps aside whenever ANY user class defines `call`, expecting the poly method dispatch to carry the callable pre-arm (#4395) — but the dispatch counts a user `call` as a candidate only when `argc >= nrequired`, and with none it declines to the unresolved raise. A four-parameter `call` beside a two-argument `pred.call(host, port)` on the TcpSocketStub/Resolv seam lands exactly between the two guards, so the site compiles to an unconditional NoMethodError with no arm at all. `Room::PushTest#test_destroys_invalid_subscriptions` fails downstream of the same lost call (the endpoint resolver's Proc). Standalone 25-line repro and the arity discriminator (2 params passes; 3, 4, 5 fail) in the issue; the fix makes the fast path's guard arity-aware, the dispatch's own rule, and all four pass on the patched compiler (39/39 across the three files).",
+      "at_zero": "spinel#4529 closed by PR #4530 (b93306b6, same day): the fast path's guard is arity-aware; spinel lane 286 -> 290/300 on the merge. The rule stays as the tripwire for the two guards disagreeing again."
+    },
+    {
+      "slug": "fixture-accessors",
+      "title": "A fixture accessor the emitted loader never defined",
+      "owner": "compiler",
+      "match": "undefined method '\\w+' for an instance of \\S*Test\\b",
+      "note": "`users(:david)`-style accessors are generated per fixture file. Where one is missing the test cannot name its own data, so nothing behind it has been seen. The name comes from the app's own fixtures rather than from Rails, which is what separates this from the emitted test base class's own surface."
+    },
+    {
+      "slug": "sti-becomes",
+      "title": "`becomes!` — recasting a record to an STI sibling",
+      "owner": "compiler",
+      "match": "undefined method 'becomes!' for an instance of",
+      "note": "campfire opens and closes rooms by recasting: `room.becomes!(Rooms::Open)` rewrites the type column and returns the record as the sibling class. The STI read and write halves landed first (7aad7ba7, 7245435a); the recast followed in f2d42854, where the copy went into the LOWERER.",
+      "at_zero": "`becomes!` landed in f2d42854; the rule stays as a regression tripwire."
+    },
+    {
+      "slug": "params-object-representation",
+      "title": "A params object read as a Hash",
+      "owner": "compiler",
+      "match": "(for an instance of \\w*Params\\b|undefined method 'to_attrs' for an instance of Hash|method 'require' called for an instance of Hash)",
+      "note": "The emit gives each permitted set its own type (`RoomParams`), and the app then indexes it, deletes from it, or hands it somewhere expecting a Hash. Both directions are the same modeling question — what a params object IS — and it is the one the indifferent-access design addresses."
+    },
+    {
+      "slug": "relation-vs-array",
+      "title": "A relation answering as an Array, or an Array asked for relation methods",
+      "owner": "compiler",
+      "match": "for an instance of (ActiveRecord::Relation|Array)\\b",
+      "note": "Both directions of one gap: a query lowered to an Array is then asked for `find_by`/`new`/a dynamic finder, or a Relation is asked for an Enumerable method the shim does not carry. `Model.where(...)` is a relation, not an array of records (eb57882f) — this is the residue of that same distinction."
+    },
+    {
+      "slug": "actiontext-attachment-from-node",
+      "title": "`ActionText::Attachment.from_node` — building an attachment from a parsed node",
+      "owner": "compiler",
+      "match": "undefined method 'from_node' for class ActionText::Attachment",
+      "note": "Was named in docs/pipeline/runtime.md's \"What is left\" for attachments, alongside `ActionText::Attachables::MissingAttachable`. The PARSE already worked — `#attachments` returns every node with every attribute it carried — so this is the constructor that turns one of those nodes back into an attachment object, plus the missing-attachable case a stale sgid should land in.",
+      "at_zero": "`from_node`, `#attachable` and `MissingAttachable` landed with the generated `ActionText::Attachable.locate` (the includer set is the registry); the rule stays as a regression tripwire."
+    },
+    {
+      "slug": "sgid-wire-format",
+      "title": "An sgid minted by Rails, read here — campfire's tolerant `from_node` for a rotated secret",
+      "owner": "compiler",
+      "match": "assert_equal failed",
+      "match_test": "ActionTextAttachmentTest#test_lookup_user_attachable_with_invalid_sgid",
+      "note": "campfire's `lib/rails_ext/action_text_attachables.rb` reopens `ActionText::Attachment.from_node` to accept a `User` sgid whose SIGNATURE fails, so rotating SECRET_KEY_BASE does not orphan every @mention: it decodes Rails' `_rails.data` base64 envelope by hand and finds the record from the gid inside. Two things stood between that and this runtime: the wire format (`SignedGlobalId` signed `<Model>/<id>` under its own salt, so an sgid a real Rails minted — every @mention in an existing database — read as missing, and the reopen's `_rails.data` read found no gid in ours), and the reopen itself, an `ActiveSupport.on_load` block the class finder skipped without a word. Both closed: the mint is Rails' bytes (`gid://<app>/<Model>/<id>?expires_in` as `data`, url-safe padded base64, HMAC-SHA1 under `signed_global_ids` — measured against Rails 8.2 and pinned as a literal in runtime/ruby/test/action_text_test.rb), and `ingest::on_load_reopen` reads the reopen for the one fact it holds, the `%w[ User ]` list, which `Attachment#attachable` consults through `SignedGlobalId.unverified_uri` only after the signed read has failed. A `from_node` reopen without the `\"_rails\"` fingerprint, or any other declaration under `on_load`, is a survey line rather than a drop.",
+      "at_zero": "the wire format is Rails' and the tolerant list is read off the reopen; the rule stays as a regression tripwire for either end drifting (a salt, digest, padding or `?expires_in` change fails the pinned literal first)."
+    },
+    {
+      "slug": "socket-interception",
+      "title": "Proving which address the HTTP client connects to — `TCPSocket.expects(:open).with { … }.throws`",
+      "owner": "compiler",
+      "match": "Resolv.stubs\\(:getaddresses\\) with 2 chained link",
+      "match_test": "dns_rebinding",
+      "note": "campfire's two DNS-rebinding tests stub `Resolv.getaddresses` with SEQUENTIAL answers (`.returns([a], [b])` — first call, then every later one), set `TCPSocket.expects(:open).with { |*args, **| … }` to `.never` for the hostname and `.throws(:dns_not_rebound)` for the resolved IP, and `assert_throws` around the fetch: the proof is which ADDRESS the client opened a socket to. Served since 2026-09-17: the Resolv slot files a sequence (`stub_getaddresses_seq`), `TcpSocketStub` (runtime/spinel/tcp_socket_stub.rb) holds the predicate expectations, and the client asks it about the address it is about to connect to — spinel's reopened `connect_with_timeout`, the ruby family's reopened `TCPSocket.open`. The `ipaddr:` pin itself had held on both lanes since matz/spinel#4420 closed; this is its proof.",
+      "at_zero": "served 2026-09-17 (sequential Resolv answers + the TcpSocketStub seam); the rule stays as a regression tripwire."
+    },
+    {
+      "slug": "object-extend",
+      "title": "`obj.extend Mod` on one live object",
+      "owner": "subset",
+      "match": "Object#extend not supported",
+      "note": "Mixing a module into a single instance needs a per-object method table, which no compiled target has — spinel refuses the call at compile time, and one such line kept this whole file from linking. `lower::object_extend` stubs the TEST that reaches for it with this report, so the file's other tests run. The earlier attachable sites (`action_text_attachment_test`, `action_text_attachables_test`) now mint with `to_sgid(for:)`, which `lower::to_sgid` grounds. Campfire `11d3fb9` still extends one live connection in `WebPush::ConnectionsTest#test_a_tls_failure_on_a_new_connection_before_the_push_is_written_is_reported_as_it_is`: `pinned_connection(server).extend(failing_check)` must change `begin_transport` on that object alone. `web_push_connections_test` is 13/14. A constant or a Ruby-only `extend` would not give Spinel a per-object method table, so the test stays the raise."
+    },
+    {
+      "slug": "globalid-sgid",
+      "title": "Global IDs — minting and dereferencing an sgid",
+      "owner": "compiler",
+      "match": "(attachable_sgid|to_gid_param|undefined method 'to_gid'|uninitialized constant ActionText::Fragment)",
+      "note": "docs/pipeline/runtime.md now carries the split: `attachable_ids(\"User\")` verifies an sgid and `lower::attachables_grep` rewrites `body.attachables.grep(User)` into a query over the ids, so a caller that NAMES its class resolves. The name-keyed dispatch exists now too: `ActionText::Attachable.locate` is generated per app as a `case` over the models that mix `Attachable` in, and `Attachment#attachable` resolves through it. What is left is MINTING — `to_gid_param` on a record — and a bare `attachables`, which still answers `[]` rather than the poly list the generated locator could now fill. MINTING SERVED 2026-09-22: `record.to_gid.to_s` joins `to_sgid(for:).to_s` in `lower::to_sgid` — same rule, one method shorter — and grounds to `GlobalID.uri(\"User\", record.id)`, the runtime function `to_gid_param` already base64s, so the two mints agree by construction rather than as two spellings kept in step. The pass also reads an IVAR's model off the setup that bound it (`@user = users(:david)`), which is how the receiver is spelled at every mint site in a test: without it the receiver was the \"model the pass cannot name\" case. action_text__attachment 2/3, the third being `object-extend`.",
+      "at_zero": "minting served 2026-09-22; the rule stays as the tripwire for a mint whose model the pass cannot name, which is reported rather than guessed."
+    },
+    {
+      "slug": "rails-module-facade",
+      "title": "`Rails.configuration` and the routes object",
+      "owner": "compiler",
+      "match": "(undefined method 'configuration' for module Rails|uninitialized constant Rails::Application::Routes)",
+      "note": "The emitted `Rails` module answers a small surface; the app reaches past it for configuration and for the application's route set (to build URLs outside a request). Each addition here is a decision about what part of Rails' global state the port models at all, rather than a missing method."
+    },
+    {
+      "slug": "turbo-streams-channel",
+      "title": "`Turbo::StreamsChannel` as a constant the app can name",
+      "owner": "compiler",
+      "match": "uninitialized constant Turbo::StreamsChannel",
+      "note": "Broadcasts lower to `Broadcasts.record`, which is the portable shape; the app also names the channel class directly to broadcast or to assert. The constant has no emitted counterpart, so those tests stop before reaching the broadcast at all.",
+      "at_zero": "the constant landed in fd1a3259; the rule stays as a regression tripwire."
+    },
+    {
+      "slug": "broadcast-assertions",
+      "title": "Broadcast assertions over a queue that is a log",
+      "owner": "compiler",
+      "match": "(assert(_turbo_stream)?_broadcasts failed|undefined method 'broadcast_append_to')",
+      "note": "The emit records broadcasts into `Broadcasts.log` rather than delivering them through a cable adapter, so the app's own `assert_broadcasts` counts a different thing than it was written against. Ties into the cable work — the dispatch half, not the streaming half."
+    },
+    {
+      "slug": "view-helper-in-helper-module",
+      "title": "A view helper called from a helper MODULE",
+      "owner": "compiler",
+      "match": "undefined method '(button_to|form_with|link_to|mail_to|image_tag|tag|content_tag)' for module",
+      "note": "Inside a template these expand at transpile time. Inside a helper module the expansion has no template to splice into, so the call survives to runtime and lands on a bare module. Already the shape behind several closed findings (`button_to` with a block, `link_to` with a block); the remaining ones are the same wall a method away from the template."
+    },
+    {
+      "slug": "belongs-to-autosave",
+      "title": "`belongs_to` autosave — an unsaved target saved with its owner",
+      "owner": "compiler",
+      "match": "Validation failed: Creator must exist",
+      "note": "Assigning an unsaved record and saving the owner saves the target first in Rails. The emit used to read `value.id` (0) and fail presence validation. Served with belongs_to defaults / autosave flattening; walk-stubs ledger deleted with #818.",
+      "at_zero": "served with #818 tip-compat (FirstRun/grant_to peel); rule stays as a regression tripwire."
+    },
+    {
+      "slug": "active-storage-attachments",
+      "title": "Active Storage — the attachment scopes and the bytes",
+      "owner": "compiler",
+      "match": "(with_attached_attachment|ActiveStorage::)",
+      "note": "The metadata half answers (205c3031). What is left is the macro-generated preload scopes (`with_attached_*`, `with_rich_text_*`) and everything variant-shaped: `ActiveStorage::VariantWithRecord`, `representation` and `preview` on an `Attached`, and the bytes — the variants landed over ruby-vips and the video poster over ffmpeg (`Preview`), so a row here now is one of the preload scopes or a shape neither covers. Avatars and logos reach it now that the fixture-file helpers in front of them answer — clearing a wall ahead of this cause moves tests INTO it, which is what just happened."
+    },
+    {
+      "slug": "conditional-get",
+      "title": "`fresh_when` / `stale?` — conditional GET",
+      "owner": "compiler",
+      "match": "undefined method '(fresh_when|stale\\?)'",
+      "note": "ETag/Last-Modified handling on the controller. Small in surface and shared by every target once the response object carries the headers; the tests behind it assert 304s, so they are only reachable after it lands.",
+      "at_zero": "`fresh_when` / `stale?` landed in 7ea262e2; the rule stays as a regression tripwire."
+    },
+    {
+      "slug": "route-helper-takes-a-record",
+      "title": "A route helper interpolated a record instead of its id",
+      "owner": "compiler",
+      "match": "expected redirect to \"[^\"]*\", got \"[^\"]*#<",
+      "note": "`room_path(room)` rendered `#<Room:0x…>` into the path. Route helpers project to `.id` only where the SEGMENT holds one (8b4258e5); these are the sites that projection does not reach yet. Visible only as a wrong string, which is why they surface as redirect assertions rather than exceptions."
+    },
+    {
+      "slug": "out-of-scope-gems",
+      "title": "A gem the emit does not carry",
+      "owner": "gem",
+      "match": "uninitialized constant (\\S*RQRCode|\\S*WebPush\\b|\\S*Concurrent\\b|\\S*Sentry\\b)",
+      "note": "web push, concurrent-ruby, and sentry-ruby. The RQRCode arm of this rule matches nothing now that qr_code_controller_test is green. Each is a decision about gem fate rather than modeling debt — shim the surface the app calls, or declare it out of scope and ledger it. None of them is on the path to more coverage than the tests naming it."
+    },
+    {
+      "slug": "pagination",
+      "title": "geared_pagination's controller surface",
+      "owner": "compiler",
+      "match": "set_page_and_extract_portion_from",
+      "note": "campfire paginates with geared_pagination — not pagy — whose concern injects `set_page_and_extract_portion_from` into the controller. It answers from a Base reopen in runtime/ruby/action_controller/pagination.rb, so the question underneath it (carry the gem, or lower pagination ourselves) was settled by lowering it.",
+      "at_zero": "landed in 0ef8fb79; the rule stays as a regression tripwire."
+    },
+    {
+      "slug": "id-zero-sentinel",
+      "title": "An unsaved `id` is 0, not nil — and a lookup used it",
+      "owner": "compiler",
+      "match": "Couldn't find \\w+ with id=0",
+      "note": "A deliberate divergence, ledgered in docs/pipeline/runtime.md: `ActiveRecord::Base#initialize` seeds `@id = 0` so ids stay plain machine integers across every target, where Rails answers nil. This is where that choice becomes visible — a code path that would have skipped a nil lookup instead performs one for id 0.",
+      "at_zero": "zero is the intended reading. This is a deliberate divergence rather than a gap, and the rule exists to catch the day it becomes visible again."
+    },
+    {
+      "slug": "arity-divergence",
+      "title": "An emitted method's arity does not match its caller",
+      "owner": "compiler",
+      "match": "wrong number of arguments \\(given",
+      "note": "The receiver exists and the name resolves; the shape does not. Usually a lowering that dropped or added a parameter — kwargs folded into a positional, a block-form helper emitted in its non-block shape. Each needs the emitted definition read against its call site."
+    },
+    {
+      "slug": "allow-browser",
+      "title": "`allow_browser` — the modern-browser gate",
+      "owner": "compiler",
+      "match": "expected \"h1\" in response body",
+      "match_test": "incompatible_browser",
+      "note": "campfire's own concern calls `allow_browser versions: VERSIONS, block: -> { render template: \"sessions/incompatible_browser\" }`, so the version FLOOR is the app's (`{ safari: 17.2, chrome: 120, … }`) and what is missing is ours: the macro, its `block:` fallback, and parsing a User-Agent into a browser plus version. Rails reads that last part from the `useragent` gem's rule table — PORT the table, do not derive it. The file is 7/8 on this one test."
+    },
+    {
+      "slug": "params-hash-in-path",
+      "title": "A params hash interpolated into the request PATH",
+      "owner": "compiler",
+      "match": "No route matches [A-Z]+ [^ ]*\\{params:",
+      "note": "The request went out as `POST /users/{params: {push_subscription: {…}}}` — the params object rendered into the path instead of being sent as the body. Bracket-nested query parameters are the shape behind it: the test writes `params: { push_subscription: { endpoint: …, keys: { … } } }` and nothing splits the nesting into a body. Reads as a routing error, which is why it sat untriaged."
+    },
+    {
+      "slug": "shared-cache-table-lock",
+      "title": "A table lock from the harness's shared-cache memory database",
+      "owner": "harness",
+      "match": "database table is locked",
+      "note": "SQLITE_LOCKED (6), not BUSY: the test database was SQLite's shared-cache memory URI, whose table locks never wait — a read cursor open on `accounts` on one connection makes an INSERT on another fail at once, `busy_timeout` notwithstanding. campfire's first-run race test (five threads posting the first account together) died on the lock before reaching the singleton guard it was written to prove: ~40% of runs on a Mac, one in eight on the box. Rails tests against a file (`storage/test.sqlite3`, `timeout: 5000`), so the harness does too now (test/test_helper.rb): writers wait, the guard answers.",
+      "at_zero": "the harness opens a per-test file database since 2026-09-17; the rule stays as the tripwire — a reappearance means a shim opened a shared-cache database again."
+    },
+    {
+      "slug": "render-json-encoder",
+      "title": "Inline `render json:` reaches the CRuby-only encoder",
+      "owner": "compiler",
+      "match": "(undefined method 'encode' for unknown|uninitialized constant ActionController::JsonRender)",
+      "note": "`render json: opengraph` lowered to `ActionController::JsonRender.encode(v)`, a reflective walk only the CRuby overlay defines — on the compiled lane the constant is unresolved and every `POST /unfurl_links` is a 500, so the app pasted links with no preview card. The key set is known at transpile time (the class's declared readers), so it is written down instead: an `as_json_str` writer on the class and `render plain: v.as_json_str, content_type: \"application/json\"` at the site (lower::as_json_poro). A value with no writer (a Hash literal, a Relation, a class with its own `as_json`) still reaches the encoder, and would still match here.",
+      "at_zero": "the monomorphized writer landed for the declared-readers case (campfire's only site); the rule stays as a regression tripwire, and names the shapes that would still reach the encoder."
+    },
+    {
+      "slug": "silent-divergence",
+      "title": "The emit ran and answered differently",
+      "owner": "unknown",
+      "match": "\\A(assertion failed|assert_equal failed|assert_difference failed|assert_enqueued_jobs failed|not all expectations|expected |UNIQUE constraint)",
+      "note": "NOT a root cause — the bucket of tests that still need one. Nothing raised: the emitted code ran to completion and produced a different answer, so each of these has to be followed down its own chain. This is the most valuable cluster on the page and the most expensive: a missing method names itself, a wrong answer does not."
+    }
+  ]
+}

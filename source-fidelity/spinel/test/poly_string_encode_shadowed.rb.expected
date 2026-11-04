@@ -1,0 +1,6 @@
+limit-3
+caf
+plain
+limit-7
+plain
+undefined method 'encode' for an instance of Integer

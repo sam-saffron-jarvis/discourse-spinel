@@ -1,0 +1,256 @@
+== i
+[[0, 0], [1, 1], [2, 2]]
+[[0, 0], [1, 1], [2, 2]]
+Array
+false
+3
+3
+false
+[0, 0]
+[2, 2]
+nil
+[0, 0]
+[2, 2]
+[[0, 0], [1, 1]]
+[[1, 1], [2, 2]]
+Array
+0:[0, 0] 1:[1, 1] 2:[2, 2] 
+["[0, 0]", "[1, 1]", "[2, 2]"]
+3
+3
+true
+2
+3
+3
+[[2, 2], [1, 1], [0, 0]]
+[[0, 0], [1, 1], [2, 2]]
+true
+true
+true
+[0, 0]
+[2, 2]
+[[0, 0], [1, 1], [2, 2]]
+[[2, 2], [1, 1], [0, 0]]
+"0,0,1,1,2,2"
+[0, 0, 1, 1, 2, 2]
+3
+[[0, 0]]
+[[2, 2]]
+[[[0, 0], [1, 1]], [[2, 2]]]
+[false, true]
+[[0, 0], [1, 1]]
+[[1, 1]]
+[[0, 0], [2, 2]]
+false
+false
+true
+6
+"[0, 0]"
+2
+3
+3
+-- mutation
+4
+5
+[1, 1]
+[0, 0]
+[2, 2]
+[1, 1]
+5
+[0, 0]
+5
+[2, 2]
+6
+"[0, 0]"
+3
+[]
+true
+-- refused
+TypeError: cannot store String into an Array[Array[Integer]]: a typed array holds one kind of element
+TypeError: cannot store Integer into an Array[Array[Integer]]: a typed array holds one kind of element
+TypeError: cannot store Symbol into an Array[Array[Integer]]: a typed array holds one kind of element
+TypeError: cannot store String into an Array[Array[Integer]]: a typed array holds one kind of element
+TypeError: cannot store String into an Array[Array[Integer]]: a typed array holds one kind of element
+3
+true
+FrozenError: can't modify frozen Array: [[1, 1], [1, 1], [2, 2]]
+true
+== f
+[[0.0, 0.0], [0.5, 0.5], [1.0, 1.0]]
+[[0.0, 0.0], [0.5, 0.5], [1.0, 1.0]]
+Array
+false
+3
+3
+false
+[0.0, 0.0]
+[1.0, 1.0]
+nil
+[0.0, 0.0]
+[1.0, 1.0]
+[[0.0, 0.0], [0.5, 0.5]]
+[[0.5, 0.5], [1.0, 1.0]]
+Array
+0:[0.0, 0.0] 1:[0.5, 0.5] 2:[1.0, 1.0] 
+["[0.0, 0.0]", "[0.5, 0.5]", "[1.0, 1.0]"]
+3
+3
+true
+2
+3
+3
+[[1.0, 1.0], [0.5, 0.5], [0.0, 0.0]]
+[[0.0, 0.0], [0.5, 0.5], [1.0, 1.0]]
+true
+true
+true
+[0.0, 0.0]
+[1.0, 1.0]
+[[0.0, 0.0], [0.5, 0.5], [1.0, 1.0]]
+[[1.0, 1.0], [0.5, 0.5], [0.0, 0.0]]
+"0.0,0.0,0.5,0.5,1.0,1.0"
+[0.0, 0.0, 0.5, 0.5, 1.0, 1.0]
+3
+[[0.0, 0.0]]
+[[1.0, 1.0]]
+[[[0.0, 0.0], [0.5, 0.5]], [[1.0, 1.0]]]
+[false, true]
+[[0.0, 0.0], [0.5, 0.5]]
+[[0.5, 0.5]]
+[[0.0, 0.0], [1.0, 1.0]]
+false
+false
+true
+6
+"[0.0, 0.0]"
+2
+3
+3
+-- mutation
+4
+5
+[0.5, 0.5]
+[0.0, 0.0]
+[1.0, 1.0]
+[0.5, 0.5]
+5
+[0.0, 0.0]
+5
+[1.0, 1.0]
+6
+"[0.0, 0.0]"
+3
+[]
+true
+-- refused
+TypeError: cannot store String into an Array[Array[Float]]: a typed array holds one kind of element
+TypeError: cannot store Integer into an Array[Array[Float]]: a typed array holds one kind of element
+TypeError: cannot store Symbol into an Array[Array[Float]]: a typed array holds one kind of element
+TypeError: cannot store String into an Array[Array[Float]]: a typed array holds one kind of element
+TypeError: cannot store String into an Array[Array[Float]]: a typed array holds one kind of element
+3
+true
+FrozenError: can't modify frozen Array: [[0.5, 0.5], [0.5, 0.5], [1.0, 1.0]]
+true
+== o
+[#<Item 0>, #<Item 1>, #<Item 2>]
+[#<Item 0>, #<Item 1>, #<Item 2>]
+Array
+false
+3
+3
+false
+#<Item 0>
+#<Item 2>
+nil
+#<Item 0>
+#<Item 2>
+[#<Item 0>, #<Item 1>]
+[#<Item 1>, #<Item 2>]
+Array
+0:#<Item 0> 1:#<Item 1> 2:#<Item 2> 
+["#<Item 0>", "#<Item 1>", "#<Item 2>"]
+3
+3
+true
+2
+3
+3
+[#<Item 2>, #<Item 1>, #<Item 0>]
+[#<Item 0>, #<Item 1>, #<Item 2>]
+true
+true
+true
+#<Item 0>
+#<Item 2>
+[#<Item 0>, #<Item 1>, #<Item 2>]
+[#<Item 2>, #<Item 1>, #<Item 0>]
+"Item(0),Item(1),Item(2)"
+[#<Item 0>, #<Item 1>, #<Item 2>]
+3
+[#<Item 0>]
+[#<Item 2>]
+[[#<Item 0>, #<Item 1>], [#<Item 2>]]
+[false, true]
+[#<Item 0>, #<Item 1>]
+[#<Item 1>]
+[#<Item 0>, #<Item 2>]
+false
+false
+true
+3
+"#<Item 0>"
+2
+3
+3
+-- mutation
+4
+5
+#<Item 1>
+#<Item 0>
+#<Item 2>
+#<Item 1>
+5
+#<Item 0>
+5
+#<Item 2>
+6
+"#<Item 0>"
+3
+[]
+true
+-- refused
+TypeError: cannot store String into an Array[Item]: a typed array holds one kind of element
+TypeError: cannot store Integer into an Array[Item]: a typed array holds one kind of element
+TypeError: cannot store Symbol into an Array[Item]: a typed array holds one kind of element
+TypeError: cannot store String into an Array[Item]: a typed array holds one kind of element
+TypeError: cannot store String into an Array[Item]: a typed array holds one kind of element
+3
+true
+FrozenError: can't modify frozen Array: [#<Item 1>, #<Item 1>, #<Item 2>]
+true
+== n
+nil
+
+NilClass
+true
+== subclass
+#<Item 9>
+Sub
+4
+TypeError: cannot store Integer into an Array[Item]: a typed array holds one kind of element
+== nested
+[0, 42]
+[42, 2, 4]
+48
+[[0, 1, 2], [42, 1, 2]]
+[0, 42, 1, 1, 2, 2]
+[1, 1]
+{"t" => [[0, 42], [1, 1], [2, 2]]}
+[[[0, 42], [1, 1], [2, 2]], 1]
+[[0, 42], [1, 1], [2, 2]]
+== either
+[1, "a"]
+[[0.0, 0.0], [0.5, 0.5]]
+[[9.5, 0.0], [0.5, 0.5]]
+[2, 2]

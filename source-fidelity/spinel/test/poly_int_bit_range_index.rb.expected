@@ -1,0 +1,13 @@
+beginless: The beginless range for Integer#[] results in infinity
+15
+15
+15
+15
+7
+0
+through a method: The beginless range for Integer#[] results in infinity
+15
+15
+11
+1
+1

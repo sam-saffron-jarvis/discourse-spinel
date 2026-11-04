@@ -1,0 +1,5 @@
+#<struct Span taken="a", from=0, to=1>
+[]
+#<data Pt x=1, label="a">
+[]
+NoMethodError names it

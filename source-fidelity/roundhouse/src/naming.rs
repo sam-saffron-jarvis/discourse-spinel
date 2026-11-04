@@ -1,0 +1,581 @@
+//! Rails naming conventions (snake_case, camelize, singular/plural).
+//!
+//! Deliberately naive. Real Rails uses `ActiveSupport::Inflector`'s rule
+//! tables; we'll grow this as fixtures demand. If a test fails because of a
+//! missed irregular plural, fix the rule here rather than working around it
+//! in the caller.
+
+/// `Billing::Invoice` → `Invoice`, as `ActiveSupport::Inflector#demodulize`.
+pub fn demodulize(class_name: &str) -> &str {
+    class_name.rsplit("::").next().unwrap_or(class_name)
+}
+
+pub fn snake_case(class_name: &str) -> String {
+    let mut s = String::with_capacity(class_name.len() + 4);
+    for (i, c) in class_name.char_indices() {
+        if c.is_uppercase() && i > 0 {
+            let prev = class_name.as_bytes()[i - 1] as char;
+            if prev.is_lowercase() || prev.is_ascii_digit() {
+                s.push('_');
+            }
+        }
+        s.push(c.to_ascii_lowercase());
+    }
+    s
+}
+
+/// ActiveSupport-style word break for a constant segment: like
+/// `snake_case`, but also splits an acronym from the next word
+/// (`HTMLApp` → `html_app`). `snake_case` keeps that as `htmlapp`.
+pub fn underscore_words(name: &str) -> String {
+    let chars: Vec<char> = name.replace("::", "_").chars().collect();
+    let mut out = String::with_capacity(chars.len() + 4);
+    for (i, c) in chars.iter().enumerate() {
+        if c.is_ascii_uppercase()
+            && i > 0
+            && (chars[i - 1].is_ascii_lowercase()
+                || chars[i - 1].is_ascii_digit()
+                || (chars[i - 1].is_ascii_uppercase()
+                    && chars.get(i + 1).is_some_and(char::is_ascii_lowercase)))
+        {
+            out.push('_');
+        }
+        out.push(c.to_ascii_lowercase());
+    }
+    out
+}
+
+/// Rails `underscore`: like `snake_case`, but `::` becomes a path
+/// separator (`ShortId::CandidateId` → `short_id/candidate_id`). Use for
+/// file placement of possibly-namespaced classes — a literal `::` in a
+/// filename breaks make dependency lists (parsed as a target separator)
+/// and diverges from the Rails file convention.
+pub fn underscore(class_name: &str) -> String {
+    class_name
+        .split("::")
+        .map(snake_case)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+pub fn camelize(snake: &str) -> String {
+    // An app acronym (`inflect.acronym "API"`) camelizes as itself:
+    // `api_keys` → `APIKeys`, `html_parser` → `HTMLParser`.
+    let acronyms = APP_INFLECTIONS.with(|a| a.borrow().acronym.clone());
+    let mut out = String::with_capacity(snake.len());
+    // `-` separates too: a view directory such as `product-item` has no
+    // valid constant spelling otherwise (`Product-item`).
+    for seg in snake.split(['_', '-']) {
+        if seg.is_empty() {
+            continue; // leading or doubled separator
+        }
+        if let Some(acr) = acronyms.iter().find(|a| a.eq_ignore_ascii_case(seg)) {
+            out.push_str(acr);
+            continue;
+        }
+        let mut c = seg.chars();
+        if let Some(f) = c.next() {
+            out.push(f.to_ascii_uppercase());
+            out.push_str(c.as_str());
+        }
+    }
+    out
+}
+
+/// Rails `camelize` on a `/`-separated path: each segment camelizes,
+/// joined by `::` (`mod/activities` → `Mod::Activities`). Inverse of
+/// `underscore`; slash-free input degrades to plain `camelize`.
+pub fn camelize_path(path: &str) -> String {
+    path.split('/')
+        .filter(|seg| !seg.is_empty())
+        .map(camelize)
+        .collect::<Vec<_>>()
+        .join("::")
+}
+
+/// Singularize only the last `/` segment, leaving namespace segments
+/// intact (`mod/activities` → `mod/activity`). Slash-free input
+/// degrades to plain `singularize`.
+pub fn singularize_last(path: &str) -> String {
+    match path.rsplit_once('/') {
+        Some((ns, last)) => format!("{ns}/{}", singularize(last)),
+        None => singularize(path),
+    }
+}
+
+/// Ruby reserved words that cannot serve as local/parameter names.
+/// Instance-variable names aren't keywords (`@for` is legal Ruby —
+/// lobsters uses it), so the view lowering's ivar→local rewrite must
+/// step around these.
+const RESERVED_LOCALS: &[&str] = &[
+    "alias", "and", "begin", "break", "case", "class", "def", "defined?",
+    "do", "else", "elsif", "end", "ensure", "false", "for", "if", "in",
+    "module", "next", "nil", "not", "or", "redo", "rescue", "retry",
+    "return", "self", "super", "then", "true", "undef", "unless",
+    "until", "when", "while", "yield",
+];
+
+/// A name safe to use as a local/param identifier: reserved words get
+/// a trailing `_` (`for` → `for_`), everything else passes through.
+/// Must be applied at EVERY point an ivar name becomes a view-local
+/// identifier (param lists, body rewrites, partial call-site args) so
+/// the renamed forms agree; ivar emission sites (`@for`) stay raw.
+pub fn safe_local(name: &str) -> String {
+    if RESERVED_LOCALS.contains(&name) {
+        format!("{name}_")
+    } else {
+        name.to_string()
+    }
+}
+
+/// True when `name` is a reserved word that a Ruby local can still have.
+/// Only a keyword parameter can (`def badge(class: "badge")`), and the
+/// body reads it as `binding.local_variable_get(:class)`, because a bare
+/// `class` does not parse as a read. A pseudo-variable (`self`, `nil`,
+/// `true`, `false`) is never a local, so it is not included.
+pub fn is_reserved_local(name: &str) -> bool {
+    RESERVED_LOCALS.contains(&name) && !matches!(name, "self" | "nil" | "true" | "false")
+}
+
+/// A numbered block parameter (`_1` … `_9`). Ruby reads it only in the
+/// block that declares none: it cannot be assigned, and a nested block
+/// with ordinary parameters cannot read it.
+pub fn is_numbered_param(name: &str) -> bool {
+    matches!(name.as_bytes(), [b'_', d] if (b'1'..=b'9').contains(d))
+}
+
+/// Base (final) segment of a `/`-separated view-dir path or a
+/// `::`-namespaced module name — the piece bare record/arg identifiers
+/// derive from (`mod/activities` → `activities`, `Mod::Activities` →
+/// `Activities`).
+pub fn last_segment(name: &str) -> &str {
+    name.rsplit(['/', ':']).next().unwrap_or(name)
+}
+
+/// Rails' inflection rules, ported from
+/// `activesupport/lib/active_support/inflections.rb` (verified identical
+/// between the 8.1.2 gem and today's rails/rails main).
+///
+/// PORTED, not derived. The hand-rolled approximation this replaces was
+/// wrong on **39 of 86 plurals and 47 of 86 singulars** in Rails' OWN
+/// test vocabulary (`activesupport/test/inflector_test_cases.rb`): every
+/// irregular (person/people, child/children, man/men), every Latin
+/// plural (datum/data, analysis/analyses, index/indices), the f→ves
+/// family (wife/wives, half/halves) and every uncountable (fish, news,
+/// series, money, jeans). The corpus happened to contain none of them,
+/// which is exactly why it survived — and its two errors that DID show
+/// up (`key`→`keies`, `custom_styles`→`custom_styleses`) each shipped a
+/// `require` naming a file the emit never wrote, invisible until
+/// campfire arrived.
+///
+/// Rules are stored in Rails' registration order and applied in
+/// REVERSE: `inflect.plural` prepends, so the last registered rule wins
+/// and `/$/ => "s"` is the fallback.
+///
+/// Every rule in Rails' table is suffix-anchored, so no regex engine is
+/// needed. A rule is `(alternatives, replacement)`; `|` separates the
+/// alternatives of a captured group. Replacement mini-language: `{}`
+/// keeps the matched text, `{-x}` keeps it minus a trailing `x`, `{-2}`
+/// minus its last two characters, and a bare literal replaces it. The
+/// handful of rules needing a character class are named pseudo-patterns
+/// handled in `apply_rule`.
+const PLURAL_RULES: &[(&str, &str)] = &[
+    ("", "{}s"),
+    ("s", "s"),
+    ("^axis|^testis", "{-is}es"),
+    ("octopus|virus", "{-us}i"),
+    ("octopi|viri", "{}"),
+    ("alias|status", "{}es"),
+    ("bus", "{-s}ses"),
+    ("buffalo|tomato", "{}es"),
+    ("tum|ium", "{-um}a"),
+    ("ta|ia", "{}"),
+    ("sis", "{-sis}ses"),
+    ("FE_VES", ""),
+    ("hive", "{}s"),
+    ("CONSONANT_Y", ""),
+    ("x|ch|ss|sh", "{}es"),
+    ("matrix|vertix|indix|matrex|vertex|index", "{-2}ices"),
+    ("^mouse|^louse", "{-ouse}ice"),
+    ("^mice|^lice", "{}"),
+    ("^ox", "{}en"),
+    ("^oxen", "{}"),
+    ("quiz", "{}zes"),
+];
+
+const SINGULAR_RULES: &[(&str, &str)] = &[
+    ("s", "{-s}"),
+    ("ss", "{}"),
+    ("news", "{}"),
+    ("ta|ia", "{-a}um"),
+    ("SIS_FAMILY", ""),
+    ("VES_FE", ""),
+    ("hives", "{-s}"),
+    ("tives", "{-s}"),
+    ("LR_VES", ""),
+    ("CONSONANT_IES", ""),
+    ("series", "{}"),
+    ("movies", "{-s}"),
+    ("xes|ches|sses|shes", "{-es}"),
+    ("^mice|^lice", "{-ice}ouse"),
+    ("buses|bus", "bus"),
+    ("oes", "{-es}"),
+    ("shoes", "{-s}"),
+    ("crisis|crises|testis|testes", "{-2}is"),
+    ("^axes|^axis", "axis"),
+    ("octopus|virus", "{}"),
+    ("octopi|viri", "{-i}us"),
+    ("aliases|alias|statuses|status", "{-es}"),
+    ("^oxen", "ox"),
+    ("vertices|indices", "{-ices}ex"),
+    ("matrices", "matrix"),
+    ("quizzes", "quiz"),
+    ("databases", "{-s}"),
+];
+
+/// `inflect.irregular` — matched as a SUFFIX, which is how Rails' own
+/// generated rules behave (`salesperson` → `salespeople`, `node_child`
+/// → `node_children`). That also reproduces Rails' quirk of inflecting
+/// `human` to `humen`; matching Rails is the contract, not English.
+const IRREGULAR: &[(&str, &str)] = &[
+    ("person", "people"),
+    ("man", "men"),
+    ("child", "children"),
+    ("sex", "sexes"),
+    ("move", "moves"),
+    ("zombie", "zombies"),
+];
+
+const UNCOUNTABLE: &[&str] = &[
+    "equipment",
+    "information",
+    "rice",
+    "money",
+    "species",
+    "series",
+    "fish",
+    "sheep",
+    "jeans",
+    "police",
+];
+
+/// Rails' uncountable check is `/\b<word>\z/i` — the match must begin at
+/// a word BOUNDARY. `_` is a word character, so `funky jeans` is
+/// uncountable while `old_news` is not (that one is handled by the
+/// explicit `(n)ews$` singular rule instead).
+fn uncountable(word: &str) -> bool {
+    let boundary = |u: &str| {
+        word.strip_suffix(u).is_some_and(|head| {
+            head.is_empty() || !head.ends_with(|c: char| c.is_alphanumeric() || c == '_')
+        })
+    };
+    APP_INFLECTIONS.with(|a| a.borrow().uncountable.iter().any(|u| boundary(u)))
+        || UNCOUNTABLE.iter().any(|u| boundary(u))
+}
+
+fn irregular_apply(word: &str, from_singular: bool) -> Option<String> {
+    // The app's own `inflect.irregular` first — Rails prepends, so a
+    // later registration (the app's initializer runs after the
+    // defaults) wins over the built-in table.
+    let app = APP_INFLECTIONS.with(|a| {
+        a.borrow().irregular.iter().rev().find_map(|(s, p)| {
+            let (from, to) = if from_singular { (s.as_str(), p.as_str()) } else { (p.as_str(), s.as_str()) };
+            word.strip_suffix(from).map(|head| format!("{head}{to}"))
+        })
+    });
+    if app.is_some() {
+        return app;
+    }
+    for (s, p) in IRREGULAR {
+        let (from, to) = if from_singular { (*s, *p) } else { (*p, *s) };
+        if let Some(head) = word.strip_suffix(from) {
+            return Some(format!("{head}{to}"));
+        }
+    }
+    None
+}
+
+// ── The app's own inflections ────────────────────────────────────────
+//
+// `config/initializers/inflections.rb` is where an app tells Rails that
+// `leaf` pluralizes to `leaves` (Rails' own table says `leafe`) or that
+// `API` is an acronym. Without it, `has_many :leaves` resolves to a
+// `Leafe` class that does not exist and every use of the association
+// is an error on the author's ledger. Ingest installs the file's
+// declarations here (thread-local, like the sources registry); the
+// naming functions consult them ahead of the built-in tables, which is
+// the order Rails applies them in.
+
+/// An app's `inflect.*` declarations.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AppInflections {
+    /// `inflect.irregular "leaf", "leaves"`, registration order.
+    pub irregular: Vec<(String, String)>,
+    /// `inflect.uncountable %w( fish )`.
+    pub uncountable: Vec<String>,
+    /// `inflect.acronym "API"`.
+    pub acronym: Vec<String>,
+    /// `inflect.singular "quotas", "quota"` — the STRING form, which
+    /// Rails applies with `String#sub` (first occurrence; in practice
+    /// the whole word), registration order.
+    pub singular: Vec<(String, String)>,
+    /// `inflect.plural "quota", "quotas"`, likewise.
+    pub plural: Vec<(String, String)>,
+    /// `inflect.plural`/`inflect.singular` REGEX rules the port cannot
+    /// carry; counted so ingest can report the gap.
+    pub regex_rules: usize,
+}
+
+thread_local! {
+    static APP_INFLECTIONS: std::cell::RefCell<AppInflections> =
+        std::cell::RefCell::new(AppInflections::default());
+}
+
+/// Install the app's inflections for this thread (replacing any
+/// previous app's). Called by ingest after reading the initializer;
+/// `reset` (an empty set) is what a fresh ingest starts from.
+pub fn install_app_inflections(inflections: AppInflections) {
+    APP_INFLECTIONS.with(|a| *a.borrow_mut() = inflections);
+}
+
+pub fn app_inflections() -> AppInflections {
+    APP_INFLECTIONS.with(|a| a.borrow().clone())
+}
+
+/// The analysis/basis/diagnosis family, both directions of
+/// `((a)naly|(b)a|(d)iagno|…)(sis|ses)$ => '\1sis'`.
+fn sis_family(word: &str) -> Option<String> {
+    const STEMS: &[&str] = &[
+        "analy", "ba", "diagno", "parenthe", "progno", "synop", "the",
+    ];
+    let head = word.strip_suffix("ses").or_else(|| word.strip_suffix("sis"))?;
+    STEMS
+        .iter()
+        .find(|st| head.ends_with(*st))
+        .map(|_| format!("{head}sis"))
+}
+
+fn apply_rule(word: &str, alts: &str, repl: &str) -> Option<String> {
+    match alts {
+        // /(?:([^f])fe|([lr])f)$/ => '\1\2ves'
+        "FE_VES" => {
+            if let Some(h) = word.strip_suffix("fe") {
+                if !h.is_empty() && !h.ends_with('f') {
+                    return Some(format!("{h}ves"));
+                }
+            }
+            let h = word.strip_suffix('f')?;
+            return (h.ends_with('l') || h.ends_with('r')).then(|| format!("{h}ves"));
+        }
+        // /([^aeiouy]|qu)y$/ => '\1ies'
+        "CONSONANT_Y" => {
+            let h = word.strip_suffix('y')?;
+            return (h.ends_with("qu") || h.ends_with(|c: char| !"aeiouy".contains(c)))
+                .then(|| format!("{h}ies"));
+        }
+        "SIS_FAMILY" => return sis_family(word),
+        // /([^f])ves$/ => '\1fe'
+        "VES_FE" => {
+            let h = word.strip_suffix("ves")?;
+            return (!h.is_empty() && !h.ends_with('f')).then(|| format!("{h}fe"));
+        }
+        // /([lr])ves$/ => '\1f'
+        "LR_VES" => {
+            let h = word.strip_suffix("ves")?;
+            return (h.ends_with('l') || h.ends_with('r')).then(|| format!("{h}f"));
+        }
+        // /([^aeiouy]|qu)ies$/ => '\1y'
+        "CONSONANT_IES" => {
+            let h = word.strip_suffix("ies")?;
+            return (h.ends_with("qu") || h.ends_with(|c: char| !"aeiouy".contains(c)))
+                .then(|| format!("{h}y"));
+        }
+        _ => {}
+    }
+    if alts.is_empty() {
+        return Some(expand(word, "", repl));
+    }
+    // A leading `^` marks a rule Rails anchors at both ends
+    // (`/^(ox)$/`, `/^(m|l)ice$/`): it matches the WHOLE word, never a
+    // tail. Without that, `box` hit the `ox` rule and pluralized to
+    // `boxen`, and `slice` hit `lice` and stayed `slice`.
+    let hit = alts.split('|').find(|a| match a.strip_prefix('^') {
+        Some(whole) => word == whole,
+        None => word.ends_with(a),
+    })?;
+    Some(expand(word, hit.trim_start_matches('^'), repl))
+}
+
+fn expand(word: &str, matched: &str, repl: &str) -> String {
+    let head = &word[..word.len() - matched.len()];
+    let Some(body) = repl.strip_prefix('{') else {
+        return format!("{head}{repl}");
+    };
+    let (inner, tail) = body.split_once('}').unwrap_or((body, ""));
+    let kept = if inner == "-2" {
+        &matched[..matched.len().saturating_sub(2)]
+    } else if let Some(drop) = inner.strip_prefix('-') {
+        matched.strip_suffix(drop).unwrap_or(matched)
+    } else {
+        matched
+    };
+    format!("{head}{kept}{tail}")
+}
+
+fn inflect(word: &str, rules: &[(&str, &str)], from_singular: bool) -> String {
+    if word.is_empty() || uncountable(word) {
+        return word.to_string();
+    }
+    if let Some(hit) = irregular_apply(word, from_singular) {
+        return hit;
+    }
+    // The app's string rules, registered after the defaults and so
+    // tried before them (Rails prepends). `sub` semantics: the first
+    // occurrence is replaced — a suffix match covers every real use.
+    let app_hit = APP_INFLECTIONS.with(|a| {
+        let a = a.borrow();
+        let table = if from_singular { &a.plural } else { &a.singular };
+        table.iter().rev().find_map(|(from, to)| {
+            word.strip_suffix(from.as_str()).map(|head| format!("{head}{to}"))
+        })
+    });
+    if let Some(hit) = app_hit {
+        return hit;
+    }
+    // Reverse registration order: `inflect.plural`/`inflect.singular`
+    // prepend, so Rails tries the LAST rule in the file first.
+    for (alts, repl) in rules.iter().rev() {
+        if let Some(out) = apply_rule(word, alts, repl) {
+            return out;
+        }
+    }
+    word.to_string()
+}
+
+pub fn pluralize_snake(class_name: &str) -> String {
+    inflect(&snake_case(class_name), PLURAL_RULES, true)
+}
+
+/// Rails' `undecorated_table_name`: DEMODULIZE, then underscore, then
+/// pluralize. A namespaced model does NOT get its namespace folded into
+/// the table name — `Push::Subscription` is `subscriptions`, not
+/// `push_subscriptions`. The `push_` in campfire's schema comes from
+/// `Push.table_name_prefix`, which is a separate, opt-in declaration
+/// (see `Model::table` construction in `ingest::model`).
+///
+/// Feeding the qualified name to `pluralize_snake` produces
+/// `push::subscriptions`, which cannot name a table — so the model
+/// silently ingested with NO columns and every query against it failed
+/// at `table_name must be overridden`.
+pub fn rails_table_name(class_name: &str) -> String {
+    pluralize_snake(class_name.rsplit("::").next().unwrap_or(class_name))
+}
+
+pub fn singularize(plural: &str) -> String {
+    inflect(plural, SINGULAR_RULES, false)
+}
+
+
+pub fn singularize_camelize(plural_symbol: &str) -> String {
+    camelize(&singularize(plural_symbol))
+}
+
+/// Rails' `String#classify` over a `/`-separated path: singularize the
+/// LAST segment only, then camelize every segment and join with `::`.
+///
+/// This is the fixture-set rule. `test/fixtures/push/subscriptions.yml`
+/// loads `Push::Subscription`, not `PushSubscription` — the directory is
+/// a NAMESPACE, and flattening it first (`push_subscriptions` ->
+/// `singularize_camelize`) loses that and names a class the app does not
+/// have. Namespace segments keep their plurality: `action_text/
+/// rich_texts` is `ActionText::RichText`, never `ActionTexts::RichText`.
+///
+/// A slash-free path degrades to `singularize_camelize`, which is what
+/// every top-level fixture wants (`articles` -> `Article`).
+pub fn classify_path(path: &str) -> String {
+    camelize_path(&singularize_last(path))
+}
+
+pub fn habtm_join_table(owner_class: &str, target_plural_sym: &str) -> String {
+    let a = pluralize_snake(owner_class);
+    let b = target_plural_sym.to_string();
+    if a < b { format!("{a}_{b}") } else { format!("{b}_{a}") }
+}
+
+/// One physical SQLite identifier in DDL or DML, preserving its spelling.
+/// Ordinary ASCII names stay bare; keywords and other names are double-
+/// quoted, with embedded quotes doubled. Qualification is composed by the
+/// caller from separate identifiers: `legacy.entries` here is one name,
+/// not a schema/table pair. Values and SQL expressions must not use this.
+pub fn sql_ident(name: &str) -> String {
+    let mut chars = name.chars();
+    let bare = chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if bare && !is_sqlite_keyword(name) {
+        name.to_string()
+    } else {
+        format!("\"{}\"", name.replace('"', "\"\""))
+    }
+}
+
+pub(crate) fn is_sqlite_keyword(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "abort" | "action" | "add" | "after" | "all" | "alter" | "always" | "analyze" | "and" | "as"
+            | "asc" | "attach" | "autoincrement" | "before" | "begin" | "between" | "by" | "cascade"
+            | "case" | "cast" | "check" | "collate" | "column" | "commit" | "conflict" | "constraint"
+            | "create" | "cross" | "current" | "current_date" | "current_time" | "current_timestamp"
+            | "database" | "default" | "deferrable" | "deferred" | "delete" | "desc" | "detach"
+            | "distinct" | "do" | "drop" | "each" | "else" | "end" | "escape" | "except" | "exclude"
+            | "exclusive" | "exists" | "explain" | "fail" | "filter" | "first" | "following" | "for"
+            | "foreign" | "from" | "full" | "generated" | "glob" | "group" | "groups" | "having" | "if"
+            | "ignore" | "immediate" | "in" | "index" | "indexed" | "initially" | "inner" | "insert"
+            | "instead" | "intersect" | "into" | "is" | "isnull" | "join" | "key" | "last" | "left"
+            | "like" | "limit" | "match" | "materialized" | "natural" | "no" | "not" | "nothing"
+            | "notnull" | "null" | "nulls" | "of" | "offset" | "on" | "or" | "order" | "others"
+            | "outer" | "over" | "partition" | "plan" | "pragma" | "preceding" | "primary" | "query"
+            | "raise" | "range" | "recursive" | "references" | "regexp" | "reindex" | "release"
+            | "rename" | "replace" | "restrict" | "returning" | "right" | "rollback" | "row" | "rows"
+            | "savepoint" | "select" | "set" | "table" | "temp" | "temporary" | "then" | "ties" | "to"
+            | "transaction" | "trigger" | "unbounded" | "union" | "unique" | "update" | "using"
+            | "vacuum" | "values" | "view" | "virtual" | "when" | "where" | "window" | "with" | "without"
+    )
+}
+
+#[cfg(test)]
+mod string_query_parity {
+    use super::{is_reserved_local, RESERVED_LOCALS};
+    use ruby_prism::StringQuery;
+
+    /// Prism's `StringQuery::is_keyword` is a *superset* of
+    /// [`RESERVED_LOCALS`]: it also treats `__FILE__` / `__LINE__` /
+    /// `__ENCODING__` as keywords. Pseudo-vars stay in the table for
+    /// `safe_local` but are excluded from [`is_reserved_local`]. Until
+    /// those differences are modeled explicitly, do not replace the
+    /// table with StringQuery.
+    #[test]
+    fn reserved_locals_are_prism_keywords_but_prism_has_extras() {
+        for name in RESERVED_LOCALS {
+            assert_eq!(
+                StringQuery::new(name.as_bytes()).is_keyword(),
+                Ok(true),
+                "{name} should be a Prism keyword"
+            );
+        }
+        for magic in ["__FILE__", "__LINE__", "__ENCODING__"] {
+            assert_eq!(
+                StringQuery::new(magic.as_bytes()).is_keyword(),
+                Ok(true),
+                "{magic}"
+            );
+            assert!(
+                !RESERVED_LOCALS.contains(&magic),
+                "{magic} is intentionally absent from RESERVED_LOCALS"
+            );
+        }
+        for pseudo in ["self", "nil", "true", "false"] {
+            assert!(RESERVED_LOCALS.contains(&pseudo));
+            assert!(!is_reserved_local(pseudo));
+        }
+    }
+}

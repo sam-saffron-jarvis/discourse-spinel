@@ -1,0 +1,2215 @@
+//! Parse a standalone Ruby source file (intended to hold runtime
+//! library code authored in Ruby) into Roundhouse `MethodDef` values.
+//!
+//! This is the Ruby-body half of the runtime-extraction pipeline;
+//! [`crate::rbs`] covers signatures. A later step marries the two: for
+//! each method name, the body from here gets the signature from there.
+//!
+//! Scope: top-level `def`s and `def`s inside a single-level `module`/
+//! `class` body. Required positional params only. Anything more exotic
+//! (keyword args, rest/splat, blocks, nested scopes) is rejected with
+//! `Err` rather than silently dropped, mirroring the RBS side.
+
+use ruby_prism::{Node, parse};
+
+use crate::dialect::{MethodDef, MethodReceiver, Param};
+use crate::effect::EffectSet;
+use crate::expr::{Expr, ExprNode, LValue};
+use crate::ident::{ClassId, Symbol};
+use crate::rbs::parse_signatures;
+use crate::span::Span;
+use crate::ty::Ty;
+
+const VIRTUAL_FILE: &str = "<runtime>";
+
+// Each runtime parser projects its artifact before typing: the standalone
+// expression parser below, or the complete library parser. Neither admits
+// native full declarations, so keyword producers keep the existing runtime ABI.
+fn project_runtime_keywords(e: &mut Expr) {
+    if let ExprNode::KeywordSplat { value } = &mut *e.node {
+        *e = std::mem::replace(value, crate::lower::typing::nil_lit());
+    }
+    e.node.for_each_child_mut(&mut project_runtime_keywords);
+}
+
+fn ingest_expr(node: &Node<'_>, file: &str) -> Result<Expr, crate::ingest::IngestError> {
+    let mut expr = crate::ingest::ingest_expr(node, file)?;
+    project_runtime_keywords(&mut expr);
+    Ok(expr)
+}
+
+/// Parse Ruby source and collect module/class-level constant
+/// assignments whose value is a typeable literal. Patterns recognized:
+///   `CONST = { k: v, ... }`
+///   `CONST = { k: v, ... }.freeze`
+///   `CONST = [a, b, ...]`
+///   `CONST = [a, b, ...].freeze`
+/// The returned map keys are the constant's last-segment name; values
+/// are the inferred Ty (Hash[K, V] / Array[T] / etc.). Used by the
+/// body-typer's `ExprNode::Const` arm so dispatch on a constant
+/// (`STATUS_CODES.fetch(...)`) lands in the right primitive method
+/// table.
+pub fn parse_module_constants(source: &str) -> Result<crate::det::HashMap<Symbol, Ty>, String> {
+    Ok(parse_module_constant_tables(source, false).0)
+}
+
+type ConstantTypes = crate::det::HashMap<Symbol, Ty>;
+type OwnedConstantTypes = crate::det::HashMap<ClassId, ConstantTypes>;
+
+pub(crate) fn parse_module_constant_tables(source: &str, with_owners: bool) -> (ConstantTypes, OwnedConstantTypes) {
+    let mut global = ConstantTypes::default();
+    let mut by_owner = OwnedConstantTypes::default();
+    let result = parse(source.as_bytes());
+    if result.errors().count() == 0 {
+        walk_constants(&result.node(), "", &mut global, &mut by_owner, with_owners);
+    }
+    (global, by_owner)
+}
+
+/// Parallel to `parse_module_constants` but returns each constant as
+/// an ingested `Expr` (the ingest of its RHS, with `.freeze` peeled).
+/// runtime_loader uses this to emit the constants as top-level
+/// `const NAME = ...;` declarations in the transpiled file. The
+/// types come from `parse_module_constants`; the values come from
+/// here.
+pub fn parse_module_constant_exprs(
+    source: &str,
+) -> Result<Vec<(Symbol, Expr)>, String> {
+    let result = crate::ingest::prism::parse_silent(source.as_bytes());
+    let mut out: Vec<(Symbol, Expr)> = Vec::new();
+    if result.errors().count() > 0 {
+        return Ok(out);
+    }
+    let root = result.node();
+    walk_constant_exprs(&root, &mut out);
+    Ok(out)
+}
+
+/// Parallel to `parse_module_constant_exprs` but captures top-level
+/// `@ivar = value` assignments (instance variables at module/class
+/// scope, NOT inside a method body). Used by transpile targets that
+/// need to emit module-state as package-level variables — e.g.
+/// `ActionView::ViewHelpers`' `@slots` becomes a Go package var.
+///
+/// Returns `(qualified_owner, ivar_name_without_at, value_expr)`
+/// triples in source order. `qualified_owner` is the `::`-joined
+/// module/class path the ivar was declared inside (e.g.
+/// `"ActionView::ViewHelpers"`) — empty when the ivar is at the
+/// program root. `.freeze` is peeled the same way constants do;
+/// nested modules/classes recurse.
+pub fn parse_module_ivar_exprs(
+    source: &str,
+) -> Result<Vec<(String, Symbol, Expr)>, String> {
+    let result = crate::ingest::prism::parse_silent(source.as_bytes());
+    let mut out: Vec<(String, Symbol, Expr)> = Vec::new();
+    if result.errors().count() > 0 {
+        return Ok(out);
+    }
+    let root = result.node();
+    walk_ivar_exprs(&root, "", &mut out);
+    Ok(out)
+}
+
+fn walk_ivar_exprs(node: &Node<'_>, owner: &str, out: &mut Vec<(String, Symbol, Expr)>) {
+    if let Some(program) = node.as_program_node() {
+        for stmt in program.statements().body().iter() {
+            collect_ivar_expr_from_stmt(&stmt, owner, out);
+        }
+    } else if let Some(stmts) = node.as_statements_node() {
+        for stmt in stmts.body().iter() {
+            collect_ivar_expr_from_stmt(&stmt, owner, out);
+        }
+    }
+}
+
+fn join_owner(parent: &str, child: &str) -> String {
+    if parent.is_empty() {
+        child.to_string()
+    } else {
+        format!("{parent}::{child}")
+    }
+}
+
+fn collect_ivar_expr_from_stmt(node: &Node<'_>, owner: &str, out: &mut Vec<(String, Symbol, Expr)>) {
+    if let Some(module) = node.as_module_node() {
+        let name_bytes = module.name().as_slice();
+        let Ok(name_str) = std::str::from_utf8(name_bytes) else { return };
+        let nested = join_owner(owner, name_str);
+        if let Some(body) = module.body() {
+            walk_ivar_exprs(&body, &nested, out);
+        }
+        return;
+    }
+    if let Some(class) = node.as_class_node() {
+        let name_bytes = class.name().as_slice();
+        let Ok(name_str) = std::str::from_utf8(name_bytes) else { return };
+        let nested = join_owner(owner, name_str);
+        if let Some(body) = class.body() {
+            walk_ivar_exprs(&body, &nested, out);
+        }
+        return;
+    }
+    // Module-scope `@ivar = value` — skip writes inside method
+    // defs (those are body locals, handled by the body walker).
+    if let Some(write) = node.as_instance_variable_write_node() {
+        let name_bytes = write.name().as_slice();
+        let Ok(raw) = std::str::from_utf8(name_bytes) else { return };
+        let name = raw.strip_prefix('@').unwrap_or(raw);
+        let value = write.value();
+        let inner = match value.as_call_node() {
+            Some(call)
+                if std::str::from_utf8(call.name().as_slice()).ok() == Some("freeze") =>
+            {
+                match call.receiver() {
+                    Some(r) => r,
+                    None => value,
+                }
+            }
+            _ => value,
+        };
+        if let Ok(expr) = ingest_expr(&inner, VIRTUAL_FILE) {
+            out.push((owner.to_string(), Symbol::new(name), expr));
+        }
+    }
+}
+
+fn walk_constant_exprs(node: &Node<'_>, out: &mut Vec<(Symbol, Expr)>) {
+    if let Some(program) = node.as_program_node() {
+        for stmt in program.statements().body().iter() {
+            collect_constant_expr_from_stmt(&stmt, out);
+        }
+    } else if let Some(stmts) = node.as_statements_node() {
+        for stmt in stmts.body().iter() {
+            collect_constant_expr_from_stmt(&stmt, out);
+        }
+    }
+}
+
+fn collect_constant_expr_from_stmt(node: &Node<'_>, out: &mut Vec<(Symbol, Expr)>) {
+    if let Some(module) = node.as_module_node() {
+        if let Some(body) = module.body() {
+            walk_constant_exprs(&body, out);
+        }
+        return;
+    }
+    if let Some(class) = node.as_class_node() {
+        if let Some(body) = class.body() {
+            walk_constant_exprs(&body, out);
+        }
+        return;
+    }
+    if let Some(write) = node.as_constant_write_node() {
+        let name_bytes = write.name().as_slice();
+        let Ok(name_str) = std::str::from_utf8(name_bytes) else { return };
+        let value = write.value();
+        // Strip `.freeze` so the emitted TS gets the underlying
+        // hash/array/regex literal — TS has no freeze concept and
+        // the runtime distinction is not load-bearing for the
+        // framework Ruby's call sites.
+        let inner = match value.as_call_node() {
+            Some(call)
+                if std::str::from_utf8(call.name().as_slice()).ok() == Some("freeze") =>
+            {
+                match call.receiver() {
+                    Some(r) => r,
+                    None => value,
+                }
+            }
+            _ => value,
+        };
+        if let Ok(mut expr) = ingest_expr(&inner, VIRTUAL_FILE) {
+            bare_hash_new_as_literal(&mut expr);
+            out.push((Symbol::new(name_str), expr));
+        }
+    }
+}
+
+/// `Hash.new` with no arguments and no block: an empty Hash, exactly
+/// what `{}` builds. The runtime spells a constant this way when it
+/// needs its own object: CRuby compiles `{}.freeze` to one shared
+/// frozen empty Hash, so two constants written `{}.freeze` are the same
+/// object (`HYDRATE_ATTRS` in `active_record/base.rb` is told apart
+/// from `EMPTY_ATTRS` by identity). The transpiled targets have no
+/// such sharing and lower an empty Hash literal, not a `Hash`
+/// constructor, so a constant value of this shape is read as `{}`:
+/// typed here, and its value rewritten by `bare_hash_new_as_literal`.
+fn is_bare_hash_new(node: &Node<'_>) -> bool {
+    let Some(call) = node.as_call_node() else { return false };
+    if call.name().as_slice() != b"new" || call.arguments().is_some() || call.block().is_some() {
+        return false;
+    }
+    call.receiver()
+        .and_then(|r| r.as_constant_read_node())
+        .is_some_and(|k| k.name().as_slice() == b"Hash")
+}
+
+/// The ingested-`Expr` side of `is_bare_hash_new`: a constant whose
+/// value is `Hash.new` (or `Hash.new.freeze`) becomes the empty Hash
+/// literal it is equal to.
+fn bare_hash_new_as_literal(value: &mut Expr) {
+    let target = match &mut *value.node {
+        ExprNode::Send { recv: Some(r), method, args, block: None, .. }
+            if method.as_str() == "freeze" && args.is_empty() =>
+        {
+            r
+        }
+        _ => value,
+    };
+    let is_hash_new = matches!(&*target.node,
+        ExprNode::Send { recv: Some(r), method, args, block: None, .. }
+            if method.as_str() == "new" && args.is_empty()
+                && matches!(&*r.node, ExprNode::Const { path } if path.len() == 1 && path[0].as_str() == "Hash"));
+    if is_hash_new {
+        *target.node = ExprNode::Hash { entries: vec![], kwargs: false };
+    }
+}
+
+fn walk_constants(
+    node: &Node<'_>,
+    owner: &str,
+    global: &mut ConstantTypes,
+    by_owner: &mut OwnedConstantTypes,
+    with_owners: bool,
+) {
+    if let Some(program) = node.as_program_node() {
+        for stmt in program.statements().body().iter() {
+            collect_constant_from_stmt(&stmt, owner, global, by_owner, with_owners);
+        }
+    } else if let Some(stmts) = node.as_statements_node() {
+        for stmt in stmts.body().iter() {
+            collect_constant_from_stmt(&stmt, owner, global, by_owner, with_owners);
+        }
+    }
+}
+
+fn collect_constant_from_stmt(
+    node: &Node<'_>,
+    owner: &str,
+    global: &mut ConstantTypes,
+    by_owner: &mut OwnedConstantTypes,
+    with_owners: bool,
+) {
+    if let Some(module) = node.as_module_node() {
+        let Ok(name) = std::str::from_utf8(module.name().as_slice()) else { return };
+        if let Some(body) = module.body() {
+            let nested = join_owner(owner, name);
+            walk_constants(&body, &nested, global, by_owner, with_owners);
+        }
+        return;
+    }
+    if let Some(class) = node.as_class_node() {
+        let Ok(name) = std::str::from_utf8(class.name().as_slice()) else { return };
+        if let Some(body) = class.body() {
+            let nested = join_owner(owner, name);
+            walk_constants(&body, &nested, global, by_owner, with_owners);
+        }
+        return;
+    }
+    if let Some(write) = node.as_constant_write_node() {
+        let Ok(name) = std::str::from_utf8(write.name().as_slice()) else { return };
+        if let Some(ty) = type_of_const_literal(&write.value()) {
+            let name = Symbol::from(name);
+            if with_owners && !owner.is_empty() {
+                by_owner.entry(ClassId(Symbol::from(owner))).or_default().insert(name.clone(), ty.clone());
+            }
+            global.insert(name, ty);
+        }
+    }
+}
+
+/// Best-effort type inference for the right-hand side of a constant
+/// assignment. Recognizes scalar literals, integer arithmetic on integer
+/// literals (`SMART = 1 << 10`), and Hash and Array literals (typing
+/// element types from the first key/value or first array element), with
+/// an optional trailing `.freeze`. Falls back to None for unsupported
+/// shapes — the body-typer's existing fallback still applies.
+fn type_of_const_literal(node: &Node<'_>) -> Option<Ty> {
+    if let Some(ty) = type_of_literal_node(node) {
+        return Some(ty);
+    }
+    // Strip `.freeze` if present — it's a no-op for typing.
+    if let Some(call) = node.as_call_node() {
+        let name = std::str::from_utf8(call.name().as_slice()).ok()?;
+        if name == "freeze" {
+            let inner = call.receiver()?;
+            return type_of_const_literal(&inner);
+        }
+        // `1 << 10`, `FLAG_A | FLAG_B`-free integer arithmetic: both
+        // operands integer literals (or such arithmetic) is an Integer.
+        if matches!(name, "<<" | ">>" | "|" | "&" | "^" | "+" | "-" | "*") {
+            let int = |n: &Node<'_>| matches!(type_of_const_literal(n), Some(Ty::Int));
+            let recv = call.receiver()?;
+            let args: Vec<_> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+            if int(&recv) && args.len() == 1 && int(&args[0]) {
+                return Some(Ty::Int);
+            }
+            return None;
+        }
+        // `Hash.new` types as the `{}` it equals (see `is_bare_hash_new`).
+        if is_bare_hash_new(node) {
+            return Some(Ty::Hash {
+                key: std::sync::Arc::new(Ty::Untyped),
+                value: std::sync::Arc::new(Ty::Untyped),
+            });
+        }
+        // `CONST = Klass.new(…)` — a constructed instance is as much a
+        // typed constant as a literal is, and it is the shape a rule
+        // TABLE takes when its entries are objects rather than strings:
+        // `surfguard.rb`'s `NAT64_WELL_KNOWN = IPAddr.new("64:ff9b::/96")`.
+        // Without this the constant fell back to
+        // `Class { <THE CONSTANT'S OWN NAME> }` and every predicate
+        // called on it typed as an unresolved variable.
+        if name == "new" {
+            let recv = call.receiver()?;
+            let konst = recv.as_constant_read_node()?;
+            let name = std::str::from_utf8(konst.name().as_slice()).ok()?;
+            return Some(Ty::Class {
+                id: crate::ident::ClassId(crate::ident::Symbol::new(name)),
+                args: vec![].into(),
+            });
+        }
+        return None;
+    }
+    if let Some(hash) = node.as_hash_node() {
+        let first = hash.elements().iter().next();
+        let Some(first) = first else {
+            return Some(Ty::Hash {
+                key: std::sync::Arc::new(Ty::Untyped),
+                value: std::sync::Arc::new(Ty::Untyped),
+            });
+        };
+        let assoc = first.as_assoc_node()?;
+        let key_ty = type_of_literal_node(&assoc.key())?;
+        // A table of tables (`ActionCable::INTERNAL`'s `disconnect_reasons`)
+        // is typed as deep as its literals go.
+        let value_ty = type_of_const_literal(&assoc.value())?;
+        return Some(Ty::Hash {
+            key: std::sync::Arc::new(key_ty),
+            value: std::sync::Arc::new(value_ty),
+        });
+    }
+    if let Some(array) = node.as_array_node() {
+        let first = array.elements().iter().next();
+        let Some(first) = first else {
+            return Some(Ty::Array { elem: std::sync::Arc::new(Ty::Untyped) });
+        };
+        // Literal elements first; a `Klass.new(…)` element falls through
+        // to the constructed-instance rule above, which is how a table
+        // of objects (`DISALLOWED_IPV4 = [IPAddr.new("0.0.0.0/8"), …]`)
+        // types as `Array[IPAddr]` rather than not at all.
+        let elem_ty = type_of_literal_node(&first)
+            .or_else(|| type_of_const_literal(&first))?;
+        return Some(Ty::Array { elem: std::sync::Arc::new(elem_ty) });
+    }
+    // Regex literal -> Ty::Class { Regexp }. The body-typer's existing
+    // Regexp dispatch (instance methods `match?`, `source`, etc.)
+    // resolves through this; per-target emit picks the appropriate
+    // regex shape (LazyLock<regex::Regex> in rust, RegExp in TS, etc.).
+    if node.as_regular_expression_node().is_some() {
+        return Some(Ty::Class {
+            id: crate::ident::ClassId(crate::ident::Symbol::new("Regexp")),
+            args: vec![].into(),
+        });
+    }
+    // A scalar literal (`SALT = "active_record/signed_id"`) types as
+    // itself. Without this a runtime class's scalar constant had no table
+    // entry, so an app read of it resolved to the runtime declaration with
+    // no type and was refused as an unsupported constant.
+    type_of_literal_node(node)
+}
+
+fn type_of_literal_node(node: &Node<'_>) -> Option<Ty> {
+    if node.as_integer_node().is_some() { return Some(Ty::Int); }
+    if node.as_float_node().is_some() { return Some(Ty::Float); }
+    if node.as_string_node().is_some() { return Some(Ty::Str); }
+    if node.as_symbol_node().is_some() { return Some(Ty::Sym); }
+    if node.as_true_node().is_some() || node.as_false_node().is_some() {
+        return Some(Ty::Bool);
+    }
+    if node.as_nil_node().is_some() { return Some(Ty::Nil); }
+    None
+}
+
+/// Parse Ruby source and extract every `def` it finds (at top level
+/// and one level inside module/class bodies) as a `MethodDef`.
+pub fn parse_methods(source: &str) -> Result<Vec<MethodDef>, String> {
+    let result = crate::ingest::prism::parse_silent(source.as_bytes());
+
+    let errors: Vec<String> = result
+        .errors()
+        .map(|e| crate::ingest::prism_api::diagnostic_message(&e))
+        .collect();
+    if !errors.is_empty() {
+        return Err(format!("parse error: {}", errors.join("; ")));
+    }
+
+    let root = result.node();
+    let mut out = Vec::new();
+    walk_scope(&root, &mut out, None)?;
+    Ok(out)
+}
+
+/// Parse Ruby source and its RBS sidecar, returning `MethodDef`s with
+/// the RBS-derived `Ty::Fn` attached to `signature`. Every Ruby method
+/// must have a matching RBS signature and vice versa; arities must match.
+/// Method-body expressions are left with `ty: None` — sub-expression
+/// typing is a separate step.
+pub fn parse_methods_with_rbs(
+    ruby_src: &str,
+    rbs_src: &str,
+) -> Result<Vec<MethodDef>, String> {
+    parse_methods_with_rbs_in_ctx(
+        ruby_src,
+        rbs_src,
+        &crate::det::HashMap::default(),
+    )
+}
+
+/// Class-shape variant of `parse_methods_with_rbs`: ingest a whole
+/// `.rb` file into per-class `LibraryClass` records (preserving parent,
+/// includes, and is_module), attach the per-class RBS signatures from
+/// the sidecar, and run the body-typer on each class's methods.
+///
+/// Class identity matching: `ingest_library_classes` keys by syntactic
+/// last-segment (e.g. `RecordInvalid`); `parse_app_signatures` keys by
+/// fully-qualified path (e.g. `ActiveRecord::RecordInvalid`). The match
+/// here normalizes both sides to the last segment, which is sufficient
+/// for the framework-runtime corpus (no name collisions across
+/// runtime/ruby/).
+///
+/// Empty RBS for a class — including a class whose entire signature
+/// comes from inheritance (e.g. `class RecordNotFound < StandardError`
+/// with no body) — is allowed; methods that DO exist still need
+/// matching signatures.
+pub fn parse_library_with_rbs(
+    ruby_src: &[u8],
+    rbs_src: &str,
+    file: &str,
+) -> Result<Vec<crate::dialect::LibraryClass>, String> {
+    use crate::ingest::ingest_library_classes;
+
+    let mut library_classes = ingest_library_classes(ruby_src, file)
+        .map_err(|e| format!("ingest_library_classes: {e:?}"))?;
+    let sigs_by_class = crate::rbs::parse_app_signatures(rbs_src)?;
+    // `@ivar: T` decls (e.g. HeaderStore `@keys: Array[String]`). Pass B
+    // seeds these so empty `[]`/`{}` initializers stamp via
+    // `propagate_expected_to_empty_container` — without this, Go/Kotlin/
+    // C#/Swift emit `[]interface{}` / `MutableList<Any?>` and fail when
+    // `[]` returns `String?`.
+    let rbs_ivars_by_class = crate::rbs::parse_app_ivars(rbs_src)?;
+
+    // The class-grouped sig parser doesn't carry the `%a{abstract}`
+    // annotation; the flat parser does. Use the flat result purely as
+    // an abstract-name filter so per-class orphan checks skip
+    // contract-only methods (e.g. base.rb's `[]` / `[]=`).
+    let abstract_method_names: crate::det::HashSet<Symbol> =
+        crate::rbs::parse_signatures(rbs_src)
+            .map(|s| s.abstract_methods)
+            .unwrap_or_default();
+
+    // Both `parse_app_signatures` (RBS) and `ingest_library_classes`
+    // (Ruby) now produce fully-qualified ClassIds (e.g.
+    // `ActiveRecord::Base`), so the lookup is direct. The prior
+    // last-segment normalization was a workaround for the bare-name
+    // collision between RBS and ingest; both sides have caught up.
+    let sigs_by_full_path: crate::det::HashMap<String, crate::det::HashMap<Symbol, Ty>> =
+        sigs_by_class
+            .into_iter()
+            .map(|(cid, m)| (cid.0.as_str().to_string(), m))
+            .collect();
+
+    // Step 1: marry signatures to methods (with arity check + abstract-
+    // method orphan filter). Done up front so the class registry below
+    // can be built from typed methods.
+    // (Done inside the per-class loop below.)
+    let ruby_text = String::from_utf8_lossy(ruby_src);
+    let (literal_constants, owned_constants) = parse_module_constant_tables(&ruby_text, true);
+    let constants = crate::analyze::ConstScope::global(literal_constants);
+    let class_constants: crate::det::HashMap<_, _> = owned_constants
+        .into_iter()
+        .map(|(owner, own)| (owner, constants.with_own(own)))
+        .collect();
+
+    // Step 1: attach RBS signatures to each method, with arity check.
+    // After this loop every method has its `signature` populated.
+    for lc in &mut library_classes {
+        let class_name = lc.name.0.as_str().to_string();
+        let mut class_sigs = sigs_by_full_path
+            .get(&class_name)
+            .cloned()
+            .unwrap_or_default();
+
+        for m in &mut lc.methods {
+            if m.params.iter().any(|p| p.forwarding) {
+                return Err(format!("class `{class_name}` method `{}`: full forwarding is outside the typed runtime-source subset", m.name));
+            }
+            project_runtime_keywords(&mut m.body);
+            for default in m.params.iter_mut().filter_map(|p| p.default.as_mut()) {
+                project_runtime_keywords(default);
+            }
+            let sig = class_sigs.remove(&m.name).ok_or_else(|| {
+                format!(
+                    "class `{}` method `{}` has no matching RBS signature",
+                    class_name, m.name
+                )
+            })?;
+            if let Ty::Fn { params, .. } = &sig {
+                let rbs_arity = params
+                    .iter()
+                    .filter(|p| !matches!(p.kind, crate::ty::ParamKind::Block))
+                    .count();
+                if rbs_arity != m.params.len() {
+                    return Err(format!(
+                        "class `{}` method `{}`: Ruby has {} positional param(s), RBS has {}",
+                        class_name,
+                        m.name,
+                        m.params.len(),
+                        rbs_arity
+                    ));
+                }
+            } else {
+                return Err(format!(
+                    "class `{}` method `{}`: signature is not Ty::Fn",
+                    class_name, m.name
+                ));
+            }
+            m.signature = Some(sig);
+        }
+        // With the signatures on, a raise-bodied reader/writer pair
+        // becomes the attribute it stands in for, plus its zero in
+        // `initialize` (see the fn).
+        reclassify_abstract_attributes(&mut lc.methods);
+        for (_, value) in &mut lc.constants {
+            project_runtime_keywords(value);
+            bare_hash_new_as_literal(value);
+        }
+        for call in &mut lc.unknown_calls {
+            project_runtime_keywords(call);
+        }
+
+        // Drop abstract sigs from the orphan check. Subclass-overridden
+        // contract methods declared `%a{abstract}` in the RBS have no
+        // Ruby body in the base class by design (per the same convention
+        // `parse_methods_with_rbs` already honors).
+        for name in &abstract_method_names {
+            class_sigs.remove(name);
+        }
+        if !class_sigs.is_empty() {
+            let mut orphaned: Vec<String> = class_sigs.keys().map(|s| s.as_str().to_string()).collect();
+            orphaned.sort();
+            return Err(format!(
+                "class `{}`: RBS signature(s) with no matching Ruby method: {}",
+                class_name,
+                orphaned.join(", "),
+            ));
+        }
+    }
+
+    // Step 2: build a class registry from the now-typed methods. The
+    // body-typer dispatches `Send { recv: SelfRef, method: m }` against
+    // self_ty's class entry, so without this registry self-method
+    // calls resolve to `Ty::Untyped`.
+    let mut class_registry: crate::det::HashMap<
+        crate::ident::ClassId,
+        crate::analyze::ClassInfo,
+    > = crate::det::HashMap::default();
+    // Use the shared `class_info_from_library_class` helper so kinds
+    // (and the ivar-shadows-method reclassification — `def errors` paired
+    // with `@errors = []` reads as a field, so its dispatch should not
+    // force-parens) match what the model lowerer produces.
+    for lc in &library_classes {
+        let info = crate::lower::class_info_from_library_class(lc);
+        class_registry.insert(lc.name.clone(), info);
+    }
+    // Well-known cross-file runtime classes that the per-file
+    // body-typer needs to resolve dispatches against. Each base.rb
+    // gets its own isolated class_registry; without this seed,
+    // references like `ActiveRecord.adapter.find(...)` in
+    // active_record/base.rb would see `adapter` typed as
+    // Ty::Class { AdapterInterface } (from the RBS) but then
+    // miss every method lookup on that class — the runtime body-typer
+    // has no analog of the analyzer's hand-registered known-classes
+    // map (`analyze/mod.rs`).
+    seed_well_known_classes(&mut class_registry);
+
+    // Step 3: body-type each method. Two-pass ivar typing mirroring the
+    // module-flat path: pass A seeds nothing, pass B seeds ivar
+    // bindings observed during pass A. With `annotate_self_dispatch`
+    // set on the Ctx (below), the typer writes back `Some(SelfRef)`
+    // on bare Sends that resolve through `class_registry[lc.name]`,
+    // making the dispatch decision explicit in the IR. Per-target
+    // emitters then render uniformly:
+    // their return types flow into outer expressions (e.g. `errors`'s
+    // `Array[String]` reaches `errors << "..."` so `<<` resolves to
+    // `.push()` per the type-aware operator dispatch).
+    // Standalone runtime files lack the declarations in their sibling
+    // files. Their constant values use owner-first lookup with the
+    // legacy bare-name fallback; other class reads keep exact paths without a
+    // partial Rubydex graph that would misreport them as missing.
+    let typer = crate::analyze::BodyTyper::new(&class_registry);
+    for lc in &mut library_classes {
+        let scope_constants = class_constants.get(&lc.name).unwrap_or(&constants);
+        let build_ctx = |m: &MethodDef,
+                         ivars: &crate::det::HashMap<Symbol, Ty>|
+         -> crate::analyze::Ctx {
+            let mut ctx = crate::analyze::Ctx::default();
+            if let Some(Ty::Fn { params, .. }) = &m.signature {
+                for (param, p) in m.params.iter().zip(params.iter()) {
+                    ctx.local_bindings.insert(param.name.clone(), (*p.ty).clone());
+                }
+            }
+            ctx.self_ty = Some(Ty::Class {
+                id: lc.name.clone(),
+                args: vec![].into(),
+            });
+            ctx.ivar_bindings = ivars.clone();
+            ctx.constants = scope_constants.clone();
+            // Opt in to typer's self-dispatch annotation: bare Sends
+            // that resolve through this class's methods get
+            // `Some(SelfRef)` written back on their recv. Per-target
+            // emit sees explicit self-receivers and renders accordingly
+            // (Ruby: implicit, drop the prefix; TS: `this.method`).
+            // Eliminates the prior `rewrite_bare_sends_to_self` pre-pass.
+            ctx.annotate_self_dispatch = true;
+            ctx
+        };
+
+        let empty_ivars: crate::det::HashMap<Symbol, Ty> =
+            crate::det::HashMap::default();
+        for m in &mut lc.methods {
+            stamp_sig_return_on_empty_tail(m);
+            let ctx = build_ctx(m, &empty_ivars);
+            typer.analyze_expr(&mut m.body, &ctx);
+        }
+
+        let mut flow_ivars: crate::det::HashMap<Symbol, Ty> =
+            crate::det::HashMap::default();
+        for m in &lc.methods {
+            crate::analyze::extract_ivar_assignments(&m.body, &mut flow_ivars);
+        }
+        // Override flow-inferred ivar types with RBS-declared
+        // attr_accessor getter return types. `@params = {}` infers
+        // `Hash<Var, Var>` from the body; the RBS getter says
+        // `Hash[String, Roundhouse::ParamValue]`. The declared type
+        // is the contract; downstream strict-target emit (Crystal
+        // empty-hash `{} of K => V`) needs the RBS shape, not the
+        // initializer's inferred shape.
+        if let Some(info) = class_registry.get(&lc.name) {
+            for (m_name, sig) in &info.instance_methods {
+                if let Ty::Fn { params, ret, .. } = sig {
+                    if params.is_empty() {
+                        flow_ivars.insert(m_name.clone(), (**ret).clone());
+                    }
+                }
+            }
+        }
+        // Explicit RBS `@ivar: T` wins last — including over a
+        // zero-arg computed method of the same name (e.g. `@items:
+        // Array[String]` must not be replaced by `def items; …; end`
+        // returning Integer). Same contract as the seed that made
+        // HeaderStore `@keys`/`@vals` Array[String].
+        if let Some(declared) = rbs_ivars_by_class.get(&lc.name) {
+            for (name, ty) in declared {
+                flow_ivars.insert(name.clone(), ty.clone());
+            }
+        }
+        if !flow_ivars.is_empty() {
+            let reseeded: crate::det::HashMap<Symbol, Ty> = flow_ivars
+                .into_iter()
+                .map(|(name, ty)| (name, Ty::Union { variants: vec![ty, Ty::Nil].into() }))
+                .collect();
+            for m in &mut lc.methods {
+                stamp_sig_return_on_empty_tail(m);
+                let ctx = build_ctx(m, &reseeded);
+                typer.analyze_expr(&mut m.body, &ctx);
+            }
+        }
+        // Not the assigned local's own type: `@table = table` built from `{}` keeps an open key, and each emitter declares the ivar from what is assigned
+        if let Some(declared) = rbs_ivars_by_class.get(&lc.name) {
+            fn stamp(e: &mut Expr, declared: &crate::det::HashMap<Symbol, Ty>) {
+                if let ExprNode::Assign { target: crate::expr::LValue::Ivar { name }, value } = &mut *e.node
+                    && let Some(ty) = declared.get(name)
+                    && value.ty.as_ref().is_none_or(|t| t.mentions_unknown())
+                {
+                    value.ty = Some(ty.clone());
+                }
+                e.node.for_each_child_mut(&mut |c| stamp(c, declared));
+            }
+            for m in &mut lc.methods {
+                stamp(&mut m.body, declared);
+            }
+        }
+    }
+
+    Ok(library_classes)
+}
+
+/// Pre-seed the per-file body-typer's class registry with phantom
+/// classes that the analyzer registers globally (see
+/// `analyze/mod.rs`'s hand-coded ClassInfo blocks). The runtime
+/// transpile pipeline runs *before* the analyzer over the user's app,
+/// so we duplicate the relevant entries here. Today this is just
+/// `ActiveRecord::AdapterInterface` — the trait-shaped phantom whose
+/// 9 methods (`all/find/where/count/exists?/insert/update/delete/
+/// truncate`) `runtime/ruby/active_record/base.rb` dispatches through
+/// `ActiveRecord.adapter`.
+fn seed_well_known_classes(
+    classes: &mut crate::det::HashMap<crate::ident::ClassId, crate::analyze::ClassInfo>,
+) {
+    use crate::analyze::ClassInfo;
+    use crate::ident::{ClassId, Symbol};
+
+    // Db — the primitive persistence shim's contract, shared with the
+    // app-lowering registry. The raw-SQL connection facade
+    // (active_record/connection.rb) calls `Db.prepare`/`step?`/
+    // `column_*` directly, so its bodies need the same typing here.
+    crate::lower::view_to_library::insert_db_stub(classes);
+
+    // Not transpiled with the rest: each strict target writes I18nHost by hand, so only its signatures reach the files that call it.
+    let host = crate::rbs::parse_app_signatures(include_str!("../runtime/ruby/i18n_host.rbs"))
+        .expect("runtime/ruby/i18n_host.rbs must parse");
+    for (class_id, methods) in host {
+        let info = classes.entry(class_id).or_default();
+        for (name, ty) in methods {
+            info.class_methods.insert(name, ty);
+        }
+    }
+
+    let row_ty = Ty::Hash {
+        key: std::sync::Arc::new(Ty::Str),
+        value: std::sync::Arc::new(Ty::Untyped),
+    };
+    let nilable_row = Ty::Union {
+        variants: vec![row_ty.clone(), Ty::Nil].into(),
+    };
+    let array_of_rows = Ty::Array { elem: std::sync::Arc::new(row_ty.clone()) };
+    let mut adapter_iface = ClassInfo::default();
+    adapter_iface
+        .instance_methods
+        .insert(Symbol::from("all"), array_of_rows.clone());
+    adapter_iface
+        .instance_methods
+        .insert(Symbol::from("find"), nilable_row.clone());
+    adapter_iface
+        .instance_methods
+        .insert(Symbol::from("where"), array_of_rows.clone());
+    adapter_iface
+        .instance_methods
+        .insert(Symbol::from("count"), Ty::Int);
+    adapter_iface
+        .instance_methods
+        .insert(Symbol::from("exists?"), Ty::Bool);
+    adapter_iface
+        .instance_methods
+        .insert(Symbol::from("insert"), Ty::Int);
+    adapter_iface
+        .instance_methods
+        .insert(Symbol::from("update"), Ty::Nil);
+    adapter_iface
+        .instance_methods
+        .insert(Symbol::from("delete"), Ty::Nil);
+    adapter_iface
+        .instance_methods
+        .insert(Symbol::from("truncate"), Ty::Nil);
+    adapter_iface
+        .instance_methods
+        .insert(Symbol::from("select_rows"), array_of_rows.clone());
+    adapter_iface
+        .instance_methods
+        .insert(Symbol::from("each_row"), Ty::Nil);
+    adapter_iface
+        .instance_methods
+        .insert(Symbol::from("execute_ddl"), Ty::Nil);
+    adapter_iface
+        .instance_methods
+        .insert(Symbol::from("changes"), Ty::Int);
+    adapter_iface
+        .instance_methods
+        .insert(Symbol::from("escape_value"), Ty::Str);
+    classes
+        .entry(ClassId(Symbol::from("ActiveRecord::AdapterInterface")))
+        .or_insert(adapter_iface);
+}
+
+/// Private typing view: re-attach this file's full `Ty::Fn` for methods
+/// that declare a block. Shared registries are often return-only
+/// (`ret` stripped); `block_params_for` needs the Fn. Non-block entries
+/// already present in `classes` still win (registry-seeded returns).
+///
+/// Non-block local signatures fill in with `or_insert` for every
+/// enclosing class, not only one that declares a block: a sparse
+/// `ClassInfo` with only block-bearing methods unions `send(name)` to
+/// `Nil` instead of `Untyped`, and a module function's call to a
+/// sibling (`erb_url_encode` reading `erb_url_byte`) types unknown
+/// without it. Never mutates `classes`.
+fn typing_classes_with_local_block_contracts(
+    classes: &crate::det::HashMap<crate::ident::ClassId, crate::analyze::ClassInfo>,
+    methods: &[MethodDef],
+) -> crate::det::HashMap<crate::ident::ClassId, crate::analyze::ClassInfo> {
+    let mut typing_classes = classes.clone();
+    for m in methods {
+        let (Some(enclosing), Some(sig)) = (&m.enclosing_class, &m.signature) else {
+            continue;
+        };
+        let info = typing_classes
+            .entry(crate::ident::ClassId(enclosing.clone()))
+            .or_default();
+        let table = match m.receiver {
+            MethodReceiver::Instance => &mut info.instance_methods,
+            MethodReceiver::Class => &mut info.class_methods,
+        };
+        if matches!(sig, Ty::Fn { block: Some(_), .. }) {
+            table.insert(m.name.clone(), sig.clone());
+        } else {
+            table.entry(m.name.clone()).or_insert_with(|| sig.clone());
+        }
+    }
+    typing_classes
+}
+
+/// Same as `parse_methods_with_rbs` but takes a pre-built class
+/// registry — so cross-class method dispatch during body-typing can
+/// resolve. Used by the runtime-sweep test, which builds a unified
+/// registry from every `runtime/ruby/**/*.rbs` file before typing any
+/// file's method bodies individually.
+pub fn parse_methods_with_rbs_in_ctx(
+    ruby_src: &str,
+    rbs_src: &str,
+    classes: &crate::det::HashMap<crate::ident::ClassId, crate::analyze::ClassInfo>,
+) -> Result<Vec<MethodDef>, String> {
+    let mut methods = parse_methods(ruby_src)?;
+
+    // Per-class signature maps. A flat name-keyed map collapses
+    // entries when the same method name appears in two classes
+    // (e.g. `initialize` on both RecordNotFound and RecordInvalid in
+    // active_record/errors). parse_app_signatures groups by the
+    // fully-qualified class id; we re-key by last segment to match
+    // Ruby's MethodDef.enclosing_class, which carries the bare
+    // class name. For module-flat / top-level defs (no enclosing
+    // class) we fall back to a name-keyed map built from
+    // parse_signatures.
+    let app_sigs = crate::rbs::parse_app_signatures(rbs_src)?;
+    let mut sig_by_class: crate::det::HashMap<String, crate::det::HashMap<Symbol, Ty>> =
+        crate::det::HashMap::default();
+    for (cid, sigs) in app_sigs {
+        let raw = cid.0.as_str();
+        let last = raw.rsplit("::").next().unwrap_or(raw).to_string();
+        let entry = sig_by_class.entry(last).or_default();
+        for (n, ty) in sigs {
+            entry.insert(n, ty);
+        }
+    }
+
+    let flat_sigs = parse_signatures(rbs_src)?;
+    let abstract_methods: crate::det::HashSet<Symbol> =
+        flat_sigs.abstract_methods.iter().cloned().collect();
+    let mut flat_sig_map: crate::det::HashMap<Symbol, Ty> =
+        flat_sigs.methods.into_iter().collect();
+
+    // Names that satisfied a top-level (no enclosing class) Ruby def
+    // via flat lookup. These should also be skipped during the
+    // per-class orphan check — emit_method drops module wrappers, so
+    // a round-trip test re-parses with `enclosing_class = None` but
+    // the RBS sigs still live inside a `module M`.
+    let mut flat_matched_names: crate::det::HashSet<Symbol> =
+        crate::det::HashSet::default();
+
+    for m in &mut methods {
+        let ty = if let Some(enclosing) = &m.enclosing_class {
+            let class_key = enclosing.as_str();
+            let class_sigs = sig_by_class.get_mut(class_key).ok_or_else(|| {
+                format!(
+                    "class `{}` method `{}` has no matching RBS signature",
+                    class_key, m.name
+                )
+            })?;
+            class_sigs.remove(&m.name).ok_or_else(|| {
+                format!(
+                    "class `{}` method `{}` has no matching RBS signature",
+                    class_key, m.name
+                )
+            })?
+        } else {
+            let ty = flat_sig_map.remove(&m.name).ok_or_else(|| {
+                format!("method `{}` has no matching RBS signature", m.name)
+            })?;
+            flat_matched_names.insert(m.name.clone());
+            ty
+        };
+
+        if let Ty::Fn { params, .. } = &ty {
+            // RBS injects a synthetic Block-kind param into Ty::Fn
+            // when the signature declares `{ ... } -> T`. Ruby's flat
+            // param list collects an `&block` only when explicitly
+            // declared — implicit `yield` produces no Ruby-side
+            // param. Filter the RBS Block param out of the arity
+            // comparison: blocks are a separate axis from positionals
+            // and keywords, and Ruby code that yields without
+            // declaring `&block` is the common case (validates_*_of
+            // is the canonical example).
+            let rbs_arity = params
+                .iter()
+                .filter(|p| !matches!(p.kind, crate::ty::ParamKind::Block))
+                .count();
+            if rbs_arity != m.params.len() {
+                return Err(format!(
+                    "method `{}`: Ruby has {} positional param(s), RBS has {}",
+                    m.name,
+                    m.params.len(),
+                    rbs_arity
+                ));
+            }
+        } else {
+            return Err(format!("method `{}`: signature is not Ty::Fn", m.name));
+        }
+
+        m.signature = Some(ty);
+    }
+
+    // Per-class orphan check, with abstract-method filtering applied
+    // uniformly across all classes (the flat parser is the only
+    // source of `%a{abstract}` markers). Also drop names already
+    // claimed by a top-level Ruby def (see `flat_matched_names`).
+    for (class_key, mut sigs) in sig_by_class {
+        for name in &abstract_methods {
+            sigs.remove(name);
+        }
+        for name in &flat_matched_names {
+            sigs.remove(name);
+        }
+        if !sigs.is_empty() {
+            let mut orphaned: Vec<String> = sigs.keys().map(|s| s.as_str().to_string()).collect();
+            orphaned.sort();
+            return Err(format!(
+                "class `{}`: RBS signature(s) with no matching Ruby method: {}",
+                class_key,
+                orphaned.join(", ")
+            ));
+        }
+    }
+    // Drop the flat name-keyed map — it's a fallback for top-level
+    // (module-flat) defs only. Runtime RBS files wrap declarations
+    // in classes/modules, so flat_sig_map's residue overlaps with
+    // sig_by_class entries already orphan-checked above; a separate
+    // flat orphan check would double-count.
+    drop(flat_sig_map);
+
+    // Two-pass flow-sensitive ivar typing, mirroring the model-side
+    // analyzer (`src/analyze/mod.rs`):
+    //
+    // Pass A: type each body with only RBS-derived params + self_ty
+    // seeded. Ivar reads resolve to `Ty::Var` (unknown), but ivar
+    // *assignments* leave their value-expression typed, which Pass B
+    // harvests.
+    //
+    // Pass B: gather every `@x = expr` across all method bodies,
+    // wrap each in `Union<T, Nil>` (a first read can observe nil
+    // before any assignment), seed `ivar_bindings`, and re-type.
+    // Reads now resolve cleanly even when they lexically precede
+    // the assignment (e.g. `@cache ||= compute` lowers to a `BoolOp`
+    // whose left arm reads the unset ivar).
+    let typing_classes = typing_classes_with_local_block_contracts(classes, &methods);
+    let typer = crate::analyze::BodyTyper::new(&typing_classes);
+
+    // Extract module-level constants from the .rb so dispatch on
+    // `STATUS_CODES.fetch(...)` etc. resolves through the constant's
+    // typed value (Hash[Sym, Int]) rather than falling through as
+    // `Ty::Class { STATUS_CODES }` to unknown.
+    let constants = crate::analyze::ConstScope::global(parse_module_constants(ruby_src).unwrap_or_default());
+
+    let build_ctx = |m: &MethodDef,
+                     ivars: &crate::det::HashMap<Symbol, Ty>|
+     -> crate::analyze::Ctx {
+        let mut ctx = crate::analyze::Ctx::default();
+        ctx.class_side = m.receiver == MethodReceiver::Class;
+        if let Some(Ty::Fn { params, .. }) = &m.signature {
+            for (param, p) in m.params.iter().zip(params.iter()) {
+                ctx.local_bindings.insert(param.name.clone(), (*p.ty).clone());
+            }
+            // `def subscribe(subscriber, &block)`: the captured block is
+            // the signature's block, which `m.params` does not carry.
+            if let Some(block_param) = &m.block_param {
+                if let Some(p) = params.iter().find(|p| matches!(p.kind, crate::ty::ParamKind::Block)) {
+                    ctx.local_bindings.insert(block_param.name.clone(), (*p.ty).clone());
+                }
+            }
+        }
+        if let Some(enclosing) = &m.enclosing_class {
+            ctx.self_ty = Some(Ty::Class {
+                id: crate::ident::ClassId(enclosing.clone()),
+                args: vec![].into(),
+            });
+        }
+        ctx.ivar_bindings = ivars.clone();
+        ctx.constants = constants.clone();
+        ctx
+    };
+
+    let empty_ivars: crate::det::HashMap<Symbol, Ty> =
+        crate::det::HashMap::default();
+    for m in &mut methods {
+        stamp_sig_return_on_empty_tail(m);
+        let ctx = build_ctx(m, &empty_ivars);
+        typer.analyze_expr(&mut m.body, &ctx);
+    }
+
+    let mut flow_ivars: crate::det::HashMap<Symbol, Ty> =
+        crate::det::HashMap::default();
+    for m in &methods {
+        crate::analyze::extract_ivar_assignments(&m.body, &mut flow_ivars);
+    }
+
+    if !flow_ivars.is_empty() {
+        let reseeded: crate::det::HashMap<Symbol, Ty> = flow_ivars
+            .into_iter()
+            .map(|(name, ty)| (name, Ty::Union { variants: vec![ty, Ty::Nil].into() }))
+            .collect();
+        for m in &mut methods {
+            stamp_sig_return_on_empty_tail(m);
+            let ctx = build_ctx(m, &reseeded);
+            typer.analyze_expr(&mut m.body, &ctx);
+        }
+    }
+
+    Ok(methods)
+}
+
+/// Forward a method's declared Hash/Array return onto a bare empty
+/// `{}` / `[]` tail before body-typing. See
+/// [`crate::analyze::stamp_expected_on_empty_return_tail`].
+fn stamp_sig_return_on_empty_tail(m: &mut MethodDef) {
+    if let Some(Ty::Fn { ret, .. }) = m.signature.as_ref() {
+        crate::analyze::stamp_expected_on_empty_return_tail(&mut m.body, ret);
+    }
+}
+
+fn walk_scope(
+    node: &Node<'_>,
+    out: &mut Vec<MethodDef>,
+    enclosing: Option<&str>,
+) -> Result<(), String> {
+    // `module_function` (called bare in a module body) flips
+    // subsequent `def`s in the same body into module-functions:
+    // both an instance method AND a class method. For our targets
+    // we only need the class-method form (callers spell it
+    // `ViewHelpers.x(...)`), so promote those defs to
+    // `MethodReceiver::Class`. Only direct `def` children of the
+    // current scope get promoted — nested class bodies (e.g. a
+    // FormBuilder class inside the same module) carry their own
+    // method-receiver decisions through the recursive walk.
+    // The `module_function :a, :b` form names its methods instead of
+    // flipping a mode. Ruby requires those methods to already be
+    // defined (it copies the existing definition, and raises NameError
+    // otherwise), so the promotion is retroactive — collected here and
+    // applied once the whole scope has been walked, which makes it
+    // order-independent and keeps the two forms from interleaving
+    // awkwardly.
+    let scope_start = out.len();
+    let mut named: Vec<String> = Vec::new();
+    let mut module_function_active = false;
+    let mut visit = |stmt: &Node<'_>, out: &mut Vec<MethodDef>| -> Result<(), String> {
+        if is_module_function_marker(stmt) {
+            module_function_active = true;
+            return Ok(());
+        }
+        if let Some(names) = module_function_arg_names(stmt) {
+            named.extend(names);
+            return Ok(());
+        }
+        let is_direct_def = stmt.as_def_node().is_some();
+        let before = out.len();
+        collect_from_stmt(stmt, out, enclosing)?;
+        if module_function_active && is_direct_def {
+            for m in &mut out[before..] {
+                m.receiver = MethodReceiver::Class;
+            }
+        }
+        Ok(())
+    };
+    if let Some(program) = node.as_program_node() {
+        for stmt in program.statements().body().iter() {
+            visit(&stmt, out)?;
+        }
+    } else if let Some(stmts) = node.as_statements_node() {
+        for stmt in stmts.body().iter() {
+            visit(&stmt, out)?;
+        }
+    }
+    // Only this scope's own methods: `out` carries earlier siblings and
+    // nested-scope results, and a name collision across scopes must not
+    // promote someone else's method.
+    if !named.is_empty() {
+        for m in &mut out[scope_start..] {
+            if named.iter().any(|n| n == m.name.as_str()) {
+                m.receiver = MethodReceiver::Class;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// True when `node` is a bare `module_function` call (no receiver,
+/// no args, no block) — the marker that flips subsequent defs in
+/// the same module body to module-functions.
+fn is_module_function_marker(node: &Node<'_>) -> bool {
+    let Some(call) = node.as_call_node() else { return false };
+    if call.receiver().is_some() {
+        return false;
+    }
+    if call.arguments().is_some() {
+        return false;
+    }
+    if call.block().is_some() {
+        return false;
+    }
+    let Ok(name) = std::str::from_utf8(call.name().as_slice()) else {
+        return false;
+    };
+    name == "module_function"
+}
+
+/// The method names in a `module_function :a, :b` call, or `None` when
+/// `node` isn't that shape.
+///
+/// Symbol arguments only. Ruby also allows `module_function def x; end`
+/// (the def node evaluates to the symbol), which no corpus source uses;
+/// it returns `None` here and so falls through to the ordinary
+/// instance-method path rather than being silently mis-promoted.
+pub(crate) fn module_function_arg_names(node: &Node<'_>) -> Option<Vec<String>> {
+    let call = node.as_call_node()?;
+    if call.receiver().is_some() || call.block().is_some() {
+        return None;
+    }
+    if std::str::from_utf8(call.name().as_slice()).ok()? != "module_function" {
+        return None;
+    }
+    let args = call.arguments()?;
+    let mut names = Vec::new();
+    for arg in args.arguments().iter() {
+        let sym = arg.as_symbol_node()?;
+        let unescaped = sym.unescaped();
+        names.push(std::str::from_utf8(unescaped).ok()?.to_string());
+    }
+    if names.is_empty() { None } else { Some(names) }
+}
+
+fn collect_from_stmt(
+    node: &Node<'_>,
+    out: &mut Vec<MethodDef>,
+    enclosing: Option<&str>,
+) -> Result<(), String> {
+    if let Some(def) = node.as_def_node() {
+        out.push(method_def_from(&def, enclosing)?);
+        return Ok(());
+    }
+    // attr_reader / attr_writer / attr_accessor lower at parse time
+    // to synthetic getter/setter MethodDef pairs. The RBS sidecar
+    // declares the per-attr signatures (`def id: () -> Integer`); the
+    // synthetic body here exists to satisfy the orphan check and to
+    // give the body-typer something concrete to type. Body shape:
+    //   def attr; @attr; end           (reader)
+    //   def attr=(v); @attr = v; end   (writer)
+    if let Some(call) = node.as_call_node() {
+        if call.receiver().is_none() {
+            let name_bytes = call.name().as_slice();
+            if let Ok(name_str) = std::str::from_utf8(name_bytes) {
+                let (mk_reader, mk_writer) = match name_str {
+                    "attr_reader" => (true, false),
+                    "attr_writer" => (false, true),
+                    "attr_accessor" => (true, true),
+                    _ => (false, false),
+                };
+                if mk_reader || mk_writer {
+                    if let Some(args) = call.arguments() {
+                        for arg in args.arguments().iter() {
+                            let Some(sym) = arg.as_symbol_node() else { continue };
+                            let loc = sym.content_loc();
+                            let attr_name = std::str::from_utf8(loc.as_slice())
+                                .map_err(|_| "attr name not UTF-8".to_string())?;
+                            if mk_reader {
+                                out.push(synthesize_reader(attr_name, enclosing));
+                            }
+                            if mk_writer {
+                                out.push(synthesize_writer(attr_name, enclosing));
+                            }
+                        }
+                    }
+                    return Ok(());
+                }
+            }
+        }
+    }
+    // `class << self ... end` — singleton-class block. Recurse into
+    // its body in the same enclosing scope, then promote every method
+    // collected inside to `MethodReceiver::Class`. Covers both
+    // `def self.x` (already Class) and `attr_*` lowerings (default
+    // Instance), so e.g. `class << self; attr_accessor :adapter; end`
+    // produces module-level `adapter` / `adapter=` class methods.
+    if let Some(sc) = node.as_singleton_class_node() {
+        if let Some(body) = sc.body() {
+            let before = out.len();
+            walk_scope(&body, out, enclosing)?;
+            for m in &mut out[before..] {
+                m.receiver = MethodReceiver::Class;
+            }
+        }
+        return Ok(());
+    }
+    if let Some(module) = node.as_module_node() {
+        let name_bytes = module.name().as_slice();
+        let name_str = std::str::from_utf8(name_bytes)
+            .map_err(|_| "module name is not UTF-8".to_string())?;
+        if let Some(body) = module.body() {
+            walk_scope(&body, out, Some(name_str))?;
+        }
+        return Ok(());
+    }
+    if let Some(class) = node.as_class_node() {
+        let name_bytes = class.name().as_slice();
+        let name_str = std::str::from_utf8(name_bytes)
+            .map_err(|_| "class name is not UTF-8".to_string())?;
+        if let Some(body) = class.body() {
+            walk_scope(&body, out, Some(name_str))?;
+        }
+        return Ok(());
+    }
+    Ok(())
+}
+
+/// An ABSTRACT ATTRIBUTE: a `def x` / `def x=(v)` pair whose bodies do
+/// nothing but `raise`. The runtime base writes `id` that way — the
+/// contract that every record has a key, with the slot and the typed
+/// accessors on each model rather than on the base, because under
+/// Spinel a base-class ivar is the union of every subclass's writes
+/// (roundhouse#90). The property-typed targets (Kotlin, Swift, C#,
+/// Crystal) render an accessor pair as a property that subclasses
+/// override, and cannot override a base *function* with a subclass
+/// *property* — so here, on the transpile path only (the ruby family
+/// ships the source verbatim), the pair reads as the `attr_accessor`
+/// it stands in for, and `initialize` gains `@x = <zero>` for the
+/// declared scalar type, because those targets' constructors are
+/// where a field is initialised (Crystal makes an unassigned property
+/// nilable; Kotlin wants an initializer). What those targets get is,
+/// byte for byte, the base they had before it stopped holding the
+/// slot: an integer `id` with the unsaved sentinel `0`. Runs after the
+/// RBS signatures are married, so the zero follows the declared type.
+fn reclassify_abstract_attributes(methods: &mut [MethodDef]) {
+    fn raise_only(body: &Expr) -> bool {
+        match &*body.node {
+            ExprNode::Raise { .. } => true,
+            // A bare `raise NotImplementedError, "…"` in a runtime body
+            // arrives as the Kernel send, not the `Raise` node.
+            ExprNode::Send { recv: None, method, .. } if method.as_str() == "raise" => true,
+            ExprNode::Seq { exprs } => exprs.len() == 1 && raise_only(&exprs[0]),
+            _ => false,
+        }
+    }
+    let names: Vec<Symbol> = methods
+        .iter()
+        .filter(|m| {
+            m.receiver == MethodReceiver::Instance
+                && m.kind == crate::dialect::AccessorKind::Method
+                && m.params.is_empty()
+                && !m.name.as_str().ends_with('=')
+                && raise_only(&m.body)
+        })
+        .map(|m| m.name.clone())
+        .collect();
+    for name in names {
+        let setter = Symbol::new(&format!("{}=", name.as_str()));
+        let has_setter = methods.iter().any(|m| {
+            m.receiver == MethodReceiver::Instance
+                && m.kind == crate::dialect::AccessorKind::Method
+                && m.name == setter
+                && m.params.len() == 1
+                && raise_only(&m.body)
+        });
+        if !has_setter {
+            continue;
+        }
+        let mut zero: Option<Expr> = None;
+        for m in methods.iter_mut() {
+            if m.receiver != MethodReceiver::Instance {
+                continue;
+            }
+            let unsupported_formals = m.unsupported_formals;
+            let has_anonymous_block = m.has_anonymous_block;
+            if m.name == name {
+                let enclosing = m.enclosing_class.as_ref().map(|s| s.as_str().to_string());
+                let sig = m.signature.take();
+                if let Some(Ty::Fn { ret, .. }) = &sig {
+                    zero = zero_literal(ret);
+                }
+                *m = synthesize_reader(name.as_str(), enclosing.as_deref());
+                m.signature = sig;
+            } else if m.name == setter {
+                let enclosing = m.enclosing_class.as_ref().map(|s| s.as_str().to_string());
+                let sig = m.signature.take();
+                *m = synthesize_writer(name.as_str(), enclosing.as_deref());
+                m.signature = sig;
+            }
+            m.unsupported_formals = unsupported_formals;
+            m.has_anonymous_block = has_anonymous_block;
+        }
+        let Some(zero) = zero else { continue };
+        if let Some(init) = methods
+            .iter_mut()
+            .find(|m| m.receiver == MethodReceiver::Instance && m.name.as_str() == "initialize")
+        {
+            let assign = Expr::new(
+                Span::synthetic(),
+                ExprNode::Assign { target: LValue::Ivar { name: name.clone() }, value: zero },
+            );
+            let body = std::mem::replace(
+                &mut init.body,
+                Expr::new(Span::synthetic(), ExprNode::Lit { value: crate::expr::Literal::Nil }),
+            );
+            init.body = match *body.node {
+                ExprNode::Seq { exprs } => {
+                    let mut all = Vec::with_capacity(exprs.len() + 1);
+                    all.push(assign);
+                    all.extend(exprs);
+                    Expr::new(Span::synthetic(), ExprNode::Seq { exprs: all })
+                }
+                _ => Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![assign, body] }),
+            };
+        }
+    }
+}
+
+/// The scalar zero for a declared type — the unsaved sentinel an
+/// abstract attribute's slot holds on the transpile path.
+fn zero_literal(ty: &Ty) -> Option<Expr> {
+    use crate::expr::Literal;
+    let value = match ty {
+        Ty::Int => Literal::Int { value: 0 },
+        Ty::Float => Literal::Float { value: 0.0 },
+        Ty::Bool => Literal::Bool { value: false },
+        Ty::Str => Literal::Str { value: String::new() },
+        _ => return None,
+    };
+    let mut e = Expr::new(Span::synthetic(), ExprNode::Lit { value });
+    e.ty = Some(ty.clone());
+    Some(e)
+}
+
+/// Synthesize `def <attr>; @<attr>; end`. Body is a single Ivar
+/// read; the RBS sidecar's `def <attr>: () -> T` provides the type.
+fn synthesize_reader(attr: &str, enclosing: Option<&str>) -> MethodDef {
+    let name = Symbol::new(attr);
+    let body = Expr::new(
+        Span::synthetic(),
+        ExprNode::Ivar { name: name.clone() },
+    );
+    MethodDef {
+        visibility: crate::dialect::MethodVisibility::Public,
+        unsupported_formals: None,
+        has_anonymous_block: false,
+        name_span: crate::span::Span::synthetic(),
+        name,
+        receiver: MethodReceiver::Instance,
+        params: Vec::new(),
+        body,
+        signature: None,
+        effects: EffectSet::pure(),
+        enclosing_class: enclosing.map(Symbol::new),
+        kind: crate::dialect::AccessorKind::AttributeReader,
+        is_async: false,
+            mutates_self: false,
+            block_param: None,
+    }
+}
+
+/// Synthesize `def <attr>=(value); @<attr> = value; end`. Body is
+/// `Assign { target: Ivar(attr), value: Var(value) }`. The RBS
+/// sidecar's `def <attr>=: (T) -> T` provides the type.
+fn synthesize_writer(attr: &str, enclosing: Option<&str>) -> MethodDef {
+    let attr_sym = Symbol::new(attr);
+    let setter_name = Symbol::new(&format!("{attr}="));
+    let value_param = Symbol::new("value");
+    let value_read = Expr::new(
+        Span::synthetic(),
+        ExprNode::Var {
+            id: crate::ident::VarId(0),
+            name: value_param.clone(),
+        },
+    );
+    let body = Expr::new(
+        Span::synthetic(),
+        ExprNode::Assign {
+            target: LValue::Ivar { name: attr_sym },
+            value: value_read,
+        },
+    );
+    MethodDef {
+        visibility: crate::dialect::MethodVisibility::Public,
+        unsupported_formals: None,
+        has_anonymous_block: false,
+        name_span: crate::span::Span::synthetic(),
+        name: setter_name,
+        receiver: MethodReceiver::Instance,
+        params: vec![Param::positional(value_param)],
+        body,
+        signature: None,
+        effects: EffectSet::pure(),
+        enclosing_class: enclosing.map(Symbol::new),
+        kind: crate::dialect::AccessorKind::AttributeWriter,
+        is_async: false,
+            mutates_self: false,
+            block_param: None,
+    }
+}
+
+fn method_def_from(
+    def: &ruby_prism::DefNode<'_>,
+    enclosing: Option<&str>,
+) -> Result<MethodDef, String> {
+    let name_bytes = def.name().as_slice();
+    let name = Symbol::new(
+        std::str::from_utf8(name_bytes)
+            .map_err(|_| "method name is not UTF-8".to_string())?,
+    );
+
+    let receiver = if def.receiver().is_some() {
+        MethodReceiver::Class
+    } else {
+        MethodReceiver::Instance
+    };
+
+    let mut formals = crate::ingest::forwarding::parse(def);
+    // The typed runtime keeps the strict rule: an anonymous `*` (even an
+    // unforwarded one, which app ingest binds to a generated name) has
+    // no business in a runtime method and stays a recorded fact.
+    if formals.anonymous_rest_name.is_some() && formals.unsupported.is_none() {
+        formals.unsupported = Some(crate::dialect::UnsupportedFormal::AnonymousRest);
+    }
+    if formals.anonymous == Some(crate::ingest::forwarding::AnonymousFormal::Forwarding) {
+        return Err(format!("method `{name}`: full forwarding is outside the typed runtime-source subset"));
+    }
+    let (params, block_param) = method_params(def, name.as_str())?;
+
+    let body = match def.body() {
+        Some(b) => ingest_expr(&b, VIRTUAL_FILE).map_err(|e| format!("in `{name}`: {e}"))?,
+        None => Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![] }),
+    };
+
+    Ok(MethodDef {
+        visibility: if receiver == MethodReceiver::Instance && matches!(name.as_str(), "initialize" | "initialize_copy" | "initialize_dup" | "initialize_clone") {
+            crate::dialect::MethodVisibility::Private
+        } else {
+            crate::dialect::MethodVisibility::Public
+        },
+        unsupported_formals: formals.unsupported,
+        has_anonymous_block: formals.has_anonymous_block,
+        name_span: crate::span::Span::synthetic(),
+        name,
+        receiver,
+        params,
+        body,
+        signature: None,
+        effects: EffectSet::pure(),
+        enclosing_class: enclosing.map(Symbol::new),
+        // Source-defined `def` from runtime_src — Method by default.
+        // Pattern-matching for attr_reader-shaped bodies could refine
+        // this, but `attr_*` calls go through synthesize_reader/writer
+        // above with explicit kinds; bare `def` is overwhelmingly Method.
+        kind: crate::dialect::AccessorKind::Method,
+        is_async: false,
+        mutates_self: false,
+        block_param,
+    })
+}
+
+/// Collect every parameter's name across positional/keyword kinds, plus
+/// the def-site block parameter (`&block`) split into its own slot.
+/// Anonymous forms (`*`, `**`, `&`) are skipped.
+///
+/// Returned list is flat — no positional/keyword kind distinction
+/// preserved. The RBS signature's `Ty::Fn` encodes the per-position
+/// kind; the arity check in `parse_methods_with_rbs_in_ctx` ensures
+/// same-length alignment, and the body-typer seeds local bindings by
+/// position-zipping names to signature params.
+///
+/// The `&block` parameter rides in `MethodDef.block_param` rather than
+/// the flat list — it occupies the call-site `block:` slot, never
+/// `args:`, and keeping it out of `params` aligns Ruby's arity with
+/// the RBS Block-kind filter (`runtime_src.rs:700` etc.) without a
+/// per-call-site length mismatch fallback.
+fn method_params(
+    def: &ruby_prism::DefNode<'_>,
+    method_name: &str,
+) -> Result<(Vec<Param>, Option<Param>), String> {
+    let Some(params_node) = def.parameters() else {
+        return Ok((Vec::new(), None));
+    };
+
+    let mut names = Vec::new();
+
+    // Required positional: `def foo(a, b)`.
+    for req in params_node.requireds().iter() {
+        let rp = req.as_required_parameter_node().ok_or_else(|| {
+            format!("method `{method_name}`: unexpected required-parameter shape")
+        })?;
+        names.push(Param::positional(Symbol::new(decode_utf8(rp.name().as_slice(), method_name)?)));
+    }
+
+    // Optional positional: `def foo(a = 1)`. Ingest the default
+    // expression so per-target emit can produce `name: T = <default>`
+    // signatures — without it, the param emits as `name?: T` (TS
+    // optional) and the method body's `name.<method>` calls trip on
+    // undefined when callers omit the arg. Framework code like
+    // `def label(field, opts = {})` relies on the default reaching
+    // the merge / iteration sites as `{}`, not undefined.
+    for opt in params_node.optionals().iter() {
+        let op = opt.as_optional_parameter_node().ok_or_else(|| {
+            format!("method `{method_name}`: unexpected optional-parameter shape")
+        })?;
+        let name = Symbol::new(decode_utf8(op.name().as_slice(), method_name)?);
+        let default = ingest_expr(&op.value(), VIRTUAL_FILE)
+            .map_err(|e| format!("method `{method_name}` default for `{name}`: {e}"))?;
+        names.push(Param::with_default(name, default));
+    }
+
+    // Rest/splat: `*args`. Anonymous `*` has no name — skip.
+    if let Some(rest) = params_node.rest() {
+        if let Some(rp) = rest.as_rest_parameter_node() {
+            if let Some(loc) = rp.name() {
+                names.push(Param::positional(Symbol::new(decode_utf8(loc.as_slice(), method_name)?)));
+            }
+        }
+        // ImplicitRestNode (shorthand `def foo(a, *)`) has no name.
+    }
+
+    // Post-rest required positional: `def foo(*rest, a, b)`.
+    for post in params_node.posts().iter() {
+        let pp = post.as_required_parameter_node().ok_or_else(|| {
+            format!("method `{method_name}`: unexpected post-required-parameter shape")
+        })?;
+        names.push(Param::positional(Symbol::new(decode_utf8(pp.name().as_slice(), method_name)?)));
+    }
+
+    // Keywords (required and optional): `def foo(a:, b: 1)`.
+    // Optional keywords (`status: :found`) carry a default Expr —
+    // capture so emit can produce `status: T = :found` rather than
+    // `status?: T` (which binds undefined when the caller omits the
+    // arg, breaking framework code that relies on the default).
+    for kw in params_node.keywords().iter() {
+        if let Some(rkp) = kw.as_required_keyword_parameter_node() {
+            names.push(Param::positional(Symbol::new(decode_utf8(rkp.name().as_slice(), method_name)?)));
+        } else if let Some(okp) = kw.as_optional_keyword_parameter_node() {
+            let name = Symbol::new(decode_utf8(okp.name().as_slice(), method_name)?);
+            let default = ingest_expr(&okp.value(), VIRTUAL_FILE)
+                .map_err(|e| format!("method `{method_name}` default for `{name}`: {e}"))?;
+            names.push(Param::with_default(name, default));
+        } else {
+            return Err(format!(
+                "method `{method_name}`: unexpected keyword-parameter shape"
+            ));
+        }
+    }
+
+    // Kwargs splat: `**opts`. `**nil` explicitly forbids kwargs and has
+    // no name — skip it.
+    if let Some(krest) = params_node.keyword_rest() {
+        if let Some(krp) = krest.as_keyword_rest_parameter_node() {
+            if let Some(loc) = krp.name() {
+                names.push(Param::positional(Symbol::new(decode_utf8(loc.as_slice(), method_name)?)));
+            }
+        }
+        // NoKeywordsParameterNode (`**nil`) — skip.
+    }
+
+    // Block: `&block` — populated into `block_param` slot, not the
+    // flat list. Anonymous `&` has no name — return None.
+    let block_param = match crate::ingest::prism_api::block_parameter(&params_node) {
+        Some(block) => match block.name() {
+            Some(loc) => Some(Param::positional(Symbol::new(decode_utf8(
+                loc.as_slice(),
+                method_name,
+            )?))),
+            None => None,
+        },
+        None => None,
+    };
+
+    Ok((names, block_param))
+}
+
+fn decode_utf8<'a>(bytes: &'a [u8], method_name: &str) -> Result<&'a str, String> {
+    std::str::from_utf8(bytes)
+        .map_err(|_| format!("method `{method_name}`: param name is not UTF-8"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::expr::{ExprNode, InterpPart, Literal};
+
+    fn parse_one(src: &str) -> MethodDef {
+        let mut methods = parse_methods(src).expect("parses");
+        assert_eq!(methods.len(), 1, "expected exactly one method");
+        methods.remove(0)
+    }
+
+    /// A runtime constant spelled `Hash.new.freeze` (so CRuby gives it its
+    /// own object rather than the shared frozen `{}`) reaches the
+    /// transpiled targets as the empty Hash literal, typed as a Hash, in
+    /// both the module-constant and the class-constant views. A
+    /// `Hash.new` with a default value is a different thing and is left
+    /// alone.
+    #[test]
+    fn bare_hash_new_constant_reads_as_empty_hash_literal() {
+        let src = "class Widget\n  SHARED = {}.freeze\n  OWN = Hash.new.freeze\n  PLAIN = Hash.new\n  DEFAULTED = Hash.new(0)\nend\n";
+        let empty = |e: &Expr| matches!(&*e.node, ExprNode::Hash { entries, .. } if entries.is_empty());
+        let exprs = parse_module_constant_exprs(src).expect("parses");
+        let by_name = |n: &str| exprs.iter().find(|(k, _)| k.as_str() == n).map(|(_, v)| v).unwrap();
+        assert!(empty(by_name("SHARED")));
+        assert!(empty(by_name("OWN")), "{:?}", by_name("OWN").node);
+        assert!(empty(by_name("PLAIN")), "{:?}", by_name("PLAIN").node);
+        assert!(!empty(by_name("DEFAULTED")), "{:?}", by_name("DEFAULTED").node);
+
+        let types = parse_module_constants(src).expect("parses");
+        for name in ["SHARED", "OWN", "PLAIN"] {
+            assert!(matches!(types.get(&Symbol::from(name)), Some(Ty::Hash { .. })), "{name}: {:?}", types.get(&Symbol::from(name)));
+        }
+
+        // The class-constant view keeps the `.freeze` and rewrites its receiver.
+        let parsed = parse(b"Hash.new.freeze\n");
+        let program = parsed.node();
+        let stmt = program.as_program_node().unwrap().statements().body().iter().next().unwrap();
+        let mut class_value = ingest_expr(&stmt, VIRTUAL_FILE).expect("ingests");
+        bare_hash_new_as_literal(&mut class_value);
+        assert!(
+            matches!(&*class_value.node, ExprNode::Send { recv: Some(r), method, .. } if method.as_str() == "freeze" && empty(r)),
+            "{:?}",
+            class_value.node
+        );
+    }
+
+    #[test]
+    fn toplevel_def_is_found() {
+        let src = "def pluralize(count, word)\n  count == 1 ? \"1 #{word}\" : \"#{count} #{word}s\"\nend\n";
+        let m = parse_one(src);
+        assert_eq!(m.name.as_str(), "pluralize");
+        assert_eq!(m.receiver, MethodReceiver::Instance);
+        assert_eq!(
+            m.params.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            vec!["count", "word"]
+        );
+    }
+
+    #[test]
+    fn module_nested_def_is_found() {
+        let src = "module Inflector\n  def pluralize(count, word)\n    \"#{count} #{word}\"\n  end\nend\n";
+        let m = parse_one(src);
+        assert_eq!(m.name.as_str(), "pluralize");
+        assert_eq!(m.params.len(), 2);
+    }
+
+    #[test]
+    fn class_nested_def_is_found() {
+        let src = "class Inflector\n  def f\n    1\n  end\nend\n";
+        let m = parse_one(src);
+        assert_eq!(m.name.as_str(), "f");
+        assert!(m.params.is_empty());
+    }
+
+    #[test]
+    fn self_receiver_is_class_kind() {
+        let src = "module M\n  def self.f\n    1\n  end\nend\n";
+        let m = parse_one(src);
+        assert_eq!(m.receiver, MethodReceiver::Class);
+    }
+
+    #[test]
+    fn pluralize_body_has_conditional_shape() {
+        let src = "def pluralize(count, word)\n  count == 1 ? \"1 #{word}\" : \"#{count} #{word}s\"\nend\n";
+        let m = parse_one(src);
+
+        let (cond, then_branch, else_branch) = match *m.body.node {
+            ExprNode::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => (cond, then_branch, else_branch),
+            other => panic!("expected If at body, got {other:?}"),
+        };
+
+        // cond: count == 1
+        match *cond.node {
+            ExprNode::Send { method, .. } => assert_eq!(method.as_str(), "=="),
+            other => panic!("expected `==` send in cond, got {other:?}"),
+        }
+
+        // Then branch: "1 #{word}"
+        match *then_branch.node {
+            ExprNode::StringInterp { parts } => {
+                assert!(has_literal_text(&parts, "1 "), "then-branch missing `1 `");
+                assert!(has_expr_var(&parts, "word"), "then-branch missing `word`");
+            }
+            other => panic!("expected StringInterp in then-branch, got {other:?}"),
+        }
+
+        // Else branch: "#{count} #{word}s"
+        match *else_branch.node {
+            ExprNode::StringInterp { parts } => {
+                assert!(has_expr_var(&parts, "count"), "else-branch missing `count`");
+                assert!(has_expr_var(&parts, "word"), "else-branch missing `word`");
+                assert!(has_literal_text(&parts, "s"), "else-branch missing trailing `s`");
+            }
+            other => panic!("expected StringInterp in else-branch, got {other:?}"),
+        }
+    }
+
+    fn has_literal_text(parts: &[InterpPart], needle: &str) -> bool {
+        parts.iter().any(|p| match p {
+            InterpPart::Text { value } => value.contains(needle),
+            _ => false,
+        })
+    }
+
+    fn has_expr_var(parts: &[InterpPart], var: &str) -> bool {
+        parts.iter().any(|p| match p {
+            InterpPart::Expr { expr } => matches!(
+                &*expr.node,
+                ExprNode::Var { name, .. } if name.as_str() == var
+            ),
+            _ => false,
+        })
+    }
+
+    #[test]
+    fn multiple_defs_in_order() {
+        let src = "def a; 1; end\ndef b; 2; end\n";
+        let methods = parse_methods(src).expect("parses");
+        assert_eq!(
+            methods.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+    }
+
+    #[test]
+    fn integer_literal_body_roundtrips() {
+        let src = "def f\n  42\nend\n";
+        let m = parse_one(src);
+        assert!(matches!(
+            &*m.body.node,
+            ExprNode::Lit {
+                value: Literal::Int { value: 42 }
+            }
+        ));
+    }
+
+    #[test]
+    fn attr_reader_lowers_to_getter() {
+        let src = "class C\n  attr_reader :name\nend\n";
+        let methods = parse_methods(src).expect("parses");
+        assert_eq!(methods.len(), 1);
+        let m = &methods[0];
+        assert_eq!(m.name.as_str(), "name");
+        assert!(m.params.is_empty());
+        assert!(matches!(
+            &*m.body.node,
+            ExprNode::Ivar { name } if name.as_str() == "name"
+        ));
+    }
+
+    #[test]
+    fn attr_writer_lowers_to_setter() {
+        let src = "class C\n  attr_writer :name\nend\n";
+        let methods = parse_methods(src).expect("parses");
+        assert_eq!(methods.len(), 1);
+        let m = &methods[0];
+        assert_eq!(m.name.as_str(), "name=");
+        assert_eq!(m.params.len(), 1);
+        assert_eq!(m.params[0].name.as_str(), "value");
+    }
+
+    #[test]
+    fn attr_accessor_lowers_to_getter_and_setter() {
+        let src = "class C\n  attr_accessor :name\nend\n";
+        let methods = parse_methods(src).expect("parses");
+        assert_eq!(methods.len(), 2);
+        assert_eq!(methods[0].name.as_str(), "name");
+        assert_eq!(methods[1].name.as_str(), "name=");
+    }
+
+    #[test]
+    fn attr_accessor_multi_arg_lowers_per_attr() {
+        let src = "class C\n  attr_accessor :a, :b\nend\n";
+        let methods = parse_methods(src).expect("parses");
+        let names: Vec<_> = methods.iter().map(|m| m.name.as_str().to_string()).collect();
+        assert_eq!(names, vec!["a", "a=", "b", "b="]);
+    }
+
+    #[test]
+    fn multi_statement_body_is_sequenced() {
+        let src = "def f\n  1\n  2\nend\n";
+        let m = parse_one(src);
+        let exprs = match *m.body.node {
+            ExprNode::Seq { exprs } => exprs,
+            other => panic!("expected Seq for multi-stmt body, got {other:?}"),
+        };
+        assert_eq!(exprs.len(), 2);
+    }
+
+    #[test]
+    fn parse_error_surfaces() {
+        let err = parse_methods("def f(").unwrap_err();
+        assert!(err.contains("parse error"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn keyword_params_collected() {
+        let src = "def f(a:, b: 1)\n  1\nend\n";
+        let m = parse_one(src);
+        assert_eq!(
+            m.params.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b"],
+            "keyword param names preserved in order"
+        );
+    }
+
+    #[test]
+    fn splat_params_collected() {
+        let src = "def f(*args)\n  1\nend\n";
+        let m = parse_one(src);
+        assert_eq!(
+            m.params.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            vec!["args"]
+        );
+    }
+
+    #[test]
+    fn block_params_collected() {
+        // `&blk` rides in `MethodDef.block_param`, not the flat list —
+        // it occupies the call-site `block:` slot, never `args:`.
+        let src = "def f(&blk)\n  1\nend\n";
+        let m = parse_one(src);
+        assert!(m.params.is_empty());
+        assert_eq!(
+            m.block_param.as_ref().map(|p| p.name.as_str()),
+            Some("blk")
+        );
+    }
+
+    #[test]
+    fn optional_params_collected() {
+        let src = "def f(a = 1)\n  a\nend\n";
+        let m = parse_one(src);
+        assert_eq!(
+            m.params.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            vec!["a"]
+        );
+    }
+
+    #[test]
+    fn block_forwarding_ingests_as_var_in_send_block_slot() {
+        // `def foo(&blk); bar(&blk); end` — the def-site `&blk` lands
+        // in `MethodDef.block_param`; the call-site `&blk` ingests as
+        // `Send { method: bar, block: Some(Var("blk")) }`. The slot
+        // context (`Send.block:`) signals Proc-forward without a new
+        // IR variant. Issue #25 stage 2.
+        let src = "def foo(&blk)\n  bar(&blk)\nend\n";
+        let m = parse_one(src);
+        assert_eq!(
+            m.block_param.as_ref().map(|p| p.name.as_str()),
+            Some("blk")
+        );
+        // Body should be a Send to `bar` whose `block:` slot holds a
+        // Var referencing `blk` (not a Lambda, not an error).
+        let send = match &*m.body.node {
+            ExprNode::Send { method, block, .. } => {
+                assert_eq!(method.as_str(), "bar");
+                block.as_ref().expect("&blk forwarding produces a block expr")
+            }
+            other => panic!("expected Send in body, got {other:?}"),
+        };
+        match &*send.node {
+            ExprNode::Var { name, .. } => assert_eq!(name.as_str(), "blk"),
+            other => panic!("expected Var in Send.block:, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mixed_param_kinds_in_source_order() {
+        let src = "def f(a, b = 1, *rest, c, d:, e: 2, **opts, &blk)\n  a\nend\n";
+        let m = parse_one(src);
+        assert_eq!(
+            m.params.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b", "rest", "c", "d", "e", "opts"],
+        );
+        assert_eq!(
+            m.block_param.as_ref().map(|p| p.name.as_str()),
+            Some("blk")
+        );
+    }
+
+    #[test]
+    fn anonymous_splat_and_block_skipped() {
+        // `*` and `&` without names are positional/block anonymous
+        // forwards. No name to capture; kept out of the params list.
+        let src = "def f(a, *, &)\n  a\nend\n";
+        let m = parse_one(src);
+        assert_eq!(
+            m.params.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            vec!["a"]
+        );
+    }
+
+    #[test]
+    fn def_without_params_or_body() {
+        let src = "def f\nend\n";
+        let m = parse_one(src);
+        assert!(m.params.is_empty());
+        assert!(matches!(&*m.body.node, ExprNode::Seq { exprs } if exprs.is_empty()));
+    }
+
+    // ── parse_methods_with_rbs ──────────────────────────────────────
+
+    use crate::ty::{Param, ParamKind};
+
+    const PLURALIZE_RB: &str =
+        "module Inflector\n  def pluralize(count, word)\n    count == 1 ? \"1 #{word}\" : \"#{count} #{word}s\"\n  end\nend\n";
+    const PLURALIZE_RBS: &str =
+        "module Inflector\n  def pluralize: (Integer, String) -> String\nend\n";
+
+    #[test]
+    fn marrying_attaches_signature() {
+        let methods = parse_methods_with_rbs(PLURALIZE_RB, PLURALIZE_RBS).expect("types");
+        assert_eq!(methods.len(), 1);
+        let m = &methods[0];
+        assert_eq!(m.name.as_str(), "pluralize");
+
+        let sig = m.signature.as_ref().expect("signature attached");
+        let Ty::Fn { params, ret, .. } = sig else {
+            panic!("expected Ty::Fn, got {sig:?}");
+        };
+        assert_eq!(params.len(), 2);
+        assert_eq!(params[0].ty, Ty::Int.into());
+        assert_eq!(params[1].ty, Ty::Str.into());
+        assert_eq!(**ret, Ty::Str);
+
+        // Param kinds come from RBS (Required in this case).
+        assert!(params.iter().all(|p: &Param| p.kind == ParamKind::Required));
+    }
+
+    #[test]
+    fn ruby_param_names_coexist_with_rbs_types() {
+        // RBS has anonymous positionals; Ruby param names should survive.
+        let methods = parse_methods_with_rbs(PLURALIZE_RB, PLURALIZE_RBS).expect("types");
+        let m = &methods[0];
+        assert_eq!(
+            m.params.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            vec!["count", "word"]
+        );
+    }
+
+    #[test]
+    fn ruby_method_missing_signature_errors() {
+        let ruby = "def foo\n  1\nend\n";
+        let rbs = "module M\nend\n";
+        let err = parse_methods_with_rbs(ruby, rbs).unwrap_err();
+        assert!(
+            err.contains("foo") && err.contains("no matching RBS"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn orphan_rbs_signature_errors() {
+        let ruby = "def foo\n  1\nend\n";
+        let rbs = "module M\n  def foo: () -> Integer\n  def bar: () -> String\nend\n";
+        let err = parse_methods_with_rbs(ruby, rbs).unwrap_err();
+        assert!(
+            err.contains("no matching Ruby method") && err.contains("bar"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn arity_mismatch_errors() {
+        let ruby = "def f(a, b)\n  1\nend\n";
+        let rbs = "module M\n  def f: (Integer) -> Integer\nend\n";
+        let err = parse_methods_with_rbs(ruby, rbs).unwrap_err();
+        assert!(
+            err.contains("2 positional param") && err.contains("RBS has 1"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn multi_method_marrying_preserves_ruby_order() {
+        let ruby = "module M\n  def b\n    1\n  end\n  def a\n    \"x\"\n  end\nend\n";
+        let rbs = "module M\n  def a: () -> String\n  def b: () -> Integer\nend\n";
+        let methods = parse_methods_with_rbs(ruby, rbs).expect("types");
+        // Ruby order: b, a
+        assert_eq!(
+            methods.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
+            vec!["b", "a"]
+        );
+        // And each has its own signature.
+        let b_sig = methods[0].signature.as_ref().unwrap();
+        let a_sig = methods[1].signature.as_ref().unwrap();
+        assert!(matches!(b_sig, Ty::Fn { ret, .. } if **ret == Ty::Int));
+        assert!(matches!(a_sig, Ty::Fn { ret, .. } if **ret == Ty::Str));
+    }
+
+    #[test]
+    fn empty_ruby_and_empty_rbs_yields_empty() {
+        let methods = parse_methods_with_rbs("", "").expect("types");
+        assert!(methods.is_empty());
+    }
+
+    #[test]
+    fn ruby_parse_error_surfaces_through_marrying() {
+        let err = parse_methods_with_rbs("def f(", "module M\nend\n").unwrap_err();
+        assert!(err.contains("parse error"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn rbs_parse_error_surfaces_through_marrying() {
+        let err = parse_methods_with_rbs("", "class { end").unwrap_err();
+        assert!(!err.is_empty());
+    }
+
+    // ── body-typer integration ──────────────────────────────────────
+
+    fn find_var_ty(e: &crate::expr::Expr, name: &str) -> Option<Ty> {
+        // Walk the tree looking for `Var { name }` and return its `.ty`.
+        match &*e.node {
+            ExprNode::Var { name: n, .. } if n.as_str() == name => e.ty.clone(),
+            ExprNode::If { cond, then_branch, else_branch } => find_var_ty(cond, name)
+                .or_else(|| find_var_ty(then_branch, name))
+                .or_else(|| find_var_ty(else_branch, name)),
+            ExprNode::Send { recv, args, .. } => {
+                if let Some(r) = recv {
+                    if let Some(t) = find_var_ty(r, name) {
+                        return Some(t);
+                    }
+                }
+                args.iter().find_map(|a| find_var_ty(a, name))
+            }
+            ExprNode::StringInterp { parts } => parts.iter().find_map(|p| match p {
+                crate::expr::InterpPart::Expr { expr } => find_var_ty(expr, name),
+                _ => None,
+            }),
+            ExprNode::Seq { exprs } => exprs.iter().find_map(|e| find_var_ty(e, name)),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn body_typer_populates_param_refs_with_signature_types() {
+        let methods = parse_methods_with_rbs(PLURALIZE_RB, PLURALIZE_RBS).expect("types");
+        let m = &methods[0];
+        // `count` is used in the cond (`count == 1`) and in the else-branch
+        // interpolation (`"#{count} ..."`); both should resolve to Int.
+        assert_eq!(find_var_ty(&m.body, "count"), Some(Ty::Int));
+        // `word` is used in both branches; should resolve to Str.
+        assert_eq!(find_var_ty(&m.body, "word"), Some(Ty::Str));
+    }
+
+    #[test]
+    fn body_typer_populates_literal_and_interp_types() {
+        let methods = parse_methods_with_rbs(PLURALIZE_RB, PLURALIZE_RBS).expect("types");
+        let m = &methods[0];
+        // The If as a whole unions its branches (both StringInterp → Str).
+        assert_eq!(m.body.ty.as_ref(), Some(&Ty::Str));
+    }
+
+    /// Declared `-> Hash[Symbol, String]` must stamp a bare `{}` return
+    /// so Crystal emit renders `{} of Symbol => String`, not the
+    /// String=>String empty-hash default (FV compare-extra crystal:
+    /// `default_url_options` on ActionController::Base).
+    #[test]
+    fn rbs_return_stamps_empty_hash_on_default_url_options() {
+        let ruby = include_bytes!("../runtime/ruby/action_controller/base.rb");
+        let rbs = include_str!("../runtime/ruby/action_controller/base.rbs");
+        let classes = parse_library_with_rbs(ruby, rbs, "action_controller/base.rb")
+            .expect("action_controller/base parses and types");
+        let base = classes
+            .iter()
+            .find(|c| c.name.0.as_str() == "ActionController::Base")
+            .expect("Base class");
+        let m = base
+            .methods
+            .iter()
+            .find(|m| m.name.as_str() == "default_url_options")
+            .expect("default_url_options");
+        match m.body.ty.as_ref() {
+            Some(Ty::Hash { key, value }) => {
+                assert!(
+                    matches!(key.as_ref(), Ty::Sym),
+                    "expected Hash[Symbol, _], key={key:?}"
+                );
+                assert!(
+                    matches!(value.as_ref(), Ty::Str),
+                    "expected Hash[_, String], value={value:?}"
+                );
+            }
+            other => panic!("default_url_options body must be Hash[Symbol, String], got {other:?}"),
+        }
+        // End-to-end Crystal emit (the FV failure surface): annotation
+        // and empty-hash `of` clause must agree on Symbol keys.
+        let crystal = crate::emit::crystal::emit_library_class(base)
+            .expect("Crystal emit of ActionController::Base");
+        let needle = "def default_url_options : Hash(Symbol, String)";
+        let idx = crystal
+            .find(needle)
+            .unwrap_or_else(|| panic!("missing `{needle}` in Crystal emit"));
+        let window = &crystal[idx..crystal.len().min(idx + 200)];
+        assert!(
+            window.contains("{} of Symbol => String"),
+            "Crystal empty-hash return must match declared Hash(Symbol, String):\n{window}"
+        );
+        assert!(
+            !window.contains("{} of String => String"),
+            "Crystal must not emit String-keyed empty hash for default_url_options:\n{window}"
+        );
+    }
+
+    /// RBS `@keys`/`@vals` must stamp empty `[]` initializers so
+    /// Go/Kotlin/C#/Swift emit typed slices/lists, not `interface{}`/`Any?`.
+    #[test]
+    fn rbs_ivar_decls_stamp_empty_array_initializers() {
+        let ruby = include_bytes!("../runtime/ruby/action_controller/base.rb");
+        let rbs = include_str!("../runtime/ruby/action_controller/base.rbs");
+        let classes = parse_library_with_rbs(ruby, rbs, "action_controller/base.rb")
+            .expect("action_controller/base parses and types");
+        let hs = classes
+            .iter()
+            .find(|c| c.name.0.as_str() == "ActionController::HeaderStore")
+            .expect("HeaderStore class");
+        let init = hs
+            .methods
+            .iter()
+            .find(|m| m.name.as_str() == "initialize")
+            .expect("initialize");
+        fn ivar_assign_ty<'a>(e: &'a crate::expr::Expr, name: &str) -> Option<&'a Ty> {
+            use crate::expr::{ExprNode, LValue};
+            match &*e.node {
+                ExprNode::Assign {
+                    target: LValue::Ivar { name: n },
+                    value,
+                } if n.as_str() == name => value.ty.as_ref(),
+                ExprNode::Seq { exprs } => exprs.iter().find_map(|x| ivar_assign_ty(x, name)),
+                _ => None,
+            }
+        }
+        match ivar_assign_ty(&init.body, "keys") {
+            Some(Ty::Array { elem }) => assert!(
+                matches!(elem.as_ref(), Ty::Str),
+                "expected Array[String], got Array[{elem:?}]"
+            ),
+            other => panic!("@keys = [] must carry Array[String], got {other:?}"),
+        }
+        match ivar_assign_ty(&init.body, "vals") {
+            Some(Ty::Array { elem }) => assert!(
+                matches!(elem.as_ref(), Ty::Str),
+                "expected Array[String], got Array[{elem:?}]"
+            ),
+            other => panic!("@vals = [] must carry Array[String], got {other:?}"),
+        }
+    }
+}

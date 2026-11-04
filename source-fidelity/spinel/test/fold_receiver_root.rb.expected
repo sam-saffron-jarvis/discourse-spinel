@@ -1,0 +1,18 @@
+hash map n=40 out=40
+hash collect n=40 out=40
+hash select n=40 out=40
+hash filter n=40 out=40
+hash reject n=40 out=40
+hash select local n=40 out=40
+hash transform_keys n=40 out=40 first=K1
+hash transform_values n=40 out=40 first=V1
+array min_by n=40 out=a1
+array max_by n=40 out=a9
+array minmax_by n=40 out=["a1", "a9"]
+array group_by n=40 out=40
+array grep n=40 out=40
+array grep_v n=40 out=40
+hash each_with_object n=40 out=40
+array each_with_object n=40 out=40
+array each_with_object local n=40 out=40
+array partition n=40 out=40

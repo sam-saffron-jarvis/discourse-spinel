@@ -1,0 +1,61 @@
+# Spinel-subset compliance gate. Single cop: Spinel/Unsupported
+# (rubocop_spinel) — bans the surface spinel rejects (eval,
+# class_eval, method_missing, extend, module_function, Thread/Mutex,
+# bare `send`, `class << self`, etc.) that CRuby silently accepts.
+#
+# Copied verbatim into the toolchain-spinel scratch dir (alongside
+# scaffold/, runtime/, and the lowered emit) by spinel_toolchain.rs.
+# `bundle exec rubocop` from the scratch root then lints the entire
+# shipped tree, catching both source drift in runtime/ruby/ and
+# lowering bugs in emit_spinel output.
+#
+# Run locally:
+#   cargo test --test spinel_toolchain -- --ignored --nocapture
+#   cd $TMPDIR/roundhouse-spinel-real-blog && bundle exec rubocop
+
+plugins:
+  - rubocop_spinel
+
+AllCops:
+  TargetRubyVersion: 3.3
+  NewCops: disable
+  DisabledByDefault: true
+  Exclude:
+    # vendor/bundle/ contains rubocop_spinel's own .rubocop.yml
+    # (used for linting the gem's own source — declares
+    # `plugins: [standard-custom, standard-performance,
+    # rubocop-performance]`). When CI's bundler-cache: true vendors
+    # gems into scaffold/vendor/bundle/, the toolchain test copies
+    # that into the scratch tree; rubocop walks up from files inside
+    # the gem dir, finds the gem's config, and tries to require
+    # standard-custom (which isn't in our bundle). Excluding
+    # vendor/ keeps lint scope to our shipped tree only. Standard
+    # rubocop idiom; node_modules/ and tmp/ also excluded by
+    # convention even though we don't use them today.
+    - vendor/**/*
+    - node_modules/**/*
+    - tmp/**/*
+    # Test bootstrap. The `Object.constants` + `Object.const_get` scan
+    # in FixtureLoader.load_all! has been replaced at emit time by
+    # explicit `<X>Fixtures._fixtures_load!` calls (see
+    # `src/emit/ruby.rs::render_test_helper`); the source file keeps
+    # the scan as a CRuby-only fallback for source-side framework_ruby
+    # _tests_pass. The remaining 4 `eval(string)` calls in
+    # assert_difference / assert_no_difference are still real subset
+    # violations — fix needs the helper to take a block / lambda
+    # instead of a string expression (changes every emit site that
+    # uses these assertions). Tracked as follow-up.
+    - test/test_helper.rb
+    # active_record/base.rb uses the idiomatic
+    # `class << self; attr_accessor :adapter` pattern. Spinel itself
+    # accepts this (matz/spinel#126); rubocop_spinel 0.1.0 doesn't
+    # yet have the allowance — refactoring to explicit `def self.x`
+    # accessors broke the TS emitter (which treats attr_accessor
+    # call sites as property access, def self.x as method call,
+    # and the two diverged). Excluded until rubocop_spinel publishes
+    # the singleton-accessor allowance OR the TS emitter is taught
+    # to handle both shapes uniformly.
+    - runtime/active_record/base.rb
+
+Spinel/Unsupported:
+  Enabled: true

@@ -1,0 +1,8 @@
+[:new_anon, 1]
+[:new_named, 2]
+[:anon_super, 3]
+[:named_super, 4]
+[:zsuper, 5]
+[:paren_super, 6]
+:no_block
+:no_block

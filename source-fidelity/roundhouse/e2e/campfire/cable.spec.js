@@ -1,0 +1,175 @@
+import { test, expect } from '@playwright/test'
+import { signIn, watchForFailures, triage, report } from './helpers.js'
+
+// THE MILESTONE, IN A BROWSER: two tabs, one room, one live message.
+//
+// This is the browser port of `scripts/campfire-cable-drive.rb` — the
+// cable walk. That script drives two raw WebSockets with a hand-built
+// subscribe frame and reads the turbo-stream payload off the wire; this
+// drives campfire's OWN client, and asserts the outcome the wire was
+// carrying. Neither replaces the other, and the split is deliberate:
+//
+//   - The walk can assert things a browser cannot see — that the frame
+//     echoes the subscription identifier byte for byte, that the payload
+//     is an `append` rather than a `replace`. It also fails with a much
+//     better diagnosis, because it names the frame that was wrong.
+//   - This spec can assert the thing the walk cannot: that campfire's
+//     own JavaScript — Turbo, Stimulus, the cable consumer, ninety-five
+//     ES modules loaded from `static/assets/` — actually boots and does
+//     the right thing with what arrives. A walk that is green while
+//     Turbo never loaded is a walk that proves the server half only.
+//
+// WHY THE ARCHIVE SHIPS THIS ONE AND NOT THE WALK. The walk is Ruby, and
+// needs `websocket-driver` and `net/http`. A downloader of the published
+// archive has spinel, a C compiler and Node — no Ruby, and no gems. The
+// browser is the only driver the archive can assume.
+//
+// Mapping onto the walk's checks, so a change to one can be reflected in
+// the other:
+//
+//   walk check                                   | here
+//   ---------------------------------------------+-------------------------
+//   the account has a session cookie             | signIn's landing assertion
+//   GET /rooms/1                                 | goto + response check
+//   the room page carries a stream source        | the locator below
+//   the page names the app's own channel         | the channel attribute
+//   both connections are welcomed                | [connected] on both tabs
+//   both subscriptions are confirmed             | [connected] on both tabs
+//   POST /rooms/1/messages                       | submitting the composer
+//   connection A receives the broadcast          | the message in tab A
+//   connection B receives the broadcast          | the message in tab B
+//   it is an append to the room's message list   | asserted INSIDE the messages list
+//   it carries the message that was posted       | the body text
+//   the frame echoes the subscription identifier | NOT OBSERVABLE — walk only
+//   the stock channel refuses the stream         | cable_guard.spec.js
+//
+// `--unsigned` is expected in the stream name: the emitted tree mints
+// unsigned stream names on purpose (the guard, not the signature, is what
+// authorizes a subscribe — see cable_guard.spec.js).
+
+// Unique per run: the archive database persists across runs, and an
+// exactly-once assertion against a repeated literal would count the
+// previous run's rows.
+const BODY = `hello from the cable spec ${Date.now()}`
+
+// Playwright's default is 30s for a whole test, and this one does more
+// than any other in the suite: two sign-ins (the first of which completes
+// campfire's first-run form and creates the account, the user and the
+// room), two room loads of ~130 subresources each, two subscription
+// waits, and a Trix interaction. The default is not a meaningful budget
+// for that, and blowing it reports as "browserContext.close: Test ended"
+// pointing at the cleanup line — which says nothing about what was slow.
+test.setTimeout(90_000)
+
+// THE MILESTONE, ACTIVE. This spec spent its first day as `test.fixme`
+// over two defects it found itself: a ~30s second-client stall (a
+// truncated /account/logo response the browser waited out — closed
+// 2026-08-31) and the empty message body (the safe-list sanitizer was
+// a raising façade behind campfire's `rescue Exception`, and Trix
+// always submits HTML — closed the same day, twice: the sanitizer
+// port, then the `h()` escape-exemption for the filter chain's
+// product). The scripts/smoke campfire floor rose 3 -> 4 with this
+// marker's removal; if this spec ever stops executing, that floor is
+// what notices.
+test('a message posted in one tab arrives live in another', async ({ browser }) => {
+  // Two independent contexts, not two pages in one — separate cookie
+  // jars and separate cable connections, which is what "a second
+  // connection" means in the milestone. Two pages in one context can
+  // share a connection and would prove less.
+  const contextA = await browser.newContext()
+  const contextB = await browser.newContext()
+  const pageA = await contextA.newPage()
+  const pageB = await contextB.newPage()
+
+  const findingsA = watchForFailures(pageA)
+
+  try {
+    // Tab A signs in first: on a fresh archive database this is the
+    // /first_run POST that creates the account, the user and room 1, so
+    // it must complete before B tries to sign in.
+    await signIn(pageA)
+    await signIn(pageB)
+
+    const responseA = await pageA.goto('/rooms/1')
+    expect(responseA?.status(), 'GET /rooms/1').toBe(200)
+    await pageB.goto('/rooms/1')
+
+    // The room page carries a stream source, and it names the app's OWN
+    // channel. campfire routes the subscription away from the stock
+    // Turbo::StreamsChannel deliberately; if this attribute ever reads
+    // `Turbo::StreamsChannel`, the guard in cable_guard.spec.js is being
+    // bypassed rather than enforced.
+    const source = pageA.locator('turbo-cable-stream-source').first()
+    await expect(source).toBeAttached()
+    await expect(source).toHaveAttribute('channel', 'RoomMessagesChannel')
+
+    // `connected` is set by Turbo's own cable consumer once the socket
+    // is open AND the subscription is confirmed — the browser-visible
+    // equivalent of the walk's "welcomed" plus "confirmed" pair.
+    for (const [name, page] of [['A', pageA], ['B', pageB]]) {
+      await expect(
+        page.locator('turbo-cable-stream-source[connected]').first(),
+        `tab ${name} subscribed to the room stream`,
+      ).toBeAttached({ timeout: 20_000 })
+    }
+
+    // Post through the real composer. The editor is a custom element
+    // either way — Lexxy's contenteditable since campfire's Lexxy merge
+    // (the element campfire's own system tests drive), Trix's before —
+    // so it takes focus + typed keys; `fill()` would target the wrong
+    // node and submit an empty body while looking like it worked.
+    await pageA
+      .locator('lexxy-editor#message_body .lexxy-editor__content, trix-editor#message_body')
+      .first()
+      .click()
+    await pageA.keyboard.type(BODY)
+    await pageA.locator('button[name="send"]').click()
+
+    // The assertion is scoped INSIDE the room's message list, which is
+    // what makes it the "append to the room's message list" check rather
+    // than "the text appears somewhere on the page".
+    // `[id^="messages_"]`, not a literal id: the list is named by
+    // dom_id(room, :messages), and room 1 is an STI Rooms::Open — the
+    // element is `messages_rooms_open_1` now that dom_prefix
+    // dispatches on the type column, exactly as it is on Rails.
+    // Hardcoding either spelling would re-couple this spec to a
+    // divergence the comparator retired.
+    const list = '[id^="messages_"]'
+    await expect(
+      pageB.locator(list),
+      'tab B received the broadcast',
+    ).toContainText(BODY, { timeout: 20_000 })
+    await expect(
+      pageA.locator(list),
+      'tab A received the broadcast',
+    ).toContainText(BODY, { timeout: 20_000 })
+
+    // …and holds it EXACTLY ONCE. The sender's page minted an
+    // optimistic client-side echo whose dom id is the
+    // client_message_id (campfire's Message#to_key), and the broadcast
+    // row now carries the SAME id — so Turbo's append replaces the
+    // echo. Two rows here is the broadcast-row-identity divergence
+    // come back (docs/pipeline/runtime.md § Broadcast row identity).
+    await expect(
+      pageA.locator(`${list} .message`).filter({ hasText: BODY }),
+      "the sender's tab shows the message exactly once",
+    ).toHaveCount(1)
+
+    // REPORTED, NOT ASSERTED. A live message that arrived over a page
+    // whose modules 404'd is worth knowing about, so the findings are
+    // printed — but asserting on them here would make the MILESTONE spec
+    // fail for a reason assets.spec.js already owns, and the walk's own
+    // milestone/ledger split exists to stop exactly that. One spec, one
+    // claim: this one says the message arrived.
+    const { open } = triage([
+      ...findingsA.responses, ...findingsA.failed,
+      ...findingsA.console, ...findingsA.errors,
+    ])
+    if (open.length) {
+      console.log(`note: the room page reported failures (see assets.spec.js):\n${report(findingsA)}`)
+    }
+  } finally {
+    await contextA.close()
+    await contextB.close()
+  }
+})

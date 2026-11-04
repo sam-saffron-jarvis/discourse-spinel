@@ -1,0 +1,13 @@
+
+class Item
+  def id: () -> Integer?
+end
+
+class Rel
+  def to_a: () -> Array[untyped]
+  def map: () { (untyped) -> untyped } -> untyped
+end
+
+class Room
+  def user_ids: () -> Array[Integer]
+end

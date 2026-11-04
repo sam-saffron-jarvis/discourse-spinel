@@ -1,0 +1,9 @@
+[false, false, false]
+false
+true
+true
+"a-b"
+"ab"
+"a-b"
+"no implicit conversion of Integer into String"
+"no implicit conversion of Float into String"

@@ -1,0 +1,386 @@
+//! `Ty::Relation` producer + dispatch coverage (relation-type-plan
+//! R3/R4): scope calls and relation-returning class methods type as
+//! `Relation { of }`, chains preserve the representation, terminals
+//! produce exactly the types the Array representation produces, and
+//! class-side delegation resolves scopes on relation receivers.
+//!
+//! Inline MapVfs app so the fixture stays next to the assertions —
+//! tiny-blog/real-blog deliberately keep their emit-stable shapes.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+use roundhouse::analyze::Analyzer;
+use roundhouse::expr::ExprNode;
+use roundhouse::ingest::ingest_app_from_tree;
+use roundhouse::ty::Ty;
+use roundhouse::{ClassId, Symbol};
+
+fn tree(files: &[(&str, &str)]) -> HashMap<PathBuf, Vec<u8>> {
+    files
+        .iter()
+        .map(|(p, c)| (PathBuf::from(p), c.as_bytes().to_vec()))
+        .collect()
+}
+
+/// One app exercising every producer/consumer pair under test.
+fn analyzed_app() -> roundhouse::App {
+    let mut app = ingest_app_from_tree(tree(&[
+        (
+            "db/schema.rb",
+            r#"ActiveRecord::Schema.define do
+  create_table "stories", force: :cascade do |t|
+    t.string "title", null: false
+    t.integer "score", null: false
+    t.integer "user_id", null: false
+  end
+  create_table "comments", force: :cascade do |t|
+    t.text "body", null: false
+    t.integer "story_id", null: false
+  end
+end
+"#,
+        ),
+        (
+            "app/models/comment.rb",
+            r#"class Comment < ApplicationRecord
+  belongs_to :story
+end
+"#,
+        ),
+        (
+            "app/models/story/pagination.rb",
+            r#"module Story::Pagination
+  extend ActiveSupport::Concern
+
+  PAGE_SIZE = 40
+
+  included do
+    scope :ordered, -> { order(:score) }
+    scope :last_page, -> { ordered.last(PAGE_SIZE) }
+    scope :first_page, -> { ordered.first(PAGE_SIZE) }
+    scope :before, ->(story) { where("score < ?", story.score) }
+    scope :page_before, ->(story) { before(story).last_page }
+  end
+
+  class_methods do
+    def page_around(story)
+      page_before(story) + [ story ] + first_page
+    end
+  end
+end
+"#,
+        ),
+        (
+            "app/models/story.rb",
+            r#"class Story < ApplicationRecord
+  include Pagination
+  has_many :comments
+  scope :recent, -> { order(score: :desc).limit(10) }
+  scope :banged, -> { where!(score: 1).order!(:score) }
+  scope :bare_reload, -> { reload }
+  scope :reloaded, -> { where(score: 1).reload }
+  scope :top, -> { recent.where("score > 0") }
+  scope :titles_only, -> { pluck(:title) }
+  scope :filtered, ->(uid) { uid ? where(user_id: uid) : all }
+
+  def self.for_user(user_id)
+    where(user_id: user_id)
+  end
+
+  def self.best_title
+    order(score: :desc).first
+  end
+end
+"#,
+        ),
+        (
+            "app/controllers/stories_controller.rb",
+            r#"class StoriesController < ApplicationController
+  def index
+    @relation = Story.recent
+    @banged = Story.banged
+    @bare_reload = Story.bare_reload
+    @reloaded = Story.reloaded
+    @chained = Story.recent.where(user_id: 1)
+    @delegated = Story.recent.for_user(1)
+    @first = Story.recent.first
+    @first_n = Story.recent.first(3)
+    @last_n = Story.recent.last(100)
+    @class_last_n = Story.last(5)
+    @array_first_n = Story.recent.to_a.first(2)
+    @count = Story.recent.count
+    @list = Story.recent.to_a
+    @classm = Story.for_user(1)
+    @scope_on_scope = Story.top
+    @terminal_scope = Story.titles_only
+    @mixed = Story.filtered(1).recent
+    @last_page = Story.recent.last_page
+    @page_before = Story.recent.page_before(Story.first)
+    @page_around = Story.page_around(Story.first)
+    @found_one = Story.recent.find(2)
+    @found_many = Story.recent.find([3, 1])
+    @found_normalized = Story.recent.find(Array(params[:id]))
+    @found_array_repr = Story.filtered(1).find([3, 1])
+  end
+
+  def build_probe
+    story = Story.find(params[:id])
+    @built = story.comments.build
+  end
+end
+"#,
+        ),
+        (
+            "config/routes.rb",
+            r#"Rails.application.routes.draw do
+  get "/stories", to: "stories#index", as: :stories
+end
+"#,
+        ),
+        (
+            "app/views/stories/index.html.erb",
+            "<% @list.each do |story| %><%= story.title %><% end %>\n",
+        ),
+    ]))
+    .expect("ingest");
+    Analyzer::new(&app).analyze(&mut app);
+    app
+}
+
+/// `index`'s body is a Seq of ivar assigns; return the value type of
+/// the assignment to `@name`.
+fn ivar_ty(app: &roundhouse::App, name: &str) -> Ty {
+    let index = app.controllers[0]
+        .actions()
+        .find(|a| a.name.as_str() == "index")
+        .expect("index action");
+    let ExprNode::Seq { exprs } = &*index.body.node else {
+        panic!("expected Seq body");
+    };
+    for e in exprs {
+        if let ExprNode::Assign { target, value } = &*e.node {
+            if format!("{target:?}").contains(name) {
+                return value.ty.clone().unwrap_or_else(|| {
+                    panic!("no ty on the @{name} assignment value")
+                });
+            }
+        }
+    }
+    panic!("no assignment to @{name} found");
+}
+
+fn story() -> ClassId {
+    ClassId(Symbol::from("Story"))
+}
+
+fn relation_of_story() -> Ty {
+    Ty::Relation { of: story() }
+}
+
+#[test]
+fn scope_call_types_as_relation() {
+    let app = analyzed_app();
+    assert_eq!(ivar_ty(&app, "relation"), relation_of_story());
+}
+
+#[test]
+fn bang_builder_alias_scope_types_as_relation() {
+    // `where!` / `order!` are catalog aliases of builders. The scope
+    // seed has to read the same names the chain lowerer does, or a
+    // body that lowers onto `__rel` is still declared `Array[Story]`.
+    let app = analyzed_app();
+    assert_eq!(ivar_ty(&app, "banged"), relation_of_story());
+}
+
+#[test]
+fn relation_reload_continues_a_builder_chain() {
+    // `reload` is a Relation builder and an Instance read. A bare
+    // `reload` is the instance method. `where(…).reload` is the
+    // relation hop and keeps the relation type.
+    let app = analyzed_app();
+    let stories = Ty::Array {
+        elem: std::sync::Arc::new(Ty::Class { id: story(), args: vec![].into() }),
+    };
+    assert_eq!(ivar_ty(&app, "bare_reload"), stories);
+    assert_eq!(ivar_ty(&app, "reloaded"), relation_of_story());
+}
+
+#[test]
+fn builder_chain_preserves_relation() {
+    let app = analyzed_app();
+    assert_eq!(ivar_ty(&app, "chained"), relation_of_story());
+}
+
+#[test]
+fn class_side_scope_delegates_on_relation_receiver() {
+    // `Story.recent.for_user(1)` — `for_user` is a class method whose
+    // body tail is a builder chain; it must resolve on the relation
+    // receiver and keep the relation representation.
+    let app = analyzed_app();
+    assert_eq!(ivar_ty(&app, "delegated"), relation_of_story());
+}
+
+#[test]
+fn relation_terminals_produce_array_representation_types() {
+    // Settled decision: terminal result types must not change.
+    let app = analyzed_app();
+    assert_eq!(
+        ivar_ty(&app, "first"),
+        Ty::Union {
+            variants: vec![Ty::Class { id: story(), args: vec![].into() }, Ty::Nil].into()
+        },
+    );
+    assert_eq!(ivar_ty(&app, "count"), Ty::Int);
+    assert_eq!(
+        ivar_ty(&app, "list"),
+        Ty::Array { elem: std::sync::Arc::new(Ty::Class { id: story(), args: vec![].into() }) },
+    );
+}
+
+#[test]
+fn counted_first_and_last_type_as_arrays() {
+    // `first(n)` / `last(n)` answer an Array of up to n records on a
+    // relation, a model class and a plain Array alike; only the bare
+    // form is `elem | nil`. campfire's `reachable_messages.search(q)
+    // .last(100)` was typed as one `Message?` and the controller ivar
+    // then disagreed with the `Array[Message]` the view declares.
+    let app = analyzed_app();
+    let stories = Ty::Array { elem: std::sync::Arc::new(Ty::Class { id: story(), args: vec![].into() }) };
+    assert_eq!(ivar_ty(&app, "first_n"), stories);
+    assert_eq!(ivar_ty(&app, "last_n"), stories);
+    assert_eq!(ivar_ty(&app, "class_last_n"), stories);
+    assert_eq!(ivar_ty(&app, "array_first_n"), stories);
+}
+
+#[test]
+fn counted_last_with_a_constant_count_types_as_array_through_a_scope() {
+    // campfire's `Message::Pagination`: `scope :last_page, -> {
+    // ordered.last(PAGE_SIZE) }` with `PAGE_SIZE` a concern constant,
+    // and `page_around` concatenating two pages with `[ message ]`.
+    // Every `@messages` in the app is one of these, and the union the
+    // analyzer carried — `Array[Message] | Message | nil` — left the
+    // `collection:` render of the message partial with an untyped
+    // local, N+1 chains through it opaque, and the room page's own
+    // partial unreachable to the dead-view walk.
+    let app = analyzed_app();
+    let stories = Ty::Array { elem: std::sync::Arc::new(Ty::Class { id: story(), args: vec![].into() }) };
+    assert_eq!(ivar_ty(&app, "last_page"), stories);
+    assert_eq!(ivar_ty(&app, "page_before"), stories);
+    assert_eq!(ivar_ty(&app, "page_around"), stories);
+}
+
+#[test]
+fn relation_returning_class_method_types_as_relation() {
+    // `Story.for_user(1)` — a class method whose body tail is a
+    // builder chain declares `Relation { of: Story }` to callers.
+    let app = analyzed_app();
+    assert_eq!(ivar_ty(&app, "classm"), relation_of_story());
+}
+
+#[test]
+fn scope_rooted_at_sibling_scope_types_as_relation() {
+    // `scope :top, -> { recent.where(...) }` — a scope rooted at a
+    // sibling scope call still seeds the relation type.
+    let app = analyzed_app();
+    assert_eq!(ivar_ty(&app, "scope_on_scope"), relation_of_story());
+}
+
+#[test]
+fn relation_typed_scope_delegates_on_array_representation_receiver() {
+    // Mixed-representation chain. C1 converged class-side chain
+    // starts (`Story.where(...)`) onto the Relation representation,
+    // so this pins the seam that C1 did NOT close: a scope whose
+    // body the seed classifier can't read (`filtered`'s ternary)
+    // still falls back to `Array<Story>`, and `.recent` — a scope
+    // whose seed carries the Relation representation — must still
+    // delegate on it, preserving the RECEIVER's representation:
+    // `Array<Story>`, not Var. This is exactly the Mastodon
+    // `Account.with_username(u).with_domain(d)` regression (CI
+    // browser-smoke-ide) in its original shape: the unflipped
+    // ternary-body scope keeps the chain on the Array
+    // representation, and the flipped scope's hop poisoned it to
+    // Var → Untyped. Retire this test only when the scope-seed
+    // fallback itself converges.
+    let app = analyzed_app();
+    assert_eq!(
+        ivar_ty(&app, "mixed"),
+        Ty::Array { elem: std::sync::Arc::new(Ty::Class { id: story(), args: vec![].into() }) },
+    );
+}
+
+#[test]
+fn terminal_tailed_scope_keeps_legacy_array_seed() {
+    // Conservative NON-flip: `scope :titles_only, -> { pluck(:title) }`
+    // ends in a terminal, so the classifier must refuse the Relation
+    // seed and the legacy `Array<Self>` stand-in stays.
+    let app = analyzed_app();
+    assert_eq!(
+        ivar_ty(&app, "terminal_scope"),
+        Ty::Array { elem: std::sync::Arc::new(Ty::Class { id: story(), args: vec![].into() }) },
+    );
+}
+
+#[test]
+fn assoc_collection_build_rewrites_to_fk_preset_constructor() {
+    // Ruby-lane lowering (relation-type-plan R5): `story.comments
+    // .build` on a TYPED owner rewrites to the target constructor
+    // with the association preset — `Comment.new(story: story)`, the
+    // owner handed to the automatic inverse `belongs_to :story` as
+    // Rails sets it (its writer presets the FK) — instead of calling
+    // `build` on the folded Array reader. Owner typing is what
+    // disambiguates assoc names declared on several models.
+    let app = analyzed_app();
+    let controllers = roundhouse::emit::ruby::emit_lowered_controllers(&app);
+    let src: String = controllers
+        .iter()
+        .map(|f| f.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        src.contains("Comment.new(story: story)"),
+        "expected FK-preset constructor rewrite in emitted controller:\n{src}",
+    );
+}
+
+#[test]
+fn view_iteration_over_materialized_list_still_types_element() {
+    // `@list` is `Array<Story>` (to_a terminal); the view's
+    // `@list.each { |story| story.title }` must type `story.title`
+    // as the column's String — proves block-param typing survives
+    // the relation-typed chain upstream.
+    let app = analyzed_app();
+    let view = app
+        .views
+        .iter()
+        .find(|v| v.name.as_str().contains("index"))
+        .expect("index view");
+    let mut found_title_str = false;
+    fn walk(e: &roundhouse::expr::Expr, found: &mut bool) {
+        if let ExprNode::Send { method, recv, .. } = &*e.node {
+            if method.as_str() == "title"
+                && matches!(
+                    recv.as_ref().and_then(|r| r.ty.as_ref()),
+                    Some(Ty::Class { id, .. }) if id.0.as_str() == "Story"
+                )
+                && e.ty == Some(Ty::Str)
+            {
+                *found = true;
+            }
+        }
+        e.node.for_each_child(&mut |c| walk(c, found));
+    }
+    walk(&view.body, &mut found_title_str);
+    assert!(found_title_str, "story.title should type as Str in the view");
+}
+
+#[test]
+fn find_result_depends_on_the_id_container() {
+    let app = analyzed_app();
+    let record = Ty::Class { id: story(), args: vec![].into() };
+    assert_eq!(ivar_ty(&app, "found_one"), record);
+    let records = Ty::Array { elem: std::sync::Arc::new(record) };
+    assert_eq!(ivar_ty(&app, "found_many"), records);
+    assert_eq!(ivar_ty(&app, "found_normalized"), records);
+    assert_eq!(ivar_ty(&app, "found_array_repr"), records);
+}

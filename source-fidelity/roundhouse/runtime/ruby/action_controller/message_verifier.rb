@@ -1,0 +1,489 @@
+# frozen_string_literal: true
+# ActiveSupport::MessageVerifier, reproduced at the wire level.
+#
+# This exists so a signed cookie the emitted app mints is one the
+# reference Rails accepts, and vice versa. That matters twice: the
+# differential test boots both and sends one cookie to each, and a real
+# migration keeps every session and every signed id already in the wild
+# (campfire puts `signed_id`s in URLs — `avatar_token` on every message).
+#
+# The format, measured against ActiveSupport 8.2 rather than inferred:
+#
+#   cookie  = strict_base64(envelope) + "--" + hex_digest
+#   digest  = HMAC(derived_key, strict_base64(envelope))
+#   key     = PBKDF2-HMAC-SHA256(secret_key_base, salt, 1_000, 64)
+#
+# TWO ENVELOPES, and which one a caller gets depends on its verifier's
+# serializer rather than on anything the caller says:
+#
+#   signed cookie  {"_rails":{"message":<strict_base64(json)>,"exp":null,
+#                             "pur":"cookie.<name>"}}
+#   signed id      {"_rails":{"data":<json>,"pur":"<model>/<purpose>"}}
+#                  {"_rails":{"data":<json>,"exp":"<iso8601_ms>",
+#                             "pur":"<model>/<purpose>"}}
+#   signed gid     {"_rails":{"data":"gid://<app>/<Model>/<id>?expires_in",
+#                             "pur":"attachable"}}
+#
+# and they are base64'd differently too: a cookie is strict base64, a
+# signed id is URL-safe and unpadded (the verifier is `url_safe` because
+# the token goes in a path segment), a signed GlobalID is URL-safe and
+# PADDED (`GlobalID::Verifier` overrides `encode` with the default
+# `urlsafe_encode64`) — see `gid_envelope` for the measurement.
+#
+# The cookie jar hands its verifier an already-serialized String, so
+# `Messages::Metadata` cannot nest the metadata inside the payload and
+# base64s it into a `message` field with an always-present `exp`. The
+# signed-id verifier's serializer CAN, so the id goes in verbatim as
+# `data` and `exp` is OMITTED ENTIRELY when there is none. Both measured
+# against campfire under Rails 8.2, minting through the app's own
+# `signed_id` and `CookieJar.build` — not through a hand-assembled
+# `MessageVerifier`, which produces a third shape no app ever emits and
+# which this file was pinned to for a while.
+#
+# The `_rails` envelope is `use_message_serializer_for_metadata`, a 7.1
+# default, and it is INSIDE the signed payload — the digest covers the
+# base64 text, not the JSON.
+#
+# Rails uses two different digests, which is the one thing here most
+# likely to look like a bug:
+#
+#   signed cookies   HMAC-SHA1    (`signed_cookie_digest || "SHA1"`, and
+#                                 no load_defaults version sets
+#                                 `cookies_digest` — 8.2 included)
+#   signed ids       HMAC-SHA256  (`use_legacy_signed_id_verifier` is
+#                                 `:generate_and_verify` by default, and
+#                                 that path passes digest: "SHA256")
+#
+# Salts are Rails' defaults: "signed cookie" for the cookie jar,
+# "active_record/signed_id" for signed ids. An app that overrides
+# `config.action_dispatch.signed_cookie_salt` or `cookies_digest` would
+# need those lifted at ingest; none of the corpus does.
+module ActionController
+  module MessageVerifier
+    # 1_000, WHICH IS THE APPLICATION'S NUMBER AND NOT THE CLASS'S.
+    # `ActiveSupport::KeyGenerator.new(secret)` defaults to 2**16, and
+    # this file said 65_536 for that reason — but no Rails app ever
+    # constructs one that way. `Rails::Application#key_generator` passes
+    # `iterations: 1000` explicitly, and every signed cookie and signed
+    # id in a Rails app derives through it.
+    #
+    # MEASURED, not read: a `session_token` cookie minted by campfire
+    # under Rails 8.2 (`ActionDispatch::Cookies::CookieJar.build` against
+    # the app's own env_config) reproduces bit for bit at
+    # PBKDF2-HMAC-SHA256(secret, "signed cookie", 1_000, 64) + HMAC-SHA1,
+    # and at no other point in the {1_000, 65_536} x {SHA1, SHA256}^2
+    # grid. At 65_536 the emitted app and Rails rejected each other's
+    # cookies in both directions — the exact opposite of what the top of
+    # this file promises, and it went unnoticed because both lanes of
+    # every test we run derive the key HERE.
+    #
+    # ONCE's own load harness had the answer all along:
+    # `test/performance/create_dummy_cookies.rb` forges its 10,000
+    # cookies with `KeyGenerator.new("dummy", iterations: 1000)`.
+    ITERATIONS = 1_000
+    KEY_SIZE = 64
+    SIGNED_COOKIE_SALT = "signed cookie"
+
+    # PBKDF2 is deliberately expensive (2**16 iterations of HMAC), so a
+    # derived key is worth keeping: a request that reads the session
+    # cookie and then writes it back would otherwise pay twice.
+    def self.derived_keys
+      @derived_keys ||= {}
+    end
+
+    def self.derive_key(secret, salt)
+      # Keyed by a separator neither part contains: the salts are
+      # framework constants ("signed cookie", "active_record/signed_id")
+      # and the secret is hex.
+      cache_key = salt + "|" + secret
+      # `key?` then read, rather than binding the read and testing it
+      # for nil — the same idiom the cookie jar uses, and it keeps a
+      # nilable local off spinel's `const char *` path.
+      return derived_keys[cache_key] if derived_keys.key?(cache_key)
+      key = MessageDigest.pbkdf2_sha256(secret, salt, ITERATIONS, KEY_SIZE)
+      derived_keys[cache_key] = key
+      key
+    end
+
+    # The signed string for `value` under `purpose`. `sha1` selects the
+    # cookie digest; signed ids pass false for the SHA-256 one.
+    #
+    # A cookie's message is a String and never expires, so this is the
+    # String/no-exp face of `envelope` below.
+    def self.generate(secret, salt, value, purpose, sha1)
+      envelope(secret, salt, json_string(value), purpose, "null", sha1)
+    end
+
+    # The general form, for callers that serialize the message
+    # themselves. `message_json` is the JSON of the payload — a signed
+    # id's is a bare Integer (`123`), NOT the quoted `"123"` a String
+    # message produces, and getting that wrong is invisible until a
+    # token minted here meets a real Rails. `exp` is the JSON for the
+    # envelope's `exp` slot: "null", or a quoted `iso8601_ms` instant.
+    def self.envelope(secret, salt, message_json, purpose, exp, sha1)
+      payload = Base64.strict_encode64(message_envelope(message_json, purpose, exp))
+      payload + "--" + digest_for(secret, salt, payload, sha1)
+    end
+
+    # The `_rails` envelope a cookie jar wraps its message in, before it
+    # signs it (above) or encrypts it (MessageEncryptor): the message JSON
+    # base64ed into `message`, then `exp` and `pur`. The encrypted jar and
+    # the session store write the same envelope, inside the ciphertext.
+    def self.message_envelope(message_json, purpose, exp)
+      "{\"_rails\":{\"message\":\"" + Base64.strict_encode64(message_json) +
+        "\",\"exp\":" + exp + ",\"pur\":\"" + purpose + "\"}}"
+    end
+
+    # ISO8601 in UTC with exactly three fractional digits — the shape
+    # `ActiveSupport::Messages::Metadata` writes into `exp`
+    # (`expires_at.utc.iso8601(3)`). That form is fixed-width and
+    # zero-padded in a single zone, so LEXICOGRAPHIC order on it is
+    # chronological order: expiry is a string compare and this runtime
+    # needs no date parser to check one.
+    def self.iso8601_ms(t)
+      u = t.utc
+      f = u.to_f
+      ms = ((f - f.to_i) * 1000).to_i
+      format(
+        "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ",
+        u.year, u.mon, u.mday, u.hour, u.min, u.sec, ms
+      )
+    end
+
+    # The value carried by `signed`, or "" when the signature does not
+    # verify, the purpose does not match, or the shape is not ours. A
+    # tampered cookie is indistinguishable from an absent one, which is
+    # what Rails does too (it returns nil and the app treats it as signed
+    # out).
+    #
+    # UTF-8, as Rails' JSON deserializer answers: the message comes back
+    # through a base64 decode, which CRuby tags ASCII-8BIT, and a
+    # non-ASCII value (campfire's `notice: "✓"`, a `cookies.signed`
+    # value) spliced into a UTF-8 page as binary is an
+    # Encoding::CompatibilityError. A no-op on spinel, which assumes
+    # UTF-8. `+` because `json_value` may answer its argument.
+    def self.verified(secret, salt, signed, purpose, sha1)
+      json = verified_json(secret, salt, signed, purpose, sha1)
+      return "" if json == ""
+      (+json_value(json)).force_encoding("UTF-8")
+    end
+
+    # The message JSON carried by `signed`, or "" for every rejection:
+    # bad shape, bad signature, wrong purpose, or an `exp` already
+    # past. Callers that signed a non-String message read this and
+    # deserialize themselves.
+    def self.verified_json(secret, salt, signed, purpose, sha1)
+      sep = signed.index("--")
+      return "" if sep.nil?
+      payload = signed[0, sep]
+      supplied = signed[sep + 2, signed.length - sep - 2]
+      return "" unless secure_compare(supplied, digest_for(secret, salt, payload, sha1))
+      envelope_message(Base64.strict_decode64(payload), purpose)
+    end
+
+    # The message JSON inside a `message_envelope`, or "" when its
+    # purpose is not `purpose` or its `exp` has passed. Shared by the
+    # signed jar (above) and the encrypted one, which reach the same
+    # envelope by a digest and by a cipher.
+    def self.envelope_message(env, purpose)
+      return "" if extract(env, "\"pur\":\"") != purpose
+      # `"exp":null` does not match the quoted prefix, so an
+      # unexpiring message reads "" here and skips the compare — which
+      # is every signed cookie this file writes.
+      exp = extract(env, "\"exp\":\"")
+      return "" if exp != "" && exp <= iso8601_ms(Time.now)
+      message = extract(env, "\"message\":\"")
+      return "" if message == ""
+      Base64.strict_decode64(message)
+    end
+
+    # The SIGNED-ID form: the value goes in as JSON, not base64, and an
+    # absent expiry is an absent KEY rather than `"exp":null`. Separate
+    # from `envelope` above rather than a flag on it, because the two
+    # shapes have different fields in a different order and a caller that
+    # picked the wrong one would mint a token that verifies here and
+    # nowhere else — which is exactly the bug this pair replaces.
+    def self.data_envelope(secret, salt, data_json, purpose, exp, sha1)
+      env = data_envelope_json(data_json, purpose, exp)
+      # URL-SAFE AND UNPADDED, which is the other thing a signed id does
+      # differently: `ActiveRecord::SignedId`'s verifier is `url_safe`,
+      # because the token goes in a path segment (campfire's
+      # `route_for :user_avatar, user.avatar_token`). The cookie jar's is
+      # not. Measured: Rails' avatar token ends `…YXIifX0` where strict
+      # base64 of the same envelope ends `…YXIifX0=`.
+      payload = Base64.urlsafe_encode64_nopad(env)
+      payload + "--" + digest_for(secret, salt, payload, sha1)
+    end
+
+    # The SIGNED-GLOBALID form: the `data` envelope again, under the
+    # THIRD base64 and the OTHER digest. `GlobalID::Verifier` (globalid
+    # 1.4.0, `verifier.rb`) is `ActiveSupport::MessageVerifier` with
+    # `encode`/`decode` overridden to `Base64.urlsafe_encode64` — whose
+    # default KEEPS the padding the signed-id verifier strips — and the
+    # railtie constructs it with no `digest:`, so it signs with
+    # MessageVerifier's default SHA1 rather than the SHA256 a signed id
+    # passes explicitly. Salt is the railtie's `signed_global_ids`,
+    # through the same 1_000-iteration generator as everything else.
+    #
+    # MEASURED against campfire under Rails 8.2, `User.new(id: 7)
+    # .attachable_sgid` with `SECRET_KEY_BASE=test-secret`:
+    #
+    #   eyJfcmFpbHMiOnsiZGF0YSI6ImdpZDovL2NhbXBmaXJlL1VzZXIvNz9leHBpcmVzX2luIiwicHVyIjoiYXR0YWNoYWJsZSJ9fQ==--8c250383b1669d154e58c89f7b60a493c02aa10f
+    #   {"_rails":{"data":"gid://campfire/User/7?expires_in","pur":"attachable"}}
+    #
+    # reproduced bit for bit at PBKDF2(secret, "signed_global_ids",
+    # 1_000, 64) + HMAC-SHA1 over the PADDED url-safe payload, and not
+    # under SHA256. `runtime/ruby/test/action_text_test.rb` pins that
+    # literal, so the two ends stay interoperable by test rather than
+    # by reading. The `?expires_in` inside the gid is globalid's own
+    # doing (`attachable_sgid` passes `expires_in: nil` and the nil
+    # param is serialized as a bare key); it is part of the signed
+    # bytes, so the caller mints it and the reader ignores it.
+    def self.gid_envelope(secret, salt, data_json, purpose, exp)
+      env = data_envelope_json(data_json, purpose, exp)
+      payload = Base64.urlsafe_encode64(env)
+      payload + "--" + digest_for(secret, salt, payload, true)
+    end
+
+    # `{"_rails":{"data":<json>[,"exp":<json>],"pur":"<purpose>"}}` —
+    # the `Messages::Metadata` envelope a serializer that can nest
+    # writes, shared by the two url-safe forms above. `exp` is the JSON
+    # for the slot, or "" to omit the key entirely (an unexpiring signed
+    # id or sgid has NO `exp`, where a cookie has `"exp":null`).
+    def self.data_envelope_json(data_json, purpose, exp)
+      env = "{\"_rails\":{\"data\":" + data_json
+      env = env + ",\"exp\":" + exp if exp != ""
+      env + ",\"pur\":\"" + purpose + "\"}}"
+    end
+
+    # The `data` a signed id carries, as JSON text, or "" for every
+    # rejection — the mirror of `verified_json` for the other envelope.
+    # Also the reader for `gid_envelope` (with `sha1` true): the decoder
+    # skips padding, so the padded and unpadded url-safe forms read the
+    # same way, and the digest is over the payload text as sent.
+    def self.verified_data_json(secret, salt, signed, purpose, sha1)
+      sep = signed.index("--")
+      return "" if sep.nil?
+      payload = signed[0, sep]
+      supplied = signed[sep + 2, signed.length - sep - 2]
+      return "" unless secure_compare(supplied, digest_for(secret, salt, payload, sha1))
+      env = Base64.urlsafe_decode64(payload)
+      return "" if extract(env, "\"pur\":\"") != purpose
+      exp = extract(env, "\"exp\":\"")
+      return "" if exp != "" && exp <= iso8601_ms(Time.now)
+      extract_raw(env, "\"data\":")
+    end
+
+    # `data` is a bare JSON value — an Integer id, a quoted String, or an
+    # object (Active Storage's blob keys) — so it runs to the end of that
+    # VALUE: past a string's escaped quotes, and over the commas and
+    # braces inside an object, which the first-`,`-or-`}` scan this used
+    # to be cut short (tests/rails_compat_vectors.rb, `blob_key`).
+    def self.extract_raw(envelope, prefix)
+      at = envelope.index(prefix)
+      return "" if at.nil?
+      start = at + prefix.length
+      close = value_end(envelope, start)
+      return "" if close < 0
+      envelope[start, close - start]
+    end
+
+    # Where the JSON value starting at `start` ends (exclusive), or -1.
+    def self.value_end(s, start)
+      depth = 0
+      in_string = false
+      i = start
+      n = s.length
+      while i < n
+        c = s[i]
+        if in_string
+          if c == "\\"
+            i += 1
+          elsif c == "\""
+            in_string = false
+            return i + 1 if depth == 0
+          end
+        elsif c == "\""
+          in_string = true
+        elsif c == "{" || c == "["
+          depth += 1
+        elsif c == "}" || c == "]"
+          return i if depth == 0
+          depth -= 1
+          return i + 1 if depth == 0
+        elsif c == ","
+          return i if depth == 0
+        end
+        i += 1
+      end
+      -1
+    end
+
+    # `ActiveSupport::SecurityUtils.secure_compare`, which is what Rails'
+    # verifier checks a digest with: the loop never exits early on a
+    # mismatch, so the time taken does not say how many leading
+    # characters of a forged digest were right. The length is not
+    # secret — every digest of one kind has the same one.
+    def self.secure_compare(a, b)
+      MessageDigest.secure_compare(a, b)
+    end
+
+    def self.digest_for(secret, salt, payload, sha1)
+      key = derive_key(secret, salt)
+      return MessageDigest.hmac_sha1_hex(key, payload) if sha1
+      MessageDigest.hmac_sha256_hex(key, payload)
+    end
+
+    # The envelope is a fixed shape this file also writes, so the two
+    # string fields it carries are read by scanning rather than by
+    # parsing JSON — the ruby-family runtimes ship no parser, and a
+    # parser sized for one known object is more surface than the scan.
+    # A field that is absent (or not a plain string) reads as "".
+    def self.extract(envelope, prefix)
+      at = envelope.index(prefix)
+      return "" if at.nil?
+      rest = at + prefix.length
+      close = envelope.index("\"", rest)
+      return "" if close.nil?
+      envelope[rest, close - rest]
+    end
+
+    # A String as ActiveSupport's JSON writes it — what Rails' cookie jar
+    # and its message serializer put inside every signed value:
+    # `"` and `\` escaped, control characters as `\n`/`\t`/… or `\u00XX`,
+    # and `<`, `>`, `&` as `\u003c`/`\u003e`/`\u0026`
+    # (`escape_html_entities_in_json`). Everything else goes through as
+    # its UTF-8 bytes, U+2028/U+2029 included under 8.x defaults. Held to
+    # the JSON inside Rails' own signed cookies by
+    # tests/rails_compat_vectors.rb (`json_string`).
+    #
+    # It was quote-wrapping, which wrote a quote or a backslash into the
+    # envelope bare. BYTE-WISE, like the rest of this file, so CRuby never
+    # meets an encoding clash and spinel sees the same bytes.
+    def self.json_string(value)
+      s = value.to_s
+      out = +"\""
+      i = 0
+      n = s.bytesize
+      while i < n
+        b = s.getbyte(i)
+        if b == 34
+          out << "\\\""
+        elsif b == 92
+          out << "\\\\"
+        elsif b == 60
+          out << "\\u003c"
+        elsif b == 62
+          out << "\\u003e"
+        elsif b == 38
+          out << "\\u0026"
+        elsif b == 10
+          out << "\\n"
+        elsif b == 13
+          out << "\\r"
+        elsif b == 9
+          out << "\\t"
+        elsif b == 8
+          out << "\\b"
+        elsif b == 12
+          out << "\\f"
+        elsif b < 32
+          out << "\\u" + format("%04x", b)
+        else
+          out << b.chr
+        end
+        i += 1
+      end
+      out << "\""
+      out.force_encoding("UTF-8")
+    end
+
+    # The inverse, for a JSON String; anything else (an Integer id, an
+    # object) is handed back verbatim for the caller to read. Every JSON
+    # string escape is undone — `\uXXXX` (surrogate pairs joined) to its
+    # UTF-8 bytes — where this used to strip the quotes and keep the
+    # escapes, so a value Rails signed with a `<` or a newline in it read
+    # back as `\u003c` / `\n`.
+    def self.json_value(json)
+      return json if json.length < 2
+      return json if json[0, 1] != "\""
+      out = +""
+      i = 1
+      n = json.bytesize - 1
+      while i < n
+        b = json.getbyte(i)
+        if b == 92 && i + 1 < n
+          e = json.getbyte(i + 1)
+          if e == 117 && i + 5 < n + 1
+            cp = hex4(json, i + 2)
+            i += 6
+            if cp >= 0xD800 && cp <= 0xDBFF && i + 5 < n + 1 &&
+               json.getbyte(i) == 92 && json.getbyte(i + 1) == 117
+              low = hex4(json, i + 2)
+              if low >= 0xDC00 && low <= 0xDFFF
+                cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00)
+                i += 6
+              end
+            end
+            append_utf8(out, cp)
+          else
+            out << unescape_char(e).chr
+            i += 2
+          end
+        else
+          out << b.chr
+          i += 1
+        end
+      end
+      out.force_encoding("UTF-8")
+    end
+
+    # `\n` and friends: the byte a one-letter escape stands for (`\"`,
+    # `\\` and `\/` stand for themselves).
+    def self.unescape_char(e)
+      return 10 if e == 110
+      return 13 if e == 114
+      return 9 if e == 116
+      return 8 if e == 98
+      return 12 if e == 102
+      e
+    end
+
+    # Four hex digits at byte `at` as an Integer, or -1.
+    def self.hex4(s, at)
+      v = 0
+      k = 0
+      while k < 4
+        d = s.getbyte(at + k)
+        digit = -1
+        digit = d - 48 if d >= 48 && d <= 57
+        digit = d - 87 if d >= 97 && d <= 102
+        digit = d - 55 if d >= 65 && d <= 70
+        return -1 if digit < 0
+        v = v * 16 + digit
+        k += 1
+      end
+      v
+    end
+
+    # A code point's UTF-8 bytes, onto `out`.
+    def self.append_utf8(out, cp)
+      if cp < 0x80
+        out << cp.chr
+      elsif cp < 0x800
+        out << (0xC0 | (cp >> 6)).chr
+        out << (0x80 | (cp & 0x3F)).chr
+      elsif cp < 0x10000
+        out << (0xE0 | (cp >> 12)).chr
+        out << (0x80 | ((cp >> 6) & 0x3F)).chr
+        out << (0x80 | (cp & 0x3F)).chr
+      else
+        out << (0xF0 | (cp >> 18)).chr
+        out << (0x80 | ((cp >> 12) & 0x3F)).chr
+        out << (0x80 | ((cp >> 6) & 0x3F)).chr
+        out << (0x80 | (cp & 0x3F)).chr
+      end
+      nil
+    end
+  end
+end

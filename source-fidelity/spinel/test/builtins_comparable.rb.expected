@@ -1,0 +1,41 @@
+true
+false
+true
+false
+true
+true
+true
+5
+10
+1
+5
+5
+10.0
+5.5
+10.0
+5.5
+1180591620717411303424
+3
+10
+5
+min argument must be less than or equal to max argument
+comparison of String with 10 failed
+comparison of Integer with String failed
+comparison of Integer with String failed
+comparison of Symbol with 10 failed
+comparison of Array with 10 failed
+comparison of Integer with true failed
+comparison of Float with 1 failed
+comparison of Integer with NaN failed
+5
+10
+1
+10
+1
+5.5
+cannot clamp with an exclusive range
+undefined method 'between?' for nil
+undefined method 'clamp' for nil
+5
+5.5
+true

@@ -1,0 +1,12 @@
+undefined method 'digits' for nil
+undefined method 'bit_length' for nil
+undefined method 'gcd' for nil
+undefined method 'lcm' for nil
+undefined method 'gcdlcm' for nil
+undefined method 'ceildiv' for nil
+undefined method 'remainder' for nil
+undefined method 'fdiv' for nil
+undefined method 'digits' for nil
+4
+[2, 1]
+1.5

@@ -1,0 +1,1996 @@
+//! The language-core expression IR: `Expr` (span, inferred type,
+//! effects, annotations) wrapping the ~15-variant `ExprNode` that
+//! Ruby's ~80 Prism node kinds collapse into. Ingest builds these
+//! bare; analyze stamps `ty` and `effects`; lowerers rewrite trees
+//! and tag `IrHint`s; every emitter walks the result. The
+//! surface-preservation fields (`ArrayStyle`, `BlockStyle`,
+//! `parenthesized`, `leading_blank_line`) carry the author's spelling
+//! so ingest → emit-ruby reproduces the source — the discipline
+//! `roundhouse-ast --round-trip` checks. `PartialEq` deliberately
+//! ignores `span`: round-trip tests compare re-ingested IR whose
+//! byte offsets legitimately differ.
+
+use serde::{Deserialize, Serialize};
+
+use crate::diagnostic::DiagnosticKind;
+use crate::effect::EffectSet;
+use crate::ident::{Symbol, VarId};
+use crate::span::Span;
+use crate::ty::Ty;
+
+/// The source reference names a modeled class or module. The Ruby emitter
+/// uses its resolved `Ty::Class` when it changes lexical nesting.
+pub const RESOLVED_CLASS_REF: u64 = 1 << 2;
+/// The value is a proven class/module object, rather than a nominal instance.
+pub const CLASS_OBJECT_VALUE: u64 = 1 << 5;
+/// A proven request-params store after its wrapper type was lowered to Hash.
+/// Plain Hash[String, _] is not itself indifferent-access evidence.
+pub const INDIFFERENT_PARAMS_STORE: u64 = 1 << 40;
+/// Positive instance provenance for generated model-indexer key lowering.
+/// A nominal `Ty::Class` alone is not instance evidence.
+pub const INDEXER_INSTANCE_VALUE: u64 = 1 << 39;
+/// A class-valued query, possibly an unknown subclass. Unlike
+/// `CLASS_OBJECT_VALUE`, this does not establish exact class identity.
+pub const INDEXER_CLASS_QUERY_VALUE: u64 = 1 << 38;
+/// This receiver's operator call is backed by a registered method definition.
+pub const RESOLVED_OPERATOR_RECEIVER: u64 = 1 << 6;
+/// The cast's type was declared by source, rather than synthesized by lowering.
+pub const SOURCE_TYPE_ASCRIPTION: u64 = 1 << 7;
+/// A generated constant may borrow a source span for diagnostics/layout;
+/// that position is not a written Ruby constant reference to index.
+pub const GENERATED_CONST_REF: u64 = 1 << 4;
+
+/// An admitted library-class Data factory with its exact declaration identity.
+pub const RESOLVED_DATA_FACTORY: u64 = 1 << 3;
+
+/// A `permit` Send that the source wrote as `params.expect(r: [...])`.
+/// `rewrite_params` respells `expect` as `require(:r).permit(...)`, and
+/// the two refuse a malformed request differently in Rails, so the
+/// strong-params lowering reads this to know which refusal to apply.
+pub const FROM_PARAMS_EXPECT: u64 = 1 << 8;
+
+/// A statement whose value the enclosing sequence discards (not its tail).
+pub const DISCARDED_VALUE: u64 = 1 << 9;
+
+/// A `Preloader.new(records:, associations:).call` the analyzer admitted:
+/// discarded, over one model's records. Only this one lowers.
+pub const ADMITTED_PRELOADER_CALL: u64 = 1 << 10;
+
+/// A written constant inside a body Rubydex does not index (the
+/// `class << Rails.application` settings block): the file is in the
+/// snapshot, but no reference was recorded at this span, so the absence
+/// is not evidence of an indexing defect.
+pub const UNINDEXED_SCOPE_CONST_REF: u64 = 1 << 11;
+
+/// A source `**value` call argument that the shared keyword lowering made
+/// positional (`lower::forwarding`, legacy policy) for targets without
+/// keyword arguments. The Ruby emitter writes the splat back: in Ruby 3 a
+/// positional Hash does not bind keyword parameters.
+pub const ERASED_KEYWORD_SPLAT: u64 = 1 << 12;
+
+/// This string literal is the source file's own location (`__FILE__`,
+/// or the directory `__dir__` names), written relative to the app root.
+/// Ruby gives the absolute path of the loaded file there, whatever the
+/// process's cwd. A target that relocates the file (the Ruby family
+/// emits `lib/x.rb` as `app/models/x.rb`) uses this bit to anchor the
+/// path on the emitted file's own directory. Then `File.expand_path("../..",
+/// __FILE__)` still names the app root, and the same relative walk
+/// reaches the files carried there. Other targets emit the literal.
+pub const SOURCE_FILE_PATH: u64 = 1 << 13;
+
+/// A source `T.bind(self, T)` / `#: self as T`: a `Cast` of `self` whose
+/// target is the type `self` has for the rest of the enclosing body. As a
+/// statement it only informs the typer; its value is `self`.
+pub const SELF_BINDING: u64 = 1 << 14;
+
+/// A [`SELF_BINDING`] to a class object (`T.bind(self, T.class_of(X))`,
+/// `#: self as singleton(X)`): `self` is then the class side of its type,
+/// which `Ty` alone does not tell apart from an instance.
+pub const SELF_BINDING_CLASS_OBJECT: u64 = 1 << 15;
+
+/// The `defaults.merge(hash)` ingest wrote for `hash.reverse_merge(defaults)`.
+pub const REVERSE_MERGE: u64 = 1 << 16;
+
+/// A `t` in a controller's copy of an `app/helpers` method no controller
+/// calls: it only ever runs in the view, so it is ActionView's `t`.
+pub const HELPER_COPY_TRANSLATE: u64 = 1 << 17;
+
+/// A `t` in an `app/helpers` module's own body (or a parameter default),
+/// which the analyzer types with an includer as `self`: ActionView's `t`
+/// all the same.
+pub const HELPER_BODY_TRANSLATE: u64 = 1 << 18;
+
+/// A model's class-body `extend AppModule`, or a call after it to that
+/// module's own method (`load_settings(…)`): app code the Ruby family
+/// replays where the source has it (`ingest::app_extension_calls`).
+pub const REPLAYED_CLASS_BODY: u64 = 1 << 19;
+
+/// A model's `private :has_role?` naming a method its body does not
+/// define (generated, a superclass's or a gem's): kept as a statement for
+/// the lowering to apply and the analyzer to enforce.
+pub const INHERITED_VISIBILITY: u64 = 1 << 20;
+
+/// `time_calendar` renamed a zero-arg `iso8601` to `to_rfc3339`. Later
+/// re-analysis can widen the receiver (`minimum(:col) || Time.utc`), so
+/// emitters cannot rediscover the rename from the type alone. Ruby prints
+/// `iso8601`; the other targets keep their time-format mapping.
+pub const GROUNDED_TIME_FORMAT: u64 = 1 << 21;
+
+/// `written_names` has applied Rubydex to this mixin path. The stored
+/// spelling is the answer, including when Rubydex left a short name
+/// because the reference is top-level. Absent on a per-file ingest,
+/// which never ran that pass.
+pub const RESOLVED_MIXIN: u64 = 1 << 22;
+
+/// Analysis admitted this send as a read-only Module query (`const_defined?`,
+/// `include?`, …) on a class object, which only the ruby family and spinel
+/// can ask; `project::report_unsupported_bundled_constants` reports it elsewhere.
+pub const MODULE_QUERY: u64 = 1 << 23;
+
+/// A runtime Class/Module factory or implicit singleton-class access.
+/// The Ruby and JRuby targets retain these runtime class objects.
+pub const RUNTIME_CLASS_OBJECT: u64 = 1 << 31;
+
+/// The call an `alias new builtin` delegates to (`ingest::library_class::
+/// OBJECT_BUILTINS`): a method every Ruby object answers, which only the
+/// ruby family has; `project::report_builtin_aliases` refuses it elsewhere.
+pub const BUILTIN_ALIAS: u64 = 1 << 26;
+
+/// The owner read an association build captures into its temp
+/// (`rh_build_owner_N = @article`): it stands in for the receiver of the
+/// `@article.x` the build replaced, which read the owner unconditionally.
+pub const BUILD_OWNER: u64 = 1 << 24;
+
+/// A constant path whose parent is a value (`self.class::KINDS`), ingested
+/// as the analysis' `const_get(:KINDS)`. The ruby family writes it back as
+/// the path: `const_get` also finds a top-level constant, which `::` does
+/// not (`Base::String` raises).
+pub const CONST_PATH: u64 = 1 << 25;
+
+/// A library class or module body statement only Ruby itself answers:
+/// a loop that `class_eval`s or `define_method`s, a call to a core
+/// `Module` method (`freeze`), a write through a class-side writer the
+/// class or an ancestor defines (`ingest::body_statements`). The Ruby
+/// and JRuby trees write it back where the source has it, among the
+/// class's methods; every other target drops it and reports it.
+pub const BODY_STATEMENT: u64 = 1 << 27;
+
+/// On a body statement or a constant's value: the source wrote it inside
+/// the class's own `class << self`, where Ruby runs it with the singleton
+/// class as `self` and puts a constant on the singleton class
+/// (`X.singleton_class.constants`, not `X.constants`). The Ruby and JRuby
+/// trees write it back inside a `class << self`; other targets keep the
+/// constant on the class.
+pub const SINGLETON_BODY: u64 = 1 << 28;
+
+/// On a `Const` the analyzer qualified to a constant of `X`'s
+/// `class << self` (Rubydex's `X::<X>::NAME`): the Ruby and JRuby trees
+/// read it as `X.singleton_class::NAME`, where it lives.
+pub const SINGLETON_CONSTANT_REF: u64 = 1 << 29;
+
+/// Analysis admitted this receiverless send as Kernel's `Rational(...)`,
+/// `Pathname(...)` or `URI(...)`: its own class, on its own side, defines
+/// no method of that name. Only the ruby family and spinel have the
+/// libraries, so `project::report_ruby_only_sends` refuses it elsewhere.
+/// The mark stays when lowering spells `Pathname(x)` as `Pathname.new(x)`.
+pub const KERNEL_CONVERSION: u64 = 1 << 30;
+
+/// On the body of a method `ingest::inherited_alias::resolve` copied
+/// from an ancestor for an `alias` of it: the Ruby family writes the
+/// captured `alias_method` back instead, and drops the copy.
+pub const INHERITED_ALIAS_COPY: u64 = 1 << 36;
+
+/// A source-resolved library call whose native keyword ABI is preserved.
+pub const NATIVE_KEYWORD_ARGUMENTS: u64 = 1 << 35;
+
+/// On a route-helper call `lower::route_format_suffix` renamed for its
+/// literal `format:` (`widget_url(w, format: :json)` to
+/// `widget_json_url(w)`): the only calls `routes_to_library` builds a
+/// format variant for. A `<route>_<word>_url` written in the source is
+/// not a Rails helper, whatever it splits into.
+pub const FORMAT_VARIANT_CALL: u64 = 1 << 37;
+
+/// Whether `expr` is a [`SELF_BINDING`] cast.
+pub fn is_self_binding(expr: &Expr) -> bool {
+    expr.decisions & SELF_BINDING != 0
+        && matches!(&*expr.node, ExprNode::Cast { value, .. } if matches!(&*value.node, ExprNode::SelfRef))
+}
+
+/// Cross-target intent annotation for canonical Ruby idioms whose
+/// optimal emit shape differs per target. Set by the lowerer when it
+/// synthesizes a pattern it knows the target-specific name for (and by
+/// ingest for `+"literal"`, below); consumed by per-target emitters
+/// that want the idiomatic form.
+///
+/// Currently covers the string-accumulator triple emitted by
+/// `view_to_library` (`io = String.new; io << "..."; io`):
+///
+/// - Ruby/Spinel: the canonical `String#<<` form is already optimal;
+///   these emitters ignore the hint.
+/// - Rust: `String::new()` / `push_str` / bare var — already optimal;
+///   hint short-circuits the inference-based pattern detection.
+/// - Crystal: `String::Builder.new` / `<<` / `.to_s` — replaces
+///   O(n²) `io + x` concat chains.
+/// - Go: `var io strings.Builder` / `io.WriteString(...)` /
+///   `io.String()` — replaces O(n²) `io = io + x`.
+/// - TypeScript: `[]` / `.push(...)` / `.join("")` — V8 prefers
+///   array+join over repeated string concat.
+///
+/// And one that ingest sets: `+"literal"`, the copy a
+/// frozen-string-literal file makes of a literal it will mutate
+/// (`buf = +""; buf << x`). The Ruby family writes the `+` back,
+/// because Spinel freezes string literals; every other target emits
+/// the plain literal, as it always has, since its strings have no
+/// frozen state to opt out of.
+///
+/// `None` means "no hint" — emitters fall through to their default
+/// per-`ExprNode` handling. Adding a variant has zero effect on
+/// existing emit paths until each target opts in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IrHint {
+    /// On the `Assign` node initializing a string accumulator local
+    /// (typically `io = String.new` synthesized by the view lowerer).
+    StringBuilderInit,
+    /// On the `Send { method: "<<" }` node appending to a string
+    /// accumulator local.
+    StringBuilderAppend,
+    /// On the terminal `Var` reference returning a string accumulator
+    /// at the tail of a view function body.
+    StringBuilderResult,
+    /// On a string `Lit` ingested from `+"literal"` (an unfrozen copy).
+    MutableStringLiteral,
+}
+
+/// The core typed λ-calculus. Ruby's ~80 AST node kinds collapse into ~15 here;
+/// everything else lives in the Rails dialect or is handled by normalization.
+///
+/// `ty` is populated by the analyzer; ingest leaves it `None`. Inline for
+/// simplicity; migrate to a salsa-indexed side table when incrementality
+/// becomes load-bearing.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Expr {
+    pub span: Span,
+    pub node: Box<ExprNode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ty: Option<Ty>,
+    /// Side-effects this expression may perform. Populated by the analyzer
+    /// during the same pass that assigns `ty`; ingest leaves it empty.
+    /// Set semantics — the effects this node contributes *locally* (direct
+    /// Sends on Active Record methods, `render`/`redirect_to` I/O, etc.);
+    /// effects of nested subexpressions live on those subexpressions.
+    /// Readers that want the transitive effect of a subtree can fold over
+    /// the walk (same shape as the per-action aggregation in `analyze`).
+    #[serde(default, skip_serializing_if = "EffectSet::is_pure")]
+    pub effects: EffectSet,
+    /// Set when this Expr is a `Seq` member whose source was preceded
+    /// by a blank line. Meaningless outside that context; emit honors
+    /// it when walking a `Seq` body. Populated from source offsets
+    /// at ingest time.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub leading_blank_line: bool,
+    /// Rarely-set annotations (`diagnostic`, `hint`), boxed so a node
+    /// that has none of them pays one pointer. Read them through
+    /// [`Expr::diagnostic`] and [`Expr::hint`]; write them through
+    /// [`Expr::set_diagnostic`] and [`Expr::set_hint`], which drop the box
+    /// again once both are `None`. Flattened, so the serialized shape is
+    /// unchanged.
+    #[serde(flatten, default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_cold")]
+    pub cold: Option<Box<ExprCold>>,
+    /// Bit-packed source facts and target decisions. Bits 0–31 are
+    /// cross-target (`NEEDS_PARENS`, `LAST_USE`, source-resolution facts);
+    /// the analyzer sets source facts and the decide passes set the rest.
+    /// Bits 32–63 are per-target-local (e.g. rust's `OWNED`,
+    /// `CLONE_AT`). See `src/emit/rust/decide/bits.rs` for the
+    /// rust bit allocation. Default `0` = "no decisions" — emitters
+    /// that don't run a decide pass see no behavioral change.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub decisions: u64,
+}
+
+/// A declaration macro's runtime event, at the calling statement rather
+/// than the source offset inside its definer. `ordinal` preserves the
+/// expansion's evaluation/definition sequence without fabricating spans.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeclarationStep {
+    pub call: Span,
+    pub ordinal: u32,
+}
+
+/// The annotations most nodes never carry, stored behind [`Expr::cold`].
+/// Keeping rare data boxed avoids growing every node of every tree.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ExprCold {
+    /// Analyzer-set diagnostic annotation — present when the body-
+    /// typer detected a user error (Incompatible `+`, etc.) at this
+    /// site. Emitters read this first on the expr: if set, they
+    /// produce a target-language raise-equivalent instead of the
+    /// normal emission. Consumed by `analyze::diagnose` to surface
+    /// to users; empty on well-typed input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<DiagnosticKind>,
+    /// Cross-target intent annotation. Set by the lowerer when it
+    /// synthesizes a canonical Ruby idiom whose optimal emit shape
+    /// differs per target, and by ingest for `+"literal"`. See `IrHint`
+    /// for variants and per-target consumption notes. `None` for nodes
+    /// nothing tagged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<IrHint>,
+    /// The method `ingest` parsed for a `def` at expression position.
+    /// The node stays the nil that carries the nested-def diagnostic;
+    /// this is that same parse, so a hoist does not read the source again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nested_def: Option<crate::dialect::MethodDef>,
+    /// On a generated constant initializer or a generated method's body
+    /// root: where the enclosing declaration executes. Source spans still
+    /// describe the original expression/block, including foreign files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declaration_step: Option<DeclarationStep>,
+    /// On a staged method body's root: this member is a semantic alias of
+    /// the method currently installed under this name, not a forwarding def.
+    /// The copied body remains for typing; Ruby-family emit replays alias.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method_alias_source: Option<Symbol>,
+}
+
+static EMPTY_COLD: ExprCold = ExprCold {
+    diagnostic: None,
+    hint: None,
+    nested_def: None,
+    declaration_step: None,
+    method_alias_source: None,
+};
+
+impl ExprCold {
+    fn is_empty(&self) -> bool {
+        self.diagnostic.is_none() && self.hint.is_none() && self.nested_def.is_none() && self.declaration_step.is_none() && self.method_alias_source.is_none()
+    }
+
+    /// Apply `f` to the annotations in `slot` (an [`Expr::cold`] field),
+    /// allocating the box only when `f` leaves something set and
+    /// dropping it when nothing is. Takes the field rather than the
+    /// `Expr` so callers holding a borrow of `node` can still write.
+    pub fn update(slot: &mut Option<Box<ExprCold>>, f: impl FnOnce(&mut ExprCold)) {
+        match slot {
+            Some(cold) => {
+                f(cold);
+                if cold.is_empty() {
+                    *slot = None;
+                }
+            }
+            None => {
+                let mut cold = ExprCold::default();
+                f(&mut cold);
+                if !cold.is_empty() {
+                    *slot = Some(Box::new(cold));
+                }
+            }
+        }
+    }
+
+    /// The annotations in `slot`; all `None` when it is empty.
+    pub fn of(slot: &Option<Box<ExprCold>>) -> &ExprCold {
+        slot.as_deref().unwrap_or(&EMPTY_COLD)
+    }
+
+    /// Field-level forms of [`Expr::diagnostic`] / [`Expr::set_diagnostic`]
+    /// and the hint equivalents, for callers that hold a borrow of the
+    /// node while reading or writing an annotation.
+    pub fn diagnostic(slot: &Option<Box<ExprCold>>) -> &Option<DiagnosticKind> {
+        &Self::of(slot).diagnostic
+    }
+
+    pub fn set_diagnostic(slot: &mut Option<Box<ExprCold>>, diagnostic: Option<DiagnosticKind>) {
+        Self::update(slot, |c| c.diagnostic = diagnostic);
+    }
+
+    /// Field-level form of [`Expr::diagnostic_mut`]; allocates the box.
+    pub fn diagnostic_mut(slot: &mut Option<Box<ExprCold>>) -> &mut Option<DiagnosticKind> {
+        &mut slot.get_or_insert_with(Default::default).diagnostic
+    }
+
+    pub fn hint(slot: &Option<Box<ExprCold>>) -> &Option<IrHint> {
+        &Self::of(slot).hint
+    }
+
+    pub fn set_hint(slot: &mut Option<Box<ExprCold>>, hint: Option<IrHint>) {
+        Self::update(slot, |c| c.hint = hint);
+    }
+}
+
+/// A flattened `Option` deserializes as `Some` even when none of its
+/// fields are present, which would give every node read back an empty
+/// box. Read an empty one as `None`.
+fn deserialize_cold<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Box<ExprCold>>, D::Error> {
+    let cold = ExprCold::deserialize(d)?;
+    Ok(if cold.is_empty() { None } else { Some(Box::new(cold)) })
+}
+
+// A field that grows `Expr` grows every tree about fourfold (see
+// `ExprCold`). Put rare data in `ExprCold` instead of raising these.
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<Expr>() <= 120);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<ExprNode>() <= 392);
+
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
+}
+
+/// Structural equality ignores `span`: it's provenance metadata, not
+/// semantics. The round-trip tests compare IR re-ingested from emitted
+/// Ruby against the original ingest, and those two parses legitimately
+/// sit at different byte offsets (and in different files).
+impl PartialEq for Expr {
+    fn eq(&self, other: &Self) -> bool {
+        self.node == other.node
+            && self.ty == other.ty
+            && self.effects == other.effects
+            && self.leading_blank_line == other.leading_blank_line
+            && self.cold() == other.cold()
+            && self.decisions == other.decisions
+    }
+}
+
+impl Expr {
+    pub fn new(span: Span, node: ExprNode) -> Self {
+        Self {
+            span,
+            node: Box::new(node),
+            ty: None,
+            effects: EffectSet::pure(),
+            leading_blank_line: false,
+            cold: None,
+            decisions: 0,
+        }
+    }
+
+    /// The rarely-set annotations; all `None` when the node has none.
+    pub fn cold(&self) -> &ExprCold {
+        ExprCold::of(&self.cold)
+    }
+
+    /// The analyzer's diagnostic annotation, if any.
+    pub fn diagnostic(&self) -> &Option<DiagnosticKind> {
+        &self.cold().diagnostic
+    }
+
+    /// Set or clear the diagnostic annotation.
+    pub fn set_diagnostic(&mut self, diagnostic: Option<DiagnosticKind>) {
+        ExprCold::set_diagnostic(&mut self.cold, diagnostic);
+    }
+
+    /// Mutable access to the diagnostic annotation. Allocates the cold
+    /// box, so prefer [`Expr::set_diagnostic`] when only writing.
+    pub fn diagnostic_mut(&mut self) -> &mut Option<DiagnosticKind> {
+        ExprCold::diagnostic_mut(&mut self.cold)
+    }
+
+    /// Remove and return the diagnostic annotation.
+    pub fn take_diagnostic(&mut self) -> Option<DiagnosticKind> {
+        let mut taken = None;
+        ExprCold::update(&mut self.cold, |c| taken = c.diagnostic.take());
+        taken
+    }
+
+    /// The cross-target intent annotation, if any.
+    pub fn hint(&self) -> &Option<IrHint> {
+        &self.cold().hint
+    }
+
+    /// Set or clear the cross-target intent annotation.
+    pub fn set_hint(&mut self, hint: Option<IrHint>) {
+        ExprCold::set_hint(&mut self.cold, hint);
+    }
+
+    /// Mutable access to the hint annotation. Allocates the cold box,
+    /// so prefer [`Expr::set_hint`] when only writing.
+    pub fn hint_mut(&mut self) -> &mut Option<IrHint> {
+        &mut self.cold.get_or_insert_with(Default::default).hint
+    }
+
+    /// Remove and return the hint annotation.
+    pub fn take_hint(&mut self) -> Option<IrHint> {
+        let mut taken = None;
+        ExprCold::update(&mut self.cold, |c| taken = c.hint.take());
+        taken
+    }
+
+    /// Explicit class-body execution order assigned by declaration expansion.
+    pub fn declaration_step(&self) -> Option<DeclarationStep> {
+        self.cold().declaration_step
+    }
+
+    pub fn set_declaration_step(&mut self, step: DeclarationStep) {
+        ExprCold::update(&mut self.cold, |c| c.declaration_step = Some(step));
+    }
+
+    pub fn method_alias_source(&self) -> Option<&Symbol> {
+        self.cold().method_alias_source.as_ref()
+    }
+
+    pub fn set_method_alias_source(&mut self, source: Symbol) {
+        ExprCold::update(&mut self.cold, |cold| cold.method_alias_source = Some(source));
+    }
+
+    /// The method parsed at a nested `def`, when ingest kept one.
+    pub fn nested_def(&self) -> Option<&crate::dialect::MethodDef> {
+        self.cold().nested_def.as_ref()
+    }
+
+    /// Remember the method ingest parsed for this nested `def`.
+    pub fn set_nested_def(&mut self, method: crate::dialect::MethodDef) {
+        ExprCold::update(&mut self.cold, |c| c.nested_def = Some(method));
+    }
+
+    /// Provenance backfill for lowerer-synthesized subtrees: every node
+    /// with a synthetic span takes the nearest enclosing real span.
+    /// Nodes that already carry a real span keep it — and become the
+    /// enclosing span for their own descendants — so source subtrees
+    /// spliced into synthesized wrappers stay exactly attributed.
+    /// Lowerers call this at synthesis choke points (the lowered
+    /// statement inherits the source statement's span) instead of
+    /// threading a span argument through every small IR constructor.
+    pub fn inherit_span(&mut self, enclosing: Span) {
+        if self.span.is_synthetic() {
+            if matches!(&*self.node, ExprNode::Const { .. }) {
+                self.decisions |= GENERATED_CONST_REF;
+            }
+            self.span = enclosing;
+        }
+        let here = self.span;
+        self.node.for_each_child_mut(&mut |c| c.inherit_span(here));
+    }
+}
+
+/// Surface form of an array literal. Source fidelity: `[:a, :b]` (Brackets),
+/// `%i[a b]` (PercentI, symbol list), `%w[a b]` (PercentW, word list) all
+/// produce the same Prism `ArrayNode` but differ byte-for-byte in source.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ArrayStyle {
+    /// `[elem, elem, ...]` — the common form.
+    #[default]
+    Brackets,
+    /// `[ elem, elem, ... ]` — brackets with a space between each
+    /// bracket and the first / last element. Rails scaffolds emit
+    /// literals this way in a few places (e.g. `params.expect(article:
+    /// [ :title, :body ])`). Round-trip only; semantically identical
+    /// to `Brackets`.
+    BracketsSpaced,
+    /// `%i[sym sym ...]` — symbol-list literal. Elements must be bare symbols.
+    PercentI,
+    /// `%w[word word ...]` — word-list literal. Elements must be bare strings.
+    PercentW,
+}
+
+/// Delimiter style for a block body.
+///
+/// Ruby's two block forms (`{ … }` and `do … end`) bind differently to
+/// chained method calls — `{ … }` binds tight, `do … end` binds to the
+/// leftmost call. That difference is surface-observable and sometimes
+/// semantically relevant, so we preserve whichever one the source used.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockStyle {
+    /// `do … end` (or no explicit delimiter context, e.g. lambda bodies
+    /// that emit as `->(x) { … }` where the brace is implicit in the
+    /// lambda form). The conservative default when style can't be
+    /// determined.
+    #[default]
+    Do,
+    /// `{ … }` — the tight-binding form; preferred for one-liners.
+    Brace,
+}
+
+/// Which short-circuit operator is meant.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BoolOpKind {
+    And,
+    Or,
+}
+
+/// Surface spelling for `BoolOp`. Ruby's `and`/`or` keywords have lower
+/// precedence than `=` whereas `&&`/`||` bind tighter — not interchangeable
+/// in all positions, so we preserve which one the source wrote.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BoolOpSurface {
+    /// `&&` / `||` — the tight-binding operator form.
+    #[default]
+    Symbol,
+    /// `and` / `or` — the keyword form (lower precedence).
+    Word,
+}
+
+/// Piece of an interpolated string. Ingested from Prism's
+/// InterpolatedStringNode so the emitter can re-synthesize `"x#{expr}y"`
+/// byte-for-byte. Lowering to `"x" + expr.to_s + "y"` would lose the
+/// distinction between real interpolation and real concatenation.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum InterpPart {
+    /// Literal chunk between interpolations (already unescaped).
+    Text { value: String },
+    /// Embedded `#{expr}` — the expression's result is converted to a
+    /// string at runtime.
+    Expr { expr: Expr },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ExprNode {
+    Lit { value: Literal },
+    Var { id: VarId, name: Symbol },
+    /// Instance variable read: `@post`. Writes use `LValue::Ivar`.
+    Ivar { name: Symbol },
+    Const { path: Vec<Symbol> },
+    /// Hash literal: `{ k1 => v1, k2 => v2 }` or trailing kwargs `k: v`.
+    /// Keys and values are both expressions. `kwargs` distinguishes the
+    /// trailing-kwargs form (KeywordHashNode in the Ruby parser, only at
+    /// the last position of a method call) from an explicit `{}` Hash
+    /// literal (HashNode). The two forms are semantically distinct in
+    /// some targets — Crystal's `{k: v}` parses as `NamedTuple(k: V)`
+    /// (compile-time, fixed shape) while `{ "k" => v }` produces an
+    /// `Hash(String, V)` (runtime, dynamic). Per-target emit dispatches
+    /// on this flag: kwargs render bare (`a: 1, b: 2` at the call site,
+    /// NamedTuple-compatible), Hash literals render with explicit
+    /// hashrocket-style braces.
+    Hash {
+        entries: Vec<(Expr, Expr)>,
+        #[serde(default)]
+        kwargs: bool,
+    },
+    /// Array literal: `[a, b, c]`, `%i[a b c]`, `%w[a b c]`.
+    /// `style` preserves which surface form the source used.
+    Array {
+        elements: Vec<Expr>,
+        #[serde(default)]
+        style: ArrayStyle,
+    },
+    /// Interpolated double-quoted string: `"x#{expr}y"`. Parts alternate
+    /// between literal text and embedded expressions. A single-part
+    /// Text-only list would degenerate to `Lit::Str` at ingest; we keep
+    /// this variant reserved for cases with at least one Expr part.
+    StringInterp { parts: Vec<InterpPart> },
+    /// Short-circuit logical operator: `left && right` or `left || right`.
+    /// Ruby also has keyword forms (`and`/`or`) with different precedence;
+    /// `surface` preserves which spelling the source used so round-trip
+    /// is byte-accurate.
+    BoolOp {
+        op: BoolOpKind,
+        #[serde(default)]
+        surface: BoolOpSurface,
+        left: Expr,
+        right: Expr,
+    },
+    Let { id: VarId, name: Symbol, value: Expr, body: Expr },
+    Lambda {
+        params: Vec<Symbol>,
+        /// The REST parameter (`|*args|`), without its sigil.
+        ///
+        /// Collected because dropping it is not a degradation but a
+        /// CORRUPTION: the body still reads the name, and in an emitted
+        /// module a bare `args` resolves to whatever else answers that
+        /// name — a module function, or nothing. campfire's Opengraph
+        /// tests stub a socket with `.with { |*args, **| args.first ==
+        /// … }`, and unparameterized that block died on `undefined
+        /// local variable or method 'args'`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rest_param: Option<Symbol>,
+        /// The parameters `params` and `rest_param` do not hold, in
+        /// source order: optional positionals (`size = 18`, with
+        /// `default`), keywords (`key:` / `limit: 10`, `keyword`) and a
+        /// keyword rest (`**opts`, `keyword` and `rest`; empty name for
+        /// an anonymous `**`). Kept for the same reason as `rest_param`:
+        /// the body reads these names, and a signature without them
+        /// raises `NameError`. Optionals come after `params` and before
+        /// `rest_param`; keywords after it, as Ruby orders them.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        extra_params: Vec<crate::dialect::Param>,
+        block_param: Option<Symbol>,
+        body: Expr,
+        /// Surface form when this Lambda represents a block attached to
+        /// a method call (`foo { ... }` vs `foo do ... end`) — or the
+        /// body delimiter of a `->` lambda (which is always braces in
+        /// Prism, so we default to `Brace` for lambda literals).
+        /// For round-trip fidelity; analyzer and typed targets ignore it.
+        #[serde(default)]
+        block_style: BlockStyle,
+    },
+    /// A bound-method value: `method(:name)` (`recv: None`, dispatches
+    /// on `self`), `self.method(:name)` / `recv.method(:name)`
+    /// (`recv: Some(...)`). Surfaces almost exclusively in block-
+    /// argument position (`&method(:name)`) — see `ingest_call_block`
+    /// — but is a general value-producing node, not block-slot-only.
+    ///
+    /// Distinct from `Lambda` because there is no body to desugar to
+    /// at ingest time: the callee's arity is a property of `name`'s
+    /// *definition*, unknown until the class registry resolves it (see
+    /// `BodyTyper`'s `MethodRef` arm, which types this like a Send with
+    /// no args — same registry lookup ordinary dispatch uses). Ruby/
+    /// Spinel emit this verbatim (`&method(:name)`); Spinel supports
+    /// `Method` objects natively (see `~/working/spinel/README.md`
+    /// and `docs/limitations.md`'s extensive `obj.method(:m)`
+    /// coverage). Strict targets emit an `unsupported` stub — see each
+    /// emitter's `MethodRef` arm.
+    MethodRef { recv: Option<Expr>, name: Symbol },
+    Apply { fun: Expr, args: Vec<Expr>, block: Option<Expr> },
+    Send {
+        /// `None` means implicit self (bare method call in current scope).
+        recv: Option<Expr>,
+        method: Symbol,
+        args: Vec<Expr>,
+        block: Option<Expr>,
+        /// Did the source wrap args in parens (`foo(x)` vs `foo x`)? Matters
+        /// only for implicit-self calls with args; explicit-receiver calls
+        /// always use parens in Ruby syntax.
+        #[serde(default)]
+        parenthesized: bool,
+    },
+    If { cond: Expr, then_branch: Expr, else_branch: Expr },
+    Case { scrutinee: Expr, arms: Vec<Arm> },
+    /// Ruby 3 structural pattern matching: `case scrutinee; in pat
+    /// [if/unless guard]; body; ... [else else_body] end`. Deliberately
+    /// separate from `Case`/`Arm`/`Pattern` (the `case/when` triple):
+    /// `when` tests each candidate via `pattern === scrutinee` and has
+    /// no way to destructure, so its `Pattern` type has no constant-
+    /// narrowing, capture, find, or rich hash/array-rest shapes, and an
+    /// arm-less `case/in` raises `NoMatchingPatternError` where
+    /// `case/when` falls through to `nil` — different enough semantics
+    /// that folding them into one IR shape would either strip case/in's
+    /// destructuring or teach case/when's emit path dead branches it
+    /// can never legally take. `else_body` absent means an unmatched
+    /// scrutinee raises at runtime, exactly as CRuby's case/in does.
+    CaseMatch { scrutinee: Expr, arms: Vec<MatchArm>, else_body: Option<Expr> },
+    /// `value in pattern` — one-line pattern predicate, returning Bool
+    /// rather than raising on mismatch. User pattern methods can raise.
+    /// Bindings escape to the enclosing lexical scope, including partial
+    /// bindings on failure; a newly introduced local otherwise holds nil.
+    MatchPredicate { value: Expr, pattern: MatchPattern },
+    /// `value => pattern` — one-line pattern *assertion*: binds on
+    /// match, raises `NoMatchingPatternError` on mismatch. Evaluates to
+    /// `nil`.
+    MatchRequired { value: Expr, pattern: MatchPattern },
+    Seq { exprs: Vec<Expr> },
+    Assign { target: LValue, value: Expr },
+    /// Compound assignment: `target ||= value`, `target += value`, etc.
+    /// Distinct from `Assign` because the short-circuit forms (`OrOr`,
+    /// `AndAnd`) only fire the setter when the read returns
+    /// falsy/truthy — naive desugar `target = target || value` ALWAYS
+    /// writes, which triggers Rails dirty-tracking (`*_will_change!`)
+    /// on no-op writes and widens narrowed types in typed targets.
+    /// Carrying the op explicitly lets each emitter pick the faithful
+    /// form: `||=` in Ruby/Crystal, `??=` in TS, conditional in others.
+    /// Arithmetic ops have no short-circuit so emitters may desugar
+    /// freely, but the IR shape preserves source intent.
+    OpAssign { target: LValue, op: OpAssignOp, value: Expr },
+    Yield { args: Vec<Expr> },
+    Raise { value: Expr },
+    /// Trailing `rescue` modifier: `expr rescue fallback`. Semantically
+    /// `begin; expr; rescue StandardError; fallback; end` but preserved
+    /// as its surface form so the Ruby emitter can round-trip it
+    /// without promoting it to a multi-line `begin` block.
+    RescueModifier { expr: Expr, fallback: Expr },
+    /// Bare `self` reference. Refers to the enclosing method's receiver
+    /// (instance methods) or the class itself (class-scope / class
+    /// methods). The body-typer fills `ty` with the appropriate type
+    /// from its lexical context.
+    SelfRef,
+    /// Early return from enclosing method: `return` (value = Lit::Nil)
+    /// or `return x`. Control-flow construct; the analyzer treats the
+    /// expression type as `Never`/divergent, and the emitter lowers to
+    /// the target language's return statement.
+    Return { value: Expr },
+    /// `super` (args = None — forward current method's args unchanged)
+    /// or `super(args...)` (args = Some(vec)). Distinct from Send with
+    /// an implicit receiver because the dispatch target is the parent
+    /// class's method, not the current one.
+    Super {
+        args: Option<Vec<Expr>>,
+    },
+    /// `next` inside an iterator block. `value` is `None` for bare
+    /// `next`, `Some(expr)` for `next val`. Divergent control flow
+    /// (analyzer treats type as `Never`); only meaningful inside a
+    /// Lambda body attached as a block to an iterator Send.
+    Next { value: Option<Expr> },
+    /// `break` inside an iterator block — exits the enclosing
+    /// iterator entirely (vs `Next`, which just skips to the next
+    /// iteration). `value` is the result of the WHOLE iterator call
+    /// when present; `None` for bare `break`. Divergent at the source
+    /// site (`Ty::Bottom`); only meaningful inside a Lambda attached
+    /// as a block.
+    Break { value: Option<Expr> },
+    /// `retry` inside a `rescue` body — re-runs the enclosing
+    /// `begin`/`rescue` block from the top. Carries no value; divergent
+    /// at the source site (`Ty::Bottom`). Only legal lexically inside a
+    /// `BeginRescue` rescue clause (the parser enforces placement).
+    Retry,
+    /// `redo` inside an iterator block or loop — re-runs the current
+    /// iteration without re-evaluating the loop condition, advancing the
+    /// iterator, or rebinding block params. Carries no value; divergent
+    /// at the source site (`Ty::Bottom`).
+    Redo,
+    /// `*expr` in argument position (`foo(*arr)`), array-literal
+    /// position (`[a, *rest, b]`), or assignment LHS (rest pattern —
+    /// not yet wired). At call sites the receiver spreads the array
+    /// across formal parameters; analyzer treats the splat's type as
+    /// the element type of the underlying Array. Only valid inside
+    /// argument lists / array literals; standalone Splat is a Ruby
+    /// syntax error.
+    Splat { value: Expr },
+    /// Full argument forwarding in a call or `super(...)`. Retains
+    /// positional/keyword/block provenance; never a user variable or
+    /// an ordinary positional hash. Requires a forwarding formal.
+    ForwardArgs,
+    /// Anonymous keyword forwarding (`**`) in call argument position.
+    /// This is an opaque packet sourced from the enclosing anonymous
+    /// keyword-rest formal, not a value or a synthetic local binding.
+    ForwardKeywords,
+    /// Ordered literal keyword pairs followed by anonymous keyword
+    /// forwarding (`key: value, **`) in call argument position. The
+    /// forwarded packet merges after the explicit pairs, so it may
+    /// override them; each pair expression still evaluates once and in
+    /// source order. The pair values are children for typing/effects,
+    /// while the opaque forwarded packet is not a capturable value.
+    ForwardKeywordsWithPairs { entries: Vec<(Expr, Expr)> },
+    /// Native Ruby syntax query. The operand is syntax, not a value child:
+    /// generic typing/lowering must not resolve or rewrite it. Reachability
+    /// may inspect it to retain methods whose existence is being queried.
+    Defined { operand: Expr },
+    /// Source keyword argument group containing `**expression`.
+    /// The one value child is the existing ordered hash merge expression;
+    /// it evaluates once. This is not a positional `{**hash}` literal.
+    KeywordSplat { value: Expr },
+    /// Parallel assignment: `a, b = expr` — RHS evaluates once, then
+    /// is destructured (Ruby array-like) across the targets. Limited
+    /// to the no-rest, no-rights shape; `a, *b = c` is not yet
+    /// supported.
+    MultiAssign { targets: Vec<LValue>, value: Expr },
+    /// `while cond; body; end` (and `until cond; body; end`, mapped
+    /// here with `until_form: true`). Evaluates to nil; loop control
+    /// flows through `Next` and `Return`. Ruby's `begin … end while`
+    /// (do-while) form is not yet supported.
+    While {
+        cond: Expr,
+        body: Expr,
+        #[serde(default)]
+        until_form: bool,
+    },
+    /// Range literal: `begin..end` (inclusive) or `begin...end`
+    /// (exclusive). Either side may be `None` for endless / beginless
+    /// ranges (`1..`, `..5`).
+    Range {
+        begin: Option<Expr>,
+        end: Option<Expr>,
+        exclusive: bool,
+    },
+    /// Multi-clause `begin / rescue / else / ensure / end`. For the
+    /// single-line modifier form (`expr rescue fallback`) use
+    /// `RescueModifier` instead. An `implicit` begin arises when a
+    /// `def` body contains trailing `rescue` clauses — same shape, no
+    /// surface `begin` keyword.
+    BeginRescue {
+        body: Expr,
+        rescues: Vec<RescueClause>,
+        else_branch: Option<Expr>,
+        ensure: Option<Expr>,
+        #[serde(default)]
+        implicit: bool,
+    },
+    /// Type assertion: tells the typer + per-target emitters that
+    /// `value` should be treated as having `target_ty` at this
+    /// position. Lowerers insert this where the runtime value is
+    /// known to be wider than the static target — most prominently
+    /// at adapter-row boundaries (`row[:id]` returning `DB::Any` /
+    /// `untyped` being assigned to a typed column).
+    ///
+    /// Per-target rendering:
+    ///   - Crystal: `(value).as(T)` (runtime-checked cast)
+    ///   - TS:      `(value as T)` (compile-time assertion)
+    ///   - Ruby/Spinel: render `value` unchanged (Ruby is dynamic;
+    ///     no cast operator needed)
+    ///   - Rust/strict targets: emit a type-narrowing pattern
+    ///     (try_into / match) to make the cast explicit at runtime
+    ///
+    /// `target_ty` is the type the value should have AFTER the cast.
+    /// The typer types the whole `Cast` expression as `target_ty`,
+    /// so downstream uses see the narrowed type.
+    Cast { value: Expr, target_ty: crate::ty::Ty },
+}
+
+impl ExprNode {
+    /// Stable, human-readable name for this node kind — the grep-able
+    /// `construct` label an emitter passes to `report_unsupported` when
+    /// it hits a node it can't lower yet. Preferred over
+    /// `std::mem::discriminant`, which renders as an opaque
+    /// `Discriminant(..)`.
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            ExprNode::Lit { .. } => "Lit",
+            ExprNode::Var { .. } => "Var",
+            ExprNode::Ivar { .. } => "Ivar",
+            ExprNode::Const { .. } => "Const",
+            ExprNode::Hash { .. } => "Hash",
+            ExprNode::Array { .. } => "Array",
+            ExprNode::StringInterp { .. } => "StringInterp",
+            ExprNode::BoolOp { .. } => "BoolOp",
+            ExprNode::Let { .. } => "Let",
+            ExprNode::Lambda { .. } => "Lambda",
+            ExprNode::MethodRef { .. } => "MethodRef",
+            ExprNode::Apply { .. } => "Apply",
+            ExprNode::Send { .. } => "Send",
+            ExprNode::If { .. } => "If",
+            ExprNode::Case { .. } => "Case",
+            ExprNode::CaseMatch { .. } => "CaseMatch",
+            ExprNode::MatchPredicate { .. } => "MatchPredicate",
+            ExprNode::MatchRequired { .. } => "MatchRequired",
+            ExprNode::Seq { .. } => "Seq",
+            ExprNode::Assign { .. } => "Assign",
+            ExprNode::OpAssign { .. } => "OpAssign",
+            ExprNode::Yield { .. } => "Yield",
+            ExprNode::Raise { .. } => "Raise",
+            ExprNode::RescueModifier { .. } => "RescueModifier",
+            ExprNode::SelfRef => "SelfRef",
+            ExprNode::Return { .. } => "Return",
+            ExprNode::Super { .. } => "Super",
+            ExprNode::Next { .. } => "Next",
+            ExprNode::Break { .. } => "Break",
+            ExprNode::Retry => "Retry",
+            ExprNode::Redo => "Redo",
+            ExprNode::Splat { .. } => "Splat",
+            ExprNode::ForwardArgs => "ForwardArgs",
+            ExprNode::ForwardKeywords => "ForwardKeywords",
+            ExprNode::ForwardKeywordsWithPairs { .. } => "ForwardKeywordsWithPairs",
+            ExprNode::Defined { .. } => "Defined",
+            ExprNode::KeywordSplat { .. } => "KeywordSplat",
+            ExprNode::MultiAssign { .. } => "MultiAssign",
+            ExprNode::While { .. } => "While",
+            ExprNode::Range { .. } => "Range",
+            ExprNode::BeginRescue { .. } => "BeginRescue",
+            ExprNode::Cast { .. } => "Cast",
+        }
+    }
+
+    /// Visit every direct child `Expr` of this node, mutably — including
+    /// the ones embedded in `LValue` targets, `Case` arms (guards,
+    /// bodies, `Pattern::Expr`), rescue clauses, and `StringInterp`
+    /// parts. Shallow: one level only; callers recurse themselves.
+    pub fn for_each_child_mut(&mut self, f: &mut impl FnMut(&mut Expr)) {
+        fn lvalue_children(lv: &mut LValue, f: &mut impl FnMut(&mut Expr)) {
+            match lv {
+                LValue::Var { .. } | LValue::Ivar { .. } | LValue::Const { .. } => {}
+                LValue::Attr { recv, .. } => f(recv),
+                LValue::Index { recv, index } => {
+                    f(recv);
+                    f(index);
+                }
+            }
+        }
+        fn pattern_children(p: &mut Pattern, f: &mut impl FnMut(&mut Expr)) {
+            match p {
+                Pattern::Wildcard | Pattern::Bind { .. } | Pattern::Lit { .. } => {}
+                Pattern::Array { elems, .. } => {
+                    for e in elems {
+                        pattern_children(e, f);
+                    }
+                }
+                Pattern::Record { fields, .. } => {
+                    for (_, p) in fields {
+                        pattern_children(p, f);
+                    }
+                }
+                Pattern::Expr { expr } => f(expr),
+            }
+        }
+        match self {
+            ExprNode::Lit { .. }
+            | ExprNode::Var { .. }
+            | ExprNode::Ivar { .. }
+            | ExprNode::Const { .. }
+            | ExprNode::Retry
+            | ExprNode::Redo
+            | ExprNode::ForwardArgs
+            | ExprNode::ForwardKeywords
+            | ExprNode::Defined { .. }
+            | ExprNode::SelfRef => {}
+            ExprNode::ForwardKeywordsWithPairs { entries } => {
+                for (k, v) in entries {
+                    f(k);
+                    f(v);
+                }
+            }
+            ExprNode::Hash { entries, .. } => {
+                for (k, v) in entries {
+                    f(k);
+                    f(v);
+                }
+            }
+            ExprNode::Array { elements, .. } => {
+                for e in elements {
+                    f(e);
+                }
+            }
+            ExprNode::StringInterp { parts } => {
+                for p in parts {
+                    if let InterpPart::Expr { expr } = p {
+                        f(expr);
+                    }
+                }
+            }
+            ExprNode::BoolOp { left, right, .. } => {
+                f(left);
+                f(right);
+            }
+            ExprNode::Let { value, body, .. } => {
+                f(value);
+                f(body);
+            }
+            ExprNode::Lambda { extra_params, body, .. } => {
+                // Defaults are evaluated where the lambda is called, before
+                // the body runs; walk them first.
+                for p in extra_params.iter_mut() {
+                    if let Some(d) = &mut p.default { f(d); }
+                }
+                f(body)
+            }
+            ExprNode::MethodRef { recv, .. } => {
+                if let Some(r) = recv {
+                    f(r);
+                }
+            }
+            ExprNode::Apply { fun, args, block } => {
+                f(fun);
+                for a in args {
+                    f(a);
+                }
+                if let Some(b) = block {
+                    f(b);
+                }
+            }
+            ExprNode::Send { recv, args, block, .. } => {
+                if let Some(r) = recv {
+                    f(r);
+                }
+                for a in args {
+                    f(a);
+                }
+                if let Some(b) = block {
+                    f(b);
+                }
+            }
+            ExprNode::If { cond, then_branch, else_branch } => {
+                f(cond);
+                f(then_branch);
+                f(else_branch);
+            }
+            ExprNode::Case { scrutinee, arms } => {
+                f(scrutinee);
+                for arm in arms {
+                    pattern_children(&mut arm.pattern, f);
+                    if let Some(g) = arm.guard.as_mut() {
+                        f(g);
+                    }
+                    f(&mut arm.body);
+                }
+            }
+            ExprNode::CaseMatch { scrutinee, arms, else_body } => {
+                f(scrutinee);
+                for arm in arms {
+                    arm.pattern.for_each_expr_mut(f);
+                    if let Some((_, g)) = arm.guard.as_mut() {
+                        f(g);
+                    }
+                    f(&mut arm.body);
+                }
+                if let Some(e) = else_body {
+                    f(e);
+                }
+            }
+            ExprNode::MatchPredicate { value, pattern } | ExprNode::MatchRequired { value, pattern } => {
+                f(value);
+                pattern.for_each_expr_mut(f);
+            }
+            ExprNode::Seq { exprs } => {
+                for e in exprs {
+                    f(e);
+                }
+            }
+            ExprNode::Assign { target, value } => {
+                lvalue_children(target, f);
+                f(value);
+            }
+            ExprNode::OpAssign { target, value, .. } => {
+                lvalue_children(target, f);
+                f(value);
+            }
+            ExprNode::Yield { args } => {
+                for a in args {
+                    f(a);
+                }
+            }
+            ExprNode::Raise { value } => f(value),
+            ExprNode::RescueModifier { expr, fallback } => {
+                f(expr);
+                f(fallback);
+            }
+            ExprNode::Return { value } => f(value),
+            ExprNode::Super { args } => {
+                if let Some(args) = args {
+                    for a in args {
+                        f(a);
+                    }
+                }
+            }
+            ExprNode::Next { value } | ExprNode::Break { value } => {
+                if let Some(v) = value {
+                    f(v);
+                }
+            }
+            ExprNode::Splat { value } | ExprNode::KeywordSplat { value } => f(value),
+            ExprNode::MultiAssign { targets, value } => {
+                for t in targets {
+                    lvalue_children(t, f);
+                }
+                f(value);
+            }
+            ExprNode::While { cond, body, .. } => {
+                f(cond);
+                f(body);
+            }
+            ExprNode::Range { begin, end, .. } => {
+                if let Some(b) = begin {
+                    f(b);
+                }
+                if let Some(e) = end {
+                    f(e);
+                }
+            }
+            ExprNode::BeginRescue { body, rescues, else_branch, ensure, .. } => {
+                f(body);
+                for r in rescues {
+                    for c in &mut r.classes {
+                        f(c);
+                    }
+                    f(&mut r.body);
+                }
+                if let Some(e) = else_branch {
+                    f(e);
+                }
+                if let Some(e) = ensure {
+                    f(e);
+                }
+            }
+            ExprNode::Cast { value, .. } => f(value),
+        }
+    }
+
+    /// Visit every direct child `Expr`, immutably — the read-side mirror
+    /// of [`ExprNode::for_each_child_mut`], covering the same embedded
+    /// children (`LValue` targets, `Case` arm guards/bodies/patterns,
+    /// rescue clauses, `StringInterp` parts). Shallow: one level only;
+    /// callers recurse themselves.
+    ///
+    /// The handed-out references share the `&'a self` borrow, so a caller
+    /// may *retain* them past the call (e.g. to return the node covering a
+    /// cursor offset) — the lifetime is what `for_each_child_mut` can't
+    /// offer and what the position-query layer (`crate::ide`) needs.
+    pub fn for_each_child<'a>(&'a self, f: &mut dyn FnMut(&'a Expr)) {
+        fn lvalue_children<'a>(lv: &'a LValue, f: &mut dyn FnMut(&'a Expr)) {
+            match lv {
+                LValue::Var { .. } | LValue::Ivar { .. } | LValue::Const { .. } => {}
+                LValue::Attr { recv, .. } => f(recv),
+                LValue::Index { recv, index } => {
+                    f(recv);
+                    f(index);
+                }
+            }
+        }
+        fn pattern_children<'a>(p: &'a Pattern, f: &mut dyn FnMut(&'a Expr)) {
+            match p {
+                Pattern::Wildcard | Pattern::Bind { .. } | Pattern::Lit { .. } => {}
+                Pattern::Array { elems, .. } => {
+                    for e in elems {
+                        pattern_children(e, f);
+                    }
+                }
+                Pattern::Record { fields, .. } => {
+                    for (_, p) in fields {
+                        pattern_children(p, f);
+                    }
+                }
+                Pattern::Expr { expr } => f(expr),
+            }
+        }
+        match self {
+            ExprNode::Lit { .. }
+            | ExprNode::Var { .. }
+            | ExprNode::Ivar { .. }
+            | ExprNode::Const { .. }
+            | ExprNode::Retry
+            | ExprNode::Redo
+            | ExprNode::ForwardArgs
+            | ExprNode::ForwardKeywords
+            | ExprNode::Defined { .. }
+            | ExprNode::SelfRef => {}
+            ExprNode::ForwardKeywordsWithPairs { entries } => {
+                for (k, v) in entries {
+                    f(k);
+                    f(v);
+                }
+            }
+            ExprNode::Hash { entries, .. } => {
+                for (k, v) in entries {
+                    f(k);
+                    f(v);
+                }
+            }
+            ExprNode::Array { elements, .. } => {
+                for e in elements {
+                    f(e);
+                }
+            }
+            ExprNode::StringInterp { parts } => {
+                for p in parts {
+                    if let InterpPart::Expr { expr } = p {
+                        f(expr);
+                    }
+                }
+            }
+            ExprNode::BoolOp { left, right, .. } => {
+                f(left);
+                f(right);
+            }
+            ExprNode::Let { value, body, .. } => {
+                f(value);
+                f(body);
+            }
+            ExprNode::Lambda { extra_params, body, .. } => {
+                for p in extra_params.iter() {
+                    if let Some(d) = &p.default { f(d); }
+                }
+                f(body)
+            }
+            ExprNode::MethodRef { recv, .. } => {
+                if let Some(r) = recv {
+                    f(r);
+                }
+            }
+            ExprNode::Apply { fun, args, block } => {
+                f(fun);
+                for a in args {
+                    f(a);
+                }
+                if let Some(b) = block {
+                    f(b);
+                }
+            }
+            ExprNode::Send { recv, args, block, .. } => {
+                if let Some(r) = recv {
+                    f(r);
+                }
+                for a in args {
+                    f(a);
+                }
+                if let Some(b) = block {
+                    f(b);
+                }
+            }
+            ExprNode::If { cond, then_branch, else_branch } => {
+                f(cond);
+                f(then_branch);
+                f(else_branch);
+            }
+            ExprNode::Case { scrutinee, arms } => {
+                f(scrutinee);
+                for arm in arms {
+                    pattern_children(&arm.pattern, f);
+                    if let Some(g) = arm.guard.as_ref() {
+                        f(g);
+                    }
+                    f(&arm.body);
+                }
+            }
+            ExprNode::CaseMatch { scrutinee, arms, else_body } => {
+                f(scrutinee);
+                for arm in arms {
+                    arm.pattern.for_each_expr(f);
+                    if let Some((_, g)) = arm.guard.as_ref() {
+                        f(g);
+                    }
+                    f(&arm.body);
+                }
+                if let Some(e) = else_body {
+                    f(e);
+                }
+            }
+            ExprNode::MatchPredicate { value, pattern } | ExprNode::MatchRequired { value, pattern } => {
+                f(value);
+                pattern.for_each_expr(f);
+            }
+            ExprNode::Seq { exprs } => {
+                for e in exprs {
+                    f(e);
+                }
+            }
+            ExprNode::Assign { target, value } => {
+                lvalue_children(target, f);
+                f(value);
+            }
+            ExprNode::OpAssign { target, value, .. } => {
+                lvalue_children(target, f);
+                f(value);
+            }
+            ExprNode::Yield { args } => {
+                for a in args {
+                    f(a);
+                }
+            }
+            ExprNode::Raise { value } => f(value),
+            ExprNode::RescueModifier { expr, fallback } => {
+                f(expr);
+                f(fallback);
+            }
+            ExprNode::Return { value } => f(value),
+            ExprNode::Super { args } => {
+                if let Some(args) = args {
+                    for a in args {
+                        f(a);
+                    }
+                }
+            }
+            ExprNode::Next { value } | ExprNode::Break { value } => {
+                if let Some(v) = value {
+                    f(v);
+                }
+            }
+            ExprNode::Splat { value } | ExprNode::KeywordSplat { value } => f(value),
+            ExprNode::MultiAssign { targets, value } => {
+                for t in targets {
+                    lvalue_children(t, f);
+                }
+                f(value);
+            }
+            ExprNode::While { cond, body, .. } => {
+                f(cond);
+                f(body);
+            }
+            ExprNode::Range { begin, end, .. } => {
+                if let Some(b) = begin {
+                    f(b);
+                }
+                if let Some(e) = end {
+                    f(e);
+                }
+            }
+            ExprNode::BeginRescue { body, rescues, else_branch, ensure, .. } => {
+                f(body);
+                for r in rescues {
+                    for c in &r.classes {
+                        f(c);
+                    }
+                    f(&r.body);
+                }
+                if let Some(e) = else_branch {
+                    f(e);
+                }
+                if let Some(e) = ensure {
+                    f(e);
+                }
+            }
+            ExprNode::Cast { value, .. } => f(value),
+        }
+    }
+}
+
+/// One `rescue` clause inside a `BeginRescue`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RescueClause {
+    /// Exception classes this clause catches. Empty means the default
+    /// `StandardError` (Ruby's implicit when none given).
+    pub classes: Vec<Expr>,
+    /// Name bound to the exception object: `rescue E => name`.
+    pub binding: Option<Symbol>,
+    pub body: Expr,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Literal {
+    Nil,
+    Bool { value: bool },
+    Int { value: i64 },
+    Float { value: f64 },
+    Str { value: String },
+    Sym { value: Symbol },
+    /// Regex literal: `/pattern/flags`. `pattern` is the unescaped
+    /// pattern bytes (lossy UTF-8); `flags` is a string of the
+    /// supported single-letter Ruby flags concatenated in canonical
+    /// `imxoesun` order (`/foo/im`, `/foo/x`).
+    Regex { pattern: String, flags: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Arm {
+    pub pattern: Pattern,
+    pub guard: Option<Expr>,
+    pub body: Expr,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Pattern {
+    Wildcard,
+    Bind { name: Symbol },
+    Lit { value: Literal },
+    Array { elems: Vec<Pattern>, rest: Option<Symbol> },
+    Record { fields: Vec<(Symbol, Pattern)>, rest: bool },
+    /// `when <expr>` with a non-literal pattern — e.g.
+    /// `when ->(b) { b == Story }` (lambda predicate, common Rails
+    /// idiom for class-equality matching since `Class === instance`
+    /// is true but `Class === Class` isn't). Ruby evaluates
+    /// `pattern === scrutinee` for each `when`; Proc#=== invokes the
+    /// proc with the scrutinee, so a lambda acts as a predicate.
+    /// Ruby/Crystal emit renders `when <expr>` directly (their `===`
+    /// dispatch handles it); typed targets desugar to
+    /// `if expr.call(scrutinee)` chains.
+    Expr { expr: Expr },
+}
+
+/// One `in pattern [guard] then body` arm of a `CaseMatch`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MatchArm {
+    pub pattern: MatchPattern,
+    pub guard: Option<(MatchGuardKind, Expr)>,
+    pub body: Expr,
+}
+
+/// Which keyword introduced a `MatchArm`'s guard — `in pat if cond` vs
+/// `in pat unless cond`. Prism folds the guard into the arm's pattern
+/// slot as an `IfNode`/`UnlessNode` wrapping the real pattern (see
+/// `ingest_pattern`'s guard-unwrap); this is what lets emit tell the two
+/// apart again without re-deriving polarity from a negated `Expr`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MatchGuardKind {
+    If,
+    Unless,
+}
+
+/// A `case/in` structural pattern, plus the `in`/`=>`/`in` one-liners
+/// (`MatchPredicate`/`MatchRequired` share this same pattern grammar).
+/// Distinct from `Pattern` (the `case/when` triple just above): `when`
+/// only ever tests `pattern === scrutinee`, so it has no destructuring,
+/// no captures, no constant-narrowed collections, and no find/rest
+/// vocabulary — building those out on `Pattern` would add branches every
+/// existing `when`-only emitter match can never legally reach.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MatchPattern {
+    /// Anything tested via `pattern === scrutinee`: literals, ranges,
+    /// regexes, bare constants/class refs (`in Success`), and pins
+    /// (`in ^expected`, `in ^(expr)`) — Ruby lowers all of these to an
+    /// expression on the pattern side of `===`, so IR keeps them as one
+    /// verbatim `Expr` rather than a family of near-duplicate variants.
+    Value { expr: Expr },
+    /// Bare `in nil`, distinct from a pinned `Value { expr: Lit::Nil }`.
+    Nil,
+    /// A bare identifier: `in company`. Always binds (Ruby pattern
+    /// syntax has no plain "read this local and test equality" form —
+    /// that's what the pin operator is for), so unlike `Pattern::Bind`
+    /// on `case/when` there's no ambiguity to document here.
+    Bind { name: Symbol },
+    /// `pattern => name` — bind the whole matched value under `name` in
+    /// addition to whatever `pattern` itself binds.
+    Capture { pattern: Box<MatchPattern>, name: Symbol },
+    /// `p1 | p2 | ... | pn`, flattened at ingest from Prism's
+    /// left-associative binary `AlternationPatternNode` tree. A pattern
+    /// alternative may only bind names beginning with `_`.
+    Alt { alternatives: Vec<MatchPattern> },
+    /// `in [a, b, *rest, c]`, optionally class-narrowed (`in
+    /// Success(page)`, `in Success[entities, errors]` — Prism represents
+    /// both the parenthesized and bracketed constant-prefixed forms as
+    /// this same node). `rest`: `None` — no splat in the pattern; `Some(None)`
+    /// — bare `*` (skip, don't bind); `Some(Some(name))` — `*name`.
+    Array {
+        constant: Option<Expr>,
+        pre: Vec<MatchPattern>,
+        rest: Option<Option<Symbol>>,
+        post: Vec<MatchPattern>,
+    },
+    /// `in [*, x, y, *]` — exactly one splat on each side of a fixed
+    /// middle run, matched against any contiguous subsequence. `pre_rest`/
+    /// `post_rest` follow the same `None` = bare `*` convention as
+    /// `Array::rest`'s inner `Option<Symbol>`.
+    Find {
+        constant: Option<Expr>,
+        pre_rest: Option<Symbol>,
+        middle: Vec<MatchPattern>,
+        post_rest: Option<Symbol>,
+    },
+    /// `in {status: "ok", data:, **rest}`, optionally class-narrowed
+    /// (`in Success(value:)`). Each pair's value is `None` for Ruby's
+    /// 3.1 keyword-value-omission shorthand (`data:` binds a local named
+    /// `data`) and `Some(pattern)` when the key has an explicit
+    /// sub-pattern (`status: "ok"`).
+    Hash {
+        constant: Option<Expr>,
+        pairs: Vec<(Symbol, Option<MatchPattern>)>,
+        rest: Option<HashRest>,
+    },
+}
+
+/// The `**` tail of a `MatchPattern::Hash`, when the source wrote one at
+/// all. Nonempty hash patterns allow additional keys by default; an
+/// empty `{}` requires an empty hash, whereas `{**}` accepts any hash.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HashRest {
+    /// Bare `**` — allow unmatched keys without binding them.
+    Ignore,
+    /// `**rest` — collect every unmatched key into a Hash bound to
+    /// `rest`.
+    Collect { name: Symbol },
+    /// `**nil` — assert there are no unmatched keys; the pattern fails
+    /// if the scrutinee has any key beyond the ones listed.
+    Nil,
+}
+
+impl MatchPattern {
+    /// Visit every `Expr` embedded in this pattern, immutably — a
+    /// `Value`'s test expression, or an `Array`/`Find`/`Hash` pattern's
+    /// narrowing `constant`. Shallow like `ExprNode::for_each_child`:
+    /// callers recurse themselves. Shared here so the many plain
+    /// tree-walkers across `analyze`/`lower`/`emit` that need to reach
+    /// into a `CaseMatch` arm's pattern don't each re-derive this recursion.
+    pub fn for_each_expr<'a>(&'a self, f: &mut dyn FnMut(&'a Expr)) {
+        match self {
+            MatchPattern::Nil | MatchPattern::Bind { .. } => {}
+            MatchPattern::Value { expr } => f(expr),
+            MatchPattern::Capture { pattern, .. } => pattern.for_each_expr(f),
+            MatchPattern::Alt { alternatives } => {
+                for a in alternatives {
+                    a.for_each_expr(f);
+                }
+            }
+            MatchPattern::Array { constant, pre, post, .. } => {
+                if let Some(c) = constant {
+                    f(c);
+                }
+                for p in pre.iter().chain(post.iter()) {
+                    p.for_each_expr(f);
+                }
+            }
+            MatchPattern::Find { constant, middle, .. } => {
+                if let Some(c) = constant {
+                    f(c);
+                }
+                for p in middle {
+                    p.for_each_expr(f);
+                }
+            }
+            MatchPattern::Hash { constant, pairs, .. } => {
+                if let Some(c) = constant {
+                    f(c);
+                }
+                for (_, p) in pairs {
+                    if let Some(p) = p {
+                        p.for_each_expr(f);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Mutable mirror of [`MatchPattern::for_each_expr`].
+    pub fn for_each_expr_mut(&mut self, f: &mut dyn FnMut(&mut Expr)) {
+        match self {
+            MatchPattern::Nil | MatchPattern::Bind { .. } => {}
+            MatchPattern::Value { expr } => f(expr),
+            MatchPattern::Capture { pattern, .. } => pattern.for_each_expr_mut(f),
+            MatchPattern::Alt { alternatives } => {
+                for a in alternatives {
+                    a.for_each_expr_mut(f);
+                }
+            }
+            MatchPattern::Array { constant, pre, post, .. } => {
+                if let Some(c) = constant {
+                    f(c);
+                }
+                for p in pre.iter_mut().chain(post.iter_mut()) {
+                    p.for_each_expr_mut(f);
+                }
+            }
+            MatchPattern::Find { constant, middle, .. } => {
+                if let Some(c) = constant {
+                    f(c);
+                }
+                for p in middle {
+                    p.for_each_expr_mut(f);
+                }
+            }
+            MatchPattern::Hash { constant, pairs, .. } => {
+                if let Some(c) = constant {
+                    f(c);
+                }
+                for (_, p) in pairs {
+                    if let Some(p) = p {
+                        p.for_each_expr_mut(f);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every name this pattern binds when it matches, in the order
+    /// they'd bind — a plain structural listing with no type
+    /// information (see the body-typer's `match_pattern_bindings` for
+    /// the typed version used by `analyze`). Used where only the NAMES
+    /// matter, such as lexical binding inventories.
+    pub fn bound_names(&self, out: &mut Vec<Symbol>) {
+        match self {
+            MatchPattern::Nil | MatchPattern::Value { .. } => {}
+            MatchPattern::Alt { alternatives } => {
+                for pattern in alternatives { pattern.bound_names(out); }
+            }
+            MatchPattern::Bind { name } => out.push(name.clone()),
+            MatchPattern::Capture { pattern, name } => {
+                pattern.bound_names(out);
+                out.push(name.clone());
+            }
+            MatchPattern::Array { pre, rest, post, .. } => {
+                for p in pre.iter().chain(post.iter()) {
+                    p.bound_names(out);
+                }
+                if let Some(Some(name)) = rest {
+                    out.push(name.clone());
+                }
+            }
+            MatchPattern::Find { middle, pre_rest, post_rest, .. } => {
+                for p in middle {
+                    p.bound_names(out);
+                }
+                if let Some(name) = pre_rest {
+                    out.push(name.clone());
+                }
+                if let Some(name) = post_rest {
+                    out.push(name.clone());
+                }
+            }
+            MatchPattern::Hash { pairs, rest, .. } => {
+                for (key, sub) in pairs {
+                    match sub {
+                        Some(p) => p.bound_names(out),
+                        None => out.push(key.clone()),
+                    }
+                }
+                if let Some(HashRest::Collect { name }) = rest {
+                    out.push(name.clone());
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LValue {
+    Var { id: VarId, name: Symbol },
+    Ivar { name: Symbol },
+    Attr { recv: Expr, name: Symbol },
+    Index { recv: Expr, index: Expr },
+    /// In-class constant assignment: `FLAGGABLE_DAYS = 7` inside a
+    /// `class` body, or `Foo::BAR = 1` qualified write. Reads use
+    /// `ExprNode::Const { path }`. Class-scoped — the path here is
+    /// the constant's name relative to the enclosing scope, not the
+    /// fully-qualified path; lowerers/emitters resolve to the
+    /// containing class as needed.
+    Const { path: Vec<Symbol> },
+}
+
+/// Compound-assignment operator carried by `ExprNode::OpAssign`. The
+/// short-circuit forms (`OrOr`, `AndAnd`) are semantically distinct
+/// from the arithmetic forms because they suppress the write when the
+/// read's truthiness already matches; the arithmetic forms always
+/// read-compute-write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpAssignOp {
+    /// `||=` — assign only if the target reads as nil/false. Setter
+    /// (for Attr/Index targets) is suppressed on truthy reads.
+    OrOr,
+    /// `&&=` — assign only if the target reads as truthy.
+    AndAnd,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    Pow,
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
+}
+
+impl OpAssignOp {
+    /// Render the operator as it appears in Ruby source. Used by the
+    /// Ruby/Crystal/Spinel emitters for native `target op= value` emit.
+    pub fn as_ruby(self) -> &'static str {
+        match self {
+            OpAssignOp::OrOr => "||=",
+            OpAssignOp::AndAnd => "&&=",
+            OpAssignOp::Add => "+=",
+            OpAssignOp::Sub => "-=",
+            OpAssignOp::Mul => "*=",
+            OpAssignOp::Div => "/=",
+            OpAssignOp::Mod => "%=",
+            OpAssignOp::Pow => "**=",
+            OpAssignOp::BitAnd => "&=",
+            OpAssignOp::BitOr => "|=",
+            OpAssignOp::BitXor => "^=",
+            OpAssignOp::Shl => "<<=",
+            OpAssignOp::Shr => ">>=",
+        }
+    }
+
+    /// The binary operator that the arithmetic forms desugar to (for
+    /// emitters that lack native compound assignment). Returns `None`
+    /// for the short-circuit forms — those have no binary-operator
+    /// equivalent that preserves write-suppression semantics.
+    pub fn binary_op(self) -> Option<&'static str> {
+        match self {
+            OpAssignOp::OrOr | OpAssignOp::AndAnd => None,
+            OpAssignOp::Add => Some("+"),
+            OpAssignOp::Sub => Some("-"),
+            OpAssignOp::Mul => Some("*"),
+            OpAssignOp::Div => Some("/"),
+            OpAssignOp::Mod => Some("%"),
+            OpAssignOp::Pow => Some("**"),
+            OpAssignOp::BitAnd => Some("&"),
+            OpAssignOp::BitOr => Some("|"),
+            OpAssignOp::BitXor => Some("^"),
+            OpAssignOp::Shl => Some("<<"),
+            OpAssignOp::Shr => Some(">>"),
+        }
+    }
+}
+
+/// Desugar an `OpAssign` to the equivalent existing-IR shape. Used by
+/// emitters that lack native compound assignment (Go, Python, Elixir,
+/// Rust2 for non-trivial cases). Arithmetic ops produce
+/// `Assign(target, BinOp(target_read, op, value))`. Short-circuit ops
+/// produce `If(target_read, target_read, Assign(target, value))` for
+/// `||=` and the swapped form for `&&=`.
+///
+/// Note on fidelity: the desugared form re-evaluates the target's
+/// read side, which is observable for Attr/Index targets with setter
+/// side-effects (Rails dirty-tracking, ORM callbacks). Emitters that
+/// care about that fidelity — Ruby, Crystal, Spinel — render
+/// `target op= value` natively instead of calling this. Targets where
+/// dirty-tracking doesn't apply (Go/Python/etc.) can desugar freely.
+pub fn desugar_op_assign(
+    target: &LValue,
+    op: OpAssignOp,
+    value: &Expr,
+    span: crate::span::Span,
+) -> Expr {
+    // Build a read of the target as an Expr, so it can appear on both
+    // sides of the desugared form. The read and the combined value are
+    // new nodes, so they carry the type the analyzer gave the operand
+    // — an emitter that renders `+` by type (Rust's `String + &str`)
+    // reads it off them.
+    let mut target_read = match target {
+        LValue::Var { id, name } => Expr::new(span, ExprNode::Var { id: *id, name: name.clone() }),
+        LValue::Ivar { name } => Expr::new(span, ExprNode::Ivar { name: name.clone() }),
+        LValue::Attr { recv, name } => Expr::new(
+            span,
+            ExprNode::Send {
+                recv: Some(recv.clone()),
+                method: name.clone(),
+                args: vec![],
+                block: None,
+                parenthesized: false,
+            },
+        ),
+        LValue::Index { recv, index } => Expr::new(
+            span,
+            ExprNode::Send {
+                recv: Some(recv.clone()),
+                method: Symbol::from("[]"),
+                args: vec![index.clone()],
+                block: None,
+                parenthesized: true,
+            },
+        ),
+        LValue::Const { path } => Expr::new(span, ExprNode::Const { path: path.clone() }),
+    };
+    target_read.ty = value.ty.clone();
+    match op {
+        OpAssignOp::OrOr | OpAssignOp::AndAnd => {
+            // `target ||= value` → `target || (target = value)` — but
+            // the IR has If, not BoolOp-with-Assign-on-the-right; use
+            // If so the assignment is statement-shaped (matters for
+            // emitters that distinguish expression vs statement). For
+            // `||=`: if target is truthy, evaluate to target; else,
+            // assign value and evaluate to that. For `&&=`: opposite.
+            let assign = Expr::new(
+                span,
+                ExprNode::Assign { target: target.clone(), value: value.clone() },
+            );
+            let (then_branch, else_branch) = if matches!(op, OpAssignOp::OrOr) {
+                (target_read.clone(), assign)
+            } else {
+                (assign, target_read.clone())
+            };
+            let mut e = Expr::new(
+                span,
+                ExprNode::If {
+                    cond: target_read,
+                    then_branch,
+                    else_branch,
+                },
+            );
+            e.ty = value.ty.clone();
+            e
+        }
+        _ => {
+            // Arithmetic / bitwise: `target += value` →
+            // `target = target + value`. The BinOp is a Send with the
+            // binary-op string as the method name.
+            let binop_name = op
+                .binary_op()
+                .expect("arithmetic OpAssignOp has a binary_op");
+            let mut combined = Expr::new(
+                span,
+                ExprNode::Send {
+                    recv: Some(target_read),
+                    method: Symbol::from(binop_name),
+                    args: vec![value.clone()],
+                    block: None,
+                    parenthesized: false,
+                },
+            );
+            combined.ty = value.ty.clone();
+            Expr::new(
+                span,
+                ExprNode::Assign { target: target.clone(), value: combined },
+            )
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ident::VarId;
+    use crate::span::FileId;
+
+    fn real(start: u32, end: u32) -> Span {
+        Span { file: FileId(1), start, end }
+    }
+
+    fn var(name: &str, span: Span) -> Expr {
+        Expr::new(span, ExprNode::Var { id: VarId(0), name: Symbol::from(name) })
+    }
+
+    #[test]
+    fn inherit_span_fills_synthetic_nodes() {
+        let mut e = Expr::new(
+            Span::synthetic(),
+            ExprNode::Send {
+                recv: Some(var("io", Span::synthetic())),
+                method: Symbol::from("<<"),
+                args: vec![var("x", Span::synthetic())],
+                block: None,
+                parenthesized: false,
+            },
+        );
+        e.inherit_span(real(10, 20));
+        assert_eq!(e.span, real(10, 20));
+        let ExprNode::Send { recv, args, .. } = &*e.node else { panic!() };
+        assert_eq!(recv.as_ref().unwrap().span, real(10, 20));
+        assert_eq!(args[0].span, real(10, 20));
+    }
+
+    #[test]
+    fn inherit_span_keeps_real_spans_and_uses_them_for_descendants() {
+        // Synthetic wrapper around a source subtree: the wrapper takes
+        // the enclosing span, the source node keeps its own, and a
+        // synthetic node UNDER the source node takes the source node's
+        // span (nearest enclosing), not the outer one.
+        let source_child = Expr::new(
+            real(30, 40),
+            ExprNode::Send {
+                recv: Some(var("article", Span::synthetic())),
+                method: Symbol::from("title"),
+                args: vec![],
+                block: None,
+                parenthesized: false,
+            },
+        );
+        let mut wrapper = Expr::new(
+            Span::synthetic(),
+            ExprNode::Send {
+                recv: None,
+                method: Symbol::from("html_escape"),
+                args: vec![source_child],
+                block: None,
+                parenthesized: false,
+            },
+        );
+        wrapper.inherit_span(real(10, 50));
+        assert_eq!(wrapper.span, real(10, 50));
+        let ExprNode::Send { args, .. } = &*wrapper.node else { panic!() };
+        assert_eq!(args[0].span, real(30, 40), "real span survives");
+        let ExprNode::Send { recv, .. } = &*args[0].node else { panic!() };
+        assert_eq!(
+            recv.as_ref().unwrap().span,
+            real(30, 40),
+            "synthetic descendant takes nearest enclosing real span",
+        );
+    }
+
+    #[test]
+    fn inherit_span_with_synthetic_enclosing_is_a_no_op() {
+        let mut e = var("x", Span::synthetic());
+        e.inherit_span(Span::synthetic());
+        assert!(e.span.is_synthetic());
+    }
+}
+
+#[cfg(test)]
+mod cold_tests {
+    use super::{Expr, ExprNode, IrHint, Literal};
+    use crate::diagnostic::DiagnosticKind;
+    use crate::span::Span;
+
+    fn nil() -> Expr {
+        Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil })
+    }
+
+    /// A node with no rare annotations carries no cold box, writes
+    /// none of their keys, and reads back without allocating one.
+    #[test]
+    fn absent_annotations_round_trip_without_a_box() {
+        let e = nil();
+        assert!(e.cold.is_none());
+        let json = serde_json::to_value(&e).unwrap();
+        assert!(json.get("diagnostic").is_none() && json.get("hint").is_none());
+        let back: Expr = serde_json::from_value(json.clone()).unwrap();
+        assert!(back.cold.is_none());
+        assert_eq!(serde_json::to_value(&back).unwrap(), json);
+    }
+
+    /// Set annotations serialize flat, beside `node`, and survive a
+    /// round trip.
+    #[test]
+    fn present_annotations_round_trip_flat() {
+        let mut e = nil();
+        e.set_diagnostic(Some(DiagnosticKind::Parse { message: "m".into() }));
+        e.set_hint(Some(IrHint::MutableStringLiteral));
+        let json = serde_json::to_value(&e).unwrap();
+        assert!(json.get("diagnostic").is_some() && json.get("hint").is_some());
+        assert!(json.get("cold").is_none());
+        let back: Expr = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(back.diagnostic(), e.diagnostic());
+        assert_eq!(back.hint(), &Some(IrHint::MutableStringLiteral));
+        assert_eq!(serde_json::to_value(&back).unwrap(), json);
+    }
+
+    /// Clearing the last annotation drops the box.
+    #[test]
+    fn cold_box_dropped_when_emptied() {
+        let mut e = nil();
+        e.set_hint(Some(IrHint::MutableStringLiteral));
+        e.set_diagnostic(Some(DiagnosticKind::Parse { message: "m".into() }));
+        e.set_hint(None);
+        assert!(e.cold.is_some());
+        assert!(e.take_diagnostic().is_some());
+        assert!(e.cold.is_none());
+        e.set_diagnostic(None);
+        assert!(e.cold.is_none());
+    }
+}

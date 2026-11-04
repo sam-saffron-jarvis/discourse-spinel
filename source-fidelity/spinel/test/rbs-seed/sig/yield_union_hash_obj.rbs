@@ -1,0 +1,3 @@
+class YuRel
+  def group_count: () -> Hash[untyped, Integer]
+end

@@ -1,0 +1,63 @@
+module __REGISTRY__
+  class __ENTRY__
+    @token: Integer
+    @original_name: Symbol
+    @body: ^(singleton(__OWNER__), Symbol called_name, Symbol original_name) -> __RESULT__
+
+    def initialize: (Integer token, Symbol original_name, ^(singleton(__OWNER__), Symbol called_name, Symbol original_name) -> __RESULT__ body) -> void
+    def token: () -> Integer
+    def original_name: () -> Symbol
+    def body: () -> ^(singleton(__OWNER__), Symbol called_name, Symbol original_name) -> __RESULT__
+  end
+
+  class __SLOT__
+    @entry: ::__REGISTRY__::__ENTRY__
+    @visibility: Integer
+
+    def initialize: (::__REGISTRY__::__ENTRY__ entry, Integer visibility) -> void
+    def entry: () -> ::__REGISTRY__::__ENTRY__
+    def visibility: () -> Integer
+  end
+
+  class __BOUND__
+    @receiver: singleton(__OWNER__)
+    @name: Symbol
+    @entry: ::__REGISTRY__::__ENTRY__
+
+    def initialize: (singleton(__OWNER__) receiver, Symbol name, ::__REGISTRY__::__ENTRY__ entry) -> void
+    def call: () -> __RESULT__
+    def name: () -> Symbol
+    def original_name: () -> Symbol
+    def receiver: () -> singleton(__OWNER__)
+    def entry: () -> ::__REGISTRY__::__ENTRY__
+    def arity: () -> Integer
+    def ==: (::__REGISTRY__::__BOUND__ other) -> bool
+  end
+
+  class __STATE__
+    @entries: Hash[singleton(__OWNER__), Hash[Symbol, ::__REGISTRY__::__SLOT__]]
+    @next_token: Integer
+    @extensions: Hash[singleton(__OWNER__), bool]
+    def initialize: () -> void
+    def entries: () -> Hash[singleton(__OWNER__), Hash[Symbol, ::__REGISTRY__::__SLOT__]]
+    def extensions: () -> Hash[singleton(__OWNER__), bool]
+    def next_token: () -> Integer
+    def next_token=: (Integer value) -> Integer
+  end
+
+  def self.activate_extension: (singleton(__OWNER__) owner) -> nil
+  def self.extension_active: (singleton(__OWNER__) receiver) -> bool
+  def self.require_extension: (singleton(__OWNER__) receiver) -> nil
+  def self.extension_api_name: (Symbol name) -> bool
+  def self.empty_slots: () -> Hash[Symbol, ::__REGISTRY__::__SLOT__]
+  def self.ensure_virtual_name: (singleton(__OWNER__) owner, Symbol name) -> nil
+  def self.install: (singleton(__OWNER__) owner, Symbol name, ^(singleton(__OWNER__), Symbol called_name, Symbol original_name) -> __RESULT__ body, ^(singleton(__OWNER__), Symbol name) -> nil callback) -> Symbol
+  def self.parent_of: (singleton(__OWNER__) receiver) -> singleton(__OWNER__)?
+  def self.lookup: (singleton(__OWNER__) receiver, Symbol name, bool inherit) -> ::__REGISTRY__::__SLOT__?
+  def self.alias_name: (singleton(__OWNER__) owner, Symbol to, Symbol from, ^(singleton(__OWNER__), Symbol name) -> nil callback) -> Symbol
+  def self.set_visibility: (singleton(__OWNER__) owner, Symbol name, Integer visibility) -> singleton(__OWNER__)
+  def self.present: (singleton(__OWNER__) receiver, Symbol name, bool include_private) -> bool
+  def self.responds: (singleton(__OWNER__) receiver, Symbol name, bool include_private) -> bool
+  def self.call: (singleton(__OWNER__) receiver, Symbol name, bool allow_private) -> __RESULT__
+  def self.bind: (singleton(__OWNER__) receiver, Symbol name, bool public_only) -> ::__REGISTRY__::__BOUND__
+end

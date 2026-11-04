@@ -1,0 +1,1186 @@
+//! Action-body normalization — the pre-emit pipeline that reshapes
+//! an action's body `Expr` so every target emitter can walk it
+//! without per-target special cases:
+//!
+//!   1. Inline applicable `before_action` callback bodies
+//!      (`actions::resolve_before_actions`).
+//!   2. Flatten `respond_to { format.html {…} format.json {…} }` into
+//!      an `if request_format == :json; …; else …; end` dispatch
+//!      (when both branches use the `render :sym` shape); fall back
+//!      to html-only when either branch has a more complex shape
+//!      (`unwrap_respond_to`).
+//!   3. Append a synthetic `render :<action>` when the body has no
+//!      explicit response terminal (`synthesize_implicit_render`).
+//!
+//! Per-target ivar/params rewrites run AFTER this pipeline.
+
+use crate::diagnostic::{Diagnostic, DiagnosticKind};
+use crate::dialect::Controller;
+use crate::expr::{Expr, ExprNode, LValue, Literal};
+use crate::ident::Symbol;
+use crate::span::Span;
+
+use super::actions::resolve_before_actions;
+use super::util::{is_format_binding, unwrap_lambda};
+
+/// Flatten every `respond_to do |format| ... end` block in `expr`
+/// into just its HTML branch — the legacy behavior used by the
+/// per-target paths (`normalize_action_body`) that don't yet know
+/// how to emit the format dispatch. Group 1 emitters (Ruby /
+/// Crystal / TS, via `lower_controllers_with_arel_and_views`) call
+/// `unwrap_respond_to_with_format_dispatch` instead, which
+/// preserves the json branch as a `request_format == :json`
+/// conditional.
+pub fn unwrap_respond_to(expr: &Expr) -> Expr {
+    unwrap_respond_to_inner(expr, /*with_format_dispatch=*/ false, FormatBreadth::NARROW)
+}
+
+/// Which non-html `respond_to` arms an emit path can carry. The two
+/// widenings are independent because they cost different things:
+///
+/// `json_any` preserves `format.json` branches of ANY shape — inline
+/// `render json: <expr>` normalizes downstream to an
+/// `ActionController::JsonRender.encode` body render, and JsonRender
+/// is a CRuby-overlay module (`respond_to?`-dispatching, heterogeneous
+/// containers) that the AOT compile cannot type. CRuby/JRuby only.
+/// With it off, the pre-existing narrow rule still admits the simple
+/// `render :sym` json arms, which route to an emitted `<sym>_json`
+/// view and need no encoder.
+///
+/// `rss` preserves `format.rss` branches under a `request_format ==
+/// :rss` arm (lobsters' /rss feed). Everything such an arm reaches is
+/// already on every ruby-family tree — the emitted `Views::<X>.rss`
+/// template and the shared `Rails.cache.fetch_str` — so the spinel
+/// tree carries this one too. Without it the route-pinned rss entries
+/// fall through to the html arm and the feed serves the HTML page.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FormatBreadth {
+    pub json_any: bool,
+    pub rss: bool,
+    /// The tree raises `ActionController::ParameterMissing` from
+    /// `params.expect` / `params.require` and its dispatcher answers an
+    /// unrescued one with 400, as Rails does. Ruby family only: the
+    /// strict targets have no exception control flow and hand-written
+    /// `Params` primitives, so a missing resource reads as `{}` there
+    /// (ledgered in docs/pipeline/runtime.md).
+    pub raises_param_missing: bool,
+    /// The tree wraps a JSON request body under the controller's model
+    /// name, as Rails' ParamsWrapper does (`Params.wrap`, and the body
+    /// params the ruby-family dispatchers hand the request). The strict
+    /// targets read no JSON body (Rust, Python) or no body params apart
+    /// (TypeScript), so they do not.
+    pub wraps_json_params: bool,
+}
+
+impl FormatBreadth {
+    /// html only (plus the simple-`render :sym` json arms) — the emit
+    /// paths that don't recognize `request_format` at all.
+    pub const NARROW: Self = Self { json_any: false, rss: false, raises_param_missing: false, wraps_json_params: false };
+    /// The spinel/AOT tree: rss dispatch, no JsonRender.
+    pub const RSS_ONLY: Self =
+        Self { json_any: false, rss: true, raises_param_missing: true, wraps_json_params: true };
+    /// The CRuby/JRuby trees, whose overlay answers the full surface.
+    pub const FULL: Self =
+        Self { json_any: true, rss: true, raises_param_missing: true, wraps_json_params: true };
+}
+
+/// Format-dispatching variant of `unwrap_respond_to`.
+///
+/// When both the html and json branches use the simple `render :sym`
+/// shape, the respond_to becomes an `if request_format == :json` /
+/// `else` dispatch with the json branch's render carrying a `format:
+/// :json` kwarg (consumed downstream by `rewrite_render_to_views` to
+/// route to the `<sym>_json` view and tag `content_type:
+/// "application/json"`). For all other json-branch shapes — inline
+/// `render json: <expr>`, `head :no_content`, redirects in error
+/// branches — we fall back to html-only flattening so the HTTP-HTML
+/// paths every emitter targets stay lossless.
+///
+/// `breadth` widens the dispatch, one format at a time, because the
+/// two widenings have different runtime costs (see `FormatBreadth`).
+/// A fully-narrow breadth keeps the legacy behavior so an emit that
+/// asks for nothing stays byte-identical.
+///
+/// Handles both scaffold shapes:
+///   - Simple:    `respond_to { format.html { a }; format.json { b } }` → `if c; b' else a end`
+///   - Branched:  `respond_to { if c; format.html { a1 }; format.json { b1 }
+///                              else;  format.html { a2 }; format.json { b2 } end }`
+///                 → `if c; <a1+b1 dispatch> else <a2+b2 dispatch> end`
+///
+/// Walks recursively — nested `respond_to` calls (rare) flatten
+/// bottom-up, and non-respond_to sub-expressions pass through their
+/// structural variants so anything already at the top level is
+/// preserved.
+pub fn unwrap_respond_to_with_format_dispatch(expr: &Expr, breadth: FormatBreadth) -> Expr {
+    unwrap_respond_to_inner(expr, /*with_format_dispatch=*/ true, breadth)
+}
+
+fn unwrap_respond_to_inner(expr: &Expr, with_format_dispatch: bool, breadth: FormatBreadth) -> Expr {
+    // Top-level `respond_to` with a block — replace the whole Send
+    // with its flattened body. This short-circuits the structural
+    // recursion so we don't re-enter the respond_to's Send/Lambda
+    // children via the generic path.
+    if let ExprNode::Send { recv: None, method, block: Some(block), .. } = &*expr.node {
+        if method.as_str() == "respond_to" {
+            let lambda_body = unwrap_lambda(block);
+            return flatten_respond_to_body(lambda_body, with_format_dispatch, breadth);
+        }
+    }
+    let recurse = |e: &Expr| unwrap_respond_to_inner(e, with_format_dispatch, breadth);
+    let new_node = match &*expr.node {
+        ExprNode::Seq { exprs } => ExprNode::Seq {
+            exprs: exprs.iter().map(&recurse).collect(),
+        },
+        ExprNode::If { cond, then_branch, else_branch } => ExprNode::If {
+            cond: recurse(cond),
+            then_branch: recurse(then_branch),
+            else_branch: recurse(else_branch),
+        },
+        ExprNode::Send { recv, method, args, block, parenthesized } => ExprNode::Send {
+            recv: recv.as_ref().map(&recurse),
+            method: method.clone(),
+            args: args.iter().map(&recurse).collect(),
+            block: block.as_ref().map(&recurse),
+            parenthesized: *parenthesized,
+        },
+        ExprNode::BoolOp { op, surface, left, right } => ExprNode::BoolOp {
+            op: *op,
+            surface: *surface,
+            left: recurse(left),
+            right: recurse(right),
+        },
+        ExprNode::Lambda { rest_param, extra_params, params, block_param, body, block_style } => ExprNode::Lambda { rest_param: rest_param.clone(), extra_params: extra_params.clone(),
+            params: params.clone(),
+            block_param: block_param.clone(),
+            body: recurse(body),
+            block_style: *block_style,
+        },
+        ExprNode::Assign { target, value } => {
+            let new_target = match target {
+                LValue::Attr { recv, name } => LValue::Attr {
+                    recv: recurse(recv),
+                    name: name.clone(),
+                },
+                LValue::Index { recv, index } => LValue::Index {
+                    recv: recurse(recv),
+                    index: recurse(index),
+                },
+                other => other.clone(),
+            };
+            ExprNode::Assign {
+                target: new_target,
+                value: recurse(value),
+            }
+        }
+        ExprNode::Array { elements, style } => ExprNode::Array {
+            elements: elements.iter().map(&recurse).collect(),
+            style: *style,
+        },
+        ExprNode::Hash { entries, kwargs } => ExprNode::Hash {
+            entries: entries
+                .iter()
+                .map(|(k, v)| (recurse(k), recurse(v)))
+                .collect(),
+            kwargs: *kwargs,
+        },
+        // Literal, Const, Var, Ivar, Apply, Case, Yield, Raise,
+        // RescueModifier, StringInterp, Let — no respond_to inside
+        // today's fixtures; clone-verbatim. If future fixtures nest
+        // respond_to inside these variants the recursion extends
+        // here.
+        other => other.clone(),
+    };
+    Expr {
+        span: expr.span,
+        node: Box::new(new_node),
+        ty: expr.ty.clone(),
+        effects: expr.effects.clone(),
+        leading_blank_line: expr.leading_blank_line,
+        cold: expr.cold.clone(),
+        decisions: expr.decisions,
+    }
+}
+
+/// Flatten the immediate body of a `respond_to` block. Recognized
+/// shapes at this level are `Seq` (the `format.html/.json` pair) and
+/// `If` (conditional branching to different format pairs); anything
+/// else is handled via `flatten_format_pair_or_drop` directly.
+///
+/// `with_format_dispatch=false` keeps just the html branch (legacy
+/// behavior, used by Group 2 emit paths). `true` emits the
+/// `if request_format == :json; …; else; …; end` shape.
+fn flatten_respond_to_body(body: &Expr, with_format_dispatch: bool, breadth: FormatBreadth) -> Expr {
+    let recurse_outer = |e: &Expr| unwrap_respond_to_inner(e, with_format_dispatch, breadth);
+    match &*body.node {
+        ExprNode::Seq { exprs } => {
+            let mut html: Option<Expr> = None;
+            let mut json: Option<Expr> = None;
+            let mut rss: Option<Expr> = None;
+            let mut other: Vec<Expr> = Vec::new();
+            for e in exprs {
+                match classify_format_stmt(e) {
+                    Some((fmt, branch_body)) if fmt.as_str() == "html" => {
+                        html = Some(recurse_outer(&branch_body));
+                    }
+                    // `format.any` answers every format no earlier arm
+                    // claimed — for the dispatch that is the html
+                    // fallback, unless an explicit `format.html` has it.
+                    Some((fmt, branch_body)) if fmt.as_str() == "any" => {
+                        if html.is_none() {
+                            html = Some(recurse_outer(&branch_body));
+                        }
+                    }
+                    Some((fmt, branch_body)) if fmt.as_str() == "json" => {
+                        // Narrow mode preserves only simple `render :sym
+                        // [, kwargs]` shapes — others fall through and
+                        // effectively drop (the html branch alone covers
+                        // the response). Breadth mode (CRuby) keeps ANY
+                        // body: inline `render json: <expr>` normalizes
+                        // downstream. Group 2 emit doesn't carry the
+                        // dispatch (its emitters don't recognize
+                        // `request_format`), so we drop unconditionally
+                        // when `with_format_dispatch=false`.
+                        match json_arm_drop_reason(&branch_body, with_format_dispatch, breadth) {
+                            None => json = Some(recurse_outer(&branch_body)),
+                            Some(reason) => report_dropped_format_arm("json", e.span, reason),
+                        }
+                    }
+                    Some((fmt, branch_body)) if fmt.as_str() == "rss" => {
+                        if breadth.rss {
+                            rss = Some(mark_render_format(&recurse_outer(&branch_body), "rss"));
+                        } else {
+                            report_dropped_format_arm(
+                                "rss",
+                                e.span,
+                                "this tree does not carry the rss dispatch",
+                            );
+                        }
+                    }
+                    // Unknown format (e.g. format.xml) — no lowering
+                    // models it, so it drops. Ledgered so the gap is
+                    // visible rather than inferred from a parity diff.
+                    Some((fmt, _)) => {
+                        report_dropped_format_arm(fmt.as_str(), e.span, "format not modeled")
+                    }
+                    None => other.push(recurse_outer(e)),
+                }
+            }
+            build_format_dispatch(html, json, rss, other, body.span)
+        }
+        ExprNode::If { cond, then_branch, else_branch } => Expr::new(
+            body.span,
+            ExprNode::If {
+                cond: recurse_outer(cond),
+                then_branch: flatten_respond_to_body(then_branch, with_format_dispatch, breadth),
+                else_branch: flatten_respond_to_body(else_branch, with_format_dispatch, breadth),
+            },
+        ),
+        // A single expression at respond_to-body scope — either a
+        // lone `format.html`/`format.json`, or some unrelated shape
+        // the pass leaves to the generic walker.
+        _ => match classify_format_stmt(body) {
+            Some((fmt, branch_body)) if matches!(fmt.as_str(), "html" | "any") => {
+                recurse_outer(&branch_body)
+            }
+            Some((fmt, branch_body))
+                if fmt.as_str() == "json"
+                    && json_arm_drop_reason(&branch_body, with_format_dispatch, breadth).is_none() =>
+            {
+                build_format_dispatch(
+                    None,
+                    Some(recurse_outer(&branch_body)),
+                    None,
+                    Vec::new(),
+                    body.span,
+                )
+            }
+            Some((fmt, branch_body)) if fmt.as_str() == "rss" && breadth.rss => {
+                build_format_dispatch(
+                    None,
+                    None,
+                    Some(mark_render_format(&recurse_outer(&branch_body), "rss")),
+                    Vec::new(),
+                    body.span,
+                )
+            }
+            // Lone arm that survived none of the gates above. Same
+            // ledger as the Seq path — a `respond_to` whose only arm is
+            // json/rss/xml drops to an empty body, which is the most
+            // silent shape of all.
+            Some((fmt, branch_body)) => {
+                let reason = if fmt.as_str() == "json" {
+                    json_arm_drop_reason(&branch_body, with_format_dispatch, breadth)
+                        .unwrap_or("dropped")
+                } else if fmt.as_str() == "rss" {
+                    "this tree does not carry the rss dispatch"
+                } else {
+                    "format not modeled"
+                };
+                report_dropped_format_arm(fmt.as_str(), body.span, reason);
+                Expr::new(body.span, ExprNode::Seq { exprs: vec![] })
+            }
+            None => recurse_outer(body),
+        },
+    }
+}
+
+/// Ledger a `respond_to` arm that the flattening discarded.
+///
+/// Dropping an arm is SILENT otherwise, and silence here is expensive:
+/// the only downstream evidence is a parity report showing HTML where
+/// Rails sent JSON, which reads like a routing bug and sends you to the
+/// route ingester. `/hottest` cost exactly that detour — it is
+/// `get "/hottest" => "home#index", :format => "json"`, so Rails serves
+/// JSON and the emit served the HTML arm, with nothing in the emit log
+/// naming the discarded branch.
+///
+/// Warning, not error: a dropped arm is modeling debt, not a broken
+/// build — the html arm still answers the request. The span points at
+/// the `respond_to` body, which is enough to name the action.
+fn report_dropped_format_arm(format: &str, span: Span, reason: &'static str) {
+    let kind = DiagnosticKind::LowerResidue {
+        pass: Symbol::from("respond_to_flatten"),
+        construct: Symbol::from(format!("format.{format}")),
+        reason: Symbol::from(reason),
+    };
+    let d = Diagnostic {
+        span,
+        severity: Diagnostic::default_severity(&kind),
+        kind,
+        message: format!(
+            "`respond_to` arm `format.{format}` dropped ({reason}) — this action answers \
+             every format with its html branch, so a request that negotiates `{format}` \
+             (including a route pinned with `:format => \"{format}\"`) gets HTML back"
+        ),
+    };
+    crate::emit::diagnostics::push(d);
+}
+
+/// Which `reason` string a json arm was dropped for, or `None` when it
+/// survives. Keeping the gate in one place is what stops the predicate
+/// and the diagnostic drifting apart — they must agree exactly, or the
+/// ledger reports drops that did not happen (or misses ones that did).
+fn json_arm_drop_reason(
+    branch_body: &Expr,
+    with_format_dispatch: bool,
+    breadth: FormatBreadth,
+) -> Option<&'static str> {
+    if !with_format_dispatch {
+        return Some("this emit path does not dispatch on request_format");
+    }
+    // A BARE `format.json` (empty body) renders the action's own JSON
+    // template — the simplest render there is, and exactly what a
+    // `render :sym` arm would bind.
+    let bare = matches!(&*branch_body.node, ExprNode::Seq { exprs } if exprs.is_empty());
+    if bare || breadth.json_any || is_simple_render_sym(branch_body) || is_encoded_render(branch_body) {
+        return None;
+    }
+    Some("inline `render json: <expr>` needs an encoder this tree has none for")
+}
+
+/// Pull `(format_name, block_body)` out of a `format.<x> { body }`
+/// Send. Returns `None` for any statement that isn't a format
+/// binding. The bare-form `format.html` (no block) returns an empty
+/// Seq body so callers can treat block-form and bare-form uniformly.
+fn classify_format_stmt(e: &Expr) -> Option<(Symbol, Expr)> {
+    if let ExprNode::Send { recv: Some(recv), method, block, .. } = &*e.node {
+        if is_format_binding(recv) {
+            let body = match block.as_ref() {
+                Some(b) => unwrap_lambda(b).clone(),
+                None => Expr::new(e.span, ExprNode::Seq { exprs: vec![] }),
+            };
+            return Some((method.clone(), body));
+        }
+    }
+    None
+}
+
+/// True when `body` is a shape the json dispatch supports today:
+/// either `render :sym [, kwargs]` (simple view-template) or
+/// `head :sym` (status-only terminal). Inline renders (`render
+/// json: <expr>`) and redirects in error branches don't qualify
+/// and the json branch gets dropped (html alone covers the
+/// response).
+fn is_simple_render_sym(body: &Expr) -> bool {
+    match &*body.node {
+        ExprNode::Send { recv: None, method, args, .. }
+            if method.as_str() == "render" && !args.is_empty() =>
+        {
+            matches!(&*args[0].node, ExprNode::Lit { value: Literal::Sym { .. } })
+        }
+        ExprNode::Send { recv: None, method, args, .. }
+            if method.as_str() == "head" && !args.is_empty() =>
+        {
+            matches!(&*args[0].node, ExprNode::Lit { value: Literal::Sym { .. } })
+                || matches!(&*args[0].node, ExprNode::Lit { value: Literal::Int { .. } })
+        }
+        _ => false,
+    }
+}
+
+/// True when `body` renders text that is ALREADY encoded —
+/// `render plain: <str>, …`. `lower::as_json_poro` respells a `render
+/// json:` it could write down this way (`<v>.as_json_str`), so the arm
+/// no longer reaches the runtime encoder the narrow breadths exclude and
+/// travels like any other plain render.
+fn is_encoded_render(body: &Expr) -> bool {
+    let body = match &*body.node {
+        ExprNode::Seq { exprs } if exprs.len() == 1 => &exprs[0],
+        _ => body,
+    };
+    let ExprNode::Send { recv: None, method, args, .. } = &*body.node else { return false };
+    if method.as_str() != "render" || args.len() != 1 {
+        return false;
+    }
+    let ExprNode::Hash { entries, .. } = &*args[0].node else { return false };
+    let has = |name: &str| {
+        entries.iter().any(|(k, _)| {
+            matches!(&*k.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == name)
+        })
+    };
+    has("plain") && !has("json")
+}
+
+/// Build the `if request_format == :json; <json>; else; <html>; end`
+/// dispatch. Drop branches that are `None`: a missing json branch
+/// falls through to html on both paths; a missing html branch
+/// (uncommon — the source action defined only `format.json`) uses
+/// the same empty Seq on the else.
+fn build_format_dispatch(
+    html: Option<Expr>,
+    json: Option<Expr>,
+    rss: Option<Expr>,
+    other: Vec<Expr>,
+    span: Span,
+) -> Expr {
+    // Innermost-first: the html branch is the else-default, an rss arm
+    // (breadth mode only) wraps it, and the json arm wraps outermost —
+    // so the no-rss shape stays byte-identical to the legacy two-way
+    // dispatch.
+    let mut dispatch = match (&html, &json, &rss) {
+        (Some(h), None, None) => h.clone(),
+        (None, None, None) => Expr::new(span, ExprNode::Seq { exprs: vec![] }),
+        _ => html.unwrap_or_else(|| Expr::new(span, ExprNode::Seq { exprs: vec![] })),
+    };
+    if let Some(r) = rss {
+        dispatch = Expr::new(
+            span,
+            ExprNode::If {
+                cond: request_format_eq(span, "rss"),
+                then_branch: r,
+                else_branch: dispatch,
+            },
+        );
+    }
+    if let Some(j) = json {
+        let json_body = mark_render_format(&j, "json");
+        dispatch = Expr::new(
+            span,
+            ExprNode::If {
+                cond: request_format_eq(span, "json"),
+                then_branch: json_body,
+                else_branch: dispatch,
+            },
+        );
+    }
+    if other.is_empty() {
+        dispatch
+    } else {
+        let mut all = other;
+        all.push(dispatch);
+        Expr::new(span, ExprNode::Seq { exprs: all })
+    }
+}
+
+/// `request_format == :<fmt>` — the predicate every dispatched action
+/// branches on. `request_format` is a Base accessor populated by the
+/// CGI driver from a path-suffix sniff (`.json` → `:json`). Emitted
+/// with an explicit `self` receiver so Group 2 emitters (Elixir,
+/// Python, Go, Rust) that distinguish methods from locals at the
+/// emit layer route it to the accessor rather than to a bare
+/// variable lookup.
+fn request_format_eq(span: Span, fmt: &str) -> Expr {
+    let recv = Expr::new(
+        span,
+        ExprNode::Send {
+            recv: Some(Expr::new(span, ExprNode::SelfRef)),
+            method: Symbol::from("request_format"),
+            args: vec![],
+            block: None,
+            parenthesized: false,
+        },
+    );
+    let fmt_sym = Expr::new(
+        span,
+        ExprNode::Lit {
+            value: Literal::Sym {
+                value: Symbol::from(fmt),
+            },
+        },
+    );
+    Expr::new(
+        span,
+        ExprNode::Send {
+            recv: Some(recv),
+            method: Symbol::from("=="),
+            args: vec![fmt_sym],
+            block: None,
+            parenthesized: false,
+        },
+    )
+}
+
+/// Walk `body` and tag terminals with format-aware kwargs:
+///   - `render(<sym>, …)` gets a `format: :<fmt>` marker; the kwarg
+///     flows into `rewrite_render_to_views`, which strips it and
+///     uses it to route to the `<sym>_<fmt>` view + tag the outer
+///     render with `content_type: "<mime>"`.
+///   - `head(<sym>, …)` gets a `content_type: "<mime>"` kwarg
+///     directly. head doesn't go through view rewriting (its body
+///     is empty regardless of format), so the lowerer plants the
+///     MIME marker here rather than via the render-rewrite path.
+fn mark_render_format(body: &Expr, fmt: &str) -> Expr {
+    let new_node = match &*body.node {
+        ExprNode::Send {
+            recv: None,
+            method,
+            args,
+            block,
+            parenthesized,
+        } if matches!(method.as_str(), "render" | "render_to_string")
+            && !args.is_empty() =>
+        {
+            // `render action: "stories", layout: false` names its
+            // template inside the Hash; the marker joins that Hash.
+            let names_template = matches!(&*args[0].node, ExprNode::Hash { entries, .. }
+                if entries.iter().any(|(k, _)| matches!(&*k.node,
+                    ExprNode::Lit { value: Literal::Sym { value } }
+                        if matches!(value.as_str(), "action" | "template"))));
+            if matches!(&*args[0].node, ExprNode::Lit { value: Literal::Sym { .. } }) || names_template {
+                let new_args = add_format_kwarg(args, fmt, body.span);
+                ExprNode::Send {
+                    recv: None,
+                    method: method.clone(),
+                    args: new_args,
+                    block: block.clone(),
+                    parenthesized: *parenthesized,
+                }
+            } else {
+                return body.clone();
+            }
+        }
+        ExprNode::Send {
+            recv: None,
+            method,
+            args,
+            block,
+            parenthesized,
+        } if method.as_str() == "head" && !args.is_empty() => {
+            let new_args = add_content_type_kwarg(args, mime_for_format(fmt), body.span);
+            ExprNode::Send {
+                recv: None,
+                method: method.clone(),
+                args: new_args,
+                block: block.clone(),
+                parenthesized: *parenthesized,
+            }
+        }
+        ExprNode::Seq { exprs } => ExprNode::Seq {
+            exprs: exprs.iter().map(|e| mark_render_format(e, fmt)).collect(),
+        },
+        ExprNode::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => ExprNode::If {
+            cond: cond.clone(),
+            then_branch: mark_render_format(then_branch, fmt),
+            else_branch: mark_render_format(else_branch, fmt),
+        },
+        // Into assignments and blocks, for a feed branch's
+        // `content = Rails.cache.fetch("rss") { render_to_string action:
+        // "stories", layout: false }` — the render sits in a block, under
+        // an assignment. Only the rss/atom/xml marking walks this far;
+        // the json/turbo_stream/svg callers keep their exact reach.
+        _ if matches!(fmt, "rss" | "atom" | "xml") => {
+            let mut out = body.clone();
+            out.node.for_each_child_mut(&mut |c| *c = mark_render_format(c, fmt));
+            return out;
+        }
+        _ => return body.clone(),
+    };
+    Expr::new(body.span, new_node)
+}
+
+/// `head(:no_content)` — Rails' answer when an action falls off the end
+/// with no template to render.
+fn head_no_content(span: Span) -> Expr {
+    Expr::new(
+        span,
+        ExprNode::Send {
+            recv: None,
+            method: Symbol::from("head"),
+            args: vec![Expr::new(
+                span,
+                ExprNode::Lit { value: Literal::Sym { value: Symbol::from("no_content") } },
+            )],
+            block: None,
+            parenthesized: true,
+        },
+    )
+}
+
+/// Map a Rails format symbol to its canonical MIME string.
+///
+/// `pub(crate)` so the render-to-views rewrite tags a format-marked
+/// render from the same table this one uses — two copies of a MIME
+/// string is how the pair drifts.
+pub(crate) fn mime_for_format(fmt: &str) -> &'static str {
+    match fmt {
+        "json" => "application/json",
+        // What Turbo sends in `Accept` and expects back on a form
+        // submission it drives.
+        "turbo_stream" => "text/vnd.turbo-stream.html",
+        // campfire renders a user's initials as an SVG avatar; the
+        // response is an image and browsers treat it as one only with
+        // this type.
+        "svg" => "image/svg+xml",
+        // A service worker (campfire's raw `pwa/service_worker.js`):
+        // browsers refuse to register a script served as anything else.
+        "js" => "text/javascript; charset=utf-8",
+        // Feeds (Mime::Type's registrations): lobsters' /rss.
+        "rss" => "application/rss+xml; charset=utf-8",
+        "atom" => "application/atom+xml; charset=utf-8",
+        "xml" => "application/xml; charset=utf-8",
+        // Mastodon's `custom_css#show` — Rails' own Mime::Type
+        // registration for `:css`, no charset.
+        "css" => "text/css",
+        "md" => "text/markdown; charset=utf-8",
+        _ => "text/html; charset=utf-8",
+    }
+}
+
+/// Reverse of [`mime_for_format`], for a bare `render content_type:
+/// "<mime>"` (no `formats:`/`format:` marker) to resolve to the
+/// format-qualified template the way `formats: :svg` already does —
+/// `resolve_formats_only_render` is the caller. Limited to the MIME
+/// strings a controller plausibly writes BARE: `mime_for_format`'s own
+/// entries that carry no charset suffix, since nobody hand-writes one
+/// of those verbatim as a literal.
+pub(crate) fn format_for_mime(mime: &str) -> Option<&'static str> {
+    match mime {
+        "text/css" => Some("css"),
+        "application/json" => Some("json"),
+        "image/svg+xml" => Some("svg"),
+        _ => None,
+    }
+}
+
+/// Append (or merge into) a trailing kwarg-Hash carrying
+/// `content_type: "<mime>"`. Used to tag head call sites in the
+/// json branch — render call sites take the format-kwarg path so
+/// the view-rewrite layer can decide the MIME.
+fn add_content_type_kwarg(args: &[Expr], mime: &str, span: Span) -> Vec<Expr> {
+    let pair = (
+        Expr::new(
+            span,
+            ExprNode::Lit {
+                value: Literal::Sym {
+                    value: Symbol::from("content_type"),
+                },
+            },
+        ),
+        Expr::new(
+            span,
+            ExprNode::Lit {
+                value: Literal::Str {
+                    value: mime.to_string(),
+                },
+            },
+        ),
+    );
+    let mut out = args.to_vec();
+    if let Some(last) = out.last_mut() {
+        if let ExprNode::Hash { entries, kwargs: true } = &*last.node {
+            let mut new_entries = entries.clone();
+            new_entries.push(pair);
+            *last = Expr::new(
+                last.span,
+                ExprNode::Hash {
+                    entries: new_entries,
+                    kwargs: true,
+                },
+            );
+            return out;
+        }
+    }
+    out.push(Expr::new(
+        span,
+        ExprNode::Hash {
+            entries: vec![pair],
+            kwargs: true,
+        },
+    ));
+    out
+}
+
+/// Append (or merge into) a trailing kwarg-Hash carrying `format:
+/// :<fmt>`. Render call args have the shape `[symbol, ...kwarg_hash?]`
+/// — if a trailing Hash already exists we merge `format:` into it;
+/// otherwise we append a new kwarg Hash.
+fn add_format_kwarg(args: &[Expr], fmt: &str, span: Span) -> Vec<Expr> {
+    let fmt_pair = (
+        Expr::new(
+            span,
+            ExprNode::Lit {
+                value: Literal::Sym {
+                    value: Symbol::from("format"),
+                },
+            },
+        ),
+        Expr::new(
+            span,
+            ExprNode::Lit {
+                value: Literal::Sym {
+                    value: Symbol::from(fmt),
+                },
+            },
+        ),
+    );
+    let mut out = args.to_vec();
+    if let Some(last) = out.last_mut() {
+        if let ExprNode::Hash { entries, kwargs: true } = &*last.node {
+            let mut new_entries = entries.clone();
+            new_entries.push(fmt_pair);
+            *last = Expr::new(
+                last.span,
+                ExprNode::Hash {
+                    entries: new_entries,
+                    kwargs: true,
+                },
+            );
+            return out;
+        }
+    }
+    out.push(Expr::new(
+        span,
+        ExprNode::Hash {
+            entries: vec![fmt_pair],
+            kwargs: true,
+        },
+    ));
+    out
+}
+
+/// Append a synthesized `render :<action_name>` Send to `body` when
+/// `body` has no top-level render / redirect_to / head terminal.
+/// Encodes the Rails convention that an action falling off the end
+/// renders its eponymous view.
+///
+/// When `has_json_variant` is true, the synthesized render expands
+/// to a format dispatch — `if request_format == :json; render
+/// :<action>, format: :json; else; render :<action>; end` — so
+/// requests with a stripped `.json` suffix render the
+/// `<action>.json.jbuilder` template. Without a json variant the
+/// dispatch would reference an undefined `<action>_json` view at
+/// emit time, so we only synthesize it when the variant exists.
+///
+/// Target-neutral — every emitter walking the result sees an explicit
+/// terminal that `classify_controller_send` resolves to `Render`.
+/// Before this pass, each scaffold template synthesized the terminal
+/// ad-hoc at emit time; after, the walker path needs no special case.
+/// `variants` are the NON-html formats this action has a template for,
+/// in the order they should be tested. Each becomes a
+/// `request_format == :<fmt>` arm ahead of the html fallback, so an
+/// action with both a jbuilder and a `.turbo_stream.erb` template gets
+/// both. Empty means html only.
+pub fn synthesize_implicit_render(body: &Expr, action_name: &str, variants: &[&str]) -> Expr {
+    synthesize_implicit_render_with_html(body, action_name, variants, true, true)
+}
+
+/// `html_template_exists = false` makes the HTML fallback `head
+/// :no_content` instead of a render that would resolve to nothing.
+///
+/// Rails' `default_render` raises `MissingTemplate` only for an EXPLICIT
+/// `render :foo`; falling off the end of an action with no template
+/// logs "No template found … rendering head :no_content" and returns
+/// 204. We raised in both cases, so campfire's `Messages::Boosts#destroy`
+/// — a turbo_stream DELETE with no template, asserting `:success` —
+/// died on a template Rails never looks for.
+///
+/// The explicit path keeps raising, which is what lobsters' about/privacy
+/// actions rescue as their normal flow.
+pub fn synthesize_implicit_render_with_html(
+    body: &Expr,
+    action_name: &str,
+    variants: &[&str],
+    html_template_exists: bool,
+    html_exists: bool,
+) -> Expr {
+    if has_toplevel_terminal(body) {
+        return body.clone();
+    }
+    // Build the chain inside-out so the FIRST variant ends up as the
+    // outermost test.
+    let mut terminal =
+        html_fallback(action_name, body.span, variants, html_template_exists, html_exists);
+    for fmt in variants.iter().rev() {
+        let branch = mark_render_format(&render_symbol_send(action_name, body.span), fmt);
+        terminal = Expr::new(
+            body.span,
+            ExprNode::If {
+                cond: request_format_eq(body.span, fmt),
+                then_branch: branch,
+                else_branch: terminal,
+            },
+        );
+    }
+    // A body with SOME response terminal that isn't guaranteed at top
+    // level (a render inside begin/rescue, or behind a condition the
+    // detector can't prove) may already have responded by the time the
+    // synthesized default runs — Rails' own default-render check is
+    // `performed?`, not syntax. Guard the synthesized render the same
+    // way. Bodies with no terminal at all (the common case — every
+    // conventional index/show) keep the bare unguarded shape.
+    let terminal = if contains_terminal(body) {
+        Expr::new(
+            body.span,
+            ExprNode::If {
+                cond: Expr::new(
+                    body.span,
+                    ExprNode::Send {
+                        recv: None,
+                        method: Symbol::from("performed?"),
+                        args: Vec::new(),
+                        block: None,
+                        parenthesized: false,
+                    },
+                ),
+                then_branch: Expr::new(body.span, ExprNode::Lit { value: Literal::Nil }),
+                else_branch: terminal,
+            },
+        )
+    } else {
+        terminal
+    };
+    append_statement(body, terminal)
+}
+
+/// What the implicit render does when no variant arm matched — the
+/// request is html as far as the arms can tell.
+///
+/// - An html template exists: render it.
+/// - Some other format's template exists (`any_template_exists`):
+///   Rails' `default_render` renders a template when one exists for a
+///   format the request accepts. A bare `Accept: */*` — an
+///   `XMLHttpRequest` or `fetch` that set none, campfire's attachment
+///   uploader — accepts every format, so the action's other template
+///   renders (`create.turbo_stream.erb` answering an upload, which
+///   Rails serves 200). Chosen in Rails' Mime registration order, js
+///   before json before turbo_stream. Asked of the controller as
+///   `accepts_any_format`, which the dispatcher sets. Any other request
+///   keeps the render that resolves to MissingTemplate — Rails'
+///   UnknownFormat, approximated (see `controller_to_library`).
+/// - No template at all: `head :no_content`, Rails' "No template found".
+fn html_fallback(
+    action_name: &str,
+    span: Span,
+    variants: &[&str],
+    any_template_exists: bool,
+    html_exists: bool,
+) -> Expr {
+    if html_exists {
+        return render_symbol_send(action_name, span);
+    }
+    if !any_template_exists {
+        return head_no_content(span);
+    }
+    let any_fmt = ["js", "json", "turbo_stream"]
+        .into_iter()
+        .find(|f| variants.contains(f));
+    let Some(fmt) = any_fmt else {
+        return render_symbol_send(action_name, span);
+    };
+    Expr::new(
+        span,
+        ExprNode::If {
+            cond: Expr::new(
+                span,
+                ExprNode::Send {
+                    recv: None,
+                    method: Symbol::from("accepts_any_format"),
+                    args: Vec::new(),
+                    block: None,
+                    parenthesized: false,
+                },
+            ),
+            then_branch: mark_render_format(&render_symbol_send(action_name, span), fmt),
+            else_branch: render_symbol_send(action_name, span),
+        },
+    )
+}
+
+/// The implicit render as a STANDALONE statement, for an action whose
+/// default render has to run in the dispatcher instead of at the end of
+/// its own body (see `actions_reached_by_super`).
+///
+/// ALWAYS guarded on `performed?`, where the in-body form guards only
+/// when the body already contains some terminal. The whole reason this
+/// variant exists is that something else may have responded first — a
+/// subclass that called `super` and then `head :created` — so the guard
+/// is the point rather than an optimization.
+///
+/// Returns `None` when the action's own body always responds; there is
+/// no default render to run then, and emitting a dead guarded branch
+/// into every dispatcher arm would be noise.
+/// Append an ALWAYS-guarded default render, for an action whose tail is
+/// about to be moved into the dispatcher.
+///
+/// `synthesize_implicit_render` guards on `performed?` only when the
+/// body already contains some terminal — a sound optimization when the
+/// tail stays put, and WRONG here. The reason this tail moves is that
+/// something else may respond first: a subclass that called `super` and
+/// then `head :created`. Without the guard the dispatcher renders over
+/// the response the subclass just produced, and a body with no terminal
+/// of its own (the common shape) is exactly the case that lost it.
+pub fn synthesize_deferred_implicit_render(
+    body: &Expr,
+    action_name: &str,
+    variants: &[&str],
+    html_template_exists: bool,
+    html_exists: bool,
+) -> Expr {
+    match implicit_render_statement(body, action_name, variants, html_template_exists, html_exists) {
+        Some(tail) => append_statement(body, tail),
+        None => body.clone(),
+    }
+}
+
+pub fn implicit_render_statement(
+    body: &Expr,
+    action_name: &str,
+    variants: &[&str],
+    html_template_exists: bool,
+    html_exists: bool,
+) -> Option<Expr> {
+    if has_toplevel_terminal(body) {
+        return None;
+    }
+    let mut terminal =
+        html_fallback(action_name, body.span, variants, html_template_exists, html_exists);
+    for fmt in variants.iter().rev() {
+        let branch = mark_render_format(&render_symbol_send(action_name, body.span), fmt);
+        terminal = Expr::new(
+            body.span,
+            ExprNode::If {
+                cond: request_format_eq(body.span, fmt),
+                then_branch: branch,
+                else_branch: terminal,
+            },
+        );
+    }
+    Some(Expr::new(
+        body.span,
+        ExprNode::If {
+            cond: Expr::new(
+                body.span,
+                ExprNode::Send {
+                    recv: None,
+                    method: Symbol::from("performed?"),
+                    args: Vec::new(),
+                    block: None,
+                    parenthesized: false,
+                },
+            ),
+            then_branch: Expr::new(body.span, ExprNode::Lit { value: Literal::Nil }),
+            else_branch: terminal,
+        },
+    ))
+}
+
+/// True when a response terminal (`render` / `redirect_to` / `head` /
+/// `respond_to`-with-block) appears ANYWHERE in the body — the signal
+/// that the synthesized default render needs a `performed?` guard (see
+/// `synthesize_implicit_render`). Deliberately broader than
+/// `has_toplevel_terminal`: that one proves a response always happens;
+/// this one detects that a response MIGHT already have happened.
+/// The sends that RESPOND — after one of these the action has produced
+/// its body, and a synthesized default render would write over it.
+///
+/// `send_data` and `send_file` belong here for exactly the same reason
+/// `render` does: both set the body and mark the response performed.
+/// Leaving them out is not a missing feature, it is a WRONG one —
+/// campfire's account logo picks a stock icon through a two-hop private
+/// helper (`send_stock_icon` -> `send_png_file` -> `send_file`), and the
+/// unguarded tail then ran `head :no_content` over the PNG that helper
+/// had just written. The response was a 204 with an empty body, and the
+/// test failed decoding it: "buffer is not in a known format", which
+/// names the image library and nothing about the terminal.
+const RESPONSE_TERMINALS: &[&str] = &[
+    "render",
+    "redirect_to",
+    "redirect_back_or_to",
+    "head",
+    "send_data",
+    "send_file",
+    "render_inertia_json",
+    // Always responds: 409 + X-Inertia-Location, or a 302. Without this
+    // the implicit `head :no_content` runs second and raises.
+    "inertia_location",
+];
+
+/// Rails' HTTP auth helpers that render the 401 challenge when the
+/// credentials are missing or refused. They MIGHT respond, so a filter
+/// calling one needs the preamble's halting check and an action calling
+/// one a guarded default render; they are not in `RESPONSE_TERMINALS`
+/// because on success they leave the response to the action, so
+/// `has_toplevel_terminal` must not count them.
+pub const HTTP_AUTH_CHALLENGES: &[&str] = &[
+    "authenticate_or_request_with_http_basic",
+    "authenticate_or_request_with_http_token",
+    "request_http_basic_authentication",
+    "request_http_token_authentication",
+];
+
+/// One statement that writes this controller's response: a send in
+/// `RESPONSE_TERMINALS`, or an assignment to `self.response_body` (Rails
+/// counts an assigned body as performed; campfire's MessagesController
+/// and CachedResponses serve a prebuilt page that way). Shared by the
+/// implicit-render guard here and the filter halting check in
+/// `controller_to_library`, so the two cannot disagree about what a
+/// response is.
+pub fn is_response_terminal(e: &Expr) -> bool {
+    match &*e.node {
+        ExprNode::Send { recv: None, method, .. } => RESPONSE_TERMINALS.contains(&method.as_str()),
+        // `self.render …` / `self.redirect_to …` are the same terminals.
+        ExprNode::Send { recv: Some(r), method, args, .. } => {
+            matches!(&*r.node, ExprNode::SelfRef)
+                && (RESPONSE_TERMINALS.contains(&method.as_str())
+                    || (method.as_str() == "response_body="
+                        && !args.first().is_some_and(is_nil_literal)))
+        }
+        // `self.response_body = nil` clears the body and performs
+        // nothing, so the action's implicit render still runs.
+        ExprNode::Assign { target: crate::expr::LValue::Attr { recv, name }, value } => {
+            matches!(&*recv.node, ExprNode::SelfRef)
+                && name.as_str() == "response_body"
+                && !is_nil_literal(value)
+        }
+        _ => false,
+    }
+}
+
+fn is_nil_literal(e: &Expr) -> bool {
+    matches!(&*e.node, ExprNode::Lit { value: Literal::Nil })
+}
+
+fn contains_terminal(body: &Expr) -> bool {
+    fn walk(e: &Expr, found: &mut bool) {
+        if *found {
+            return;
+        }
+        if is_response_terminal(e) {
+            *found = true;
+            return;
+        }
+        if let ExprNode::Send { recv: None, method, block, .. } = &*e.node {
+            if HTTP_AUTH_CHALLENGES.contains(&method.as_str())
+                || (method.as_str() == "respond_to" && block.is_some())
+            {
+                *found = true;
+                return;
+            }
+        }
+        e.node.for_each_child(&mut |c| walk(c, found));
+    }
+    let mut found = false;
+    walk(body, &mut found);
+    found
+}
+
+/// True when `body` is guaranteed to hit a response-terminal
+/// (`render` / `redirect_to` / `head` / `respond_to`) at its top
+/// level — including every branch of the final if/else, since both
+/// branches must terminate for the action to have a response. A
+/// `respond_to` block counts as terminal because the emitter's
+/// SendKind render table expands it into per-format terminals.
+pub fn has_toplevel_terminal(body: &Expr) -> bool {
+    match &*body.node {
+        ExprNode::Seq { exprs } => exprs.last().map_or(false, has_toplevel_terminal),
+        ExprNode::Send { recv: None, method, block, .. }
+            if method.as_str() == "respond_to" && block.is_some() => true,
+        ExprNode::If { then_branch, else_branch, .. } => {
+            has_toplevel_terminal(then_branch) && has_toplevel_terminal(else_branch)
+        }
+        _ => is_response_terminal(body),
+    }
+}
+
+/// Build a synthetic `render :<name>` Send with the given span.
+/// Used by `synthesize_implicit_render`; span is inherited from the
+/// containing body so diagnostics / effect annotations point at a
+/// meaningful location rather than a free-floating synthetic span.
+fn render_symbol_send(action_name: &str, span: crate::span::Span) -> Expr {
+    let sym = Expr::new(
+        span,
+        ExprNode::Lit {
+            value: Literal::Sym { value: Symbol::from(action_name) },
+        },
+    );
+    Expr::new(
+        span,
+        ExprNode::Send {
+            recv: None,
+            method: Symbol::from("render"),
+            args: vec![sym],
+            block: None,
+            parenthesized: false,
+        },
+    )
+}
+
+/// Append `tail` as the final statement of `body`. If `body` is
+/// already a `Seq`, the result is a `Seq` with one more element;
+/// otherwise the result wraps both in a new `Seq`.
+fn append_statement(body: &Expr, tail: Expr) -> Expr {
+    let mut exprs = match &*body.node {
+        ExprNode::Seq { exprs } => exprs.clone(),
+        _ => vec![body.clone()],
+    };
+    exprs.push(tail);
+    Expr::new(body.span, ExprNode::Seq { exprs })
+}
+
+/// Apply the full pre-emit normalization pipeline to an action
+/// body — the canonical three-pass sequence every target emitter
+/// runs verbatim before walking. Returns a new `Expr`; the input
+/// body is untouched.
+///
+///   1. `resolve_before_actions` — inline `before_action` callback
+///      bodies into each action that uses them.
+///   2. `unwrap_respond_to` — flatten `respond_to { format.html {…}
+///      format.json {…} }` blocks to just their HTML branch.
+///   3. `synthesize_implicit_render` — append `render :<action>`
+///      when the body has no explicit response terminal.
+///
+/// Per-target ivar/params rewrites happen AFTER this pipeline
+/// (e.g. TS's `rewrite_for_controller`), since the rewrite shape
+/// differs between targets (JS-friendly `context.params.k` vs
+/// Rust's axum-extractor locals).
+pub fn normalize_action_body(
+    controller: &Controller,
+    action_name: &str,
+    body: &Expr,
+) -> Expr {
+    let with_callbacks = resolve_before_actions(controller, action_name, body);
+    let flattened = unwrap_respond_to(&with_callbacks);
+    synthesize_implicit_render(&flattened, action_name, /*variants=*/ &[])
+}
+
+/// True when `body` is an empty `Seq` or a `nil` literal — the two
+/// shapes every walker needs to recognize so `if cond; A; end` with
+/// no else-branch doesn't emit a spurious empty `else { }` block.
+pub fn is_empty_body(body: &Expr) -> bool {
+    matches!(&*body.node, ExprNode::Seq { exprs } if exprs.is_empty())
+        || matches!(&*body.node, ExprNode::Lit { value: Literal::Nil })
+}

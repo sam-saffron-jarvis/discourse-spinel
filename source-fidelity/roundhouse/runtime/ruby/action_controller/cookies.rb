@@ -1,0 +1,477 @@
+# frozen_string_literal: true
+# Controller-level cookie access — Rails' `cookies` CookieJar. `cookies[:k]`
+# reads the inbound cookie; `cookies[:k] = v` records a write the dispatcher
+# serializes as Set-Cookie, and `cookies.permanent[:k] = v` records one that
+# expires twenty years out, as Rails' does.
+#
+# Ruby-family only, like current.rb beside this file: a CookieJar-typed field
+# on Base must NOT transpile to the strict targets (they don't exercise
+# cookies), so it lives in a reopen outside the strict-target tables rather
+# than in the universal base.rb. Required by the action_controller.rb
+# aggregator, which the ruby/jruby/spinel trees follow (the strict targets
+# emit their runtime from tables and never see it).
+#
+# Keys normalize to String — exactly as ActionDispatch::Session does — so
+# both CRuby's symbolized inbound cookies and spinel's string-keyed
+# `Tep.str_hash` route through one store. This replaces the former CRuby-only
+# overlay CookieJar; one typed implementation now serves all three ruby-family
+# targets.
+module ActionController
+  class CookieJar
+    def initialize(inbound = {})
+      @inbound = {}
+      @out = {}
+      @flag_httponly = {}
+      @flag_samesite = {}
+      @flag_secure = {}
+      @flag_expires = {}
+      # Copy via `.each` (pair iteration), not `.keys`: the inbound hash is
+      # the request's `Tep.str_hash` (a `Hash.new("")`), whose `.keys`
+      # intrinsic yields a null array through the loosely-typed `req.cookies`
+      # accessor. `.each` normalizes Symbol keys (CRuby) to String so both
+      # the symbolized CRuby inbound and spinel's string-keyed hash share
+      # one store.
+      inbound.each { |k, v| @inbound[k.to_s] = v }
+    end
+
+    # A missing cookie reads as "" (not nil): every call site coerces with
+    # `.to_s`, and a non-null String keeps the value off spinel's nullable-
+    # String path (where `cookies[k].to_s.split(",")` otherwise yields a
+    # null array). Rails returns nil here; "" is equivalent under `.to_s`.
+    def [](key)
+      raw(key)
+    end
+
+    def []=(key, value)
+      raw_set(key, value)
+    end
+
+    # `cookies.permanent[:k] = v` — a view whose writes carry Rails'
+    # twenty-year expiry. This returned `self` until 2026-10-06, which
+    # made every "permanent" cookie a session cookie: campfire's sign-in
+    # ended when the browser closed (found running the Deccan Queen on
+    # Rails chat room). A view for the same reason `signed` is one: it
+    # keeps this jar's stores single-assignment.
+    def permanent
+      ActionController::PermanentCookieJar.new(self)
+    end
+
+    # `cookies.signed[:k]` — a view that signs on the way out and
+    # verifies on the way in, delegating storage back here so a write
+    # through it lands in the same pending map the dispatcher
+    # serializes. Rails hands back a distinct jar object too.
+    #
+    # A view rather than a flag on this object: a second CookieJar
+    # sharing @inbound/@out by assignment widened their element type —
+    # the ivars are seeded from a `{}` literal, so a second assignment
+    # from a parameter left spinel inferring a poly hash, and `to_h`'s
+    # `merge` then had no arm (a NoMethodError at runtime, which is what
+    # the spinel framework test caught and `cargo test` could not).
+    # Delegation keeps every ivar single-assignment and concrete.
+    def signed
+      ActionController::SignedCookieJar.new(self)
+    end
+
+    # `cookies.encrypted[:k]`: the same delegation as `signed`, through
+    # AES-256-GCM rather than an HMAC (ActionController::MessageEncryptor).
+    # Its reads answer the value as JSON gives it back, so this is the
+    # view that reads the session cookie: Action Cable connections
+    # authorize with `cookies.encrypted[Rails.application.config
+    # .session_options[:key]]`.
+    def encrypted
+      ActionController::EncryptedCookieJar.new(self)
+    end
+
+    # Storage, under the signing view above. `[]`/`[]=` are the same
+    # pair without signing.
+    def raw(key)
+      k = key.to_s
+      # @out wins whenever the KEY is present, not whenever its value is
+      # non-empty: `delete` records a cleared write as "", and falling
+      # through on emptiness would read the deleted cookie's inbound
+      # value straight back (the shape cookies_test's
+      # delete-from-inside-each guards).
+      return @out[k] if @out.key?(k)
+      return @inbound[k] if @inbound.key?(k)
+      ""
+    end
+
+    # `.to_s` on the way in, because a cookie value is a String on the
+    # wire and nowhere else — Rails serializes the same way. Without it
+    # `cookies.permanent[:last_room] = @room.id` (campfire's
+    # TrackedRoomVisit, and the test that seeds the same cookie) puts an
+    # Integer into a map the strict typer and every reader here treat as
+    # String→String.
+    #
+    # Returns the STORED string, not the argument. Ruby evaluates `x[k] =
+    # v` to `v` by language rule whatever the method returns, so nothing
+    # observes the difference — and it keeps this pair off the untyped
+    # ledger, which a `-> untyped` return would have joined for no gain.
+    def raw_set(key, value)
+      @out[key.to_s] = value.to_s
+      @out[key.to_s]
+    end
+
+    def record_flags(key, httponly, same_site, secure)
+      k = key.to_s
+      @flag_httponly[k] = httponly ? "1" : ""
+      ss = same_site.to_s
+      ss = "Lax" if ss == "lax" || ss == "Lax"
+      ss = "Strict" if ss == "strict" || ss == "Strict"
+      ss = "None" if ss == "none" || ss == "None"
+      @flag_samesite[k] = ss
+      @flag_secure[k] = secure ? "1" : ""
+      k
+    end
+
+    # Rails defaults HttpOnly on. A bare `cookies[:k] = v` (or
+    # `cookies.signed[:k] = v`) never calls `record_flags`, so a missing
+    # entry means the default, not an opt-out. Explicit `httponly: false`
+    # records "" and stays off.
+    def flag_httponly?(key)
+      k = key.to_s
+      return true unless @flag_httponly.key?(k)
+      @flag_httponly[k] == "1"
+    end
+
+    def flag_samesite(key)
+      @flag_samesite[key.to_s].to_s
+    end
+
+    def flag_secure?(key)
+      @flag_secure[key.to_s] == "1"
+    end
+
+    # Marks a write as permanent; the `permanent` views call it after
+    # storing the value.
+    def record_permanent(key)
+      k = key.to_s
+      @flag_expires[k] = ActionController::CookieJar.permanent_expires
+      k
+    end
+
+    # The `Expires` a permanent write recorded, as an HTTP date; "" for a
+    # cookie that ends with the browser session, which is every write
+    # that didn't go through `permanent`.
+    def flag_expires(key)
+      @flag_expires[key.to_s].to_s
+    end
+
+    # `20.years.from_now`, which is what Rails' permanent jar writes,
+    # formatted the way Rack writes `expires=`. A calendar twenty years
+    # rather than a count of seconds, as ActiveSupport's `years` is.
+    def self.permanent_expires
+      n = Time.now.utc
+      Time.utc(n.year + 20, n.month, n.day, n.hour, n.min, n.sec).strftime("%a, %d %b %Y %H:%M:%S GMT")
+    end
+
+    # Removing a cookie is recorded as an empty write; the dispatcher emits a
+    # cleared Set-Cookie. (No separate tombstone type keeps @out a plain
+    # String→String map for the strict typer.)
+    def delete(key)
+      @out[key.to_s] = ""
+      @flag_expires.delete(key.to_s)
+      ""
+    end
+
+    # Pending writes, for the dispatcher's Set-Cookie serialization. NOT
+    # `to_h`: the siblings ActionDispatch::Flash and ActionDispatch::Session
+    # both spell the whole store `to_h` and the dispatcher-facing subset
+    # something intent-named (`to_persisted` / `to_cookie`), and Rails' own
+    # CookieJar#to_h yields every cookie. This is only @out, so it takes the
+    # intent name and leaves `to_h` free for the merged view `[]` reads.
+    # (Nor `to_set`, the name this carried until 2026-07-25: spinel rewrites
+    # any zero-arg `x.to_set` to `Set.new(x.to_a)` whenever a Set class is in
+    # the program, overriding the user-defined method — matz/spinel#3378.)
+    def pending
+      @out
+    end
+
+    # The whole jar as a Hash — inbound overlaid by this request's pending
+    # writes, i.e. exactly what `[]` reads, materialized. This is the name
+    # `pending` above deliberately left free, and it matches Rails, whose
+    # CookieJar#to_h also yields every cookie rather than just the writes.
+    # (`@inbound.merge(@out)` rather than an empty-literal accumulator: a
+    # bare `{}` seed types its values Untyped — the Hash-side accumulator
+    # refinement gap — and `merge` of two Hash[String, String] stays
+    # concrete, which the fully-typed runtime gate requires.)
+    def to_h
+      @inbound.merge(@out)
+    end
+
+    # Rails spells the same thing `to_hash` on the jar, and that is the
+    # name app code reaches for — campfire's `SessionTestHelper
+    # #parsed_cookies` rebuilds a jar from `cookies.to_hash`. An alias,
+    # not a second implementation.
+    def to_hash
+      to_h
+    end
+
+    # Iterate the merged view, as Rails' CookieJar does (it is Enumerable
+    # over the same whole-jar view). Yielding over the fresh Hash `to_h`
+    # builds — rather than over @inbound/@out directly — is load-bearing,
+    # not incidental: the shape this exists for is lobsters'
+    # `remove_unknown_cookies`, which calls `cookies.delete(key)` from
+    # inside the block, and `delete` records a write into @out. Walking a
+    # snapshot keeps that allowed, the way `Hash#each` + `delete` on a dup
+    # is; iterating a live store would mutate the collection being walked.
+    def each
+      to_h.each { |k, v| yield k, v }
+      self
+    end
+  end
+
+  # The `cookies.signed` view: same storage, signed on the way out and
+  # verified on the way in. Rails' SignedKeyRotatingCookieJar, minus the
+  # rotation.
+  #
+  # A cookie that does not verify reads as "" — indistinguishable from
+  # absent, which is what Rails does (it answers nil and the app treats
+  # the request as signed out). That covers a tampered payload, a bad
+  # signature, a value signed for a different cookie name, and a string
+  # that is not of the form at all.
+  class SignedCookieJar
+    # `permanent` is true for `cookies.signed.permanent` and
+    # `cookies.permanent.signed`: same signing, writes expire with
+    # Rails' twenty years.
+    def initialize(jar, permanent = false)
+      @jar = jar
+      @permanent = permanent
+    end
+
+    # NIL for an absent cookie and for anything that does not verify —
+    # a tampered payload, a bad signature, a value signed for another
+    # name. Rails answers nil for all of those, and it is the one place
+    # in this jar where the difference between nil and `""` is visible
+    # to an app rather than absorbed by a `.to_s`:
+    #
+    #   if token = cookies.signed[:session_token]
+    #
+    # is campfire's `SessionLookup`, and an empty String is TRUTHY in
+    # Ruby. Signed out, that branch ran `Session.find_by(token: "")` —
+    # correct by accident, one query Rails never makes, and a call site
+    # that only checked presence would simply be wrong.
+    #
+    # The UNSIGNED jar keeps `""`, deliberately: its store is
+    # `Hash[String, String]` and a nullable String puts every read on
+    # spinel's nullable path. Only this one read is nullable, which is
+    # where the truthiness shape actually lives. Ledgered in
+    # docs/pipeline/runtime.md.
+    def [](key)
+      raw = @jar.raw(key)
+      return nil if raw == ""
+      verified = ActionController::MessageVerifier.verified(
+        Rails.application.secret_key_base,
+        ActionController::MessageVerifier::SIGNED_COOKIE_SALT,
+        raw, "cookie." + key.to_s, true
+      )
+      verified == "" ? nil : verified
+    end
+
+    # Rails takes either a bare value or an options Hash carrying
+    # `value:` beside `httponly:`/`same_site:`/`secure:` — campfire
+    # writes the latter. Bare writes leave flags unrecorded so
+    # `flag_httponly?` keeps the HttpOnly default; an options Hash
+    # records the explicit bits the dispatcher reads.
+    def []=(key, value)
+      signed = ActionController::MessageVerifier.generate(
+        Rails.application.secret_key_base,
+        ActionController::MessageVerifier::SIGNED_COOKIE_SALT,
+        ActionController::SignedCookieJar.value_of(value),
+        "cookie." + key.to_s, true
+      )
+      @jar.raw_set(key, signed)
+      @jar.record_permanent(key) if @permanent
+      if value.is_a?(Hash)
+        ss = value[:same_site]
+        ss = "" if ss.nil?
+        # Omitted httponly is the default (on). Only an explicit
+        # `httponly: false` records an opt-out; `== true` treated a
+        # missing key as off and dropped HttpOnly on Rack.
+        @jar.record_flags(key, value[:httponly] != false, ss.to_s, value[:secure] == true)
+      end
+      value
+    end
+
+    # `cookies.signed.permanent[:k] = v` — campfire's session cookie.
+    def permanent
+      ActionController::SignedCookieJar.new(@jar, true)
+    end
+
+    def delete(key)
+      @jar.delete(key)
+    end
+
+    # The value out of either write form. Kept a class method with an
+    # untyped parameter rather than an `is_a?` branch inside `[]=`: the
+    # options-Hash form carries mixed value types (String, bool, Symbol),
+    # and confining the poly read to one place keeps it off the jar's
+    # own String-typed surface.
+    def self.value_of(value)
+      return value[:value].to_s if value.is_a?(Hash)
+      value.to_s
+    end
+  end
+
+  # The `cookies.encrypted` view: same storage, encrypted on the way out
+  # and decrypted on the way in. Rails' EncryptedKeyRotatingCookieJar,
+  # minus the rotation.
+  #
+  # Unlike the signed view, a read answers the VALUE, not its text: the
+  # cookie carries JSON (`cookies_serializer :json`), so a Hash comes back
+  # a Hash with String keys and an Integer an Integer. That is what makes
+  # this the reader of the session cookie, whose value is the whole
+  # session Hash. nil for an absent cookie and for one that does not
+  # decrypt for this name, as Rails answers (see MessageEncryptor for
+  # what does not).
+  class EncryptedCookieJar
+    def initialize(jar, permanent = false)
+      @jar = jar
+      @permanent = permanent
+    end
+
+    def [](key)
+      raw = @jar.raw(key)
+      return nil if raw == ""
+      json = ActionController::MessageEncryptor.decrypted_json(
+        Rails.application.secret_key_base, raw, "cookie." + key.to_s
+      )
+      return nil if json == ""
+      ActionController::EncryptedCookieJar.parse(json)
+    end
+
+    # A bare value or Rails' options Hash, as the signed view takes them.
+    # The value is written as ActiveSupport's JSON; a permanent write puts
+    # its twenty years inside the envelope too, where Rails' jar records
+    # `expires` as metadata.
+    def []=(key, value)
+      exp = "null"
+      exp = "\"" + ActionController::MessageVerifier.iso8601_ms(ActionController::EncryptedCookieJar.permanent_time) + "\"" if @permanent
+      encrypted = ActionController::MessageEncryptor.encrypt(
+        Rails.application.secret_key_base,
+        ActiveSupport::JSON.encode(ActionController::EncryptedCookieJar.value_of(value)),
+        "cookie." + key.to_s, exp
+      )
+      @jar.raw_set(key, encrypted)
+      @jar.record_permanent(key) if @permanent
+      if value.is_a?(Hash)
+        ss = value[:same_site]
+        ss = "" if ss.nil?
+        @jar.record_flags(key, value[:httponly] != false, ss.to_s, value[:secure] == true)
+      end
+      value
+    end
+
+    def permanent
+      ActionController::EncryptedCookieJar.new(@jar, true)
+    end
+
+    def delete(key)
+      @jar.delete(key)
+    end
+
+    # The value out of either write form, untouched: unlike the signed
+    # view's, it is not made a String, because JSON keeps its type.
+    def self.value_of(value)
+      return value[:value] if value.is_a?(Hash)
+      value
+    end
+
+    # The JSON text a cookie decrypted to, as a value; nil when it does
+    # not parse, which is what Rails answers for a cookie whose message
+    # is not JSON (a Marshal-serialized one, say).
+    def self.parse(json)
+      ActiveSupport::JSON.decode(json)
+    rescue StandardError
+      nil
+    end
+
+    # The instant a permanent write expires at: twenty calendar years
+    # out, the moment `CookieJar.permanent_expires` formats for the header.
+    def self.permanent_time
+      n = Time.now.utc
+      Time.utc(n.year + 20, n.month, n.day, n.hour, n.min, n.sec)
+    end
+  end
+
+  # The `cookies.permanent` view: the unsigned jar's reads and writes,
+  # with each write recorded as expiring in twenty years. Rails'
+  # PermanentCookieJar, which is also where `cookies.permanent.signed`
+  # starts.
+  class PermanentCookieJar
+    def initialize(jar)
+      @jar = jar
+    end
+
+    def [](key)
+      @jar.raw(key)
+    end
+
+    def []=(key, value)
+      stored = @jar.raw_set(key, value)
+      @jar.record_permanent(key)
+      stored
+    end
+
+    def signed
+      ActionController::SignedCookieJar.new(@jar, true)
+    end
+
+    def encrypted
+      ActionController::EncryptedCookieJar.new(@jar, true)
+    end
+
+    def delete(key)
+      @jar.delete(key)
+    end
+  end
+
+  class Base
+    # Lazily initialised so a read before the dispatcher assigns the real jar
+    # (e.g. a unit-constructed controller) still returns a usable empty
+    # CookieJar rather than nil — mirrors base.rb's eager `@session`, but from
+    # a reopen so the CookieJar type stays off the strict targets.
+    def cookies
+      @cookies = ActionController::CookieJar.new if @cookies.nil?
+      @cookies
+    end
+
+    def cookies=(value)
+      @cookies = value
+      value
+    end
+  end
+end
+
+# Rails puts the jar at `ActionDispatch::Cookies::CookieJar` and reaches
+# it from a controller as `cookies`; this runtime named the class for the
+# layer that owns the accessor instead. Both names are Rails API — app
+# code that only ever writes `cookies` never sees the difference, but
+# code that rebuilds a jar around a request does:
+#
+#   ActionDispatch::Cookies::CookieJar.build(request, cookies.to_hash)
+#
+# is how campfire's SessionTestHelper re-reads a response's signed
+# cookies. So the ActionDispatch spelling exists as a constructor onto
+# the one implementation above, not as a second jar.
+#
+# `request` is accepted and ignored. Rails threads it through for the key
+# generator and the host-scoping of `domain: :all`; neither is modeled
+# here (the verifier keys straight off `Rails.application.secret_key_base`),
+# and dropping the parameter would break the documented call shape.
+module ActionDispatch
+  module Cookies
+    class CookieJar
+      def self.build(request, cookies)
+        ActionController::CookieJar.new(cookies)
+      end
+
+      # `CookieJar.new(request)` (actionpack's cookies.rb `initialize(request)`):
+      # an empty jar for the request, as a test builds one to hand a
+      # service. The request is ignored here, as in `build`.
+      def self.new(request = nil, inbound = {})
+        ActionController::CookieJar.new(inbound)
+      end
+    end
+  end
+end

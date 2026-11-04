@@ -1,0 +1,889 @@
+//! ActiveRecord literal base class, the `CollectionProxy` runtime helper,
+//! the `ActiveRecord::AdapterInterface` contract, and the `Arel` node
+//! family. Extracted verbatim from `Analyzer::with_adapter`.
+
+use crate::det::HashMap;
+
+use crate::analyze::ClassInfo;
+use crate::ident::{ClassId, Symbol};
+use crate::ty::Ty;
+
+/// `Model.connection` / `ActiveRecord::Base.connection` — the raw-SQL
+/// connection the runtime implements (`runtime/ruby/active_record/
+/// connection.rb`).
+pub(in crate::analyze) fn connection_ty() -> Ty {
+    Ty::Class { id: ClassId(Symbol::from("ActiveRecord::Connection")), args: vec![].into() }
+}
+
+/// `Model.current_transaction` — Rails 7.2's handle on the open
+/// transaction, whose `after_commit` the runtime implements
+/// (`runtime/ruby/active_record/connection.rb`).
+pub(in crate::analyze) fn transaction_ty() -> Ty {
+    Ty::Class { id: ClassId(Symbol::from("ActiveRecord::Transaction")), args: vec![].into() }
+}
+
+/// `ActiveRecord::Connection` and `ActiveRecord::Result`, read from the
+/// runtime's own signatures rather than restated here, so the analyzer
+/// knows exactly the surface both lanes implement. `connection` used to
+/// answer `Untyped`, which made every raw-SQL row gradual: lobsters'
+/// `exec_query(sql).first.symbolize_keys!` could not be grounded
+/// because nothing knew the row was a `Hash[String, _]`. A call beyond
+/// the declared surface is now a visible gap instead of a silent one.
+fn register_connection_surface(classes: &mut HashMap<ClassId, ClassInfo>) {
+    const RBS: &str = include_str!("../../../runtime/ruby/active_record/connection.rbs");
+    let Ok(parsed) = crate::rbs::parse_app_signatures(RBS) else { return };
+    for name in ["ActiveRecord::Connection", "ActiveRecord::Result", "ActiveRecord::Transaction"] {
+        let id = ClassId(Symbol::from(name));
+        let Some(methods) = parsed.get(&id) else { continue };
+        let cls = classes.entry(id).or_default();
+        for (m, ty) in methods {
+            cls.instance_methods.entry(m.clone()).or_insert_with(|| ty.clone());
+        }
+    }
+    // Beyond what the runtime implements, the connection a program gets is
+    // Rails' `AbstractAdapter`, and code that reaches for the adapter
+    // (`quote_column_name` in a hand-built query, `transaction_open?` in a
+    // guard) calls its documented surface. Those names were reported as
+    // unknown methods of `ActiveRecord::Connection`. The runtime's own
+    // signatures above win where both speak; what is added has plain Ruby
+    // result types, and the adapter objects it hands out (the transaction
+    // manager, the pool, the current transaction) stay untyped.
+    let str = Ty::Str;
+    let untyped_rows = Ty::Array { elem: std::sync::Arc::new(Ty::Array { elem: std::sync::Arc::new(Ty::Untyped) }) };
+    let untyped_list = Ty::Array { elem: std::sync::Arc::new(Ty::Untyped) };
+    let cls = classes.entry(ClassId(Symbol::from("ActiveRecord::Connection"))).or_default();
+    for (name, ty) in [
+        ("quote_column_name", str.clone()),
+        ("quote_table_name", str.clone()),
+        ("quoted_date", str.clone()),
+        ("quoted_true", str.clone()),
+        ("quoted_false", str.clone()),
+        ("transaction_open?", Ty::Bool),
+        ("table_exists?", Ty::Bool),
+        ("column_exists?", Ty::Bool),
+        ("index_exists?", Ty::Bool),
+        ("active?", Ty::Bool),
+        ("supports_json?", Ty::Bool),
+        ("open_transactions", Ty::Int),
+        ("select_rows", untyped_rows),
+        ("select_values", untyped_list.clone()),
+        ("select_one", Ty::Untyped),
+        ("select_value", Ty::Untyped),
+        ("tables", Ty::Array { elem: std::sync::Arc::new(Ty::Str) }),
+        ("columns", untyped_list.clone()),
+        ("indexes", untyped_list),
+        ("insert", Ty::Untyped),
+        ("update", Ty::Int),
+        ("delete", Ty::Int),
+        ("transaction", Ty::Untyped),
+        ("current_transaction", Ty::Untyped),
+        ("transaction_manager", Ty::Untyped),
+        ("pool", Ty::Untyped),
+        ("raw_connection", Ty::Untyped),
+        ("database_version", Ty::Untyped),
+    ] {
+        cls.instance_methods.entry(Symbol::from(name)).or_insert(ty);
+    }
+}
+
+pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
+    register_connection_surface(classes);
+    // `ActiveRecord::Base` itself — the literal base class, called
+    // directly as `ActiveRecord::Base.transaction { ... }` and
+    // `ActiveRecord::Base.connection.exec_query(...)`. It sits at the
+    // end of every model's parent chain but was never registered as a
+    // class, so dispatch on the non-model receiver `Class
+    // { ActiveRecord::Base }` found nothing and errored. `transaction`
+    // runs the block in a DB transaction (return = the block value,
+    // not statically tracked) and `connection` hands back a raw
+    // connection adapter — both gradual (`Untyped`), exactly mirroring
+    // the per-model class-side framework block above. `or_insert` so a
+    // real `active_record/base.rb` library file (none in practice)
+    // would still win.
+    {
+        // Prefer `entry().or_default()` so later registration cannot
+        // drop methods we seed here. Raw-SQL helpers live in
+        // `connection.rbs` / `connection.rb` (`sanitize_sql`,
+        // `sanitize_sql_array`, …) — without them on Base, app calls
+        // fail `send_dispatch` even though the runtime defines them
+        // (#400).
+        let base = classes
+            .entry(ClassId(Symbol::from("ActiveRecord::Base")))
+            .or_default();
+        for m in [
+            "transaction",
+            "uncached",
+            "establish_connection",
+        ] {
+            base.class_methods.entry(Symbol::from(m)).or_insert(Ty::Untyped);
+        }
+        base.class_methods
+            .entry(Symbol::from("current_transaction"))
+            .or_insert_with(transaction_ty);
+        // Which database, and the pool's `with_connection` — served on the
+        // ruby family and spinel by runtime/spinel/active_record_db_config.rb.
+        base.class_methods
+            .entry(Symbol::from("connection_db_config"))
+            .or_insert(Ty::Class {
+                id: ClassId(Symbol::from("ActiveRecord::DatabaseConfigurations::HashConfig")),
+                args: vec![].into(),
+            });
+        base.class_methods
+            .entry(Symbol::from("connection_pool"))
+            .or_insert(Ty::Class {
+                id: ClassId(Symbol::from("ActiveRecord::ConnectionAdapters::DbPool")),
+                args: vec![].into(),
+            });
+        base.class_methods
+            .entry(Symbol::from("connection"))
+            .or_insert_with(connection_ty);
+        base.class_methods.entry(Symbol::from("configurations")).or_insert(Ty::Untyped);
+        base.class_methods.entry(Symbol::from("configurations=")).or_insert(Ty::Untyped);
+        for m in ["sanitize_sql", "sanitize_sql_array", "sanitize_sql_for_order", "sanitize_sql_like"] {
+            base.class_methods.entry(Symbol::from(m)).or_insert(Ty::Str);
+        }
+        // Association / ActionText macro helpers call these on the
+        // literal Base (and on every model via the AR catalog). Seed
+        // Base itself so concern bodies typed with `self =
+        // ActiveRecord::Base` (sole includer of a load-hook module)
+        // do not ledger "lacks a shared runtime" for live AR API.
+        base.class_methods
+            .entry(Symbol::from("reflect_on_association"))
+            .or_insert(Ty::Class {
+                id: ClassId(Symbol::from(
+                    "ActiveRecord::Reflection::AssociationReflection",
+                )),
+                args: vec![].into(),
+            });
+        base.class_methods
+            .entry(Symbol::from("strict_loading_by_default"))
+            .or_insert(Ty::Bool);
+    }
+
+    {
+        let config = classes
+            .entry(ClassId(Symbol::from("ActiveRecord::DatabaseConfigurations::HashConfig")))
+            .or_default();
+        for m in ["database", "adapter", "name", "env_name", "schema_dump"] {
+            config.instance_methods.entry(Symbol::from(m)).or_insert(Ty::Str);
+        }
+        config.instance_methods.entry(Symbol::from("configuration_hash")).or_insert(Ty::Untyped);
+        for m in ["seeds?", "database_tasks?"] {
+            config.instance_methods.entry(Symbol::from(m)).or_insert(Ty::Bool);
+        }
+        // The block's value: whatever the caller computes from the connection.
+        classes
+            .entry(ClassId(Symbol::from("ActiveRecord::ConnectionAdapters::DbPool")))
+            .or_default()
+            .instance_methods
+            .entry(Symbol::from("with_connection"))
+            .or_insert(Ty::Untyped);
+        classes
+            .entry(ClassId(Symbol::from("ActiveRecord::ConnectionAdapters::SQLite3Adapter")))
+            .or_default()
+            .class_methods
+            .entry(Symbol::from("resolve_path"))
+            .or_insert(Ty::Str);
+    }
+
+    // CollectionProxy — the runtime helper transpiled models use
+    // for has_many associations. `new(...)` returns an instance;
+    // iteration/build/create/count/size live on the instance.
+    // Registered under the bare last-segment name because the
+    // body-typer instantiates `Const { path }` using `path.last()`
+    // — see ExprNode::Const branch in analyze/body/mod.rs.
+    let cp_class = ClassId(Symbol::from("CollectionProxy"));
+    let mut cp_cls = ClassInfo::default();
+    cp_cls.class_methods.insert(
+        Symbol::from("new"),
+        Ty::Class { id: cp_class.clone(), args: vec![].into() },
+    );
+    cp_cls.instance_methods.insert(Symbol::from("size"), Ty::Int);
+    cp_cls.instance_methods.insert(Symbol::from("length"), Ty::Int);
+    cp_cls.instance_methods.insert(Symbol::from("count"), Ty::Int);
+    cp_cls.instance_methods.insert(Symbol::from("empty?"), Ty::Bool);
+    // `each`, `build`, `create` — return types depend on the target
+    // class which isn't known from the proxy type alone. Leave as
+    // unknown() placeholders; real resolution requires threading
+    // association metadata through the ivar type, which is future
+    // work.
+    classes.insert(cp_class, cp_cls);
+
+    // `ActiveRecord::AdapterInterface` — the 9-method contract that
+    // `runtime/ruby/active_record/base.rb` calls into via
+    // `ActiveRecord.adapter.X`. Each per-target runtime ships its
+    // own concrete impl (Rust trait + impls in `runtime/rust/`,
+    // Crystal abstract class + SqliteAdapter, TS interface +
+    // SqliteActiveRecordAdapter). On the
+    // Ruby side there's no class declaration — the RBS for
+    // `ActiveRecord.adapter` previously returned `untyped`, which
+    // let TS get away with `any` but left rust emit producing
+    // method calls on `serde_json::Value` (E0599 on
+    // `.find/.where/.all/.insert/.update/.delete/.count/.exists/.truncate`).
+    // Registering it here gives the body-typer a concrete class to
+    // dispatch against; the RBS sidecar then references it as
+    // `() -> AdapterInterface`.
+    let hash_str_untyped = Ty::Hash {
+        key: std::sync::Arc::new(Ty::Str),
+        value: std::sync::Arc::new(Ty::Untyped),
+    };
+    let row_ty = hash_str_untyped.clone();
+    let nilable_row = Ty::Union {
+        variants: vec![row_ty.clone(), Ty::Nil].into(),
+    };
+    let array_of_rows = Ty::Array { elem: std::sync::Arc::new(row_ty.clone()) };
+    let mut adapter_iface = ClassInfo::default();
+    adapter_iface
+        .instance_methods
+        .insert(Symbol::from("all"), array_of_rows.clone());
+    adapter_iface
+        .instance_methods
+        .insert(Symbol::from("find"), nilable_row.clone());
+    adapter_iface
+        .instance_methods
+        .insert(Symbol::from("where"), array_of_rows.clone());
+    adapter_iface
+        .instance_methods
+        .insert(Symbol::from("count"), Ty::Int);
+    adapter_iface
+        .instance_methods
+        .insert(Symbol::from("exists?"), Ty::Bool);
+    adapter_iface
+        .instance_methods
+        .insert(Symbol::from("insert"), Ty::Int);
+    adapter_iface
+        .instance_methods
+        .insert(Symbol::from("update"), Ty::Nil);
+    adapter_iface
+        .instance_methods
+        .insert(Symbol::from("delete"), Ty::Nil);
+    adapter_iface
+        .instance_methods
+        .insert(Symbol::from("truncate"), Ty::Nil);
+    classes.insert(
+        ClassId(Symbol::from("ActiveRecord::AdapterInterface")),
+        adapter_iface,
+    );
+
+    // Active Storage — the value type a `has_one_attached` reader
+    // answers, the blob behind it, the identity variant, and the
+    // storage-service seam. The analyzer knew NOTHING about Active
+    // Storage, so the reader `lower::attached` synthesizes (`def avatar;
+    // ActiveStorage::Attached.new(…); end`) had no type to answer with
+    // and every `user.avatar` read was a dispatch failure — including
+    // the `@bot.avatar` in a partial, which is how it stayed hidden
+    // until `@bot` itself started resolving.
+    //
+    // The method lists are `runtime/ruby/active_storage.rbs` verbatim,
+    // so the analyzer and a strict target agree.
+    {
+        let attached_id = ClassId(Symbol::from("ActiveStorage::Attached"));
+        let blob_id = ClassId(Symbol::from("ActiveStorage::Blob"));
+        // `Blob#filename` is an `ActiveStorage::Filename` (extension,
+        // base, …), not a String — app code that wants the text writes
+        // `filename.to_s`, and Action Text's `_blob` partial reads
+        // `blob.filename.extension`. `runtime/ruby/active_storage.rb`
+        // answers the same class.
+        let filename_id = ClassId(Symbol::from("ActiveStorage::Filename"));
+        {
+            let mut filename = ClassInfo::default();
+            for m in [
+                "to_s", "extension", "extension_with_delimiter", "extension_without_delimiter",
+                "base", "sanitized", "as_json",
+            ] {
+                filename.instance_methods.insert(Symbol::from(m), Ty::Str);
+            }
+            filename.instance_methods.insert(Symbol::from("=="), Ty::Bool);
+            classes.insert(filename_id.clone(), filename);
+        }
+        let metadata_id = ClassId(Symbol::from("ActiveStorage::BlobMetadata"));
+        let variant_id = ClassId(Symbol::from("ActiveStorage::VariantWithRecord"));
+        let service_id = ClassId(Symbol::from("ActiveStorage::Service"));
+        let analyzer_id = ClassId(Symbol::from("ActiveStorage::ImageAnalyzer"));
+        let class_ty = |id: &ClassId| Ty::Class { id: id.clone(), args: vec![].into() };
+        let nilable = |ty: Ty| Ty::Union { variants: vec![ty, Ty::Nil].into() };
+        let nilable_str = nilable(Ty::Str);
+
+        let mut attached = ClassInfo::default();
+        for (m, ty) in [
+            ("attached?", Ty::Bool),
+            ("blob", nilable(class_ty(&blob_id))),
+            ("filename", nilable(class_ty(&filename_id))),
+            ("content_type", nilable_str.clone()),
+            ("key", Ty::Str),
+            ("signed_id", Ty::Str),
+            ("byte_size", Ty::Int),
+            ("metadata", class_ty(&metadata_id)),
+            ("video?", Ty::Bool),
+            ("image?", Ty::Bool),
+            ("audio?", Ty::Bool),
+            ("variable?", Ty::Bool),
+            ("previewable?", Ty::Bool),
+            ("representable?", Ty::Bool),
+            ("analyze", Ty::Nil),
+            ("variant", class_ty(&variant_id)),
+            ("representation", class_ty(&variant_id)),
+            ("preview", class_ty(&variant_id)),
+            ("url", Ty::Str),
+            ("attach_blob", Ty::Nil),
+            ("attach", Ty::Nil),
+            ("purge", Ty::Nil),
+            ("purge_later", Ty::Nil),
+            ("destroy", Ty::Nil),
+        ] {
+            attached.instance_methods.insert(Symbol::from(m), ty);
+        }
+        attached.instance_methods.insert(
+            Symbol::from("variations"),
+            Ty::Array { elem: std::sync::Arc::new(class_ty(&ClassId(Symbol::from("ActiveStorage::Variation")))) },
+        );
+        classes.insert(attached_id.clone(), attached);
+
+        // `has_many_attached` proxy — `attachments` answers
+        // `ManyAttachment` (runtime join-row value), not the
+        // synthesized Attachment MODEL, so the registry can name it
+        // without racing the model loop.
+        {
+            let many_row_id = ClassId(Symbol::from("ActiveStorage::ManyAttachment"));
+            let mut many_row = ClassInfo::default();
+            many_row.instance_methods.insert(Symbol::from("id"), Ty::Int);
+            many_row.instance_methods.insert(
+                Symbol::from("blob"),
+                Ty::Union {
+                    variants: vec![class_ty(&blob_id), Ty::Nil].into(),
+                },
+            );
+            many_row.instance_methods.insert(
+                Symbol::from("filename"),
+                Ty::Union {
+                    variants: vec![class_ty(&filename_id), Ty::Nil].into(),
+                },
+            );
+            many_row.instance_methods.insert(
+                Symbol::from("content_type"),
+                Ty::Union {
+                    variants: vec![Ty::Str, Ty::Nil].into(),
+                },
+            );
+            many_row.instance_methods.insert(Symbol::from("url"), Ty::Str);
+            classes.insert(many_row_id.clone(), many_row);
+
+            let many_id = ClassId(Symbol::from("ActiveStorage::AttachedMany"));
+            let mut many = ClassInfo::default();
+            many.instance_methods.insert(Symbol::from("attached?"), Ty::Bool);
+            many.instance_methods.insert(
+                Symbol::from("attachments"),
+                Ty::Array {
+                    elem: std::sync::Arc::new(class_ty(&many_row_id)),
+                },
+            );
+            // `delegate_missing_to :attachments` — `each` is the
+            // Enumerable call the corpus makes (`embeds.each(&:filename)`).
+            many.instance_methods.insert(
+                Symbol::from("each"),
+                super::block_fn(
+                    &class_ty(&many_row_id),
+                    Ty::Array { elem: std::sync::Arc::new(class_ty(&many_row_id)) },
+                ),
+            );
+            // The other Enumerable reads views make of the proxy: a
+            // jbuilder block over `record.pictures` maps it, and
+            // `size` / `empty?` guard it.
+            many.instance_methods.insert(
+                Symbol::from("map"),
+                super::block_fn(
+                    &class_ty(&many_row_id),
+                    Ty::Array { elem: std::sync::Arc::new(Ty::Untyped) },
+                ),
+            );
+            many.instance_methods.insert(Symbol::from("size"), Ty::Int);
+            many.instance_methods.insert(Symbol::from("empty?"), Ty::Bool);
+            many.instance_methods.insert(Symbol::from("attach_blob"), Ty::Nil);
+            many.instance_methods.insert(Symbol::from("attach"), Ty::Nil);
+            many.instance_methods.insert(Symbol::from("purge"), Ty::Nil);
+            many.instance_methods.insert(Symbol::from("purge_later"), Ty::Nil);
+            many.instance_methods.insert(Symbol::from("first"), nilable(class_ty(&many_row_id)));
+            many.instance_methods.insert(Symbol::from("destroy"), Ty::Nil);
+            classes.insert(many_id, many);
+        }
+
+        let mut blob = ClassInfo::default();
+        for (m, ty) in [
+            ("id", Ty::Int),
+            ("key", Ty::Str),
+            ("filename", class_ty(&filename_id)),
+            ("content_type", Ty::Str),
+            ("byte_size", Ty::Int),
+            ("metadata", class_ty(&metadata_id)),
+            ("signed_id", Ty::Str),
+            ("download", Ty::Str),
+            ("purge", Ty::Nil),
+            ("purge_later", Ty::Nil),
+            // `ActionText::Attachable` — the ruby-family Blob reopen
+            // (runtime/spinel/active_storage_disk.rb) mints it.
+            ("attachable_sgid", Ty::Str),
+            ("video?", Ty::Bool),
+            ("image?", Ty::Bool),
+            ("audio?", Ty::Bool),
+            ("variable?", Ty::Bool),
+            ("url", Ty::Str),
+            // Attachment#url and Attached#url call `redirect_url`;
+            // register it beside `url` so synthesized helpers type.
+            ("redirect_url", Ty::Str),
+            // Action Text's `_blob` partial: a previewable or variable
+            // blob renders through `representation(transformations)`.
+            ("representable?", Ty::Bool),
+            ("previewable?", Ty::Bool),
+            ("representation", class_ty(&variant_id)),
+            ("preview", class_ty(&variant_id)),
+            ("variant", class_ty(&variant_id)),
+        ] {
+            blob.instance_methods.insert(Symbol::from(m), ty);
+        }
+        for (m, ty) in [
+            ("service", class_ty(&service_id)),
+            ("find", nilable(class_ty(&blob_id))),
+            ("find_by_key", nilable(class_ty(&blob_id))),
+            ("find_signed", nilable(class_ty(&blob_id))),
+            ("create_and_upload!", class_ty(&blob_id)),
+            ("from_attachable", nilable(class_ty(&blob_id))),
+            ("from_io_hash", nilable(class_ty(&blob_id))),
+            ("generate_key", Ty::Str),
+        ] {
+            blob.class_methods.insert(Symbol::from(m), ty);
+        }
+        classes.insert(blob_id.clone(), blob);
+
+        let mut metadata = ClassInfo::default();
+        metadata.instance_methods.insert(Symbol::from("[]"), nilable(Ty::Int));
+        metadata.instance_methods.insert(Symbol::from("width"), Ty::Int);
+        metadata.instance_methods.insert(Symbol::from("height"), Ty::Int);
+        metadata.instance_methods.insert(Symbol::from("to_json"), Ty::Str);
+        classes.insert(metadata_id, metadata);
+
+        // The variant is Rails' `VariantWithRecord`: `image` is the
+        // variant record's own attachment once processed (nil for the
+        // identity variant), `blob` the ORIGINAL, `image_blob` the
+        // transformed one.
+        let variation_id = ClassId(Symbol::from("ActiveStorage::Variation"));
+        let mut variant = ClassInfo::default();
+        for (m, ty) in [
+            ("processed", class_ty(&variant_id)),
+            ("processed?", Ty::Bool),
+            ("process", Ty::Nil),
+            ("image", nilable(class_ty(&attached_id))),
+            ("blob", nilable(class_ty(&blob_id))),
+            ("image_blob", nilable(class_ty(&blob_id))),
+            ("variation", nilable(class_ty(&variation_id))),
+            ("key", Ty::Str),
+            ("filename", Ty::Str),
+            ("url", Ty::Str),
+        ] {
+            variant.instance_methods.insert(Symbol::from(m), ty);
+        }
+        variant.class_methods.insert(Symbol::from("record_select"), Ty::Str);
+        variant.class_methods.insert(Symbol::from("purge_records_of"), Ty::Nil);
+        classes.insert(variant_id, variant);
+        let mut variant_record = ClassInfo::default();
+        variant_record.class_methods.insert(Symbol::from("count"), Ty::Int);
+        classes.insert(ClassId(Symbol::from("ActiveStorage::VariantRecord")), variant_record);
+
+        // One `attachable.variant :name, resize_to_limit: [w, h],
+        // format: :f` declaration, constructed into the reader by
+        // `lower::attached`.
+        let mut variation = ClassInfo::default();
+        for (m, ty) in [
+            ("name", Ty::Str),
+            ("width", Ty::Int),
+            ("height", Ty::Int),
+            ("format", Ty::Str),
+            ("resize?", Ty::Bool),
+            ("output_format", Ty::Str),
+            ("output_content_type", Ty::Str),
+            ("encode", Ty::Str),
+            ("digest", Ty::Str),
+        ] {
+            variation.instance_methods.insert(Symbol::from(m), ty);
+        }
+        variation.class_methods.insert(Symbol::from("decode"), nilable(class_ty(&variation_id)));
+        classes.insert(variation_id, variation);
+
+        // The pixel seam: bytes in, bytes out; raises in the shared
+        // runtime, reopened over ruby-vips by the ruby family.
+        let mut processor = ClassInfo::default();
+        processor.class_methods.insert(Symbol::from("transform"), Ty::Str);
+        classes.insert(ClassId(Symbol::from("ActiveStorage::Processor")), processor);
+
+        let mut service = ClassInfo::default();
+        service.instance_methods.insert(Symbol::from("path_for"), Ty::Str);
+        service.instance_methods.insert(Symbol::from("upload"), Ty::Nil);
+        service.instance_methods.insert(Symbol::from("download"), Ty::Str);
+        service.instance_methods.insert(Symbol::from("delete"), Ty::Nil);
+        service.instance_methods.insert(Symbol::from("exist?"), Ty::Bool);
+        classes.insert(service_id, service);
+
+        let mut analyzer = ClassInfo::default();
+        analyzer.class_methods.insert(
+            Symbol::from("dimensions"),
+            Ty::Array { elem: std::sync::Arc::new(Ty::Int) },
+        );
+        classes.insert(analyzer_id, analyzer);
+
+        // `ActiveStorage::Previewer` / nested `VideoPreviewer` — the
+        // class-side `poster` is the draw path; the nested class is the
+        // constant apps subclass (campfire's `TimeLimitedVideoPreviewer`).
+        // Both must resolve so inheritance and `previewers` identity
+        // checks type as classes rather than unsupported constants.
+        let previewer_id = ClassId(Symbol::from("ActiveStorage::Previewer"));
+        let mut previewer = ClassInfo::default();
+        previewer.class_methods.insert(Symbol::from("poster"), Ty::Str);
+        classes.insert(previewer_id.clone(), previewer);
+        let mut video_previewer = ClassInfo::default();
+        video_previewer.parent = Some(previewer_id);
+        classes.insert(
+            ClassId(Symbol::from("ActiveStorage::Previewer::VideoPreviewer")),
+            video_previewer,
+        );
+
+        // The multipart part a permitted `has_one_attached` field
+        // carries (`runtime/spinel/multipart.rbs` verbatim): what the
+        // synthesized params class types the field as, and what
+        // `Blob.from_attachable` narrows to.
+        let mut uploaded = ClassInfo::default();
+        uploaded.instance_methods.insert(Symbol::from("original_filename"), Ty::Str);
+        uploaded.instance_methods.insert(Symbol::from("content_type"), Ty::Str);
+        uploaded.instance_methods.insert(Symbol::from("read"), Ty::Str);
+        uploaded.instance_methods.insert(Symbol::from("size"), Ty::Int);
+        // The file behind the part, as Rack hands it over: the Tempfile
+        // (`params[:file].tempfile`) and its path on disk. The Tempfile
+        // is not modelled, so it is a gradual boundary.
+        uploaded.instance_methods.insert(Symbol::from("tempfile"), Ty::Untyped);
+        uploaded.instance_methods.insert(Symbol::from("path"), Ty::Str);
+        uploaded.instance_methods.insert(Symbol::from("to_s"), Ty::Str);
+        let uploaded_id = ClassId(Symbol::from("ActionDispatch::Http::UploadedFile"));
+        uploaded.class_methods.insert(
+            Symbol::from("from_params"),
+            nilable(class_ty(&uploaded_id)),
+        );
+        uploaded.class_methods.insert(Symbol::from("provided"), Ty::Bool);
+        uploaded.class_methods.insert(Symbol::from("name_of"), Ty::Str);
+        classes.insert(uploaded_id, uploaded);
+
+        let mut storage = ClassInfo::default();
+        for m in ["default_variable_content_types", "variable_content_types"] {
+            storage.class_methods.insert(Symbol::from(m), Ty::Array { elem: std::sync::Arc::new(Ty::Str) });
+        }
+        storage.class_methods.insert(Symbol::from("variable_content_type?"), Ty::Bool);
+        storage.class_methods.insert(Symbol::from("content_type_for_format"), Ty::Str);
+        storage.class_methods.insert(Symbol::from("content_type_for_filename"), Ty::Str);
+        storage.class_methods.insert(Symbol::from("url_filename"), Ty::Str);
+        classes.insert(ClassId(Symbol::from("ActiveStorage")), storage);
+    }
+
+    // Arel — the low-level SQL AST that advanced scopes reach for
+    // (`Model.arel_table[:col].not_in(subquery)`, `relation.arel.exists`,
+    // `Arel.sql(...)`). A small class family whose methods all return
+    // Arel nodes (never `Untyped`), so a chain that drops into Arel
+    // stays typed instead of collapsing to a gradual escape at the
+    // first `arel_table`/`arel`/`Arel.sql` hop. Precision is coarse —
+    // every predicate/combinator returns the same `Arel::Node`; the
+    // win is that the chain resolves rather than which node it is.
+    let arel_node = Ty::Class { id: ClassId(Symbol::from("Arel::Node")), args: vec![].into() };
+    let arel_attribute_ty =
+        Ty::Class { id: ClassId(Symbol::from("Arel::Attribute")), args: vec![].into() };
+    let arel_select_mgr =
+        Ty::Class { id: ClassId(Symbol::from("Arel::SelectManager")), args: vec![].into() };
+
+    // `Arel.sql(...)` / `Arel.star` — module-level node constructors.
+    // `sql` answers the literal it built (`Arel::Nodes::SqlLiteral`),
+    // which is the node `to_s` renders back to the fragment.
+    let sql_literal = Ty::Class { id: ClassId(Symbol::from("Arel::Nodes::SqlLiteral")), args: vec![].into() };
+    let mut arel_mod = ClassInfo::default();
+    arel_mod.class_methods.insert(Symbol::from("sql"), sql_literal.clone());
+    arel_mod.class_methods.insert(Symbol::from("star"), arel_node.clone());
+    classes.insert(ClassId(Symbol::from("Arel")), arel_mod);
+
+    let quoted = Ty::Class { id: ClassId(Symbol::from("Arel::Nodes::Quoted")), args: vec![].into() };
+    let case_node = Ty::Class { id: ClassId(Symbol::from("Arel::Nodes::Case")), args: vec![].into() };
+    register_node(classes, "Arel::Nodes", &[("build_quoted", quoted.clone())], &[]);
+    register_node(classes, "Arel::Nodes::Node", &[], &[("to_s", Ty::Str), ("to_sql", Ty::Str)]);
+    register_node(classes, "Arel::Nodes::SqlLiteral", &[], &[("to_s", Ty::Str), ("to_sql", Ty::Str)]);
+    register_node(classes, "Arel::Nodes::Quoted", &[], &[("to_s", Ty::Str), ("to_sql", Ty::Str)]);
+    register_node(classes, "Arel::Nodes::Not", &[], &[("to_s", Ty::Str), ("to_sql", Ty::Str)]);
+    register_node(classes, "Arel::Nodes::NamedFunction", &[], &[("to_s", Ty::Str), ("to_sql", Ty::Str)]);
+    for order in ["Arel::Nodes::Ascending", "Arel::Nodes::Descending"] {
+        let node = Ty::Class { id: ClassId(Symbol::from(order)), args: vec![].into() };
+        register_node(
+            classes,
+            order,
+            &[],
+            &[("nulls_first", node.clone()), ("nulls_last", node), ("to_s", Ty::Str), ("to_sql", Ty::Str)],
+        );
+    }
+    register_node(classes, "Arel::Nodes::Predicate", &[], &[("to_s", Ty::Str), ("to_sql", Ty::Str)]);
+    register_node(
+        classes,
+        "Arel::Nodes::Case",
+        &[],
+        &[
+            ("when", case_node.clone()),
+            ("then", case_node.clone()),
+            ("else", case_node),
+            ("to_s", Ty::Str),
+            ("to_sql", Ty::Str),
+        ],
+    );
+
+    // `Model.arel_table` → table; `table[:col]` → attribute. A table
+    // also delegates query-builder calls to a select manager
+    // (`table.project(Arel.star)`, `table.where(...)`).
+    let mut arel_table = ClassInfo::default();
+    arel_table.instance_methods.insert(Symbol::from("[]"), arel_attribute_ty.clone());
+    for m in [
+        "project", "where", "order", "group", "having", "join", "on",
+        "take", "skip", "from", "distinct",
+    ] {
+        arel_table.instance_methods.insert(Symbol::from(m), arel_select_mgr.clone());
+    }
+    classes.insert(ClassId(Symbol::from("Arel::Table")), arel_table);
+
+    // `Arel::Attribute` predicates → node.
+    let mut arel_attribute = ClassInfo::default();
+    for pred in [
+        "eq", "not_eq", "in", "not_in", "gt", "gteq", "lt", "lteq",
+        "matches", "does_not_match", "between", "eq_any", "in_any",
+        "asc", "desc", "count", "sum", "minimum", "maximum", "average",
+    ] {
+        arel_attribute.instance_methods.insert(Symbol::from(pred), arel_node.clone());
+    }
+    classes.insert(ClassId(Symbol::from("Arel::Attribute")), arel_attribute);
+
+    // `Arel::Node` boolean combinators chain into nodes; `where(node)`
+    // already accepts any argument type.
+    let mut arel_node_cls = ClassInfo::default();
+    for m in ["and", "or", "not"] {
+        arel_node_cls.instance_methods.insert(Symbol::from(m), arel_node.clone());
+    }
+    classes.insert(ClassId(Symbol::from("Arel::Node")), arel_node_cls);
+
+    // `relation.arel` / `Model.arel` → select manager; `.exists` →
+    // node; further builder calls stay on the manager.
+    let mut arel_select = ClassInfo::default();
+    arel_select.instance_methods.insert(Symbol::from("exists"), arel_node.clone());
+    for m in ["where", "project", "join", "on", "group", "order", "take", "skip"] {
+        arel_select.instance_methods.insert(Symbol::from(m), arel_select_mgr.clone());
+    }
+    classes.insert(ClassId(Symbol::from("Arel::SelectManager")), arel_select);
+}
+
+fn register_node(
+    classes: &mut HashMap<ClassId, ClassInfo>,
+    name: &str,
+    class_methods: &[(&str, Ty)],
+    instance_methods: &[(&str, Ty)],
+) {
+    let mut info = ClassInfo::default();
+    for (method, ty) in class_methods {
+        info.class_methods.insert(Symbol::from(*method), ty.clone());
+    }
+    for (method, ty) in instance_methods {
+        info.instance_methods.insert(Symbol::from(*method), ty.clone());
+    }
+    classes.insert(ClassId(Symbol::from(name)), info);
+}
+
+/// Action Text's VALUE surface — `ActionText::Content` (the coder a
+/// `has_rich_text` attribute reads back through) and
+/// `ActionText::Attachment` (one parsed `<action-text-attachment>`
+/// node). Both are implemented in `runtime/ruby/action_text.rb`; this
+/// registration is what lets an app call `message.body.to_plain_text`
+/// and have it type.
+///
+/// `ActionText::RichText` is deliberately absent: it has a table, so
+/// `lower::rich_text` synthesizes it as an ordinary Model and it
+/// registers through the model loop like every other. Registering a
+/// stand-in here would shadow the real one.
+///
+/// Unconditional, like every other entry in this file — an app with no
+/// `has_rich_text` simply never dispatches against these.
+/// `ActionCable.server` and the two hops campfire takes off it —
+/// `.remote_connections.where(current_user:).disconnect(reconnect:)`,
+/// which `User#close_remote_connections` writes. Every class here
+/// exists in `runtime/spinel/action_cable.rb`; the registry is the only
+/// place they did not, so a call the emitted tree resolves read out as
+/// `no known method server on Class { ActionCable }`.
+///
+/// `broadcast` is on the same singleton and answers nothing, which is
+/// what the runtime returns.
+pub(in crate::analyze) fn register_action_cable(classes: &mut HashMap<ClassId, ClassInfo>) {
+    let server_id = ClassId(Symbol::from("ActionCable::Server"));
+    let remotes_id = ClassId(Symbol::from("ActionCable::RemoteConnections"));
+    let remote_id = ClassId(Symbol::from("ActionCable::RemoteConnection"));
+
+    let mut remote = ClassInfo::default();
+    remote.instance_methods.insert(Symbol::from("disconnect"), Ty::Nil);
+    classes.insert(remote_id.clone(), remote);
+
+    let mut remotes = ClassInfo::default();
+    remotes
+        .instance_methods
+        .insert(Symbol::from("where"), Ty::Class { id: remote_id, args: vec![].into() });
+    classes.insert(remotes_id.clone(), remotes);
+
+    // `server.config.mount_path`, which `lower::config_reader` folds to its literal; no other reader is.
+    let config_id = ClassId(Symbol::from("ActionCable::Server::Configuration"));
+    let mut config = ClassInfo::default();
+    config.instance_methods.insert(Symbol::from("mount_path"), Ty::Str);
+    classes.insert(config_id.clone(), config);
+
+    let mut server = ClassInfo::default();
+    server.instance_methods.insert(Symbol::from("config"), Ty::Class { id: config_id, args: vec![].into() });
+    server.instance_methods.insert(Symbol::from("broadcast"), Ty::Nil);
+    server
+        .instance_methods
+        .insert(Symbol::from("remote_connections"), Ty::Class { id: remotes_id, args: vec![].into() });
+    classes.insert(server_id.clone(), server);
+
+    let mut cable = ClassInfo::default();
+    cable
+        .class_methods
+        .insert(Symbol::from("server"), Ty::Class { id: server_id, args: vec![].into() });
+    // `ActionCable::INTERNAL`, as both cable runtimes define it: the
+    // `message_types` and `disconnect_reasons` tables, each a table of
+    // Strings (campfire's `close reason:
+    // ActionCable::INTERNAL[:disconnect_reasons][:unauthorized]`).
+    let strings = Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(Ty::Str) };
+    cable.constants.insert(
+        Symbol::from("INTERNAL"),
+        Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(strings) },
+    );
+    classes.insert(ClassId(Symbol::from("ActionCable")), cable);
+}
+
+/// `Sentry` as `runtime/ruby/gem_facades.rbs` declares it: the gem on
+/// the CRuby tree, the façade on the others. Registered only when the
+/// app locks `sentry-ruby`; without it Rails has no `Sentry` either.
+pub(in crate::analyze) fn register_sentry(classes: &mut HashMap<ClassId, ClassInfo>) {
+    let mut sentry = ClassInfo::default();
+    for m in ["capture_exception", "capture_message"] {
+        sentry.class_methods.insert(Symbol::from(m), Ty::Nil);
+    }
+    classes.insert(ClassId(Symbol::from("Sentry")), sentry);
+}
+
+pub(in crate::analyze) fn register_action_text(classes: &mut HashMap<ClassId, ClassInfo>) {
+    let attachment_id = ClassId(Symbol::from("ActionText::Attachment"));
+    let attachment_ty = Ty::Class { id: attachment_id.clone(), args: vec![].into() };
+
+    let mut attachment = ClassInfo::default();
+    for m in ["sgid", "content_type", "url", "to_plain_text", "to_html", "to_s", "[]"] {
+        attachment.instance_methods.insert(Symbol::from(m), Ty::Str);
+    }
+    // `filename` is the blob's `ActiveStorage::Filename` (Rails
+    // delegates it; the runtime wraps the node's text the same way).
+    attachment.instance_methods.insert(
+        Symbol::from("filename"),
+        Ty::Class { id: ClassId(Symbol::from("ActiveStorage::Filename")), args: vec![].into() },
+    );
+    // `node_attributes["caption"].presence` — the caption typed in the
+    // editor, stored on the `<action-text-attachment>` node; nil when
+    // there is none.
+    attachment.instance_methods.insert(
+        Symbol::from("caption"),
+        Ty::Union { variants: vec![Ty::Str, Ty::Nil].into() },
+    );
+    for m in ["node_attributes", "full_attributes"] {
+        attachment.instance_methods.insert(
+            Symbol::from(m),
+            Ty::Hash { key: std::sync::Arc::new(Ty::Str), value: std::sync::Arc::new(Ty::Str) },
+        );
+    }
+    // `delegate_missing_to :attachable`: an attachment wrapping a blob
+    // answers everything the blob does (`representable?`, `filename`,
+    // `byte_size`), which is how Action Text's `_blob` partial reads
+    // its `blob` local — an Attachment, not a Blob — as if it were one.
+    // The parent walk is that delegation for the Blob attachable.
+    attachment.parent = Some(ClassId(Symbol::from("ActiveStorage::Blob")));
+    attachment.instance_methods.insert(
+        Symbol::from("attributes"),
+        Ty::Hash { key: std::sync::Arc::new(Ty::Str), value: std::sync::Arc::new(Ty::Str) },
+    );
+    // Read as a constant by content filters (`Attachment.tag_name`),
+    // which is why it is a class method and not a bare literal.
+    attachment.class_methods.insert(Symbol::from("tag_name"), Ty::Str);
+    // `Attachment.from_node(node)` — how a test builds one from markup
+    // it wrote (`Fragment.wrap(html).find_all(tag).first`); typed so a
+    // local holding it is KNOWN to be an Attachment, which is what
+    // `lower::controller_class_render` needs to send
+    // `render partial: attachment.to_partial_path` to the attachment's
+    // own per-app dispatch.
+    attachment.class_methods.insert(Symbol::from("from_node"), attachment_ty.clone());
+    attachment.instance_methods.insert(Symbol::from("to_partial_path"), Ty::Str);
+    // What the node names: a record, a blob or a content attachable, as `runtime/ruby/action_text.rb` builds it.
+    attachment.instance_methods.insert(Symbol::from("attachable"), Ty::Untyped);
+    classes.insert(attachment_id, attachment);
+
+    // `ActionText::Fragment` / `ActionText::Node` — the element view a
+    // content filter (and a test) reads markup through: the selector
+    // scans answer nodes, a node answers its attributes and its html.
+    let fragment_id = ClassId(Symbol::from("ActionText::Fragment"));
+    let fragment_ty = Ty::Class { id: fragment_id.clone(), args: vec![].into() };
+    let node_id = ClassId(Symbol::from("ActionText::Node"));
+    let node_ty = Ty::Class { id: node_id.clone(), args: vec![].into() };
+    let mut fragment = ClassInfo::default();
+    fragment.class_methods.insert(Symbol::from("wrap"), fragment_ty.clone());
+    for m in ["to_s", "to_html", "source", "to_plain_text"] {
+        fragment.instance_methods.insert(Symbol::from(m), Ty::Str);
+    }
+    for m in ["find_all", "css"] {
+        fragment
+            .instance_methods
+            .insert(Symbol::from(m), Ty::Array { elem: std::sync::Arc::new(node_ty.clone()) });
+    }
+    fragment.instance_methods.insert(
+        Symbol::from("at_css"),
+        Ty::Union { variants: vec![node_ty.clone(), Ty::Nil].into() },
+    );
+    for m in ["replace", "update"] {
+        fragment.instance_methods.insert(Symbol::from(m), fragment_ty.clone());
+    }
+    classes.insert(fragment_id, fragment);
+    let mut node = ClassInfo::default();
+    for m in ["name", "to_s", "to_html", "inner_html"] {
+        node.instance_methods.insert(Symbol::from(m), Ty::Str);
+    }
+    node.instance_methods
+        .insert(Symbol::from("[]"), Ty::Union { variants: vec![Ty::Str, Ty::Nil].into() });
+    node.instance_methods.insert(
+        Symbol::from("attributes"),
+        Ty::Hash { key: std::sync::Arc::new(Ty::Str), value: std::sync::Arc::new(Ty::Str) },
+    );
+    classes.insert(node_id, node);
+
+    let mut content = ClassInfo::default();
+    for m in ["to_html", "to_s", "as_json", "to_plain_text"] {
+        content.instance_methods.insert(Symbol::from(m), Ty::Str);
+    }
+    for m in ["blank?", "empty?", "present?"] {
+        content.instance_methods.insert(Symbol::from(m), Ty::Bool);
+    }
+    // The element view the runtime's `Content#fragment` builds
+    // (campfire's `Message#plain_text_body` asks it for attachments).
+    content.instance_methods.insert(Symbol::from("fragment"), fragment_ty.clone());
+    content
+        .instance_methods
+        .insert(Symbol::from("links"), Ty::Array { elem: std::sync::Arc::new(Ty::Str) });
+    content
+        .instance_methods
+        .insert(Symbol::from("attachments"), Ty::Array { elem: std::sync::Arc::new(attachment_ty) });
+    // DIVERGENCE, and typed as such: Rails resolves each attachment's
+    // signed GlobalID back to the record it points at, so this is
+    // `Array[ActionText::Attachable]` there. Nothing dereferences an
+    // sgid here yet, so the runtime returns an empty list and the
+    // element type is gradual rather than a lie about which model
+    // comes back.
+    content
+        .instance_methods
+        .insert(Symbol::from("attachables"), Ty::Array { elem: std::sync::Arc::new(Ty::Untyped) });
+    classes.insert(ClassId(Symbol::from("ActionText::Content")), content);
+}

@@ -1,3 +1,5 @@
+> **Legacy adapted-backend document.** These counts/limitations describe the November2 root-level extraction, not the newer original-source work. See [current source-fidelity status](source-fidelity/STATUS.md).
+
 # What was actually ported?
 
 This is a **source-grounded native extraction of a small, read-only part of

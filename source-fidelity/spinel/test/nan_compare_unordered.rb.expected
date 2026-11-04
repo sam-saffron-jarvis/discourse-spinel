@@ -1,0 +1,18 @@
+[false, false, false, false, false]
+[false, false, false, false, false]
+[false, false, false, false]
+[false, false, false, false]
+nil
+nil
+max: ArgumentError
+NaN < nil: ArgumentError
+NaN < String: ArgumentError
+NaN < Symbol: ArgumentError
+NaN < Bignum: false
+NaN < Rational: false
+NaN <=> nil: nil
+NaN <=> String: nil
+NaN <=> Symbol: nil
+NaN <=> Bignum: nil
+NaN <=> Rational: nil
+max with Bignum: ArgumentError

@@ -1,0 +1,59 @@
+A(5)
+B(6,9)
+B(6,7)
+B(6,"s")
+C(1,[])
+C(1,[2, 3])
+Q(4,true)
+#<struct S x=5, y=nil>
+#<struct S x=5, y="t">
+#<data D x=7>
+A(5)
+B(6,nil)
+C(1,[2])
+Q(5,true)
+#<struct S x=8, y=9>
+#<data D x=3>
+A(5)
+B(5,9)
+P(1,5)
+P(7,2)
+B(k,9)
+B(k,"z")
+K(5,3)
+[:a, :c]
+a: wrong number of arguments (given 2, expected 1)
+b: wrong number of arguments (given 0, expected 1..2)
+s: struct size differs
+E(6,"s")
+#<struct S x=5, y="t">
+#<struct T x=5, y=10>
+#<struct KI x=nil, y=nil>
+N
+2: wrong number of arguments (given 1, expected 0)
+3: wrong number of arguments (given 1, expected 0)
+true
+#<struct S x=1, y=2>
+#<struct S x="str", y=nil>
+N
+N
+A(str)
+1: struct size differs
+2: wrong number of arguments (given 1, expected 0)
+O(1)
+O(5)
+#<struct S x=nil, y=nil>
+#<struct S x=5, y=nil>
+N
+O(1)
+O(5)
+#<struct S x=nil, y=nil>
+#<struct S x=5, y=nil>
+N
+wrong number of arguments (given 1, expected 0)
+wrong number of arguments (given 1, expected 0)
+2
+3
+7
+Bare6
+wrong number of arguments (given 1, expected 0)

@@ -1,0 +1,21 @@
+false
+Probe::Block
+Probe::Block
+x
+false
+Probe::Point
+Probe::Block
+Probe::Region
+true
+false
+matched
+no match
+matched
+Probe::Block
+["Probe::Block", "Probe::Region"]
+[:kind]
+[:size, :color]
+A::Item
+B::Item
+Top
+false

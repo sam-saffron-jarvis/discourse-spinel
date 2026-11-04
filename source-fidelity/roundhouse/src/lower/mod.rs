@@ -1,0 +1,1957 @@
+//! Target-neutral lowerings of dialect IR.
+//!
+//! Phase 4's core contribution over railcar: extract the logic that's
+//! identical across target runtimes (validation evaluation, SQL string
+//! generation, router dispatch, turbo-stream templating) as IR-level
+//! lowerings. Each target emitter consumes the lowered form and renders
+//! it in target-specific code, so adding a new target is mostly
+//! writing renders, not re-implementing the logic.
+//!
+//! The lowering IR lives alongside the dialect IR — it doesn't replace
+//! it. Surface IR captures what the developer wrote (`validates :title,
+//! presence: true`), lowered IR captures what an evaluator needs to do
+//! (`Check::Presence { attr: "title" }`). Emitters read both, but the
+//! per-target boilerplate shrinks to "render this lowered form."
+//!
+//! Starting with validations as the pilot — smallest scope that
+//! exercises the pattern. If it works, follow-ups cover query algebra,
+//! broadcasts orchestration, schema → DDL, and router dispatch tables.
+
+pub mod arel;
+pub(crate) mod runtime_definition_family;
+pub mod array_columns;
+pub mod projected_reads;
+pub mod associations;
+pub mod association_new;
+pub mod blank;
+pub mod broadcast_calls;
+pub mod module_mixins;
+pub mod broadcasts;
+pub mod chain;
+pub mod controller;
+pub mod controller_test;
+pub mod nil_operand;
+pub mod where_bounds;
+pub mod fixtures;
+pub(crate) mod forwarding;
+pub mod functionalize;
+pub mod model_associations;
+pub mod persistence;
+pub mod controller_to_library;
+pub mod fixture_to_library;
+pub mod importmap_to_library;
+pub mod jbuilder_to_library;
+pub mod library_extras;
+pub mod model_to_library;
+pub mod routes;
+pub(crate) mod rack_mounts;
+pub mod routes_to_library;
+pub mod segment_pattern;
+pub mod scope_chain;
+pub mod schema_to_library;
+pub mod seeds_to_library;
+pub mod test_module_to_library;
+pub mod create_block;
+pub mod as_json_poro;
+mod as_json_record;
+pub use as_json_writer::WRITER_METHOD as JSON_WRITER_METHOD;
+mod as_json_value;
+pub mod active_model_model;
+pub mod enumerable_ext;
+mod fused;
+pub mod time_calendar;
+pub mod indifferent_access;
+pub mod boolean_cast;
+pub mod where_range_split;
+pub mod params_merge;
+pub mod csv_generate;
+pub mod duration;
+pub mod and_return;
+pub mod case_lambda;
+pub mod first_or_create;
+pub mod default_self_recv;
+mod attr_or_assign;
+mod system_exception;
+mod case_class_narrow;
+pub(crate) mod reset_counters;
+mod perform_all_later;
+pub mod authenticate_by;
+pub mod group_count;
+pub mod bool_fold;
+pub mod friendly_id;
+pub mod generates_token_for;
+pub mod spliced_concern_bodies;
+pub mod unported_rails_subclasses;
+pub mod pathname_ctor;
+pub mod assoc_pluck;
+pub mod try_guard;
+mod core_method_names;
+pub mod class_body_new;
+pub mod mocha;
+pub mod stub_const;
+pub mod webmock;
+pub mod global_id_locate;
+pub mod record_snapshot;
+pub mod array_ordinal;
+pub mod each_with_index;
+pub mod sti_is_a;
+pub mod dead_default;
+pub mod errors_add;
+pub mod errors_full_messages;
+pub mod errors_safe_nav;
+pub mod human_attribute_name;
+pub mod i18n_translate;
+pub mod assoc_attr_key;
+pub mod attachable;
+pub mod attachables_grep;
+pub mod errors_index;
+pub mod job_class_side;
+pub mod transaction_after_commit;
+pub mod module_mattr_storage;
+pub mod job_payload;
+pub mod mailer_class_side;
+pub mod mailer_templates;
+pub mod as_json_shape;
+pub mod as_json_writer;
+pub mod as_json_super;
+pub mod string_core_ext;
+pub mod random_formatter;
+pub mod bigdecimal;
+pub mod range_enumerable;
+pub mod preloader;
+pub mod to_json;
+pub mod number_to_fs;
+pub mod attribute_aliases;
+pub mod presence_in;
+pub mod relation_ivar_materialize;
+pub mod records_to_relation_arg;
+pub mod save_without_validation;
+pub mod route_param_recall;
+pub mod expect_string_key;
+pub mod defined_ivar_memo;
+pub mod defined_const_fold;
+pub mod controller_class_render;
+pub mod dirty_predicate_kwargs;
+pub mod job_test_only;
+pub mod test_cookie_jar;
+pub mod sti_scope;
+pub mod default_scope;
+mod sti_subclass_callbacks;
+pub mod sum_symbol;
+pub mod values_at_splat;
+pub mod request_index;
+pub mod arel_attribute;
+pub mod relation_class_calls;
+pub mod exclude_predicate;
+pub mod in_predicate;
+pub mod including;
+pub mod enum_symbols;
+pub mod has_json;
+pub mod serialize;
+pub mod column_slot;
+pub mod assoc_loaded;
+pub mod object_extend;
+pub mod nested_def;
+pub mod param_rebind;
+pub mod to_sgid;
+pub mod cable_test_case;
+pub mod view_test_case;
+pub mod controller_test_case;
+pub mod current_set;
+pub mod update_writer_check;
+pub mod unscope_check;
+pub mod route_format_suffix;
+pub mod route_url_options;
+pub mod route_helper_receiver;
+pub mod config_reader;
+pub mod symbolize_keys;
+pub mod hash_options;
+pub mod enum_mapping_keys;
+pub mod exists_conditions;
+pub mod destroy_by;
+pub mod assoc_primary_key;
+pub mod has_one_builder;
+pub mod inquiry;
+pub mod byte_size;
+pub mod numeric_unary;
+pub mod tag_builder;
+pub mod kwsplat;
+pub mod arel_sql_order;
+pub mod literal_append;
+pub mod html_safe;
+pub mod rails_cache;
+pub mod session_options;
+pub mod status_literal;
+pub mod to_param_residue;
+pub mod relation_residue;
+/// Host-only: the Oj emit gate reads `project::BuildTarget`, which the
+/// wasm build excludes. The playground has no emit gate to raise it for.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod oj;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod ruby_family_gems;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod gem_refusal;
+pub mod constantize;
+pub mod params_residue;
+pub mod params_permit;
+pub mod normalizes;
+pub mod relation_select_block;
+pub mod send_dispatch;
+pub mod record_slice;
+pub mod relation_counted_terminal;
+pub(crate) mod secure_password;
+pub mod attached;
+pub mod attachment_model;
+pub mod attached_url;
+pub mod send_file;
+pub mod helper_kwargs;
+pub mod kwrest_forward;
+pub mod column_ops;
+pub mod generated_write_guard;
+pub mod signed_id;
+pub(crate) mod secure_token;
+pub mod rich_text;
+pub mod known_super_forwarding;
+pub mod plain_text_attr;
+pub mod capture_inline;
+pub mod partial_qualify;
+pub mod time_current;
+pub mod transaction_ground;
+pub mod update_kwargs;
+pub(crate) mod typed_store;
+pub mod ty_coerce_insertion;
+pub mod typing;
+pub mod validations;
+pub mod view;
+pub mod view_buffer_passing;
+pub mod view_instrumentation;
+pub mod tag_block_passing;
+pub mod lazy_model_state;
+pub(crate) mod eager_load;
+pub mod view_to_library;
+
+pub use blank::apply_blank_lowering;
+pub use create_block::apply_create_block_inline;
+pub use duration::apply_duration_lowering;
+pub use and_return::apply_and_return_lowering;
+pub use case_lambda::apply_case_lambda_lowering;
+pub use first_or_create::apply_first_or_create_lowering;
+pub use authenticate_by::apply_authenticate_by_lowering;
+pub use group_count::apply_group_count_lowering;
+pub use dead_default::apply_dead_default_lowering;
+pub use errors_add::apply_errors_add_lowering;
+pub use errors_full_messages::apply_errors_full_messages_lowering;
+pub use assoc_attr_key::apply_assoc_attr_key_lowering;
+pub use attachables_grep::apply_attachables_grep_lowering;
+pub use errors_index::apply_errors_index_lowering;
+pub use mailer_class_side::apply_mailer_class_side;
+pub use as_json_super::apply_as_json_super_grounding;
+pub use string_core_ext::apply_parameterize_grounding;
+pub use random_formatter::apply_random_formatter_grounding;
+pub use to_json::apply_to_json_lowering;
+pub use number_to_fs::apply_number_to_fs_grounding;
+pub use presence_in::apply_presence_in_grounding;
+pub use relation_ivar_materialize::apply_relation_ivar_materialize;
+pub use defined_ivar_memo::apply_defined_ivar_memo_lowering;
+pub use controller_class_render::apply_controller_class_render;
+pub use dirty_predicate_kwargs::apply_dirty_predicate_kwargs;
+pub use job_test_only::apply_job_test_only_lowering;
+pub use sti_scope::apply_sti_scope_lowering;
+pub(crate) use sti_scope::{sti_bases, untyped_subclass_diagnostics};
+pub use sti_subclass_callbacks::apply_sti_subclass_callbacks;
+pub use request_index::apply_request_index_lowering;
+pub use arel_attribute::apply_arel_attribute_lowering;
+pub use exclude_predicate::apply_exclude_predicate_lowering;
+pub use in_predicate::apply_in_predicate_lowering;
+pub use including::apply_including_lowering;
+pub use relation_select_block::apply_relation_select_block_lowering;
+pub use enum_symbols::apply_enum_symbol_lowering;
+pub use has_json::apply_has_json_lowering;
+pub use route_format_suffix::apply_route_format_suffix_lowering;
+pub use route_url_options::apply_route_url_options_lowering;
+pub use config_reader::apply_config_reader_lowering;
+pub use exists_conditions::apply_exists_conditions_lowering;
+pub use destroy_by::apply_destroy_by_lowering;
+pub use has_one_builder::apply_has_one_builder_lowering;
+pub use inquiry::apply_inquiry_lowering;
+pub use literal_append::apply_literal_append_lowering;
+pub use html_safe::apply_html_safe_lowering;
+pub use rails_cache::apply_rails_cache_lowering;
+pub use session_options::apply_session_options_lowering;
+pub use status_literal::apply_status_literal_lowering;
+pub use to_param_residue::apply_to_param_residue_lowering;
+pub use send_dispatch::apply_send_static_dispatch;
+pub use capture_inline::apply_capture_inline;
+pub use partial_qualify::apply_partial_qualification;
+pub use time_current::apply_time_current_lowering;
+pub use transaction_ground::apply_transaction_grounding;
+pub use update_kwargs::apply_update_kwargs_inline;
+
+/// Build a `LowerResidue` diagnostic — the shared assembly a pass emits
+/// when it must leave a construct dynamic. Each pass supplies its own
+/// `pass`/`construct` tags, `span`, and human-readable `message`; the
+/// kind construction, default severity, and field wiring live here so
+/// the six residue-emitting passes don't each re-derive them. Callers
+/// interpolate `reason` into `message` themselves (the phrasing is
+/// per-pass), so it is passed both as a diagnostic field and left to the
+/// caller's message text.
+pub(crate) fn residue_diagnostic(
+    pass: &str,
+    construct: &str,
+    span: crate::span::Span,
+    reason: &str,
+    message: String,
+) -> crate::diagnostic::Diagnostic {
+    use crate::diagnostic::{Diagnostic, DiagnosticKind};
+    use crate::ident::Symbol;
+    let kind = DiagnosticKind::LowerResidue {
+        pass: Symbol::from(pass),
+        construct: Symbol::from(construct),
+        reason: Symbol::from(reason),
+    };
+    Diagnostic {
+        span,
+        severity: Diagnostic::default_severity(&kind),
+        kind,
+        message,
+    }
+}
+
+/// Canonical execution order of the post-analyze pass pipeline, and the
+/// single authority for its ordering constraints. Each entry is
+/// `(pass_name, &[passes_that_must_run_before_it])`; the list itself is
+/// the intended call order in [`apply_post_analyze_lowerings`]. Passes
+/// with an empty `runs_after` are order-independent.
+///
+/// This replaces the ordering knowledge that used to live only in prose
+/// scattered across the passes ("AFTER send_dispatch, by contract" in
+/// `duration.rs` / `send_dispatch.rs`). Those comments now point here.
+/// The `fn` pointer is deliberately NOT part of the entry: the passes
+/// have heterogeneous signatures (some return `Vec<Diagnostic>`, some
+/// take the class `registry`), so a uniform table would need wrappers
+/// for zero benefit over the name — the list's job is ordering, not
+/// dispatch. Soundness (every predecessor precedes its dependent) is
+/// checked by a `debug_assert!` on entry to the pipeline and by the
+/// `post_analyze_pass_order_is_sound` unit test.
+const POST_ANALYZE_PASS_ORDER: &[(&str, &[&str])] = &[
+    // `defined?(Const)` → "constant" / nil when the tree, the lockfile
+    // and config/application.rb decide it, with the guard's dead branch
+    // pruned. First, so every later pass (and the spinel refusal of a
+    // runtime `defined?`) sees only the code that can run.
+    ("defined_const_fold", &[]),
+    // Deletes every class extending a Rails base the runtime does not
+    // port (`ApplicationMailbox < ActionMailbox::Base`) before any pass
+    // ledgers residue for a body that is not going to emit.
+    ("unported_rails_subclasses", &[]),
+    // Deletes a spliced controller concern's own copy of its instance
+    // methods — bodies with no caller and no includer — before any pass
+    // rewrites inside them or ledgers residue for them.
+    ("spliced_concern_bodies", &[]),
+    // Deletes provably-dead `false && …` tails before any pass can
+    // ledger residue for (or rewrite inside) code that cannot run.
+    ("bool_fold", &[]),
+    ("association_new", &["bool_fold"]),
+    // Before every `errors` rewrite, which match an `errors` send as the receiver.
+    ("errors_safe_nav", &["bool_fold"]),
+    // Refuses `**h` into flattened optional keywords while the splat is
+    // still a `KeywordSplat`; `forwarding_keywords` erases it to `h`.
+    ("flattened_keyword_splats", &["bool_fold"]),
+    // Preserve native full destinations; ordinary keyword producers
+    // rejoin the legacy projection before any argument-rewriting pass.
+    ("forwarding_keywords", &["bool_fold", "flattened_keyword_splats"]),
+    // Reads the analyzer's nested request-params types before any pass rewrites the controller bodies that carry them.
+    ("params_residue", &["bool_fold"]),
+    // After the ledger, which reads the calls this rewrites; before the controller lowering turns `params` into `@params`.
+    ("params_permit", &["params_residue"]),
+    ("params_value_reads", &["params_permit"]),
+    // Before the fused rewrites, which key on the plain Hash type this pass leaves on an indifferent hash.
+    ("indifferent_access", &[]),
+    // Independent send rewrites: one fused tree walk in
+    // `fused::apply_fused_independent_rewrites`. Grouped here so the
+    // executed-pass assert stays a straight list match.
+    ("pathname_ctor", &[]),
+    ("array_ordinal", &[]),
+    ("save_without_validation", &[]),
+    ("random_formatter", &[]),
+    ("number_to_fs", &[]),
+    ("string_inflections", &[]),
+    ("to_json", &[]),
+    ("preloader", &[]),
+    ("bigdecimal", &[]),
+    ("range_enumerable", &[]),
+    ("csv_generate", &[]),
+    ("presence_in", &[]),
+    ("enumerable_ext", &[]),
+    ("boolean_cast", &[]),
+    ("values_at_splat", &[]),
+    ("exclude_predicate", &[]),
+    ("in_predicate", &[]),
+    ("including", &[]),
+    ("exists_conditions", &[]),
+    ("destroy_by", &[]),
+    ("literal_append", &[]),
+    ("byte_size", &[]),
+    ("dirty_predicate_kwargs", &[]),
+    ("relation_select_block", &[]),
+    ("arel_attribute", &[]),
+    ("attr_or_assign", &[]),
+    ("group_count", &[]),
+    ("errors_full_messages", &[]),
+    ("each_with_index", &[]),
+    // After the other fused send rewrites: produces Range / ActiveSupport
+    // calls `where_range_split` later consumes. Empty runs_after of its
+    // own — the dependent is the later pass.
+    ("time_calendar", &[]),
+    ("route_param_recall", &[]),
+    ("expect_string_key", &[]),
+    ("blank", &[]),
+    ("as_json_super", &[]),
+    // `super` in a model's own `password=` → the `has_secure_password`
+    // writer under its own name. Before `create_block`, which inlines
+    // blocks: the pass leaves a `super` inside a block alone.
+    ("secure_password_super", &[]),
+    ("parameterize", &[]),
+    // A class body's bare `new` gets the class as its receiver. Reads a
+    // receiverless send no other pass produces and writes a
+    // Const-receiver one nothing else keys on, so no ordering
+    // constraints.
+    ("class_body_new", &[]),
+    ("mocha", &[]),
+    ("stub_const", &[]),
+    // Independent context-heavy send rewrites: one fused tree walk in
+    // `fused::apply_fused_context_rewrites`. Empty runs_after — they
+    // match disjoint method names and do not consume each other's
+    // output. Grouped after mocha so the executed-pass assert stays a
+    // straight list match.
+    ("time_current", &[]),
+    // `WebMock.stub_request(v, u).to_return(...)` → `HttpStub.stub(...)`.
+    // Keys on a `WebMock` Const receiver and a `to_return` send, neither
+    // of which any other pass produces or consumes; the `.to_s` it
+    // wraps header values in is a plain send. No ordering constraints.
+    ("webmock", &[]),
+    // `GlobalID::Locator.locate(gid, only: K)` → `locate_<k>(gid)`.
+    // Keys on a two-segment Const receiver and a literal `only:` kwarg,
+    // neither of which any other pass produces or consumes, so no
+    // ordering constraints.
+    ("global_id_locate", &[]),
+    ("assoc_pluck", &[]),
+    // Last in the fused context walk. Mints arbitrary method names from
+    // a literal symbol; those new `If`/`is_a?` children must not be
+    // walked by a later fused rewrite that keys on the minted name
+    // (`attribute_aliases` keys on `read_attribute`). Extra test
+    // constant / inner-class surfaces stay try_guard-only.
+    ("try_guard", &[]),
+    // `Model.instantiate(attrs)` / `name.constantize.instantiate(attrs)` —
+    // Rails' raw-attribute rebuild. Keys on `instantiate` and nothing
+    // another pass produces.
+    ("record_snapshot", &[]),
+    // After time_calendar (fused earlier): `t.all_month` becomes the Range literal this splits out.
+    // Stays sequential: rewrite plus a diagnostic walk that tracks
+    // `where`/`find_by` condition position. Fusing the rewrite would
+    // still leave the ledger walk, and the ledger must not see later
+    // fused output.
+    ("where_range_split", &["time_calendar"]),
+    // `Rooms::Open.count` → `Room.where(type: "Rooms::Open").count`.
+    // Produces a `where` at a model Const root, which is vocabulary
+    // every later pass already reads; consumes nothing any pass
+    // produces, so no ordering constraints.
+    ("sti_scope", &[]),
+    // `@ivar = <Relation>` → `@ivar = <Relation>.to_a` where the same
+    // ivar is an Array on another branch. Reads assignment value TYPES
+    // stamped by analysis and writes a `to_a` send no other pass keys
+    // on; after `sti_scope`, which rewrites the Relation-rooted
+    // `Rooms::Open.count`-style chains this pass would otherwise wrap
+    // one hop too early.
+    ("relation_ivar_materialize", &["sti_scope"]),
+    // `defined?(@x)` → `@x_defined`, with the flag set beside every
+    // assignment to `@x`. Reads a `defined?` send no other pass
+    // produces and writes an ivar name no other pass reads, so no
+    // ordering constraints. Class-level collect-then-rewrite, not a
+    // simple post-order send rewrite.
+    ("defined_ivar_memo", &[]),
+    // Folds an STI subclass's callback declarations into hook methods
+    // on that subclass. Reads `unknown_calls` on a library class and
+    // writes methods on the same class; no other pass produces or
+    // consumes either, so no ordering constraints. Sits beside
+    // `sti_scope` because both exist for the same reason — an STI
+    // subclass is not a Model, so the model-keyed machinery skips it.
+    ("sti_subclass_callbacks", &[]),
+    // Independent rewrites after the STI predecessor cluster, before
+    // `tag_builder`: one fused walk in `fused::apply_fused_pre_tag_rewrites`.
+    // `record.read_attribute(:x)` → `record[:x]`; a rename of a name no other pass produces or consumes.
+    ("attribute_aliases", &[]),
+    // `room.is_a?(Rooms::Open)` → the inheritance-column read it stands
+    // for. Beside `sti_scope` because it asks that pass the same
+    // question (which classes are STI subclasses of which base); it
+    // reads a name that pass does not produce and writes a `type`
+    // comparison it does not consume, so no ordering constraint.
+    ("sti_is_a", &[]),
+    // `only: <JobClass>` → `only: ["JobClass"]` in test bodies. Reads a
+    // Const literal nothing else produces and writes a String array
+    // nothing else reads, so no ordering constraints.
+    ("job_test_only", &[]),
+    ("test_cookie_jar", &[]),
+    // `<X>Controller.render partial:` → the view-module call. Reads a
+    // shape no pass produces and writes a `Views::` call no pass
+    // consumes, so no ordering constraints.
+    ("controller_class_render", &[]),
+    // `sum(:col)` → block form; no ordering constraints (rewrites a
+    // literal-symbol arg shape no other pass produces or consumes).
+    // Last in the fused pre-tag walk so new `to_a`/`sum` children are
+    // not fed to the other fused rewrites.
+    ("sum_symbol", &[]),
+    // `tag.div(…)` → the HTML string it builds. BEFORE `html_safe`
+    // (whose fold would erase the `.html_safe` marker it reads on
+    // content, and which must SEE the marker this pass writes so the
+    // enclosing helper registers as safe) and before `capture_inline`
+    // (which flattens the `capture { … }` this pass synthesizes for the
+    // block form). Stays sequential: the synthesized `capture` /
+    // `.html_safe` subtrees must be walked by those later passes, and
+    // fusing with mid would skip mid rewrites on those new children.
+    // Must not move after `kwsplat` (would change kwsplat's view of
+    // argument lists).
+    ("tag_builder", &[]),
+    // Independent rewrites after tag_builder, before kwsplat: one fused
+    // controller/library/model walk in `fused::apply_fused_narrow_rewrites`
+    // plus one fused hook+view+test walk in `fused::apply_fused_mid_rewrites`.
+    ("request_index", &[]),
+    // `config.session_options[:key]` → `session_cookie_key`; rewrites a
+    // receiver chain no other pass produces or consumes.
+    ("session_options", &[]),
+    // `status: 400` → `status: :bad_request` in render / redirect_to /
+    // head; a literal rewrite no other pass produces or consumes.
+    ("status_literal", &[]),
+    // `"#{v.to_param}"` on an untyped receiver → `ActiveSupport.to_param(v)`.
+    ("to_param_residue", &[]),
+    // `x_path(format: :json)` → `x_path() + ".json"`. Must run before
+    // the route-helper lowering surveys call sites for query keys; the
+    // two do not overlap (`format` is on NON_QUERY_OPTIONS) but the
+    // survey should see the shape this pass leaves behind.
+    ("route_format_suffix", &[]),
+    // `x_path(host: "h")` → `x_path()`. Rails' `RESERVED_OPTIONS` are
+    // deleted before the path generator ever sees them; ours became
+    // query params. Same ordering constraint as `route_format_suffix`
+    // — it must run before the route-helper lowering surveys these
+    // call sites for query keys.
+    ("route_url_options", &[]),
+    // `where(role: :bot)` → `where(role: 2)`. Must run BEFORE the arel
+    // folding that turns a `where` hash into SQL, so the folded literal
+    // is the integer the column stores.
+    ("enum_symbols", &[]),
+    // `account.settings.foo?` → `account.settings_foo?`. No ordering
+    // constraint: the two-hop shape it consumes is one no other pass
+    // produces, and the flat send it leaves is an ordinary typed call.
+    ("has_json", &[]),
+    // `message.boosts.loaded?` → `message.boosts_loaded?`. Same two-hop
+    // flatten as has_json: the AssociationProxy Rails returns between
+    // those hops does not exist here (has_many readers answer Arrays),
+    // and the synthesizer already exposes the flat Bool predicate.
+    // Also `association(:name).target` → `name` (rich_text / reflection).
+    ("assoc_loaded", &[]),
+    // Bare sends in parameter defaults → `self.<method>`. Spinel AOT
+    // can otherwise resolve `user` in `badge: user.memberships…` to a
+    // foreign `user` and refuse the C build. No ordering constraint:
+    // touches only default exprs, leaves bodies alone.
+    ("default_self_recv", &[]),
+    // Read-only ledger: a `self.update(k: …)` whose `k` no writer backs.
+    // Rewrites nothing, so it has no ordering constraint of its own —
+    // it just has to see the final tree.
+    ("update_writer_check", &[]),
+    // Read-only: refuses an `unscope` form the runtime cannot honour.
+    ("unscope_check", &[]),
+    // `x.inquiry` / `x.<name>?` → equality against the label; total
+    // rewrite of a name no other pass produces or consumes.
+    ("inquiry", &[]),
+    // `owner.create_<assoc>!(…)` → `Target.create!(fk: owner.id, …)` for
+    // a `has_one`. Runs after `destroy_by` and before the arel rewrite,
+    // like the other call-site rewrites: what it produces is an ordinary
+    // `Model.create!` that the AR catalog already types, so nothing
+    // downstream needs to know this pass ran.
+    ("has_one_builder", &[]),
+    // `Rails.application.config.<key>` → `Rails.application.<key>`, the
+    // read half of the config lift; no ordering constraints (no other
+    // pass produces or consumes the `config` hop).
+    ("config_reader", &[]),
+    // `hash.symbolize_keys` → `hash`, when the keys are already
+    // Symbols. Runs AFTER `config_reader` because the receiver that
+    // makes it fire — a lifted config group reader — does not exist
+    // until that pass has rewritten the `config` chain and stamped its
+    // type. Folded last into that pass's hook+view walk.
+    ("symbolize_keys", &["config_reader"]),
+    ("hash_options", &[]),
+    // No runs_after: it reads the ingested enum tables and rewrites only the key argument.
+    ("enum_mapping_keys", &[]),
+    // `-x` / `+x` on a typed Integer or Float → `x * -1` / `x`; local
+    // expression rewrite, no ordering constraints.
+    ("numeric_unary", &[]),
+    // `f(**h)` (erased to `f(h)` at ingest) → `f(k: h[:k], …)` when the
+    // callee declares explicit keywords. Reads the arg count against the
+    // callee's signature, so it must see the argument list as ingested —
+    // before any pass that appends or drops a positional argument.
+    // Stays sequential: expanding a splat produces new keyword-arg
+    // children that `send_file` (in the late fused walk) must still
+    // see. Fusing with late would skip those. Must stay after
+    // `tag_builder` so it does not observe tag-builder-rewritten args.
+    ("kwsplat", &[]),
+    // Independent late send rewrites: one fused tree walk in
+    // `fused::apply_fused_late_rewrites`. After `kwsplat` so argument
+    // lists are still as ingested for `send_file`; after `tag_builder`
+    // so `capture_inline` sees synthesized `capture` blocks.
+    ("rails_cache", &[]),
+    ("capture_inline", &["tag_builder"]),
+    ("and_return", &[]),
+    ("case_lambda", &[]),
+    ("system_exception", &[]),
+    ("perform_all_later", &[]),
+    ("attachables_grep", &[]),
+    ("send_file", &[]),
+    // `<e>.html_safe` → `<e>`, recording the producing method on the
+    // App. No ordering constraints among the lowerings; the view
+    // lowerer reads what it records, and that runs later, at emit.
+    ("html_safe", &["tag_builder"]),
+    // Initializer `X.prepend Y` / `X.include Y`: drop the ones naming a
+    // constant this tree does not define, and report them. Reads only
+    // the class lists, which every earlier pass has finished populating,
+    // so it has no ordering constraints of its own.
+    ("module_mixins", &[]),
+    ("transaction_ground", &[]),
+    ("generated_write_guard", &[]),
+    ("column_ops", &["generated_write_guard"]),
+    // `signed_id(purpose: :avatar)` → the runtime SignedId call, with
+    // the model name folded into the purpose. BEFORE `duration`: the
+    // `expires_in:` argument this wraps in `.to_i` is an
+    // `ActiveSupport::Duration`, and `duration` is what grounds one.
+    ("signed_id", &[]),
+    ("partial_qualify", &[]),
+    ("first_or_create", &[]),
+    ("case_class_narrow", &[]),
+    ("reset_counters", &[]),
+    // `Model.authenticate_by(email: …, password: …)` → bind
+    // `find_by(<identifiers>)`, then check `authenticate(<password>)`;
+    // macro-inline of a Rails 7.1 name no other pass produces or
+    // consumes. Before `relation_residue`, which then sees the grounded
+    // `find_by` chain rather than an unresolved send.
+    ("authenticate_by", &[]),
+    // Wraps finder keywords in a model's `normalizes`; authenticate_by
+    // expands into one such `find_by`.
+    ("normalizes", &["authenticate_by"]),
+    ("dead_default", &[]),
+    ("errors_add", &[]),
+    // `errors[:field]` -> `error_messages_for("field")`.
+    ("errors_index", &["errors_add"]),
+    ("human_attribute_name", &[]),
+    ("i18n_translate", &[]),
+    ("create_block", &["secure_password_super"]),
+    // `<params>.merge(k: v)` written a method away from the permit
+    // chain → `Model.from_params(p)` + per-key setters, hoisted above
+    // the enclosing statement. AFTER `create_block`, whose inlining
+    // turns `Model.create!(p.merge(...)) { }` into the `Model.new(...)`
+    // shape this pass matches.
+    ("params_merge", &["create_block"]),
+    // Reads `render json: <expr>` while it is still spelled that way,
+    // and rewrites the sites it can serve to `render plain:
+    // <v>.as_json_str` before `controller_to_library` lowers whatever
+    // is left to `JsonRender.encode` at emit time.
+    ("as_json_poro", &[]),
+    // `include ActiveModel::Model` on a library class → a synthesized
+    // `initialize(attributes = {})` / `valid?` / `persisted?`, and the
+    // include dropped. Reads only the class's own writer surface and
+    // writes only new methods, so no ordering constraints.
+    ("active_model_model", &[]),
+    ("update_kwargs", &["generated_write_guard"]),
+    // `record.update!(creator: user)` -> `update!(creator_id: user.id)`.
+    // AFTER `update_kwargs`, which INLINES the same shape into typed
+    // writer assignments when it can — and a `belongs_to` writer is the
+    // better target (it caches an unsaved record where an id column
+    // cannot). Running first would rewrite the key out from under it
+    // and silently downgrade every site that pass already served;
+    // running second leaves exactly the sites it declined, which is the
+    // division of labour intended.
+    ("assoc_attr_key", &["update_kwargs"]),
+    // `obj.extend Mod` on an instance -> a raise stub with the report.
+    // Consumes a shape no pass produces or reads; no constraints.
+    ("object_extend", &[]),
+    // A test reaching an ingest-stamped nested `def` -> the whole
+    // test a raise stub with the report. Reads only that stamp, which
+    // no pass produces or removes; no constraints.
+    ("nested_def", &[]),
+    // A parameter written after its binder (`user = users(user) unless
+    // user.is_a? User`, `id = id.to_i`) -> a fresh local, so AOT does
+    // not pin the caller's type onto the later write. Reads an Assign
+    // no other pass produces; writes a name no other pass reads.
+    ("param_rebind", &[]),
+    // `record.to_sgid(for: LOCATOR_NAME).to_s` -> the runtime's attachable
+    // sgid mint, model name baked in. Consumes a shape no pass produces
+    // or reads; no constraints.
+    ("to_sgid", &[]),
+    // `subscribe k: v` / `assert_has_stream_for r` in a channel test ->
+    // the harness calls with the channel named, and
+    // `Turbo::StreamsChannel.signed_stream_name([...])` -> the runtime
+    // signer over the spelled name. Consumes shapes no pass produces or
+    // reads; no constraints.
+    ("cable_test_case", &[]),
+    // `view.<m>` in an ActionView::TestCase -> the helper module the
+    // app's `helper_method_index` names. Consumes a shape no pass
+    // produces or reads; no constraints.
+    ("view_test_case", &[]),
+    // `Current.set(k: v) { … }` -> save / assign / begin-ensure-restore
+    // over the flattened accessors. Consumes a shape no pass produces
+    // or reads; no constraints.
+    ("current_set", &[]),
+    ("mailer_class_side", &[]),
+    ("mailer_templates", &[]),
+    ("job_class_side", &[]),
+    // `….current_transaction.after_commit { … }` -> the block as a lambda
+    // argument, the shape the runtime holds for the COMMIT. Consumes a
+    // shape no pass produces or reads; no constraints.
+    ("transaction_after_commit", &[]),
+    // A module's `mattr_*` `@@x` storage -> its own `@x`, when nothing
+    // outside the module names `@@x`. Consumes ingest's mattr expansion,
+    // which no pass rewrites; no constraints.
+    ("module_mattr_storage", &[]),
+    // `record.slice(:a, :b)` on a typed model → a Hash of its typed
+    // readers. Reads the analyzer's receiver types; nothing keys on it.
+    ("record_slice", &[]),
+    ("send_static_dispatch", &[]),
+    // Grounds the plural duration-unit calls that send_static_dispatch
+    // synthesizes into case arms, so it must observe that pass's output.
+    ("duration", &["send_static_dispatch"]),
+    // `first(n)`/`last(n)` on an analyzer-typed Relation -> `first_n` /
+    // `last_n`, and `rel.count > n` -> `more_than?(n)`, including the
+    // arms send_static_dispatch synthesizes from a `public_send(selector, n)`,
+    // so it observes that pass's output.
+    ("relation_counted_terminal", &["send_static_dispatch"]),
+    // Grounds `attach(io:, filename:, content_type:)` to positional
+    // Strings by reading the io at the call site — the runtime's RBS
+    // has no File type, and an `untyped` parameter there is five new
+    // Ty::Untyped sites every strict target pays for. No ordering
+    // constraint of its own: it matches on Rails' own keyword spelling,
+    // which no earlier pass rewrites.
+    ("attach", &[]),
+    // `image_tag(user.avatar)` → `image_tag(user.avatar.url)`: an
+    // attachment in a URL position asks itself for its route, so the
+    // String-typed helper gets a String. Matches the reader's NAME,
+    // which no earlier pass rewrites; no constraint.
+    ("attached_url", &[]),
+    // Moves a forwarded `**` bundle out of an optional keyword's
+    // flattened slot and into the `**rest` slot it was aimed at. BEFORE
+    // helper_kwargs, which splices literal keywords into those same
+    // slots: run after it, a spliced value would be indistinguishable
+    // from a forwarded bundle and get padded a second time.
+    ("kwrest_forward", &[]),
+    // Moves a helper call's named keyword into the positional slot its
+    // definition lowered to. Matches on the spelling the source wrote,
+    // which only kwrest_forward rewrites — and that one leaves no
+    // trailing kwargs Hash behind, so the two cannot both fire.
+    ("helper_kwargs", &["kwrest_forward"]),
+    // Keep owner-local form attribute computations inside their helper before
+    // the view walker substitutes builder wrappers across module boundaries.
+    ("form_wrapper_owners", &["helper_kwargs"]),
+    // Rails-API broadcast calls in ordinary method bodies (a concern's
+    // `def broadcast_create`) → `Broadcasts.<action>(…)`. Late, so the
+    // `Views::…` render call it synthesizes is not re-walked by the
+    // partial/capture passes.
+    ("broadcast_calls", &[]),
+    // Pure ledger (no rewrite): counts Relation-typed chains still
+    // dynamic after every grounding pass has had its say — last so a
+    // chain a pass grounds doesn't false-positive.
+    // AFTER `group_count`: the ledger asks `try_build_arel` whether
+    // each Relation-typed head would fold, and the builder recognizes
+    // the grouped-count chain by its LOWERED terminal (`group_count`).
+    // Ledgered before the rename, every grouped count would read as a
+    // chain that stays dynamic — and on a relation-less target that is
+    // now an error (issue #76), not a suppressed warning.
+    ("relation_residue", &["duration", "group_count"]),
+];
+
+/// True iff `POST_ANALYZE_PASS_ORDER` is a valid topological order —
+/// every pass's declared predecessors appear at an earlier index, and
+/// each predecessor name actually exists in the list.
+fn post_analyze_pass_order_is_sound() -> bool {
+    for (i, (_name, after)) in POST_ANALYZE_PASS_ORDER.iter().enumerate() {
+        for pred in *after {
+            match POST_ANALYZE_PASS_ORDER.iter().position(|(n, _)| n == pred) {
+                Some(j) if j < i => {}
+                _ => return false,
+            }
+        }
+    }
+    true
+}
+
+/// Post-analyze shared lowerings — type-directed IR rewrites every
+/// target consumes, run between `Analyzer::analyze` and any emitter.
+/// One entry point so the transpile driver, the site build, and the IR
+/// dump can't drift as passes accumulate (the LSP/MCP/IDE paths stay
+/// off it on purpose: they want source-shaped IR). Returns the residue
+/// diagnostics — sites a pass had to leave dynamic, with the reason.
+///
+/// The call order below is the canonical [`POST_ANALYZE_PASS_ORDER`];
+/// keep the two in sync when adding a pass. In debug builds an
+/// `executed` list is threaded past each call and asserted equal to the
+/// const's names in order, so a pass added to the code but not the const
+/// (or vice versa, or reordered) fails every debug test run — the
+/// code↔list correspondence the `runs_after` debug_assert alone can't
+/// catch.
+///
+/// `registry` is the analyzer's post-fixpoint class table
+/// ([`crate::analyze::Analyzer::class_registry`]) — passes that
+/// synthesize dispatches consult it to stamp what analyze would have
+/// computed.
+pub fn apply_post_analyze_lowerings(
+    app: &mut crate::app::App,
+    registry: &crate::det::HashMap<crate::ident::ClassId, crate::analyze::ClassInfo>,
+) -> Vec<crate::diagnostic::Diagnostic> {
+    apply_post_analyze_lowerings_for(app, registry, crate::build_target::BuildTarget::Ruby)
+}
+
+pub(crate) fn apply_post_analyze_lowerings_for(
+    app: &mut crate::app::App,
+    registry: &crate::det::HashMap<crate::ident::ClassId, crate::analyze::ClassInfo>,
+    target: crate::build_target::BuildTarget,
+) -> Vec<crate::diagnostic::Diagnostic> {
+    // Templates ingested for the analyzer only (`View::analysis_only`)
+    // leave here: the type checker and the IDE have seen them; no
+    // lowering or emitter should.
+    app.views.retain(|v| !v.analysis_only);
+    // Likewise the methods `ingest::graphql_ruby` gave graphql-ruby
+    // classes so inference could type their fields.
+    for gql in &app.graphql_types {
+        if let Some(class) = app.library_classes.iter_mut().find(|c| c.name == gql.class) {
+            class.methods.retain(|m| !gql.synthesized.contains(&m.name));
+        }
+    }
+    for (class, name) in &app.graphql_signatures {
+        if let Some(table) = app.rbs_signatures.get_mut(class) {
+            table.remove(name);
+        }
+    }
+    debug_assert!(
+        post_analyze_pass_order_is_sound(),
+        "POST_ANALYZE_PASS_ORDER violates a declared runs_after constraint",
+    );
+    // Debug-only record of the passes actually run, in call order,
+    // asserted against POST_ANALYZE_PASS_ORDER at the end. Catches the
+    // code↔list drift the `runs_after` check above can't: a pass added
+    // here but not to the const (or removed, or reordered) fails the
+    // assert. `push` calls sit adjacent to each pass call below.
+    #[cfg(debug_assertions)]
+    let mut executed: Vec<&str> = Vec::new();
+    // With ROUNDHOUSE_TIMINGS each pass also prints its time since the
+    // previous one (a fused group's members after its phase line read ~0).
+    #[cfg(debug_assertions)]
+    macro_rules! ran {
+        ($name:expr) => {{
+            executed.push($name);
+            crate::timings::lap(format_args!("post-analyze pass: {}", $name));
+        }};
+    }
+    #[cfg(not(debug_assertions))]
+    macro_rules! ran {
+        ($name:expr) => {
+            crate::timings::lap(format_args!("post-analyze pass: {}", $name))
+        };
+    }
+    crate::timings::lap_start();
+    defined_const_fold::apply_defined_const_fold(app);
+    ran!("defined_const_fold");
+    let mut diags = unported_rails_subclasses::apply_unported_rails_subclass_drop(app);
+    ran!("unported_rails_subclasses");
+    spliced_concern_bodies::apply_spliced_concern_body_prune(app);
+    ran!("spliced_concern_bodies");
+    bool_fold::apply_bool_fold_lowering(app);
+    ran!("bool_fold");
+    association_new::apply_association_new_lowering(app);
+    ran!("association_new");
+    errors_safe_nav::apply_errors_safe_nav_lowering(app);
+    ran!("errors_safe_nav");
+    // Before the first `forwarding::apply` erases `**h` into a
+    // positional `h`, after which `f(x, **h)` and `f(x, h)` are one tree.
+    diags.extend(helper_kwargs::refuse_flattened_keyword_splats(app));
+    ran!("flattened_keyword_splats");
+    diags.extend(forwarding::apply(app));
+    ran!("forwarding_keywords");
+    diags.extend(params_residue::apply_params_residue_ledger(app));
+    ran!("params_residue");
+    params_permit::apply_params_permit_lowering(app);
+    ran!("params_permit");
+    controller_to_library::params::lower_value_reads(app);
+    ran!("params_value_reads");
+    indifferent_access::apply_indifferent_access_lowering(app);
+    ran!("indifferent_access");
+    // Not fused: a local bound to `arel_table` is a whole-body fact, which a per-node rewrite cannot see
+    arel_attribute::apply_arel_attribute_lowering(app);
+    crate::timings::phase("post-analyze: fused send rewrites", || {
+        fused::apply_fused_independent_rewrites(app);
+    });
+    save_without_validation::apply_bare_model_saves(app);
+    ran!("pathname_ctor");
+    ran!("array_ordinal");
+    ran!("save_without_validation");
+    ran!("random_formatter");
+    ran!("number_to_fs");
+    ran!("string_inflections");
+    ran!("to_json");
+    ran!("preloader");
+    ran!("bigdecimal");
+    ran!("range_enumerable");
+    ran!("csv_generate");
+    ran!("presence_in");
+    ran!("enumerable_ext");
+    ran!("boolean_cast");
+    ran!("values_at_splat");
+    ran!("exclude_predicate");
+    ran!("in_predicate");
+    ran!("including");
+    ran!("exists_conditions");
+    ran!("destroy_by");
+    ran!("literal_append");
+    ran!("byte_size");
+    ran!("dirty_predicate_kwargs");
+    ran!("relation_select_block");
+    ran!("arel_attribute");
+    ran!("attr_or_assign");
+    ran!("group_count");
+    ran!("errors_full_messages");
+    ran!("each_with_index");
+    ran!("time_calendar");
+    route_param_recall::apply_route_param_recall(app);
+    ran!("route_param_recall");
+    expect_string_key::apply_expect_string_keys(app);
+    ran!("expect_string_key");
+    diags.extend(crate::timings::phase("post-analyze: blank", || {
+        blank::apply_blank_lowering(app)
+    }));
+    ran!("blank");
+    as_json_super::apply_as_json_super_grounding(app);
+    ran!("as_json_super");
+    secure_password::apply_secure_password_super(app);
+    ran!("secure_password_super");
+    string_core_ext::apply_parameterize_grounding(app);
+    ran!("parameterize");
+    diags.extend(class_body_new::apply_class_body_new_lowering(app));
+    ran!("class_body_new");
+    crate::timings::phase("post-analyze: mocha", || {
+        mocha::apply_mocha_lowering(app);
+    });
+    ran!("mocha");
+    stub_const::apply_stub_const_lowering(app);
+    ran!("stub_const");
+    crate::timings::phase("post-analyze: fused context rewrites", || {
+        fused::apply_fused_context_rewrites(app);
+    });
+    ran!("time_current");
+    ran!("webmock");
+    ran!("global_id_locate");
+    ran!("assoc_pluck");
+    ran!("try_guard");
+    record_snapshot::apply_record_snapshot_lowering(app);
+    ran!("record_snapshot");
+    diags.extend(where_range_split::apply_where_range_split(app));
+    ran!("where_range_split");
+    sti_scope::apply_sti_scope_lowering(app);
+    ran!("sti_scope");
+    relation_ivar_materialize::apply_relation_ivar_materialize(app);
+    ran!("relation_ivar_materialize");
+    defined_ivar_memo::apply_defined_ivar_memo_lowering(app);
+    ran!("defined_ivar_memo");
+    sti_subclass_callbacks::apply_sti_subclass_callbacks(app);
+    ran!("sti_subclass_callbacks");
+    crate::timings::phase("post-analyze: fused pre-tag rewrites", || {
+        fused::apply_fused_pre_tag_rewrites(app);
+    });
+    ran!("attribute_aliases");
+    ran!("sti_is_a");
+    ran!("job_test_only");
+    ran!("test_cookie_jar");
+    ran!("controller_class_render");
+    ran!("sum_symbol");
+    diags.extend(tag_builder::apply_tag_builder_lowering(app, registry));
+    ran!("tag_builder");
+    crate::timings::phase("post-analyze: fused narrow rewrites", || {
+        fused::apply_fused_narrow_rewrites(app);
+    });
+    ran!("request_index");
+    ran!("session_options");
+    ran!("status_literal");
+    ran!("to_param_residue");
+    crate::timings::phase("post-analyze: fused mid rewrites", || {
+        fused::apply_fused_mid_rewrites(app);
+    });
+    ran!("route_format_suffix");
+    ran!("route_url_options");
+    ran!("enum_symbols");
+    ran!("has_json");
+    ran!("assoc_loaded");
+    default_self_recv::apply_default_self_recv(app);
+    ran!("default_self_recv");
+    // Read-only ledger, no rewrite — but it must run AFTER
+    // `enum_symbols` so a label that pass already translated isn't
+    // mistaken for anything, and after every pass that could introduce
+    // an `update` site.
+    update_writer_check::apply_update_writer_check(app);
+    ran!("update_writer_check");
+    unscope_check::rewrite_unscope_where(app);
+    diags.extend(unscope_check::apply_unscope_check(app));
+    ran!("unscope_check");
+    inquiry::apply_inquiry_lowering(app);
+    ran!("inquiry");
+    has_one_builder::apply_has_one_builder_lowering(app);
+    ran!("has_one_builder");
+    config_reader::apply_config_reader_lowering(app);
+    ran!("config_reader");
+    ran!("symbolize_keys");
+    if matches!(target,
+        crate::build_target::BuildTarget::Ruby
+            | crate::build_target::BuildTarget::Jruby
+            | crate::build_target::BuildTarget::Spinel
+    ) {
+        hash_options::apply(app);
+    }
+    ran!("hash_options");
+    enum_mapping_keys::apply_enum_mapping_keys(app);
+    ran!("enum_mapping_keys");
+    numeric_unary::apply_numeric_unary_lowering(app);
+    ran!("numeric_unary");
+    diags.extend(crate::timings::phase("post-analyze: kwsplat", || {
+        kwsplat::apply_kwsplat_expansion(app)
+    }));
+    ran!("kwsplat");
+    crate::timings::phase("post-analyze: fused late rewrites", || {
+        fused::apply_fused_late_rewrites(app);
+    });
+    ran!("rails_cache");
+    ran!("capture_inline");
+    ran!("and_return");
+    ran!("case_lambda");
+    ran!("system_exception");
+    ran!("perform_all_later");
+    ran!("attachables_grep");
+    ran!("send_file");
+    html_safe::apply_html_safe_lowering(app);
+    ran!("html_safe");
+    diags.extend(crate::ingest::rake_tasks::gap_diagnostics(app));
+    diags.extend(module_mixins::apply_module_mixins_lowering(app));
+    ran!("module_mixins");
+    transaction_ground::apply_transaction_grounding(app);
+    ran!("transaction_ground");
+    diags.extend(generated_write_guard::apply(app));
+    ran!("generated_write_guard");
+    column_ops::apply_column_ops_lowering(app);
+    ran!("column_ops");
+    signed_id::apply_signed_id_lowering(app);
+    ran!("signed_id");
+    partial_qualify::apply_partial_qualification(app);
+    ran!("partial_qualify");
+    diags.extend(first_or_create::apply_first_or_create_lowering(app));
+    ran!("first_or_create");
+    case_class_narrow::apply_case_class_narrowing(app);
+    ran!("case_class_narrow");
+    reset_counters::apply_reset_counters_lowering(app);
+    ran!("reset_counters");
+    diags.extend(authenticate_by::apply_authenticate_by_lowering(app));
+    ran!("authenticate_by");
+    // After authenticate_by: its expansion is a `find_by` whose keyword
+    // a `normalizes` declaration applies to.
+    normalizes::apply_normalizes_finder_lowering(app);
+    ran!("normalizes");
+    dead_default::apply_dead_default_lowering(app, registry);
+    ran!("dead_default");
+    diags.extend(errors_add::apply_errors_add_lowering(app));
+    ran!("errors_add");
+    diags.extend(errors_index::apply_errors_index_lowering(app));
+    ran!("errors_index");
+    human_attribute_name::apply_human_attribute_name_lowering(app);
+    ran!("human_attribute_name");
+    i18n_translate::apply_i18n_translate_lowering(app);
+    ran!("i18n_translate");
+    diags.extend(create_block::apply_create_block_inline(app));
+    ran!("create_block");
+    diags.extend(params_merge::apply_params_merge_lowering(app));
+    ran!("params_merge");
+    diags.extend(as_json_poro::implicit_serializer_renders(app));
+    as_json_poro::apply_as_json_synthesis(app, registry);
+    ran!("as_json_poro");
+    diags.extend(active_model_model::apply_active_model_model_synthesis(app));
+    ran!("active_model_model");
+    diags.extend(update_kwargs::apply_update_kwargs_inline(app));
+    ran!("update_kwargs");
+    diags.extend(assoc_attr_key::apply_assoc_attr_key_lowering(app));
+    ran!("assoc_attr_key");
+    diags.extend(object_extend::apply_object_extend_stub(app));
+    ran!("object_extend");
+    diags.extend(nested_def::apply_nested_def_test_stub(app));
+    ran!("nested_def");
+    param_rebind::apply_param_rebind_lowering(app);
+    ran!("param_rebind");
+    diags.extend(to_sgid::apply_to_sgid_lowering(app));
+    ran!("to_sgid");
+    diags.extend(cable_test_case::apply_cable_test_case_lowering(app));
+    ran!("cable_test_case");
+    diags.extend(view_test_case::apply_view_test_case_lowering(app));
+    ran!("view_test_case");
+    diags.extend(current_set::apply_current_set_lowering(app));
+    ran!("current_set");
+    diags.extend(mailer_class_side::apply_mailer_class_side(app));
+    ran!("mailer_class_side");
+    diags.extend(mailer_templates::apply_mailer_templates(app));
+    ran!("mailer_templates");
+    diags.extend(job_class_side::apply_job_class_side(app));
+    ran!("job_class_side");
+    transaction_after_commit::apply_transaction_after_commit(app);
+    ran!("transaction_after_commit");
+    module_mattr_storage::apply_module_mattr_storage(app);
+    ran!("module_mattr_storage");
+    diags.extend(record_slice::apply_record_slice_lowering(app, registry));
+    ran!("record_slice");
+    diags.extend(crate::timings::phase("post-analyze: send_dispatch", || {
+        send_dispatch::apply_send_static_dispatch(app, registry)
+    }));
+    ran!("send_static_dispatch");
+    // AFTER send_dispatch — see POST_ANALYZE_PASS_ORDER (the `duration`
+    // entry's runs_after). An all-duration-unit name set dispatches
+    // through case arms synthesized as plural unit calls that count on
+    // this grounding (`send_dispatch::duration_plural`).
+    duration::apply_duration_lowering_for(app, target);
+    ran!("duration");
+    relation_counted_terminal::apply_relation_counted_terminals(app);
+    ran!("relation_counted_terminal");
+    attached::apply_attach_lowering(app);
+    ran!("attach");
+    attached_url::apply_attached_url_lowering(app);
+    ran!("attached_url");
+    diags.extend(kwrest_forward::apply_kwrest_forward_lowering(app));
+    ran!("kwrest_forward");
+    diags.extend(helper_kwargs::apply_helper_kwarg_positional_lowering(app));
+    ran!("helper_kwargs");
+    view_to_library::form_wrapper::preserve_argument_owners(app, registry);
+    ran!("form_wrapper_owners");
+    broadcast_calls::apply_broadcast_calls_lowering(app);
+    ran!("broadcast_calls");
+    diags.extend(crate::timings::phase("post-analyze: relation_residue", || {
+        relation_residue::apply_relation_residue_ledger(app, registry)
+    }));
+    ran!("relation_residue");
+    #[cfg(debug_assertions)]
+    debug_assert_eq!(
+        executed,
+        POST_ANALYZE_PASS_ORDER
+            .iter()
+            .map(|(n, _)| *n)
+            .collect::<Vec<_>>(),
+        "apply_post_analyze_lowerings call sequence drifted from POST_ANALYZE_PASS_ORDER",
+    );
+    diags
+}
+
+/// Every app body the post-analyze hook owns: model methods, scope
+/// bodies, callback conditions and unrecognized class-body exprs;
+/// library-class methods; controller actions and unrecognized items;
+/// seeds. Param DEFAULTS ride along everywhere a body does — a default
+/// is call-time-evaluated body code, and `def initialize(cache_time =
+/// 30.minutes)` needs the duration grounding (or `Time.current` its
+/// own) exactly as much as a body site; defaults were the one
+/// reachable-expr position the hook skipped (lobsters'
+/// FlaggedCommenters left an ungrounded `Integer#minutes` send whose
+/// untyped result every downstream consumer inherited).
+///
+/// Class-body CONSTANT INITIALIZERS ride along for the same reason, one
+/// step earlier: `CONNECTION_TTL = 60.seconds` is code that runs at
+/// load time, and left ungrounded it reaches the emit as a literal
+/// `Integer#seconds` send that dies the moment the file is required
+/// (campfire's `Membership::Connectable`). A library class's
+/// `unknown_calls` join them — the model side already visits its
+/// `Unknown` class-body exprs on exactly that argument, and the two
+/// fields hold the same kind of replayed class-body code.
+///
+/// The one definition of the hook's scope — passes iterate through here
+/// so they can't drift. View bodies are deliberately excluded (each
+/// target's view pipeline still has its own working walkers over
+/// source shapes — see the note in [`blank::apply_blank_lowering`];
+/// views rejoin when the view pipeline migrates to shared lowerings).
+/// Test-module and fixture bodies are excluded too (they run on CRuby
+/// lanes; extendable when a strict-target test lane needs it).
+/// Every body that runs on a MODEL INSTANCE, in one place.
+///
+/// Three families, and they are NOT all in `model.body`:
+///
+///   * the model's own methods;
+///   * an ASSOCIATION EXTENSION's methods (`has_many :memberships do
+///     def revise(…) … end end`), which hang off the association;
+///   * a model CONCERN's methods (`module User::Bannable`), which live
+///     in `app.library_classes` under a namespace naming the model.
+///
+/// This exists because `transaction_ground` hand-rolled the first
+/// family, shipped, then needed the second, shipped, then needed the
+/// third — three commits for one fact. A pass that rewrites "what a
+/// model instance can call" walks all three or it drifts, so the walk
+/// is written once and shared.
+///
+/// NOT the same set as [`for_each_hook_body`], which also covers
+/// controllers, plain library classes and seeds. A pass keyed to model
+/// instances specifically (a bare `transaction`, a bare `touch`) wants
+/// this narrower one — the wider walk would rewrite a helper module's
+/// send, which is somebody else's method.
+pub(crate) fn for_each_model_body(
+    app: &mut crate::app::App,
+    f: &mut impl FnMut(&mut crate::expr::Expr),
+) {
+    for_each_model_body_named(app, &mut |_model, e| f(e));
+}
+
+/// [`for_each_model_body`], with the OWNING MODEL's name handed to the
+/// callback. A concern's body reads as `User::Avatar`'s and an
+/// association extension's as the association's, but Rails runs all
+/// three on a `User`; a rewrite that needs the model name (Rails'
+/// `combine_signed_id_purposes` prefixes it) must be told which one,
+/// because the body itself does not say.
+pub(crate) fn for_each_model_body_named(
+    app: &mut crate::app::App,
+    f: &mut impl FnMut(&str, &mut crate::expr::Expr),
+) {
+    let model_names: crate::det::HashSet<String> =
+        app.models.iter().map(|m| m.name.0.as_str().to_string()).collect();
+    for model in &mut app.models {
+        let name = model.name.0.as_str().to_string();
+        for item in &mut model.body {
+            match item {
+                crate::dialect::ModelBodyItem::Method { method, .. } => f(&name, &mut method.body),
+                crate::dialect::ModelBodyItem::Association {
+                    assoc: crate::dialect::Association::HasMany { extension, .. },
+                    ..
+                } => {
+                    for m in extension.iter_mut() {
+                        f(&name, &mut m.body);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    for lc in &mut app.library_classes {
+        if !lc.is_module {
+            continue;
+        }
+        let Some((namespace, _)) = lc.name.0.as_str().rsplit_once("::") else { continue };
+        if !model_names.contains(namespace) {
+            continue;
+        }
+        let name = namespace.to_string();
+        for m in &mut lc.methods {
+            f(&name, &mut m.body);
+        }
+    }
+}
+
+/// Every body a TEST MODULE holds — each test's, the `setup` hook's,
+/// and each helper method's.
+///
+/// Deliberately NOT folded into [`for_each_hook_body`]: most passes
+/// that use that walk are about app semantics and have their own
+/// reasons for skipping test bodies. A pass that wants test bodies asks
+/// for them by name, which keeps the widening reviewable one pass at a
+/// time — `blank` asks (its header explains the one walk it still
+/// declines, which is VIEWS, not tests).
+pub(crate) fn for_each_test_body(
+    app: &mut crate::app::App,
+    f: &mut impl FnMut(&mut crate::expr::Expr),
+) {
+    for tm in &mut app.test_modules {
+        if let Some(setup) = &mut tm.setup {
+            f(setup);
+        }
+        for t in &mut tm.tests {
+            f(&mut t.body);
+        }
+        for h in &mut tm.helpers {
+            f(&mut h.body);
+        }
+    }
+}
+
+pub(crate) fn for_each_hook_body(
+    app: &mut crate::app::App,
+    f: &mut impl FnMut(&mut crate::expr::Expr),
+) {
+    for_each_owned_hook_body(app, &mut |_, body| f(body))
+}
+
+/// [`for_each_hook_body`] with each body's OWNER: the class (model,
+/// library class, `config/application.rb`, controller) whose method it
+/// is, so a receiver-less send can be read against what that class
+/// defines. `None` for the seeds, which belong to no class. One walk
+/// with the owner threaded through, so the two cannot disagree about
+/// the set of bodies.
+pub(crate) fn for_each_owned_hook_body(
+    app: &mut crate::app::App,
+    f: &mut impl FnMut(Option<&crate::ident::ClassId>, &mut crate::expr::Expr),
+) {
+    fn visit_param_defaults(
+        params: &mut [crate::dialect::Param],
+        f: &mut impl FnMut(&mut crate::expr::Expr),
+    ) {
+        for p in params {
+            if let Some(default) = &mut p.default {
+                f(default);
+            }
+        }
+    }
+    for model in &mut app.models {
+        let crate::dialect::Model { name, body, class_attr_defaults, .. } = model;
+        let f = &mut |e: &mut crate::expr::Expr| f(Some(&*name), e);
+        for item in body {
+            match item {
+                crate::dialect::ModelBodyItem::Method { method, .. } => {
+                    visit_param_defaults(&mut method.params, f);
+                    f(&mut method.body)
+                }
+                crate::dialect::ModelBodyItem::Scope { scope, .. } => {
+                    visit_param_defaults(&mut scope.params, f);
+                    f(&mut scope.body)
+                }
+                crate::dialect::ModelBodyItem::Callback { callback, .. } => {
+                    if let Some(cond) = &mut callback.condition {
+                        f(cond);
+                    }
+                }
+                // `validates :attr, …, if: -> { … }` / `unless: …` — a
+                // lambda guard is a general expression, same as a
+                // callback's, and needs the same passes (`.in?`
+                // rewriting, attribute aliasing, …) to see it.
+                crate::dialect::ModelBodyItem::Validation { validation, .. } => {
+                    if let Some(cond) = &mut validation.if_cond {
+                        f(cond);
+                    }
+                    if let Some(cond) = &mut validation.unless_cond {
+                        f(cond);
+                    }
+                }
+                // Unrecognized class-body exprs (constant procs and
+                // friends) round-trip verbatim into the emit — their
+                // sites are just as reachable.
+                crate::dialect::ModelBodyItem::Unknown { expr, .. } => f(expr),
+                // A has_many extension's methods (`has_many :memberships
+                // do def revise(…) … end end`) are app-authored bodies
+                // that the model lowering turns into ordinary methods;
+                // every pass driven from here has to see them first.
+                // campfire's `revise` reads `granted.present?` and the
+                // blank grounding never reached it.
+                crate::dialect::ModelBodyItem::Association {
+                    assoc: crate::dialect::Association::HasMany { extension, .. },
+                    ..
+                } => {
+                    for m in extension.iter_mut() {
+                        visit_param_defaults(&mut m.params, f);
+                        f(&mut m.body);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for default in class_attr_defaults.values_mut() {
+            f(default);
+        }
+    }
+    for lc in &mut app.library_classes {
+        let crate::dialect::LibraryClass { name, methods, constants, unknown_calls, class_ivar_initializers, .. } = lc;
+        let f = &mut |e: &mut crate::expr::Expr| f(Some(&*name), e);
+        for method in methods.iter_mut() {
+            visit_param_defaults(&mut method.params, f);
+            f(&mut method.body);
+        }
+        for (_name, value) in constants.iter_mut() {
+            f(value);
+        }
+        for call in unknown_calls.iter_mut() {
+            f(call);
+        }
+        for initializer in class_ivar_initializers.iter_mut() {
+            f(initializer);
+        }
+    }
+    // `config/application.rb`. `App::rails_application` is a
+    // `LibraryClass` that EMITS but is not in `library_classes`, so
+    // every pass driven from here skipped it — and the bodies there are
+    // app-authored Ruby like any other. campfire's
+    // `ENV["APP_VERSION"].presence || …` reached spinel un-grounded and
+    // compiled to `undefined method 'presence' for an instance of
+    // String`: a body that ships has to be walked.
+    if let Some(lc) = &mut app.rails_application {
+        let crate::dialect::LibraryClass { name, methods, constants, unknown_calls, class_ivar_initializers, .. } = lc;
+        let f = &mut |e: &mut crate::expr::Expr| f(Some(&*name), e);
+        for method in methods.iter_mut() {
+            visit_param_defaults(&mut method.params, f);
+            f(&mut method.body);
+        }
+        for (_name, value) in constants.iter_mut() {
+            f(value);
+        }
+        for call in unknown_calls.iter_mut() {
+            f(call);
+        }
+        for initializer in class_ivar_initializers.iter_mut() {
+            f(initializer);
+        }
+    }
+    for controller in &mut app.controllers {
+        let crate::dialect::Controller { name, body, .. } = controller;
+        let f = &mut |e: &mut crate::expr::Expr| f(Some(&*name), e);
+        for item in body {
+            match item {
+                crate::dialect::ControllerBodyItem::Action { action, .. } => {
+                    for (_name, default) in &mut action.opt_params {
+                        f(default);
+                    }
+                    f(&mut action.body)
+                }
+                crate::dialect::ControllerBodyItem::ClassMethod { method, .. } => {
+                    visit_param_defaults(&mut method.params, f);
+                    f(&mut method.body)
+                }
+                crate::dialect::ControllerBodyItem::Unknown { expr, .. } => f(expr),
+                // A filter's `if:` / `unless:` lambda body is spliced into
+                // the dispatcher as written (`process_action`), so it is
+                // an app body like the model callbacks' conditions above.
+                // lobsters' `around_action :track_story_reads, if: -> {
+                // @user.present? }` reached spinel un-grounded and every
+                // story page 500'd on `present?`.
+                crate::dialect::ControllerBodyItem::Filter { filter, .. } => {
+                    if let Some(c) = &mut filter.if_cond_expr {
+                        f(c);
+                    }
+                    if let Some(c) = &mut filter.unless_cond_expr {
+                        f(c);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if let Some(seeds) = &mut app.seeds {
+        f(None, seeds);
+    }
+    for stmt in &mut app.boot_program {
+        f(None, stmt);
+    }
+}
+
+/// Read-only twin of [`for_each_hook_body`], for a pass that needs to
+/// SURVEY every body before anything rewrites one — `emit::ruby::
+/// library::apply_scope_lowering` collects which class methods are
+/// reached through an association, and it runs once per emitted family
+/// (models, then controllers) over a different `lcs` slice each time.
+/// Surveying the App instead of the slice is what makes the two runs
+/// agree; disagreeing would thread a relation at the call site into a
+/// method that never grew the parameter.
+///
+/// Kept adjacent to the mutable version deliberately: the two must walk
+/// the same set, and the only defence against that drifting is that
+/// they are read together.
+pub(crate) fn for_each_hook_body_ref(
+    app: &crate::app::App,
+    f: &mut impl FnMut(&crate::expr::Expr),
+) {
+    fn visit_param_defaults(
+        params: &[crate::dialect::Param],
+        f: &mut impl FnMut(&crate::expr::Expr),
+    ) {
+        for p in params {
+            if let Some(default) = &p.default {
+                f(default);
+            }
+        }
+    }
+    for model in &app.models {
+        for item in &model.body {
+            match item {
+                crate::dialect::ModelBodyItem::Method { method, .. } => {
+                    visit_param_defaults(&method.params, f);
+                    f(&method.body)
+                }
+                crate::dialect::ModelBodyItem::Scope { scope, .. } => {
+                    visit_param_defaults(&scope.params, f);
+                    f(&scope.body)
+                }
+                crate::dialect::ModelBodyItem::Callback { callback, .. } => {
+                    if let Some(cond) = &callback.condition {
+                        f(cond);
+                    }
+                }
+                crate::dialect::ModelBodyItem::Validation { validation, .. } => {
+                    if let Some(cond) = &validation.if_cond {
+                        f(cond);
+                    }
+                    if let Some(cond) = &validation.unless_cond {
+                        f(cond);
+                    }
+                }
+                crate::dialect::ModelBodyItem::Unknown { expr, .. } => f(expr),
+                crate::dialect::ModelBodyItem::Association {
+                    assoc: crate::dialect::Association::HasMany { extension, .. },
+                    ..
+                } => {
+                    for m in extension {
+                        visit_param_defaults(&m.params, f);
+                        f(&m.body);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for default in model.class_attr_defaults.values() {
+            f(default);
+        }
+    }
+    for lc in &app.library_classes {
+        for method in &lc.methods {
+            visit_param_defaults(&method.params, f);
+            f(&method.body);
+        }
+        for (_name, value) in &lc.constants {
+            f(value);
+        }
+        for call in &lc.unknown_calls {
+            f(call);
+        }
+        for initializer in &lc.class_ivar_initializers {
+            f(initializer);
+        }
+    }
+    // Same set as the mutable twin — see the note there.
+    if let Some(lc) = &app.rails_application {
+        for method in &lc.methods {
+            visit_param_defaults(&method.params, f);
+            f(&method.body);
+        }
+        for (_name, value) in &lc.constants {
+            f(value);
+        }
+        for call in &lc.unknown_calls {
+            f(call);
+        }
+        for initializer in &lc.class_ivar_initializers {
+            f(initializer);
+        }
+    }
+    for controller in &app.controllers {
+        for item in &controller.body {
+            match item {
+                crate::dialect::ControllerBodyItem::Action { action, .. } => {
+                    for (_name, default) in &action.opt_params {
+                        f(default);
+                    }
+                    f(&action.body)
+                }
+                crate::dialect::ControllerBodyItem::ClassMethod { method, .. } => {
+                    visit_param_defaults(&method.params, f);
+                    f(&method.body)
+                }
+                crate::dialect::ControllerBodyItem::Unknown { expr, .. } => f(expr),
+                crate::dialect::ControllerBodyItem::Filter { filter, .. } => {
+                    if let Some(c) = &filter.if_cond_expr {
+                        f(c);
+                    }
+                    if let Some(c) = &filter.unless_cond_expr {
+                        f(c);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if let Some(seeds) = &app.seeds {
+        f(seeds);
+    }
+    for stmt in &app.boot_program {
+        f(stmt);
+    }
+}
+
+// One inventory for the extra emit-bound roots the hook walker intentionally
+// excludes. Keep the mutable projection and immutable survey in lockstep.
+macro_rules! forwarding_roots {
+    ($app:ident, $f:ident, $iter:ident, $option:ident $(, $mutable:tt)?) => {
+        for view in & $($mutable)? $app.views { $f(& $($mutable)? view.body); }
+        for tm in & $($mutable)? $app.test_modules {
+            if let Some(setup) = tm.setup.$option() { $f(setup); }
+            for test in & $($mutable)? tm.tests { $f(& $($mutable)? test.body); }
+            for (_, value) in & $($mutable)? tm.constants { $f(value); }
+            for method in & $($mutable)? tm.helpers {
+                $f(& $($mutable)? method.body);
+                for default in method.params.$iter().filter_map(|p| p.default.$option()) { $f(default); }
+            }
+            for class in & $($mutable)? tm.inner_classes {
+                for method in & $($mutable)? class.methods {
+                    $f(& $($mutable)? method.body);
+                    for default in method.params.$iter().filter_map(|p| p.default.$option()) { $f(default); }
+                }
+                for (_, value) in & $($mutable)? class.constants { $f(value); }
+                for call in & $($mutable)? class.unknown_calls { $f(call); }
+                for initializer in & $($mutable)? class.class_ivar_initializers { $f(initializer); }
+            }
+        }
+    }
+}
+
+pub(crate) fn for_each_forwarding_body(app: &mut crate::App, f: &mut impl FnMut(&mut crate::expr::Expr)) {
+    for_each_hook_body(app, f);
+    forwarding_roots!(app, f, iter_mut, as_mut, mut);
+}
+
+pub(crate) fn for_each_forwarding_body_ref(app: &crate::App, f: &mut impl FnMut(&crate::expr::Expr)) {
+    for_each_hook_body_ref(app, f);
+    forwarding_roots!(app, f, iter, as_ref);
+}
+
+/// Mutable twin of [`for_each_emit_body_ref`]. The two must walk the same
+/// roots: a rewrite that sees only one of them leaves the other copy to emit.
+pub(crate) fn for_each_emit_body(app: &mut crate::App, f: &mut impl FnMut(&mut crate::expr::Expr)) {
+    for_each_forwarding_body(app, f);
+    for model in &mut app.models {
+        for item in &mut model.body {
+            if let crate::dialect::ModelBodyItem::Association { assoc, .. } = item {
+                match assoc {
+                    crate::dialect::Association::BelongsTo { default: Some(e), .. }
+                    | crate::dialect::Association::HasMany { scope: Some(e), .. }
+                    | crate::dialect::Association::HasOne { scope: Some(e), .. } => f(e),
+                    _ => {}
+                }
+            }
+        }
+    }
+    for controller in &mut app.controllers {
+        for item in &mut controller.body {
+            if let crate::dialect::ControllerBodyItem::Action { action, .. } = item {
+                for default in action.kw_params.iter_mut().filter_map(|(_, e)| e.as_mut()) {
+                    f(default);
+                }
+            }
+        }
+    }
+    for view in &mut app.views {
+        if let Some(locals) = &mut view.strict_locals {
+            for param in locals {
+                if let Some(default) = &mut param.default {
+                    f(default);
+                }
+            }
+        }
+    }
+    for fixture in &mut app.fixtures {
+        for e in &mut fixture.preamble {
+            f(e);
+        }
+        for record in fixture.records.values_mut() {
+            for value in record.values_mut() {
+                if let crate::dialect::FixtureValue::Ruby(e) = value {
+                    f(e);
+                }
+            }
+        }
+    }
+    for helper in &mut app.routes.direct_helpers {
+        f(&mut helper.body);
+    }
+    for function in &mut app.sql_functions {
+        match &mut function.kind {
+            crate::app::SqlFunctionKind::Scalar { method } => visit_sql_method(method, f),
+            crate::app::SqlFunctionKind::Aggregate { step, finalize } => {
+                visit_sql_method(step, f);
+                visit_sql_method(finalize, f);
+            }
+        }
+    }
+}
+
+fn visit_sql_method(method: &mut crate::dialect::MethodDef, f: &mut impl FnMut(&mut crate::expr::Expr)) {
+    f(&mut method.body);
+    for default in method.params.iter_mut().filter_map(|p| p.default.as_mut()) {
+        f(default);
+    }
+}
+
+/// Survey every emit-bound expression root, including defaults and fixture
+/// expressions outside the forwarding pass's narrower inventory. Callers walk
+/// children themselves, so each root is visited exactly once.
+pub(crate) fn for_each_emit_body_ref(app: &crate::App, f: &mut impl FnMut(&crate::expr::Expr)) {
+    for_each_forwarding_body_ref(app, f);
+    for association in app.models.iter().flat_map(|model| model.associations()) {
+        match association {
+            crate::dialect::Association::BelongsTo { default: Some(e), .. }
+            | crate::dialect::Association::HasMany { scope: Some(e), .. }
+            | crate::dialect::Association::HasOne { scope: Some(e), .. } => f(e),
+            _ => {}
+        }
+    }
+    for action in app.controllers.iter().flat_map(|c| c.actions()) {
+        for default in action.kw_params.iter().filter_map(|(_, e)| e.as_ref()) { f(default); }
+    }
+    for view in &app.views {
+        for default in view.strict_locals.iter().flatten().filter_map(|p| p.default.as_ref()) { f(default); }
+    }
+    for fixture in &app.fixtures {
+        for e in &fixture.preamble { f(e); }
+        for value in fixture.records.values().flat_map(|record| record.values()) {
+            if let crate::dialect::FixtureValue::Ruby(e) = value { f(e); }
+        }
+    }
+    for helper in &app.routes.direct_helpers { f(&helper.body); }
+    for function in &app.sql_functions {
+        let mut visit_method = |method: &crate::dialect::MethodDef| {
+            f(&method.body);
+            for default in method.params.iter().filter_map(|p| p.default.as_ref()) { f(default); }
+        };
+        match &function.kind {
+            crate::app::SqlFunctionKind::Scalar { method } => visit_method(method),
+            crate::app::SqlFunctionKind::Aggregate { step, finalize } => {
+                visit_method(step);
+                visit_method(finalize);
+            }
+        }
+    }
+}
+
+pub use associations::{
+    build_has_many_table, resolve_has_many, resolve_has_many_on_local, HasManyRef, HasManyRow,
+};
+pub use chain::{collect_chain_modifiers, ChainModifier};
+pub use controller_to_library::{
+    lower_controller_to_library_class, lower_controllers_to_library_classes,
+    lower_controllers_with_arel, lower_controllers_with_arel_and_views,
+    lower_controllers_with_arel_views_and_assocs,
+    lower_controllers_with_arel_views_assocs_and_routes, LowerControllerOptions,
+};
+pub use model_to_library::{
+    class_info_from_library_class, lower_model_to_library_class, lower_models_to_library_classes,
+    lower_models_to_library_classes_with_params, lower_models_with_registry,
+    lower_models_with_registry_and_params, lower_models_with_registry_params_and_views,
+};
+pub use fixture_to_library::{lower_fixtures_to_library_classes, rewrite_fixture_calls};
+pub use importmap_to_library::lower_importmap_to_library_functions;
+pub use library_extras::{extras_from_funcs, extras_from_lcs};
+pub use routes_to_library::{
+    lower_routes_to_dispatch_functions, lower_routes_to_library_functions,
+    url_options_helper_name,
+};
+pub use schema_to_library::{lower_schema_module_functions, lower_schema_to_library_functions};
+pub use seeds_to_library::lower_seeds_to_library_functions;
+pub use test_module_to_library::{
+    lower_test_module_to_library_class, lower_test_modules_to_library_classes,
+    lower_test_modules_with_inner, LoweredTestModule,
+};
+pub use ty_coerce_insertion::{insert_ty_coercions, insert_ty_coercions_with_extras};
+pub use view_to_library::{
+    MAX_UNCACHED_COLLECTION_LENGTH, ViewLowerCtx, flatten_lcs_to_functions,
+    lower_view_to_library_class, lower_views_to_library_classes,
+    lower_views_to_library_functions, preliminary_view_classes,
+    type_view_library_classes,
+};
+pub use jbuilder_to_library::{
+    jbuilder_signature_classes, lower_jbuilder_to_library_class, lower_jbuilder_to_library_classes,
+};
+pub use broadcasts::{
+    app_broadcasts_live, lower_broadcasts, BroadcastAction, LoweredAssocRef, LoweredBroadcast,
+    LoweredBroadcasts,
+};
+pub use controller::{
+    chain_target_class, classify_controller_send, default_permitted_fields,
+    extract_permitted_from_expr, extract_status_from_kwargs, find_nested_parent,
+    has_toplevel_terminal, is_empty_body, is_format_binding, is_params_expr,
+    is_query_builder_method, is_resource_params_call, lower_action,
+    model_new_with_strong_params, normalize_action_body, permitted_fields_for,
+    resolve_before_actions, resource_from_controller_name, singularize_to_model,
+    split_public_private, status_sym_to_code, synthesize_implicit_render,
+    unwrap_respond_to, update_with_strong_params, walk_controller_ivars,
+    ActionKind, LoweredAction, NestedParent, SendKind, WalkedIvars,
+};
+pub use controller_test::{
+    classify_assert_select, classify_controller_test_send, classify_url_expr,
+    flatten_params_pairs, setup_fixture, test_body_stmts, AssertSelectKind, ControllerTestSend, UrlArg,
+    UrlHelperCall,
+};
+pub use fixtures::{
+    lower_fixtures, LoweredFixture, LoweredFixtureField, LoweredFixtureRecord, LoweredFixtureSet,
+    LoweredFixtureValue,
+};
+pub use persistence::{lower_persistence, BelongsToCheck, DependentChild, LoweredPersistence};
+pub use routes::{flatten_routes, standard_resource_actions, FlatRoute};
+pub use validations::{lower_validations, Check, InclusionValue, LoweredValidation};
+pub use view::{
+    classify_class_value, classify_errors_field_predicate, classify_form_builder_args,
+    classify_form_builder_method, classify_nested_form_child, classify_nested_url_element,
+    classify_render_partial, classify_turbo_stream_call, classify_view_helper,
+    classify_view_url_arg, ClassValueShape,
+    ErrorsFieldPredicate, FormBuilderMethod, NestedFormChild, NestedUrlElement, RenderPartial,
+    ViewHelperKind, ViewUrlArg,
+};
+
+/// Bundle module-level `LibraryFunction`s (RouteHelpers, Importmap,
+/// …) into a module-flavored `LibraryClass` so the per-target
+/// library-emit pipelines can render them like any other class-shaped
+/// artifact. Each function becomes a class-receiver `MethodDef`.
+/// Shared home for the helper that had grown identical copies in the
+/// Rust and Go emitters.
+pub fn module_funcs_to_library_class(
+    name: &str,
+    funcs: &[crate::dialect::LibraryFunction],
+) -> crate::dialect::LibraryClass {
+    use crate::dialect::{AccessorKind, LibraryClass, MethodDef, MethodReceiver};
+    use crate::ident::ClassId;
+    let methods: Vec<MethodDef> = funcs
+        .iter()
+        .map(|f| MethodDef {
+            visibility: crate::dialect::MethodVisibility::Public,
+            unsupported_formals: f.unsupported_formals,
+            has_anonymous_block: f.has_anonymous_block,
+            name_span: crate::span::Span::synthetic(),
+            name: f.name.clone(),
+            receiver: MethodReceiver::Class,
+            params: f.params.clone(),
+            body: f.body.clone(),
+            signature: f.signature.clone(),
+            effects: f.effects.clone(),
+            enclosing_class: Some(crate::ident::Symbol::from(name)),
+            kind: AccessorKind::Method,
+            is_async: f.is_async,
+            mutates_self: false,
+            block_param: None,
+        })
+        .collect();
+    LibraryClass {
+        name: ClassId(crate::ident::Symbol::from(name)),
+        is_module: true,
+        parent: None,
+        parent_span: Default::default(),
+        includes: Vec::new(),
+        include_spans: Vec::new(),
+        methods,
+        nullable_columns: Vec::new(),
+        origin: None,
+        constants: Vec::new(),
+        conditional_definitions: Vec::new(),
+        unknown_calls: Vec::new(),
+        class_ivar_initializers: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod pass_order_tests {
+    use super::{post_analyze_pass_order_is_sound, POST_ANALYZE_PASS_ORDER};
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn post_analyze_pass_order_is_sound_topologically() {
+        // Every declared predecessor precedes its dependent and names a
+        // real pass in the list.
+        assert!(
+            post_analyze_pass_order_is_sound(),
+            "POST_ANALYZE_PASS_ORDER is not a valid topological order",
+        );
+    }
+
+    #[test]
+    fn post_analyze_pass_names_are_unique() {
+        // Names key the ordering constraints, so duplicates would make a
+        // `runs_after` reference ambiguous.
+        let mut seen = BTreeSet::new();
+        for (name, _) in POST_ANALYZE_PASS_ORDER {
+            assert!(seen.insert(*name), "duplicate pass name in order table: {name}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod body_root_tests {
+    use super::*;
+    use crate::expr::{Expr, ExprNode, Literal, LValue};
+
+    fn trace(expr: &Expr, seen: &mut Vec<String>) {
+        match &*expr.node {
+            ExprNode::Lit { value: Literal::Int { value } } => seen.push(value.to_string()),
+            ExprNode::Assign { target: LValue::Var { name, .. }, .. }
+                if name.as_str().starts_with("@@") => seen.push(name.as_str().to_owned()),
+            _ => {}
+        }
+        expr.node.for_each_child(&mut |child| trace(child, seen));
+    }
+
+    #[test]
+    fn surveys_and_rewrites_visit_each_owned_root_once_in_order() {
+        let files = [
+            ("app/models/widget.rb", "class Widget < ApplicationRecord\n def probe(value=11); 12; end\n scope :slice, ->(value=13) { 14 }\n before_save :probe, if: -> { 15 }\n has_many :items do\n def extra(value=16); 17; end\n end\n dsl(18)\nend"),
+            ("app/controllers/widgets_controller.rb", "class WidgetsController < ApplicationController\n before_action :probe, if: -> { 19 }, unless: -> { 20 }\n def index(value=21); 22; end\n dsl(23)\nend"),
+            ("app/services/probe.rb", "class Probe\n ITEM=24\n dsl(25)\n def probe(value=26); 27; end\nend\nclass Counter\n @@counter=nil\n def probe(value=28); 29; end\nend"),
+            ("config/application.rb", "module Shell\n class Application < Rails::Application\n def probe(value=30); 31; end\n end\nend"),
+            ("db/seeds.rb", "34"),
+            ("app/views/widgets/index.html.erb", "<%= 35 %>"),
+            ("test/models/probe_test.rb", "class ProbeTest < ActiveSupport::TestCase\n def test_probe; assert_equal 36, 37; end\n def helper(value=38); 39; end\n def setup; 40; end\n ITEM=41\n class Nested\n @@nested=nil\n def probe(value=42); 43; end\n end\nend"),
+        ];
+        let mut app = crate::ingest::ingest_app_from_tree(files.into_iter()
+            .map(|(path, code)| (std::path::PathBuf::from(path), code.as_bytes().to_vec()))
+            .collect()).unwrap();
+        // Config ingest filters class-body DSL. The walker still owns every
+        // LibraryClass field, including roots supplied by later passes.
+        let config = app.rails_application.as_mut().unwrap();
+        config.constants.push((crate::ident::Symbol::from("ITEM"),
+            Expr::new(crate::span::Span::synthetic(), ExprNode::Lit { value: Literal::Int { value: 32 } })));
+        config.unknown_calls.push(Expr::new(crate::span::Span::synthetic(),
+            ExprNode::Lit { value: Literal::Int { value: 33 } }));
+        let hooks = ["11", "12", "13", "14", "15", "16", "17", "18",
+            "26", "27", "24", "25", "28", "29", "@@counter",
+            "30", "31", "32", "33", "19", "20", "21", "22", "23", "34"];
+        let extras = ["35", "40", "36", "37", "41", "39", "38", "43", "42", "@@nested"];
+        let mut seen = Vec::new();
+        for_each_hook_body_ref(&app, &mut |root| trace(root, &mut seen));
+        assert_eq!(seen, hooks);
+        seen.clear();
+        for_each_owned_hook_body(&mut app, &mut |owner, root| {
+            if matches!(&*root.node, ExprNode::Assign { target: LValue::Var { name, .. }, .. }
+                if name.as_str() == "@@counter") {
+                assert_eq!(owner.unwrap().0.as_str(), "Counter");
+            }
+            trace(root, &mut seen);
+        });
+        assert_eq!(seen, hooks);
+        let expected: Vec<_> = hooks.into_iter().chain(extras).collect();
+        seen.clear();
+        for_each_emit_body_ref(&app, &mut |root| trace(root, &mut seen));
+        assert_eq!(seen, expected);
+        seen.clear();
+        for_each_forwarding_body(&mut app, &mut |root| {
+            trace(root, &mut seen);
+            root.span.start = 99;
+        });
+        assert_eq!(seen, expected);
+        for_each_forwarding_body_ref(&app, &mut |root| assert_eq!(root.span.start, 99));
+    }
+}
+
+/// Does `expr` bind `name` anew anywhere: any parameter of a nested block
+/// or lambda (`|record = 0|`, `|*record|`, `|record:|`, `|&record|`), or an
+/// assignment to the local (`record = nil`, `record ||= x`, `a, record = …`)?
+/// A rewrite that reads the name as something else (`self`) is wrong past one.
+pub(crate) fn rebinds_local(expr: &crate::expr::Expr, name: &str) -> bool {
+    use crate::expr::{ExprNode, LValue};
+    let is = |n: &crate::ident::Symbol| n.as_str() == name;
+    let here = match &*expr.node {
+        ExprNode::Lambda { params, rest_param, extra_params, block_param, .. } => {
+            params.iter().any(is)
+                || rest_param.as_ref().is_some_and(is)
+                || block_param.as_ref().is_some_and(is)
+                || extra_params.iter().any(|p| is(&p.name))
+        }
+        ExprNode::Assign { target: LValue::Var { name: n, .. }, .. }
+        | ExprNode::OpAssign { target: LValue::Var { name: n, .. }, .. } => is(n),
+        ExprNode::MultiAssign { targets, .. } => {
+            targets.iter().any(|t| matches!(t, LValue::Var { name: n, .. } if is(n)))
+        }
+        _ => false,
+    };
+    if here {
+        return true;
+    }
+    let mut found = false;
+    expr.node.for_each_child(&mut |c| found |= rebinds_local(c, name));
+    found
+}

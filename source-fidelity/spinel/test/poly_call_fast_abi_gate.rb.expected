@@ -1,0 +1,105 @@
+3
+5
+arity: ArgumentError: wrong number of arguments (given 1, expected 2)
+rest_unused: no raise
+rest_anon: no raise
+rest_aref: no raise
+rest_slice: no raise
+cmethod: NoMethodError
+5
+7
+7
+1
+9
+9
+["x", "y"]
+["x", "y"]
+"z"
+["z", "y"]
+[1, 2, 3]
+[1, 2, 3]
+x
+nil
+slice_arity: ArgumentError: wrong number of arguments (given 2, expected 3)
+index_arity: ArgumentError: wrong number of arguments (given 1, expected 2)
+ptr_mismatch: TypeError: wrong argument type Array (expected String)
+ptr_mismatch2: TypeError: wrong argument type String (expected Array)
+unbound_call: NoMethodError
+unbound_aref: NoMethodError
+3
+7
+optional_short: no raise
+adapter_arity: -1
+3
+6
+6
+splat_over: ArgumentError: wrong number of arguments (given 20, expected 16)
+toproc_splat_over: ArgumentError: wrong number of arguments (given 20, expected 16)
+6
+ptr_arg: TypeError: wrong argument type String (expected Integer)
+ptr_splat: TypeError: wrong argument type String (expected Integer)
+rest_splat_static: no raise
+static_splat_short: ArgumentError
+static_splat_long: ArgumentError
+static_call_over: ArgumentError
+static_toproc_over: ArgumentError
+[1, 6]
+[1, 6]
+adapter_set_short: ArgumentError
+adapter_set_splat: ArgumentError
+adapter_set_empty: ArgumentError
+sadapter_set_short: ArgumentError
+rest_opt_short: no raise
+10
+iarr_push_str: TypeError: cannot store String into an Array[Integer]: a typed array holds one kind of element
+iarr_push_float: TypeError: cannot store Float into an Array[Integer]: a typed array holds one kind of element
+iarr_set_str: TypeError: cannot store String into an Array[Integer]: a typed array holds one kind of element
+iarr_poly_push: NoMethodError
+iarr_poly_set: NoMethodError
+iarr_set_splat_after_idx: TypeError: cannot store String into an Array[Integer]: a typed array holds one kind of element
+7
+[7, 2]
+iarr_get_str: TypeError
+adapter_get_short: ArgumentError
+adapter_get_proc_short: ArgumentError
+[1, 2]
+rest_kw_static: no raise
+rest_post_static: no raise
+rest_kw_toproc: ArgumentError: missing keyword: :c
+rest_kw_toproc_short: ArgumentError: missing keyword: :c
+rest_post_toproc: no raise
+rest_kwrest_toproc: no raise
+iarr_get_over: ArgumentError
+iarr_get_slice: [2, 3]
+iarr_set_over: 9 [9, 2, 3]
+iarr_poly_push_multi: NoMethodError
+[1, 2]
+default_body_local_call: 6
+default_body_local_toproc: 6
+[100]
+[6]
+long_param_call: no raise
+long_param_toproc: no raise
+kwrest_unmatched: no raise
+kwrest_positional_name: ArgumentError
+[1, {z: 2}]
+kwrest_gap_call: ArgumentError
+kwrest_gap_opt_call: no raise
+kwrest_gap2_call: ArgumentError
+bool_arg_call: TypeError: wrong argument type FalseClass (expected Integer)
+bool_arg_proc: TypeError: wrong argument type FalseClass (expected Integer)
+toproc_many_params: no raise
+toproc_many_params_fixed: no raise
+toproc_rest_over: no raise
+kwrest_toproc_empty: no raise
+kwrest_toproc_kw: no raise
+[1, 2, 3]
+toproc_opt_kw: no raise
+toproc_kw_no_opt: no raise
+toproc_rest_kw: no raise
+toproc_req_kw: no raise
+toproc_req_nokw: ArgumentError: missing keyword: :c
+class_value_call: NoMethodError
+class_value_toproc: NoMethodError
+class_value_poly: NoMethodError
+class_value_polyproc: NoMethodError

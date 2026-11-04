@@ -1,0 +1,643 @@
+// Roundhouse TypeScript server runtime — HTTP + Action Cable glue.
+//
+// The emitted `main.ts` imports `startServer` from here (via
+// tsconfig path mapping to `runtime/typescript/server.ts`) and
+// hands it the Router's match function. startServer:
+//   1. Opens a file-backed better-sqlite3 database.
+//   2. Runs schema DDL (from the generated schema_sql.ts).
+//   3. Installs the Action Cable broadcaster on ApplicationRecord.
+//   4. Starts an HTTP listener that routes requests through
+//      Router.match → ActionContext → controller action →
+//      ActionResponse → HTTP response.
+//   5. Upgrades WebSocket connections on `/cable` into
+//      Action Cable clients with the `actioncable-v1-json`
+//      subprotocol, pings every 3s, and broadcasts turbo-stream
+//      fragments to subscribed channels.
+//
+// Based on railcar's TS app.ts pattern, adapted to roundhouse's
+// emitted Router / ActionContext / ActionResponse shapes.
+
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { mkdirSync, existsSync, createReadStream, statSync } from "node:fs";
+import { dirname, extname, join, normalize, sep } from "node:path";
+import { URL } from "node:url";
+import Database from "better-sqlite3";
+
+// MIME types for `/assets/*` static responses. Small inline table —
+// only the extensions roundhouse emits (Tailwind output, turbo.min.js,
+// importmap-pinned controllers, the occasional svg/png) need entries.
+// Falls back to application/octet-stream for unknown types.
+const ASSET_CONTENT_TYPES: Record<string, string> = {
+  ".css":  "text/css; charset=utf-8",
+  ".js":   "text/javascript; charset=utf-8",
+  ".mjs":  "text/javascript; charset=utf-8",
+  ".json": "application/json; charset=utf-8",
+  ".svg":  "image/svg+xml",
+  ".png":  "image/png",
+  ".ico":  "image/x-icon",
+  ".map":  "application/json; charset=utf-8",
+};
+
+/** Serve `static/assets/<name>` for any `/assets/*` request. Mirrors
+ *  Rails' Propshaft URL shape — `bin/rh transpile typescript` writes
+ *  the Tailwind compile output and turbo.min.js into static/assets/,
+ *  and `stylesheet_link_tag("tailwind")` / importmap pins point here.
+ *  Returns `true` if the response was sent (file served OR 404 for a
+ *  missing asset); `false` for non-/assets/ paths so handleRequest
+ *  proceeds to route matching.
+ *
+ *  Path normalization prevents directory traversal: any `..` segment
+ *  in the requested path is collapsed before joining with the static
+ *  root; if the resolved path escapes `static/assets/`, the request
+ *  gets a 404. */
+function tryServeAsset(url: URL, res: ServerResponse): boolean {
+  if (!url.pathname.startsWith("/assets/")) return false;
+  const root = normalize("static/assets") + sep;
+  const requested = normalize(join("static", url.pathname));
+  if (!requested.startsWith(root)) {
+    res.statusCode = 404;
+    res.end();
+    return true;
+  }
+  try {
+    const stat = statSync(requested);
+    if (!stat.isFile()) {
+      res.statusCode = 404;
+      res.end();
+      return true;
+    }
+    res.statusCode = 200;
+    res.setHeader("Content-Type",
+      ASSET_CONTENT_TYPES[extname(requested)] ?? "application/octet-stream");
+    res.setHeader("Content-Length", stat.size);
+    createReadStream(requested).pipe(res);
+  } catch {
+    res.statusCode = 404;
+    res.end();
+  }
+  return true;
+}
+
+import { Router } from "./router.js";
+import { Flash } from "./flash.js";
+import { setBroadcaster, installDb, type ActionResponse } from "./juntos.js";
+import { Db } from "./db.js";
+import { ViewHelpers } from "./view_helpers.js";
+import { I18nHost } from "./i18n_host.js";
+
+// ── Action Cable server ────────────────────────────────────────
+
+/** Minimal Action Cable subscriber bookkeeping. `identifier` is
+ *  the opaque string the client sent in its `subscribe` command;
+ *  `send` writes a JSON-framed message back to the client. */
+interface Subscriber {
+  identifier: string;
+  send: (json: string) => void;
+}
+
+/** Tracks subscriptions per channel. Model lifecycle callbacks
+ *  call `broadcast(channel, html)` to push a Turbo Stream
+ *  fragment to every subscriber of that channel. */
+class CableServer {
+  private channels: Map<string, Set<Subscriber>> = new Map();
+
+  subscribe(channel: string, sub: Subscriber): void {
+    if (!this.channels.has(channel)) this.channels.set(channel, new Set());
+    this.channels.get(channel)!.add(sub);
+  }
+
+  unsubscribe(sub: Subscriber): void {
+    for (const subs of this.channels.values()) subs.delete(sub);
+  }
+
+  broadcast(channel: string, html: string): void {
+    const subs = this.channels.get(channel);
+    if (!subs) return;
+    for (const sub of subs) {
+      sub.send(JSON.stringify({
+        type: "message",
+        identifier: sub.identifier,
+        message: html,
+      }));
+    }
+  }
+}
+
+// ── Form data parsing ──────────────────────────────────────────
+
+/** Parse `application/x-www-form-urlencoded` body. Rails scaffold
+ *  forms send data as `article[title]=...&article[body]=...&
+ *  _method=delete`; this parser handles those shapes without an
+ *  external dependency.
+ *
+ *  One-level bracket nesting is unwrapped: the form key
+ *  `article[title]` produces `out.article.title`, matching what the
+ *  emitted controller's `params.require("article")` expects (it
+ *  reads a nested HashWithIndifferentAccess at the parent key, not
+ *  a literal bracketed flat key). Top-level keys without brackets
+ *  pass through unchanged. */
+function parseFormData(body: string): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const pair of body.split("&")) {
+    if (!pair) continue;
+    const eq = pair.indexOf("=");
+    const key = decodeURIComponent((eq < 0 ? pair : pair.slice(0, eq)).replace(/\+/g, " "));
+    const val = eq < 0 ? "" : decodeURIComponent(pair.slice(eq + 1).replace(/\+/g, " "));
+    setNestedParam(out, key, val);
+  }
+  return out;
+}
+
+function setNestedParam(out: Record<string, unknown>, key: string, val: string): void {
+  const match = key.match(/^([^[]+)\[([^\]]+)\]$/);
+  if (match) {
+    const [, parent, field] = match;
+    let bucket = out[parent];
+    if (!bucket || typeof bucket !== "object") {
+      bucket = {};
+      out[parent] = bucket;
+    }
+    (bucket as Record<string, unknown>)[field] = val;
+  } else {
+    out[key] = val;
+  }
+}
+
+function readBody(req: IncomingMessage): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (c: Buffer) => chunks.push(c));
+    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    req.on("error", reject);
+  });
+}
+
+// ── flash: cookie-backed, per-session storage adapter ──────────
+//
+// Flash is cookie-backed and per-session (per browser), so parallel
+// clients never share a flash slot — a request's flash can't leak into
+// another browser's response (the global-store bug that made flash.spec
+// race the comment specs under fullyParallel). The "show exactly once"
+// lifecycle lives in the transpiled Flash class (to_persisted keeps only
+// what the action set); the server is just storage. Mirrors go/kotlin/swift.
+const FLASH_COOKIE = "rh_flash";
+
+/** Decode the rh_flash cookie into the persisted map `new Flash(...)`
+ *  reloads from. Absent → empty (first request in a session). Only the
+ *  closed notice/alert key set; values percent-encoded. */
+function readFlashCookie(req: IncomingMessage): Record<string, string> {
+  const out: Record<string, string> = {};
+  const raw = req.headers.cookie;
+  if (!raw) return out;
+  for (const jar of raw.split(";")) {
+    const trimmed = jar.trim();
+    if (!trimmed.startsWith(`${FLASH_COOKIE}=`)) continue;
+    const val = trimmed.slice(FLASH_COOKIE.length + 1);
+    for (const kv of val.split("&")) {
+      const eq = kv.indexOf("=");
+      if (eq <= 0) continue;
+      const k = kv.slice(0, eq);
+      if (k !== "notice" && k !== "alert") continue;
+      const v = decodeURIComponent(kv.slice(eq + 1));
+      if (v) out[k] = v;
+    }
+  }
+  return out;
+}
+
+/** Set-Cookie value for the carried flash. Empty → a clearing cookie
+ *  (Max-Age=0) so a notice shown once doesn't stick. HttpOnly + Path=/. */
+function flashSetCookie(persisted: Record<string, string>): string {
+  const keys = ["notice", "alert"].filter((k) => k in persisted);
+  if (keys.length === 0) {
+    return `${FLASH_COOKIE}=; Path=/; Max-Age=0; HttpOnly`;
+  }
+  const parts = keys.map((k) => `${k}=${encodeURIComponent(persisted[k])}`);
+  return `${FLASH_COOKIE}=${parts.join("&")}; Path=/; HttpOnly`;
+}
+
+// ── HTTP request dispatcher ────────────────────────────────────
+
+/** Handle one HTTP request: parse body, route to a controller
+ *  action via Router.match, translate the returned ActionResponse
+ *  into the outgoing HTTP response. Rails method-override via
+ *  `_method=delete|patch|put` hidden field is honored. */
+async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
+  let method = (req.method ?? "GET").toUpperCase();
+
+  if (method === "GET" && tryServeAsset(url, res)) return;
+
+  // Collect form body for non-GET requests.
+  let params: Record<string, unknown> = {};
+  if (method !== "GET" && method !== "HEAD") {
+    const raw = await readBody(req);
+    const contentType = req.headers["content-type"] ?? "";
+    if (contentType.includes("application/x-www-form-urlencoded")) {
+      params = parseFormData(raw);
+    } else if (contentType.includes("application/json") && raw) {
+      try { params = JSON.parse(raw); } catch { /* ignore malformed */ }
+    }
+    // Method override: POST with `_method=delete` dispatches as DELETE.
+    // `_method` is always a top-level (non-nested) key, so the
+    // `unknown` typing is safe to coerce here.
+    const override = String(params._method ?? "").toUpperCase();
+    if (method === "POST" && (override === "DELETE" || override === "PATCH" || override === "PUT")) {
+      method = override;
+      delete params._method;
+    }
+  }
+
+  // Per-request format inference. Strip a `.json` suffix from the
+  // request path before route matching so `/articles/1.json` and
+  // `/articles/1` share one route entry, and remember the format
+  // so the controller's respond_to-flattened branch can pick the
+  // right view + Content-Type. Mirrors the Ruby scaffold's
+  // main.rb:82-93 — every target needs this glue at its server
+  // entry point since route patterns are format-agnostic.
+  let request_format: string = "html";
+  let route_path = url.pathname;
+  if (route_path.endsWith(".json")) {
+    request_format = "json";
+    route_path = route_path.slice(0, -5);
+  }
+
+  const match = Router.match(method, route_path, dispatchTable);
+  if (!match) {
+    res.statusCode = 404;
+    res.setHeader("Content-Type", "text/plain; charset=utf-8");
+    res.end(`Not Found: ${method} ${url.pathname}`);
+    return;
+  }
+
+  const ctrlClass = controllerRegistry[match.controller];
+  if (!ctrlClass) {
+    res.statusCode = 500;
+    res.setHeader("Content-Type", "text/plain; charset=utf-8");
+    res.end(`No controller registered: ${match.controller}`);
+    return;
+  }
+
+  // Merge: path params + query string + form/json body.
+  // path_params is `Hash[String, String]` (URL captures) — spread
+  // directly. The earlier HWIA shape forced an `untyped` value
+  // channel that strict-typed targets couldn't compile against.
+  const merged: Record<string, any> = { ...match.path_params };
+  for (const [k, v] of url.searchParams) merged[k] = v;
+  Object.assign(merged, params);
+
+  // Reset per-request render state (yield body, content_for
+  // slots) so nothing leaks across requests.
+  ViewHelpers.reset_slots_bang();
+
+  let response: ActionResponse;
+  try {
+    const controller = new ctrlClass();
+    controller.params = merged;
+    controller.session = sessionStore;
+    // Wrap the incoming flash (decoded from the rh_flash cookie) in a Flash
+    // so the controller's typed-as-Flash `flash` property dispatches
+    // correctly (`flash.get("notice")` etc.). Per browser, not a shared
+    // store. (Phase 2.5(b): was HashWithIndifferentAccess; Flash provides
+    // typed notice/alert fields + HWIA-shape shim methods.)
+    controller.flash = new Flash(readFlashCookie(req));
+    controller.request_method = method;
+    controller.request_path = url.pathname;
+    controller.request_format = request_format;
+    await controller.process_action(match.action);
+    // Rails carries flash forward exactly once: the action that sets
+    // `flash[:notice] = ...` then `redirect_to`s, the next request reads
+    // the notice, and the request after that sees an empty flash. The
+    // Flash class owns that sweep (ActionDispatch::Flash#to_persisted
+    // keeps only entries this request SET); the server writes it to the
+    // rh_flash cookie (per browser), then clears it once displayed. Set
+    // before any res.end below — Set-Cookie is a header.
+    const persisted = controller.flash ? controller.flash.to_persisted() : {};
+    res.setHeader("Set-Cookie", flashSetCookie(persisted));
+    response = {
+      body: controller.body,
+      status: controller.status,
+      location: controller.location,
+      content_type: controller.content_type,
+    };
+  } catch (err) {
+    console.error("handler error:", err);
+    res.statusCode = 500;
+    res.setHeader("Content-Type", "text/plain; charset=utf-8");
+    res.end(`Server error: ${(err as Error).message}`);
+    return;
+  }
+
+  if (response.location) {
+    res.statusCode = response.status ?? 303;
+    res.setHeader("Location", response.location);
+    res.end();
+    return;
+  }
+
+  res.statusCode = response.status ?? 200;
+  // JSON responses skip the html layout wrap and ship the
+  // controller body verbatim with the controller-supplied
+  // Content-Type. Mirrors the Ruby scaffold's main.rb:157-167
+  // branch — the controller's `respond_to`-flattened body picks
+  // the JSON view + content_type; the server just honors it.
+  if (request_format === "json") {
+    res.setHeader(
+      "Content-Type",
+      response.content_type ?? "application/json; charset=utf-8",
+    );
+    res.end(response.body ?? "");
+    return;
+  }
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  if (layoutRenderer) {
+    // Pass body explicitly to the layout — matches the lowered-IR
+    // shape (`def self.application(body) ... io << body ... end`).
+    // The slot-store `setYield` is still populated for layouts that
+    // also need `<% yield :head %>` / `<% yield :alt %>` style
+    // named-yield reads.
+    ViewHelpers.set_yield(response.body ?? "");
+    res.end(layoutRenderer(response.body ?? ""));
+  } else {
+    res.end(renderLayout(response.body ?? ""));
+  }
+}
+
+/** Per-process layout renderer. Set by `startServer` via
+ *  `opts.layout`; the emitted `main.ts` passes the transpiled
+ *  `renderLayoutsApplication` here so the dispatcher wraps each
+ *  view in the real Rails layout (reading the yield body and any
+ *  `content_for` slots via the module-level state in
+ *  view_helpers). When unset, `renderLayout` below provides a
+ *  minimal fallback so the server still renders in isolation. */
+let layoutRenderer: ((body: string) => string) | null = null;
+
+// ── Layout wrapping ────────────────────────────────────────────
+
+/** Wrap a controller's returned HTML body in the full HTML
+ *  document shell. Only used for fixtures without a
+ *  `layouts/application` ERB template (e.g. tiny-blog); apps with
+ *  a layout reach this file's `renderLayouts_application` instead
+ *  via the emitter-supplied `opts.layout` callback.
+ *
+ *  Asset paths point at `/assets/tailwind.css` + `/assets/
+ *  turbo.min.js` — served by `tryServeAsset` above from
+ *  `static/assets/`. `bin/rh transpile typescript` is expected to
+ *  have populated that dir with the Tailwind compile output and
+ *  a copy of turbo.min.js; without that step the page is unstyled
+ *  but functional. Plain `@hotwired/turbo` (not `@hotwired/
+ *  turbo-rails`) avoids the latter's transitive `@rails/
+ *  actioncable/src` lookup — our cable handler at `/cable`
+ *  matches turbo's default URL.
+ */
+function renderLayout(body: string): string {
+  return `<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>Roundhouse App</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <link rel="icon" href="data:,">
+    <link rel="stylesheet" href="/assets/tailwind.css">
+    <script type="importmap">
+    {
+      "imports": {
+        "@hotwired/turbo": "/assets/turbo.min.js"
+      }
+    }
+    </script>
+    <script type="module">import "@hotwired/turbo";</script>
+  </head>
+  <body>
+    <main class="container mx-auto mt-8 px-5 flex flex-col">
+      ${body}
+    </main>
+  </body>
+</html>
+`;
+}
+
+// ── Action Cable upgrade handling ──────────────────────────────
+
+/** Minimal Action Cable handshake + framing. The browser's
+ *  `@rails/actioncable` client sends `Sec-WebSocket-Protocol:
+ *  actioncable-v1-json`; we echo it back. Standard messages:
+ *  welcome on connect, ping every 3s, confirm_subscription on
+ *  subscribe, regular JSON-message broadcasts to subscribers.
+ *
+ *  Dynamic-import of `ws` so the package is optional — the
+ *  emitted project only pulls it in when it actually runs a
+ *  server. */
+async function attachCable(
+  server: ReturnType<typeof createServer>,
+  cable: CableServer,
+): Promise<void> {
+  const { WebSocketServer, WebSocket } = await import("ws");
+  const wss = new WebSocketServer({
+    server,
+    path: "/cable",
+    handleProtocols: (protocols: Set<string>) => {
+      // Echo the Action Cable subprotocol if the client requested
+      // it; falls back to the first offered protocol for safety.
+      if (protocols.has("actioncable-v1-json")) return "actioncable-v1-json";
+      return protocols.values().next().value ?? false;
+    },
+  });
+
+  wss.on("connection", (ws) => {
+    ws.send(JSON.stringify({ type: "welcome" }));
+
+    const ping = setInterval(() => {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "ping", message: Date.now() }));
+      }
+    }, 3000);
+
+    const sub: Subscriber = {
+      identifier: "",
+      send: (json: string) => {
+        if (ws.readyState === WebSocket.OPEN) ws.send(json);
+      },
+    };
+
+    ws.on("message", (raw: Buffer) => {
+      let data: any;
+      try { data = JSON.parse(raw.toString()); } catch { return; }
+      if (data.command !== "subscribe") return;
+      // Identifier is a JSON-encoded blob of the stream name.
+      // Turbo signs the stream name with a base64 prefix; we
+      // decode the base64 to recover the channel name for
+      // broadcast routing.
+      sub.identifier = data.identifier;
+      let channel = "";
+      try {
+        const id = JSON.parse(data.identifier);
+        const signed = String(id.signed_stream_name ?? "");
+        const base64 = signed.split("--")[0];
+        channel = JSON.parse(Buffer.from(base64, "base64").toString("utf8"));
+      } catch {
+        // If we can't decode a turbo signed stream name, fall
+        // back to using the raw identifier as the channel — lets
+        // tests subscribe directly by stream name.
+        channel = String(data.identifier);
+      }
+      cable.subscribe(channel, sub);
+      ws.send(JSON.stringify({
+        type: "confirm_subscription",
+        identifier: sub.identifier,
+      }));
+    });
+
+    ws.on("close", () => {
+      clearInterval(ping);
+      cable.unsubscribe(sub);
+    });
+  });
+}
+
+// ── Database + schema bootstrap ────────────────────────────────
+
+function openDatabase(dbPath: string, schemaStatements: string[]): void {
+  // better-sqlite3 creates the file if it doesn't exist, but
+  // NOT the parent directory — if we're opening `./storage/
+  // development.sqlite3` and `./storage/` doesn't exist, the
+  // constructor throws. Create intermediate dirs so first-run
+  // startup works without the user having to mkdir manually.
+  // In-memory DBs (`:memory:`) don't have a parent dir; skip.
+  if (dbPath !== ":memory:") {
+    const parent = dirname(dbPath);
+    if (parent && parent !== "." && !existsSync(parent)) {
+      mkdirSync(parent, { recursive: true });
+    }
+  }
+
+  // We open with WAL + foreign keys, apply the schema
+  // statement-by-statement, and hand the connection to the juntos
+  // runtime via installDb. All subsequent AR queries run against
+  // this connection. Per-statement execution is the portable form;
+  // each statement is `IF NOT EXISTS`-guarded by the lowerer so
+  // re-opening an existing DB is a no-op.
+  const db = new Database(dbPath);
+  db.exec("PRAGMA journal_mode = WAL");
+  db.exec("PRAGMA foreign_keys = ON");
+
+  for (const stmt of schemaStatements) {
+    db.exec(stmt);
+  }
+
+  installDb(db);
+  // Adopt the same connection for the Level-3 Db primitive surface
+  // so lowerer-emitted `_adapter_*` methods see the same rows as the
+  // legacy juntos AR adapter. Mirrors the Db.install(db) call the
+  // test setup.ts emit injects.
+  Db.install(db);
+}
+
+// ── Public entry point ─────────────────────────────────────────
+
+/** One row from the emitted `RouteTable.table()` / `RouteTable.root()`. The
+ *  routes lowerer emits these as symbol-keyed Ruby hashes whose TS
+ *  rendering is the typed `Route` class from the transpiled router.
+ *  Per-field accessors (`route.verb`, `route.controller`, etc.)
+ *  rather than bracket-string lookup; the prior `Record<string, any>`
+ *  alias is gone now that the lowerer emits `new Route(...)` rows. */
+import { Route as RouteClass } from "./router.js";
+export type RouteRow = RouteClass;
+
+/** Constructable controller shape — bare class. Each emitted
+ *  controller exports its class; `main.ts` builds a
+ *  `{ articles: ArticlesController, ... }` map keyed by the
+ *  controller_symbol form (`ArticlesController` → `articles`)
+ *  the routes table uses. Constructed per-request, fields set
+ *  from path/query/body params, then `process_action(action)`.
+ *
+ *  Typed `any` for the construct return so the emitted controllers'
+ *  declared field types don't fight this contract — controllers
+ *  declare `body: string`, `status: any`, etc. in different
+ *  combinations across the kind-agnostic emit, and TS variance on
+ *  construct signatures is invariant. The runtime expectation is
+ *  documented in the dispatcher: each controller carries `params`,
+ *  `session`, `flash`, `request_method`, `request_path`, `body`,
+ *  `status`, `location` plus `process_action(action)`. */
+export type ControllerClass = new () => any;
+
+export interface StartOptions {
+  /** File path for the sqlite DB. Defaults to `./storage/development.sqlite3`. */
+  dbPath?: string;
+  /** HTTP port. Defaults to 3000 or `PORT` env var. */
+  port?: number;
+  /** Schema DDL statements to apply on startup, one per CREATE
+   *  TABLE / CREATE INDEX. The generated `Schema.statements()`
+   *  module returns this list. Each statement is `IF NOT EXISTS`-
+   *  guarded so re-opening an existing DB is a no-op. */
+  schemaStatements: string[];
+  /** Optional seed function, run if `shouldSeed` returns true. */
+  seeds?: () => void | Promise<void>;
+  /** Predicate controlling whether to run seeds. Default: run if
+   *  the database's first AR table is empty. Emitter can override
+   *  with model-specific logic. */
+  shouldSeed?: () => boolean;
+  /** Layout renderer — the emitted `renderLayoutsApplication`
+   *  (or equivalent). Called after each non-redirect response
+   *  with the inner view body as the first arg (matches the
+   *  lowered-IR shape `def self.application(body) ... io << body
+   *  ... end`); the slot store is also populated via
+   *  `Helpers.setYield` for named-yield reads. When omitted, the
+   *  server falls back to
+   *  the minimal `renderLayout` shell below. */
+  layout?: (body: string) => string;
+  /** Routes table — `RouteTable.table()` from the emitted
+   *  `app/routes.ts`. Order is config/routes.rb order. */
+  routes: RouteRow[];
+  /** Optional root route — `RouteTable.root()` from the emitted
+   *  `app/routes.ts`. Composed at the head of `routes` so a
+   *  GET `/` matches before fallthroughs. */
+  rootRoute?: RouteRow;
+  /** Map from controller-symbol (`articles` for `ArticlesController`)
+   *  to the controller class. Built by `main.ts` from the imported
+   *  controller modules. */
+  controllers: Record<string, ControllerClass>;
+}
+
+// Per-process dispatch table — set by `startServer`. Composed
+// `[rootRoute, ...routes]` so GET `/` matches before fallthroughs.
+let dispatchTable: RouteRow[] = [];
+let controllerRegistry: Record<string, ControllerClass> = {};
+// Session store. Real Rails session carries per-cookie scoping; this
+// minimal stub is process-global so single-user dev works. (Flash, by
+// contrast, IS per-session — cookie-backed via readFlashCookie /
+// flashSetCookie — so parallel clients don't share a flash slot.)
+const sessionStore: Record<string, any> = {};
+
+/** Start the server. Returns a promise that resolves once the
+ *  HTTP + WebSocket listeners are accepting connections. */
+export async function startServer(opts: StartOptions): Promise<void> {
+  const dbPath = opts.dbPath ?? "./storage/development.sqlite3";
+  const port = opts.port ?? Number(process.env.PORT ?? 3000);
+
+  layoutRenderer = opts.layout ?? null;
+  dispatchTable = opts.rootRoute ? [opts.rootRoute, ...opts.routes] : [...opts.routes];
+  controllerRegistry = opts.controllers;
+
+  openDatabase(dbPath, opts.schemaStatements);
+
+  if (opts.seeds && (opts.shouldSeed ?? (() => true))()) {
+    await opts.seeds();
+  }
+
+  const cable = new CableServer();
+  setBroadcaster((stream, html) => cable.broadcast(stream, html));
+
+  const server = createServer((req, res) => {
+    I18nHost.per_request(() => handleRequest(req, res)).catch((err) => {
+      console.error("request error:", err);
+      res.statusCode = 500;
+      res.end("Server error");
+    });
+  });
+
+  await attachCable(server, cable);
+
+  await new Promise<void>((resolve) => server.listen(port, () => resolve()));
+  console.log(`Roundhouse server listening on http://localhost:${port}`);
+}

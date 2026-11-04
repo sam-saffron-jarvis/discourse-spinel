@@ -1,0 +1,32 @@
+["#<IO:0xADDR>", "#<File:0xADDR>", "#<Dir:0xADDR>", "#<File::Stat:0xADDR>", "#<IO:0xADDR>", "#<IO:0xADDR>"]
+[false, false, false, false]
+[false, false]
+#<File:0xADDR>
+#<Dir:0xADDR>
+#<File::Stat:0xADDR>
+pipe: #<IO:0xADDR>
+#<File:0xADDR>
+#<File:0xADDR>
+#<Dir:0xADDR>
+#<File::Stat:0xADDR>
+#<IO:0xADDR> #<Dir:0xADDR>
+[0, nil, 0, nil, 0, nil]
+[0, -1, 1, 0, nil, nil]
+[nil, nil, nil, nil, nil, nil, nil, nil]
+[0, nil, nil, nil, nil, nil, nil, nil]
+[nil, nil, 0, nil, nil, nil, nil, nil]
+[nil, nil, nil, 0, -1, nil, nil, nil]
+[nil, nil, nil, -1, 0, nil, nil, nil]
+[0, 0, 0, 0, 0, 0, 0, 0]
+[true, true, true]
+[ArgumentError, "comparison of File with IO failed"]
+[-1, 1, 0]
+[true, false, true, false, true, false, true, false]
+[true, true, false, true, true]
+[true, false, true]
+[true, true, false, true]
+[:r, :f, :d, :sa, nil, nil, 4]
+["#<IO:0xADDR>", 0, nil, true, "#<File:0xADDR>", 0, "#<Dir:0xADDR>", 0, true]
+[0, nil, true, true, 0]
+[nil, 0, 0, nil, nil, 0, "", "", true]
+[false, true, true, false]

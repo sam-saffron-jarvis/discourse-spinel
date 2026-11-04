@@ -1,0 +1,4 @@
+class_value_call: NoMethodError
+class_value_toproc: NoMethodError
+class_value_poly: NoMethodError
+class_value_polyproc: NoMethodError

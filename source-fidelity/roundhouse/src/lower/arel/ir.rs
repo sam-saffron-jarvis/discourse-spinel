@@ -1,0 +1,314 @@
+//! Arel IR — query algebra evaluable at transpile time.
+//!
+//! Most real Rails AR usage is statically resolvable: associations have
+//! known schema; named scopes have literal bodies; `where`/`find`/`count`
+//! arguments are typically literals or single-runtime-value substitutions.
+//! That majority becomes an `ArelOp` tree whose per-backend visitor
+//! (see `visitor.rs`) emits inline SQL composition + per-model hydration
+//! at codegen time. The dynamic minority (conditional chains, dynamic
+//! hashes) is Phase 2's concern: a runtime Arel module in framework
+//! Ruby with the same shape.
+//!
+//! Design notes:
+//!
+//! - `Value::Runtime { expr, ty }` carries the unrendered Expr that
+//!   provides the value at runtime, plus the `ValueType` the visitor
+//!   needs to pick `escape_int` vs `escape_string`. The visitor wraps
+//!   the expr in `Db.escape_<ty>(<expr>)`.
+//!
+//! - `ColRef` is just (table, col); joins (Phase 3+) will need an alias
+//!   slot — reserved by leaving the field name alone for now.
+//!
+//! - `LimitSpec` is `u64` only (literal). Runtime limits (pagination)
+//!   can extend later; the per-shape adapter methods we replace today
+//!   only ever pass literal limits.
+//!
+//! - Insert and Update share the `Assignment` shape: ordered, with
+//!   `Value` on the right-hand side. The schema-derived column order
+//!   matters for emit (the SELECT cols list must match the hydration
+//!   order); Insert preserves it via `Vec<Assignment>` in schema order.
+//!
+//! See `project_arel_compile_time_first.md` for the broader architecture.
+
+use crate::expr::Expr;
+use crate::ident::{ClassId, Symbol, TableRef};
+
+/// Top-level Arel operation. One per call-site recognized by
+/// `try_build_arel`.
+#[derive(Clone, Debug)]
+pub enum ArelOp {
+    Select(Select),
+    Insert(Insert),
+    Update(Update),
+    Delete(Delete),
+}
+
+/// `SELECT … FROM … [WHERE …] [ORDER BY …] [LIMIT …]`.
+///
+/// `columns` covers the common shapes:
+/// - `All` — every schema column in declaration order; the visitor
+///   expands at visit time and matches the hydration order.
+/// - `Named` — explicit list (reserved; not used by the 8 starting
+///   shapes, but find_by(<col>) shapes will want it).
+/// - `Count` — `SELECT COUNT(*)`; visitor returns the count expr.
+#[derive(Clone, Debug)]
+pub struct Select {
+    pub table: TableRef,
+    pub columns: ColumnSpec,
+    pub conditions: Option<Predicate>,
+    pub orders: Vec<Order>,
+    pub limit: Option<LimitSpec>,
+    /// Reserved for joins / includes / preload — Phase 3+. Empty for
+    /// every Select built today; visitor ignores.
+    pub joins: Vec<Join>,
+    /// Does this Select yield ONE record (or nil), or a collection?
+    ///
+    /// Not derivable from `limit`, which is the trap this field exists
+    /// to close: `find_by(...)` and `.limit(1)` both render `LIMIT 1`
+    /// and mean different things — Rails' `find_by` answers a record or
+    /// nil, while `.limit(1)` answers an Array of at most one. The
+    /// visitor keyed the hydrate shape off `limit == Some(1)` and so
+    /// emitted a single-record read for `Model.all.limit(1)`, handing
+    /// the caller a record where its type said collection. Latent only
+    /// because no fixture or corpus app wrote that chain AND folded it.
+    ///
+    /// Set by the BUILDER, which is the only place that knows which
+    /// source method it recognized.
+    pub single_record: bool,
+    /// `includes(:assoc)` eager-load directives captured off the chain.
+    /// Empty unless the source chain carried `includes`/`preload`/
+    /// `eager_load` AND the lowerer was handed the association graph.
+    /// The visitor renders each as a batched `WHERE fk IN (ids)` query
+    /// after the parent hydrate, distributing rows into each parent's
+    /// association cache (issue #27). Empty → no preload, lazy fallback.
+    pub preloads: Vec<PreloadDirective>,
+}
+
+/// One resolved `includes(:assoc)` eager-load. Resolution happens at
+/// build time (the association graph + registry are available there),
+/// so the visitor needs only the schema to render the batched query.
+#[derive(Clone, Debug)]
+pub struct PreloadDirective {
+    /// Association name as written (`:comments`). Drives the cache
+    /// setter name (`_preload_comments`) the distribute loop calls.
+    pub name: Symbol,
+    /// Class whose rows the batched query hydrates (`Comment`).
+    pub target_class: ClassId,
+    /// Table holding the associated rows (`comments`).
+    pub target_table: TableRef,
+    /// FK column on the target table pointing back at the parent
+    /// (`article_id`). Both the `IN` filter and the group key.
+    pub foreign_key: Symbol,
+}
+
+/// `INSERT INTO <table> (<cols>) VALUES (<values>)`.
+///
+/// `assignments` is in schema column order minus an integer primary
+/// key (the `_adapter_insert` shape); a non-integer key the app or the
+/// runtime supplies is an ordinary assignment. Visitor composes CSV
+/// cols + escaped values; returns the Expr that calls `Db.exec(sql)`
+/// then, when `returns_rowid`, `Db.last_insert_rowid` — the value of
+/// an integer key the database assigned. A supplied key has nothing
+/// to read back, so the caller appends the key it already holds.
+#[derive(Clone, Debug)]
+pub struct Insert {
+    pub table: TableRef,
+    pub assignments: Vec<Assignment>,
+    pub returns_rowid: bool,
+}
+
+/// `UPDATE <table> SET <col = val>, … WHERE <conditions>`.
+///
+/// `conditions` is required for the `_adapter_update(id, instance)`
+/// shape (Eq(id, Runtime(id))). A future bulk-update would allow None.
+#[derive(Clone, Debug)]
+pub struct Update {
+    pub table: TableRef,
+    pub assignments: Vec<Assignment>,
+    pub conditions: Option<Predicate>,
+}
+
+/// `DELETE FROM <table> [WHERE <conditions>]`.
+///
+/// `conditions` None covers `_adapter_truncate` (test setup);
+/// `Some(Eq(id, Runtime(id)))` covers `_adapter_delete(id)`.
+#[derive(Clone, Debug)]
+pub struct Delete {
+    pub table: TableRef,
+    pub conditions: Option<Predicate>,
+}
+
+/// One column-equals-value pair on the LHS of an Insert/Update.
+/// Visitor renders as `<col> = <escaped value>` (Update) or
+/// contributes `<col>` to the cols-list and `<escaped value>` to the
+/// values-list (Insert).
+#[derive(Clone, Debug)]
+pub struct Assignment {
+    pub column: Symbol,
+    pub value: Value,
+}
+
+/// What a Select projects, and (implicitly) what shape the visitor
+/// materializes at the boundary.
+///
+/// - `All` + `limit Some(1)` → nilable instance (single-row hydrate)
+/// - `All` + no limit         → array of instances (loop hydrate)
+/// - `Count`                  → integer scalar
+/// - `Exists`                 → bool from `step?` (projection is the
+///                              sentinel `1`; column reads skipped)
+/// - `Pluck`                  → array of column scalars (no hydrate)
+#[derive(Clone, Debug)]
+pub enum ColumnSpec {
+    /// Every schema column in declaration order. Visitor expands at
+    /// visit time so the hydrate path knows the expected order.
+    All,
+    /// Reserved — explicit projection (e.g. `SELECT id, title`).
+    /// Not built by Phase 1 patterns; landed here so the find_by
+    /// extension can target it later without a schema bump.
+    Named(Vec<ColRef>),
+    /// `SELECT COUNT(*)`. Visitor returns the integer scalar.
+    Count,
+    /// `SELECT 1` projection whose result is consumed only by
+    /// `step?` — the visitor emits a Bool-returning body. Models the
+    /// `_adapter_exists_by_id?` shape and `Model.exists?(...)` at
+    /// runtime call sites.
+    Exists,
+    /// `pluck(:col)` / `ids` — a ONE-column projection whose rows are
+    /// read as scalars, not hydrated into instances. Distinct from
+    /// `Named`, which is a reserved multi-column projection that still
+    /// describes a row: the difference is the RESULT SHAPE, and it is
+    /// the whole reason `pluck` cannot ride on `Named`. The visitor
+    /// answers `Array[<column ty>]`.
+    ///
+    /// Single column only. Rails' multi-column `pluck` answers an Array
+    /// of Arrays whose element types differ per position — a shape the
+    /// strict targets have no shared vocabulary for — so the builder
+    /// declines those and they stay on the runtime Relation path.
+    Pluck(ColRef),
+    /// `group(:col).count` — `SELECT <col>, COUNT(*) … GROUP BY <col>`,
+    /// hydrated into a `Hash[<column ty>, Int]`. Rails' grouped count,
+    /// which the `group_count` lowering has already renamed off `count`
+    /// by the time the builder sees it (splitting the name is what keeps
+    /// the scalar `count` monomorphic).
+    ///
+    /// The grouped column rides in the PROJECTION rather than in a
+    /// separate `Select::group` field, because a `group` this builder
+    /// folds is a group this builder also terminates: the arm only
+    /// recognizes the `group(:col).count` pair, never a bare `group`
+    /// (a bare one would render `SELECT * … GROUP BY col`, one arbitrary
+    /// row per group, which is not what any of the chains that carry it
+    /// mean). One column, one aggregate, one place naming both — and no
+    /// field that is empty on every Select ever built. `sum`/`average`/
+    /// `minimum`/`maximum` take the same grouped-Hash return in Rails
+    /// and would each land as a sibling variant here, once each has a
+    /// lowering and a runtime method to be consistent with (issue #78).
+    GroupCount(ColRef),
+}
+
+/// Boolean expression in the WHERE position. Phase 1 is small on
+/// purpose: Eq is what the 8 adapter methods need and what every
+/// has_many proxy emits. Other variants will land as their fixtures
+/// surface (Neq for negation scopes, In for batched lookups, …).
+#[derive(Clone, Debug)]
+pub enum Predicate {
+    Eq(ColRef, Value),
+    /// Ruby-family runtime equality: select `= value` or `IS NULL` from
+    /// the value, preserving SQLite partial-index and join optimizations.
+    NullableEq(ColRef, Value),
+    And(Box<Predicate>, Box<Predicate>),
+    Or(Box<Predicate>, Box<Predicate>),
+}
+
+/// Reference to a column. Just (table, col) for now; joins will
+/// promote this to a qualified form (alias.col) without disturbing
+/// existing call sites — the (table, col) pair is already the
+/// fully-qualified shape under a single-table SELECT.
+#[derive(Clone, Debug)]
+pub struct ColRef {
+    pub table: TableRef,
+    pub column: Symbol,
+}
+
+/// A value that flows into a SQL string at SQL composition time.
+/// `Literal*` variants are baked into the SQL at codegen (bare).
+/// `Runtime { expr, ty }` defers value computation to the emitted
+/// program: visitor wraps `expr` in `Db.escape_<ty>(<expr>)` and
+/// composes the result into the SQL string.
+#[derive(Clone, Debug)]
+pub enum Value {
+    LiteralInt(i64),
+    LiteralStr(String),
+    LiteralBool(bool),
+    LiteralNull,
+    /// Visitor wraps this expression in `Db.escape_<ty>(<expr>)`. The
+    /// expression is itself an unrendered subtree of the source
+    /// program — typically `id` (Var ref to a method param) or
+    /// `instance.<col>` (instance-field accessor) or `@id` (Ivar).
+    Runtime { expr: Expr, ty: ValueType },
+}
+
+/// Discriminator for which `Db.escape_*` primitive the visitor calls.
+/// One per primitive runtime supports today; Float/Bool can land when
+/// the runtime grows them. Mirrors the column-type → escape-method
+/// branch in today's `adapter_emit`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ValueType {
+    Int,
+    Str,
+    /// Bool not yet supported by the runtime escape surface; reserved.
+    Bool,
+    /// Nullable counterparts — the value can be nil at runtime, so it
+    /// renders through `Db.escape_<ty>_opt`, which writes the SQL
+    /// keyword NULL rather than the type's zero. The lowerer picks
+    /// these for columns the schema declares nullable. (There is no
+    /// non-nullable `Float`: a NOT NULL float column escapes as text,
+    /// which SQLite coerces on a REAL column — only the nullable case
+    /// needs its own primitive.)
+    IntOpt,
+    StrOpt,
+    FloatOpt,
+    BoolOpt,
+}
+
+impl ValueType {
+    /// True for the nullable variants. Optional binds and inline escapes
+    /// both preserve nil as SQL NULL.
+    pub fn is_nullable(self) -> bool {
+        matches!(self, ValueType::IntOpt | ValueType::StrOpt | ValueType::FloatOpt | ValueType::BoolOpt)
+    }
+}
+
+/// `ORDER BY <col> ASC|DESC`. Reserved; no current call site builds
+/// orders, but the runtime-Arel chain will (`Article.all.order(:created_at)`).
+#[derive(Clone, Debug)]
+pub struct Order {
+    pub column: ColRef,
+    pub direction: Direction,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Direction {
+    Asc,
+    Desc,
+}
+
+/// `LIMIT n`. Literal-only for now; runtime-driven pagination would
+/// extend this with a `Runtime(Expr)` variant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LimitSpec(pub u64);
+
+/// Reserved for Phase 3+. Joins/includes/preload all land in this
+/// slot once their fixtures surface; today every Select carries an
+/// empty `joins: Vec<Join>` and the visitor ignores.
+#[derive(Clone, Debug)]
+pub struct Join {
+    pub table: TableRef,
+    pub kind: JoinKind,
+    pub on: Predicate,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JoinKind {
+    Inner,
+    Left,
+}

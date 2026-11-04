@@ -1,0 +1,6 @@
+0
+double: unscan failed: previous match record not exist
+fresh: unscan failed: previous match record not exist
+standard: unscan failed: previous match record not exist
+bare: unscan failed: previous match record not exist
+is StandardError? true

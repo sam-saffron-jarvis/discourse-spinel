@@ -1,0 +1,11 @@
+.message: count zero
+.title: text hi
+.a: presence
+  in block
+.b: count zero
+  in block
+.c: count zero
+.d: count zero
+.e: {count: 0} {count: 0}
+.f: "body" {count: 1}
+  in block

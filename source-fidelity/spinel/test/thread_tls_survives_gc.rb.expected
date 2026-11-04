@@ -1,0 +1,3 @@
+main: main counter=399999
+worker: worker counter=399999
+done

@@ -1,0 +1,16 @@
+"sym"
+"abcd"
+[1, 2, 3]
+7
+"ab"
+undefined method '[]' for nil
+undefined method '[]' for nil
+undefined method '[]' for an instance of Float
+undefined method '[]' for an instance of Float
+undefined method '[]' for true
+undefined method '[]' for true
+undefined method '[]' for false
+undefined method '[]' for false
+1
+2
+undefined method '[]' for nil

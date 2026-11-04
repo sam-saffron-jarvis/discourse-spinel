@@ -1,0 +1,6 @@
+:wait_readable
+:wait_readable
+raised OpenSSL::SSL::SSLErrorWaitReadable
+caught as IO::WaitReadable
+true
+end

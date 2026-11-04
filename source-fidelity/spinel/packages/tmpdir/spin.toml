@@ -1,0 +1,6 @@
+[package]
+name = "tmpdir"
+sources = ["sp_tmpdir.c"]   # carried C is declared, not discovered (#4362)
+
+# Pre-installed spin package: ships with the compiler, versioned with it.
+# Dir.tmpdir and Dir.mktmpdir, carried in C (sp_tmpdir.c).

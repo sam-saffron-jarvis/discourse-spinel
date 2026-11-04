@@ -1,0 +1,437 @@
+diff --git a/src/lower/controller/body.rs b/src/lower/controller/body.rs
+index 80e5c458a..2004930d2 100644
+--- a/src/lower/controller/body.rs
++++ b/src/lower/controller/body.rs
+@@ -56,6 +56,10 @@ pub fn unwrap_respond_to(expr: &Expr) -> Expr {
+ #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+ pub struct FormatBreadth {
+     pub json_any: bool,
++    /// Preserve calls to the original controller serialization helper on
++    /// spinel-shaped output. This is separate from `json_any`: it does not
++    /// admit inline `render json:` or invoke the CRuby JsonRender encoder.
++    pub serialized_helper: bool,
+     pub rss: bool,
+     /// The tree raises `ActionController::ParameterMissing` from
+     /// `params.expect` / `params.require` and its dispatcher answers an
+@@ -75,13 +79,30 @@ pub struct FormatBreadth {
+ impl FormatBreadth {
+     /// html only (plus the simple-`render :sym` json arms) — the emit
+     /// paths that don't recognize `request_format` at all.
+-    pub const NARROW: Self = Self { json_any: false, rss: false, raises_param_missing: false, wraps_json_params: false };
+-    /// The spinel/AOT tree: rss dispatch, no JsonRender.
+-    pub const RSS_ONLY: Self =
+-        Self { json_any: false, rss: true, raises_param_missing: true, wraps_json_params: true };
++    pub const NARROW: Self = Self {
++        json_any: false,
++        serialized_helper: false,
++        rss: false,
++        raises_param_missing: false,
++        wraps_json_params: false,
++    };
++    /// The spinel/AOT tree: rss and original serialized-helper dispatch,
++    /// without admitting inline JsonRender/renderer encoding.
++    pub const RSS_ONLY: Self = Self {
++        json_any: false,
++        serialized_helper: true,
++        rss: true,
++        raises_param_missing: true,
++        wraps_json_params: true,
++    };
+     /// The CRuby/JRuby trees, whose overlay answers the full surface.
+-    pub const FULL: Self =
+-        Self { json_any: true, rss: true, raises_param_missing: true, wraps_json_params: true };
++    pub const FULL: Self = Self {
++        json_any: true,
++        serialized_helper: true,
++        rss: true,
++        raises_param_missing: true,
++        wraps_json_params: true,
++    };
+ }
+ 
+ /// Format-dispatching variant of `unwrap_respond_to`.
+@@ -372,12 +393,33 @@ fn json_arm_drop_reason(
+     // template — the simplest render there is, and exactly what a
+     // `render :sym` arm would bind.
+     let bare = matches!(&*branch_body.node, ExprNode::Seq { exprs } if exprs.is_empty());
+-    if bare || breadth.json_any || is_simple_render_sym(branch_body) || is_encoded_render(branch_body) {
++    if bare
++        || breadth.json_any
++        || (breadth.serialized_helper && is_serialized_helper_call(&branch_body))
++        || is_simple_render_sym(&branch_body)
++        || is_encoded_render(&branch_body)
++    {
+         return None;
+     }
+     Some("inline `render json: <expr>` needs an encoder this tree has none for")
+ }
+ 
++/// Preserve a narrow, ordinary call to the original serialized response
++/// helper without translating it to `render json:` or JsonRender. This is
++/// only a dispatch decision; the helper implementation is a separate runtime
++/// contract and is not proved by retaining its call site.
++fn is_serialized_helper_call(body: &Expr) -> bool {
++    let body = match &*body.node {
++        ExprNode::Seq { exprs } if exprs.len() == 1 => &exprs[0],
++        _ => body,
++    };
++    matches!(
++        &*body.node,
++        ExprNode::Send { recv: None, method, args, block: None, .. }
++            if method.as_str() == "render_serialized" && (2..=3).contains(&args.len())
++    )
++}
++
+ /// Pull `(format_name, block_body)` out of a `format.<x> { body }`
+ /// Send. Returns `None` for any statement that isn't a format
+ /// binding. The bare-form `format.html` (no block) returns an empty
+diff --git a/tests/respond_to_format_dispatch.rs b/tests/respond_to_format_dispatch.rs
+index 872631305..73fb44294 100644
+--- a/tests/respond_to_format_dispatch.rs
++++ b/tests/respond_to_format_dispatch.rs
+@@ -17,7 +17,8 @@
+ use std::collections::HashMap;
+ use std::path::PathBuf;
+ 
+-use roundhouse::analyze::{diagnose, Analyzer};
++use roundhouse::analyze::{Analyzer, diagnose};
++use roundhouse::emit::ruby;
+ use roundhouse::ingest::ingest_app_from_tree;
+ 
+ const FILES: &[(&str, &str)] = &[
+@@ -69,6 +70,20 @@ end
+       format.vcf
+     end
+   end
++
++  def serialized
++    respond_to do |format|
++      format.html { head :ok }
++      format.json { render_serialized(Article.all, ArticleSerializer) }
++    end
++  end
++
++  def inline_json
++    respond_to do |format|
++      format.html { head :ok }
++      format.json { render json: { ok: true } }
++    end
++  end
+ end
+ "#,
+     ),
+@@ -109,7 +124,104 @@ fn no_dispatch_failures(app: &roundhouse::App) {
+         .iter()
+         .filter(|d| d.code() == "send_dispatch_failed")
+         .collect();
+-    assert!(failed.is_empty(), "unexpected dispatch failures: {failed:?}");
++    assert!(
++        failed.is_empty(),
++        "unexpected dispatch failures: {failed:?}"
++    );
++}
++
++#[test]
++fn serialization_helper_dispatch_keeps_json_request_branch() {
++    let app = analyzed_app();
++    let source = ruby::emit_lowered_controllers(&app)
++        .into_iter()
++        .find(|file| file.path.to_string_lossy().contains("articles_controller"))
++        .expect("articles controller")
++        .content;
++    let action = source
++        .split("def serialized")
++        .nth(1)
++        .expect("serialized action");
++    assert!(
++        action.contains("request_format == :json"),
++        "JSON request branch was lost:\n{action}"
++    );
++    assert!(
++        action.contains("render_serialized(") && action.contains("ArticleSerializer)"),
++        "helper body changed:\n{action}"
++    );
++    assert!(
++        action.contains("head(:ok") || action.contains("head :ok"),
++        "HTML fallback was lost:\n{action}"
++    );
++    assert!(
++        !action.contains("JsonRender"),
++        "helper dispatch must not opt into CRuby JsonRender:\n{action}"
++    );
++    let cruby = ruby::emit_lowered_controllers_with_layout(&app)
++        .into_iter()
++        .find(|file| file.path.to_string_lossy().contains("articles_controller"))
++        .expect("CRuby articles controller")
++        .content;
++    let cruby_action = cruby
++        .split("def serialized")
++        .nth(1)
++        .expect("CRuby serialized action");
++    assert!(
++        cruby_action.contains("request_format == :json"),
++        "CRuby JSON branch was lost:\n{cruby_action}"
++    );
++    assert!(
++        cruby_action.contains("render_serialized("),
++        "CRuby helper body changed:\n{cruby_action}"
++    );
++}
++
++#[test]
++fn helper_allowance_does_not_enable_inline_json_encoder_on_spinel_shape() {
++    let app = analyzed_app();
++    let source = ruby::emit_lowered_controllers(&app)
++        .into_iter()
++        .find(|file| file.path.to_string_lossy().contains("articles_controller"))
++        .expect("articles controller")
++        .content;
++    let action = source
++        .split("def inline_json")
++        .nth(1)
++        .expect("inline_json action");
++    assert!(
++        !action.contains("request_format == :json"),
++        "unsupported encoder branch was admitted:\n{action}"
++    );
++    assert!(
++        !action.contains("JsonRender"),
++        "CRuby-only encoder leaked to native shape:\n{action}"
++    );
++    assert!(
++        action.contains("head(:ok") || action.contains("head :ok"),
++        "HTML response was lost:\n{action}"
++    );
++}
++
++#[test]
++fn spinel_refusal_of_inline_json_keeps_an_explicit_diagnostic() {
++    let app = analyzed_app();
++    let body = action_body(&app, "inline_json");
++    let (_, diagnostics) = roundhouse::emit::diagnostics::scope(|| {
++        roundhouse::lower::controller::body::unwrap_respond_to_with_format_dispatch(
++            &body,
++            roundhouse::lower::controller::body::FormatBreadth::RSS_ONLY,
++        )
++    });
++    assert!(
++        diagnostics.iter().any(|diagnostic| {
++            diagnostic.message.contains("format.json")
++                && diagnostic
++                    .message
++                    .contains("inline `render json: <expr>` needs an encoder")
++        }),
++        "unsupported inline JSON must remain an explicit lowering diagnostic: {diagnostics:?}"
++    );
+ }
+ 
+ #[test]
+diff --git a/tests/respond_to_format_dispatch_runtime.rs b/tests/respond_to_format_dispatch_runtime.rs
+new file mode 100644
+index 000000000..63b50db6d
+--- /dev/null
++++ b/tests/respond_to_format_dispatch_runtime.rs
+@@ -0,0 +1,203 @@
++//! Executed regression for the narrowly admitted `render_serialized` dispatch.
++//!
++//! The controller/helper/serializer below are a reduced test fixture, not
++//! Discourse runtime or page proof. The helper implementation is a local
++//! contract fixture used only to observe dispatch and response state; the
++//! production gate admits this call shape and does not claim to implement
++//! the framework helper.
++
++#[path = "support/emit_and_run.rs"]
++mod emit_and_run;
++
++fn app() -> emit_and_run::Overlay {
++    emit_and_run::empty_app()
++        .write(
++            "app/controllers/application_controller.rb",
++            r#"class ApplicationController < ActionController::Base
++  attr_accessor :trace
++  attr_reader :helper_calls, :argument_evaluations, :html_effects
++
++  def initialize
++    super
++    @trace = ""
++    @helper_calls = 0
++    @argument_evaluations = 0
++    @html_effects = 0
++  end
++
++  # Test-only stand-in for the framework method: deliberately local to this
++  # fixture, so this test owns the dispatch mechanism without claiming the
++  # real ApplicationController#render_serialized implementation.
++  def render_serialized(rows, serializer)
++    @helper_calls += 1
++    @trace += "helper>"
++    render plain: serializer.new(self).serialize(rows), content_type: "application/json"
++  end
++end
++"#,
++        )
++        .write(
++            "app/models/topic_list_serializer.rb",
++            r#"class TopicListSerializer
++  def serialize(rows)
++    @controller.trace += "serializer>"
++    "serialized:" + rows.join(",")
++  end
++
++  def initialize(controller)
++    @controller = controller
++  end
++end
++"#,
++        )
++        .write(
++            "app/controllers/topics_controller.rb",
++            r#"class TopicsController < ApplicationController
++  def serialized_rows
++    @argument_evaluations += 1
++    @trace += "argument>"
++    ["topic"]
++  end
++
++  def show
++    respond_to do |format|
++      format.html do
++        @html_effects += 1
++        @trace += "html>"
++        head :ok
++      end
++      format.json { render_serialized(serialized_rows, TopicListSerializer) }
++    end
++  end
++end
++"#,
++        )
++}
++
++const ASSERTIONS: &str = r#"
++require_relative "app/controllers/topics_controller"
++require_relative "app/models/topic_list_serializer"
++
++def assert_response(controller, format)
++  if format == :json
++    raise "json response was not rendered: #{controller.body.inspect}" unless controller.body == "serialized:topic"
++    raise "json content type: #{controller.content_type.inspect}" unless controller.content_type == "application/json"
++    raise "json status: #{controller.status.inspect}" unless controller.status == 200
++    raise "json helper count: #{controller.helper_calls}" unless controller.helper_calls == 1
++    raise "json argument evaluated more than once: #{controller.argument_evaluations}" unless controller.argument_evaluations == 1
++    raise "json ran HTML effects: #{controller.html_effects}" unless controller.html_effects == 0
++    raise "json order: #{controller.trace.inspect}" unless controller.trace == "argument>helper>serializer>"
++  else
++    raise "html body: #{controller.body.inspect}" unless controller.body.to_s == ""
++    raise "html status: #{controller.status.inspect}" unless controller.status == 200
++    raise "html content type: #{controller.content_type.inspect}" unless controller.content_type.to_s.start_with?("text/html")
++    raise "html called JSON helper: #{controller.helper_calls}" unless controller.helper_calls == 0
++    raise "html evaluated helper args: #{controller.argument_evaluations}" unless controller.argument_evaluations == 0
++    raise "html side effect count: #{controller.html_effects}" unless controller.html_effects == 1
++    raise "html order: #{controller.trace.inspect}" unless controller.trace == "html>"
++  end
++end
++
++[:json, :html].each do |format|
++  controller = TopicsController.new
++  controller.request_format = format
++  Thread.current[:dispatch_controller] = controller
++  controller.show
++  assert_response(controller, format)
++end
++puts "serialized helper request-format runtime passed"
++"#;
++
++#[test]
++fn serialized_helper_dispatch_executes_on_cruby() {
++    // Use the Spinel target tree for the CRuby oracle so both processes
++    // consume exactly the same lowered controller source.
++    let (emitted, errors) = app().emit(roundhouse::project::BuildTarget::Spinel);
++    assert!(errors.is_empty(), "{}", errors.join("\n"));
++    let script = format!(
++        "require_relative \"runtime/action_controller/base\"\n$LOADED_FEATURES << File.expand_path(\"runtime/action_controller.rb\", Dir.pwd)\n{ASSERTIONS}"
++    );
++    let output = emit_and_run::ruby()
++        .arg("-e")
++        .arg(script)
++        .current_dir(&emitted)
++        .env("BLOG_DB", ":memory:")
++        .output()
++        .expect("run same Spinel-lowered Ruby under CRuby");
++    assert!(
++        output.status.success(),
++        "same Spinel-lowered Ruby failed under CRuby:\\nstdout={}\\nstderr={}",
++        String::from_utf8_lossy(&output.stdout),
++        String::from_utf8_lossy(&output.stderr)
++    );
++}
++
++#[test]
++#[ignore = "requires the Spinel toolchain"]
++fn serialized_helper_dispatch_executes_on_native_spinel() {
++    app().run_spinel(ASSERTIONS).assert_passes();
++}
++
++#[test]
++fn unsupported_inline_encoder_is_not_admitted_by_the_runtime_fixture() {
++    // Keep this negative control explicit: native-shaped output must not
++    // accidentally route inline JSON through the CRuby-only encoder.
++    let fixture = app().write(
++        "app/controllers/topics_controller.rb",
++        r#"class TopicsController < ApplicationController
++  def inline
++    respond_to do |format|
++      format.html { head :ok }
++      format.json { render json: { ok: true } }
++    end
++  end
++end
++"#,
++    );
++    let (emitted, _app, diagnostics) =
++        fixture.emit_with_app(roundhouse::project::BuildTarget::Spinel);
++    let errors: Vec<_> = diagnostics
++        .iter()
++        .filter(|d| d.severity == roundhouse::diagnostic::Severity::Error)
++        .collect();
++    assert!(
++        errors.is_empty(),
++        "{}",
++        errors
++            .iter()
++            .map(|d| d.message.as_str())
++            .collect::<Vec<_>>()
++            .join("\\n")
++    );
++    let controller = std::fs::read_to_string(emitted.join("app/controllers/topics_controller.rb"))
++        .expect("emitted controller");
++    let action = controller
++        .split("def inline")
++        .nth(1)
++        .expect("inline action");
++    assert!(
++        !action.contains("request_format == :json"),
++        "unsupported encoder branch admitted:\\n{action}"
++    );
++    assert!(
++        !action.contains("JsonRender"),
++        "CRuby-only encoder dependency emitted:\\n{action}"
++    );
++    assert!(
++        !action.contains("json_any"),
++        "broad json_any path was accidentally enabled:\\n{action}"
++    );
++}
++
++#[test]
++fn helper_dispatch_fixture_has_no_cruby_json_render_dependency() {
++    let (emitted, errors) = app().emit(roundhouse::project::BuildTarget::Spinel);
++    assert!(errors.is_empty(), "{}", errors.join("\n"));
++    let controller = std::fs::read_to_string(emitted.join("app/controllers/topics_controller.rb"))
++        .expect("emitted controller");
++    assert!(controller.contains("render_serialized("), "{controller}");
++    assert!(
++        !controller.contains("JsonRender"),
++        "helper path acquired JsonRender dependency:\n{controller}"
++    );
++}

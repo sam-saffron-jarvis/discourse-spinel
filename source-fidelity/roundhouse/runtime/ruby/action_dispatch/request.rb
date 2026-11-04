@@ -1,0 +1,528 @@
+# frozen_string_literal: true
+# ActionDispatch::Request — the request-object surface controllers,
+# filters, and helpers reach (`request.remote_ip`, `request.referer`,
+# `request.xhr?`, `request.env[...]`, `request.get?`). Typed fields the
+# dispatcher assigns from its transport (Tep under the spinel binary),
+# not an env-hash bag — per-field types keep every read concrete under
+# AOT. `env` remains as the one compat bag: lobsters reads
+# `env["HTTP_USER_AGENT"]` and writes scratch keys
+# (`exception_notifier.exception_data`), shapes the typed fields can't
+# carry.
+#
+# Loaded explicitly by the spinel scaffold's main.rb (not from the
+# action_dispatch require chain): the CRuby tree keeps its overlay
+# Request (CGI-env-backed, runtime/action_dispatch_request.rb) and must
+# not blend the two shapes.
+require_relative "headers"
+require_relative "request_path_parameters"
+
+module ActionDispatch
+  # `request.body` — the raw body as Rails hands it back: an IO, not the
+  # String. campfire's bot endpoints read it the way Rails documents
+  # (`request.body.rewind; request.body.read.force_encoding("UTF-8")`),
+  # and a String answers none of that. The bytes tep read are the
+  # storage; this is the cursor over them, the subset of Rack's input
+  # (`StringIO` under CRuby, whose overlay twin hands back exactly that)
+  # a controller reaches: `rewind`, `read`, `string`, `size`, `eof?`.
+  #
+  # NOT `StringIO` itself: that is a stdlib class the strict targets do
+  # not carry, and one method each is what a request body needs.
+  class RequestBody
+    def initialize(text)
+      @text = text
+      @pos = 0
+    end
+
+    # The whole body as a String, whatever the cursor says — Rack's
+    # `StringIO#string`, and what `raw_post` is built on.
+    def string
+      @text
+    end
+
+    def rewind
+      @pos = 0
+      0
+    end
+
+    # From the cursor to the end, as CRuby's `IO#read` with no length; a
+    # second read at the end is "" (not nil — that is the `read(length)`
+    # form's answer, which no caller here spells). The cursor counts
+    # characters, not bytes: only the whole-body read is served, so the
+    # two agree on everything a caller can observe, and `[i, n]` /
+    # `length` are the slicing idioms every target already carries.
+    def read
+      out = @text[@pos, @text.length - @pos].to_s
+      @pos = @text.length
+      out
+    end
+
+    def size
+      @text.bytesize
+    end
+
+    def length
+      @text.bytesize
+    end
+
+    def eof?
+      @pos >= @text.length
+    end
+  end
+
+  # `ActionDispatch::TestRequest.create(env)` — the Request a test
+  # builds by hand, from a Rack env rather than from a transport.
+  # campfire's opengraph-embed test names the host its own links must
+  # be dropped for:
+  #
+  #   Current.set request: ActionDispatch::TestRequest.create("HTTP_HOST" => "once.campfire.test")
+  #
+  # ONE PER REQUEST SHAPE, which is why this is not in the shared test
+  # harness: the two ruby-family trees run genuinely different Request
+  # classes (see the header of `runtime/action_dispatch_request.rb`, the
+  # CRuby overlay's env-backed twin, which carries its own `create`).
+  # This one is the accessor-backed class below, so `create` maps the
+  # env keys that class models and leaves the rest in `env` — where a
+  # reader that wants them can still find them, exactly as Rails would.
+  #
+  # RAILS' OWN DEFAULTS for what the env omits, which the class's
+  # `initialize` already supplies: "localhost", "/", GET. A test that
+  # names only a host gets a request that is otherwise ordinary.
+  module TestRequest
+    # NO DEFAULT on `env`, though Rails' has one: an optional
+    # parameter widens the slot on a strict target (spinel typed the
+    # hash `sp_RbVal` and the `env=` below would not take it), and
+    # every caller names an env — a `TestRequest` with no env is a
+    # `Request.new`.
+    def self.create(env)
+      r = Request.new
+      r.env = env
+      env.each do |k, value|
+        if k == "HTTP_HOST"
+          r.host = value.to_s
+        elsif k == "PATH_INFO"
+          r.path = value.to_s
+        elsif k == "REQUEST_METHOD"
+          r.request_method = value.to_s
+        elsif k == "QUERY_STRING"
+          r.query_string = value.to_s
+        elsif k == "SCRIPT_NAME"
+          r.script_name = value.to_s
+        elsif k == "HTTP_REFERER"
+          r.referer = value.to_s
+        elsif k == "REMOTE_ADDR"
+          r.remote_ip = value.to_s
+        end
+      end
+      r
+    end
+  end
+
+  class Request
+    attr_accessor :remote_ip
+    attr_accessor :path
+    attr_accessor :query_string
+    # Rack's SCRIPT_NAME — the prefix the app is mounted under, "" at
+    # the root. Campfire's cable helper joins it with Action Cable's
+    # mount path to build the socket URL, so every page that renders
+    # the layout reads it.
+    attr_accessor :script_name
+    attr_accessor :request_method
+    attr_accessor :referer
+    # `host` is a method: it answers `raw_host_with_port`, while `@host`
+    # stays the Host header the dispatcher stored.
+    attr_reader :format
+    attr_accessor :env
+    # Rails' `request_parameters`: the BODY's params alone, without the
+    # query string or the path captures. ParamsWrapper copies from these
+    # (`Params.wrap`); the dispatcher fills them.
+    attr_accessor :request_parameters
+    # Rails' `query_parameters`: the QUERY STRING's params alone, nested
+    # by the dispatcher's own parser (`ParamBuilder` on the spinel lane,
+    # which fills it; the CRuby overlay twin parses `query_string` on
+    # read). A reader, not a re-parse here: this file is shared with
+    # every target and names neither parser.
+    attr_accessor :query_parameters
+
+    def initialize
+      @remote_ip = "127.0.0.1"
+      @path = "/"
+      @query_string = +""
+      @script_name = +""
+      @request_method = "GET"
+      @referer = +""
+      @host = "localhost"
+      @format = "html"
+      @body = +""
+      @body_io = nil
+      @env = {}
+      @request_parameters = {}
+      @query_parameters = {}
+      @path_parameters = RequestPathParameters.new({})
+      # `@params` too, and for a reason `@env` shows: `Request.for`
+      # COPIES into both (`params.each { |k, v| r.params[k] = v }`),
+      # which READS the slot before anything writes it. Unset, that read
+      # is nil on a dynamic target and a null `sp_StrPolyHash *` under
+      # spinel AOT — `sp_StrPolyHash_set` then dereferences it and the
+      # whole test binary segfaults with no output.
+      #
+      # It went unnoticed because the two trees run DIFFERENT Request
+      # classes: the CRuby lane loads the overlay twin
+      # (`runtime/action_dispatch_request.rb`), so `ruby_toolchain`
+      # passes the same test file this one dies on. Every ivar this
+      # class declares gets a value here, or only the AOT lane finds
+      # out.
+      @params = {}
+      # Declared in the .rbs and previously left unset — the same
+      # defect `@params` had, one read away from surfacing.
+      @user_agent = +""
+      @session_options = {}
+      # Memo for `content_security_policy`. False until the first read
+      # copies the app default; a later read returns that same object so
+      # a before_action and the header writer share the narrowed policy.
+      @csp_ready = false
+      @content_security_policy = nil
+    end
+
+    # Rack's per-request session options. The one key the corpus writes
+    # is `:skip` — lobsters' `clear_session_cookie` after-action sets it
+    # on an anonymous page whose session holds only defaults, so the
+    # response carries no session cookie. Typed Boolean-valued: the
+    # other keys rack reads (`:expire_after`, `:renew`, …) are consumed
+    # by a cookie-store middleware we don't run, and a write of one
+    # refuses at the type rather than being silently ignored.
+    # `request.headers["Accept-Encoding"]` — see `Http::Headers`.
+    def headers
+      ActionDispatch::Http::Headers.new(@env)
+    end
+
+    def session_options
+      @session_options
+    end
+
+    # Whether the dispatcher should leave the session cookie alone this
+    # response (Rails: the session middleware skips its commit).
+    def session_skip?
+      @session_options[:skip] == true
+    end
+
+    # Rails accepts a symbol (`request.format = :json`); store the
+    # canonical string.
+    def format=(value)
+      @format = value.to_s
+    end
+
+    # The body the transport (or the test harness) hands over is a
+    # String; what a controller reads back is the IO over it. A fresh
+    # write drops the old cursor, so a body assigned twice — the
+    # harness re-posting through one Request — starts at 0 again.
+    def body=(value)
+      @body = value
+      @body_io = nil
+      value
+    end
+
+    def body
+      @body_io = RequestBody.new(@body) if @body_io.nil?
+      @body_io
+    end
+
+    # Rails' `raw_post`: the body as one String, cursor untouched.
+    def raw_post
+      @body
+    end
+
+    # Rails checks the ordinary Rack Authorization key, legacy server
+    # spellings, and the CGI redirect fallback.
+    def authorization
+      ActionDispatch::Http::Headers.authorization(@env)
+    end
+
+    def path_parameters
+      @path_parameters
+    end
+
+    def path_parameters=(values)
+      @path_parameters = RequestPathParameters.new(values)
+    end
+
+    def get?
+      @request_method == "GET"
+    end
+
+    def post?
+      @request_method == "POST"
+    end
+
+    def put?
+      @request_method == "PUT"
+    end
+
+    # `head?` sits beside `get?` because Rails' "is this a safe
+    # request" idiom is `request.get? || request.head?` and campfire
+    # writes exactly that (`BlockBannedRequests#safe_request?`). It had
+    # no caller only because the `unless:` guard naming that predicate
+    # was carried and never enforced; enforcing it turned a silently
+    # skipped condition into 128 `undefined method 'head?'`.
+    def head?
+      @request_method == "HEAD"
+    end
+
+    def xhr?
+      @env.fetch("HTTP_X_REQUESTED_WITH", "").to_s == "XMLHttpRequest"
+    end
+
+    def inertia?
+      @env.fetch("HTTP_X_INERTIA", "").to_s != ""
+    end
+
+    def fullpath
+      if @query_string == ""
+        @path
+      else
+        @path + "?" + @query_string
+      end
+    end
+
+    # No middleware rewrites paths here, so original_* == current.
+    def original_fullpath
+      fullpath
+    end
+
+    # Rack's answer to "did the client connect over TLS?": the server
+    # says so (`HTTPS=on`), or a proxy that terminated TLS in front of
+    # us says so in `X-Forwarded-Proto` — Fly, a load balancer, Kamal's
+    # proxy. Rack honors the header without configuration, so Rails
+    # does too; answering http behind such a proxy made every absolute
+    # URL (`room_refresh_url`, the direct-upload URL) mixed content on
+    # an https page, and the browser blocked the fetch.
+    def ssl?
+      return true if @env.fetch("HTTPS", "").to_s == "on"
+      forwarded = @env.fetch("HTTP_X_FORWARDED_PROTO", "").to_s.split(",").first.to_s.strip.downcase
+      return forwarded == "https" unless forwarded.empty?
+      # No proxy header: the scheme Rack itself reports, the one key the
+      # Rack spec requires (`Rack::Request#scheme`'s last resort).
+      @env.fetch("rack.url_scheme", "").to_s.downcase == "https"
+    end
+
+    # Rails' `request.optional_port`: the port, unless it is the
+    # scheme's standard one (80, or 443 over TLS) — then nil, so a URL
+    # built from it carries no `:port`. The authority is
+    # `raw_host_with_port` (port included), which is how `base_url`
+    # uses it. campfire's `default_url_options` passes it as `port:`.
+    def optional_port
+      authority = raw_host_with_port
+      sep = authority.rindex(":")
+      return nil if sep.nil? || authority.end_with?("]")
+      port = authority[(sep + 1)..].to_s.to_i
+      return nil if port == 0
+      return nil if port == (ssl? ? 443 : 80)
+      port
+    end
+
+    # Rails' `raw_host_with_port`. The last `X-Forwarded-Host` entry is
+    # the client-facing authority, and only from a loopback or private
+    # peer (the proxy in front of the app). A public client can set the
+    # header itself, so it does not override Host. A value that is not
+    # a host authority is ignored, so it cannot land in a Location or
+    # an href. `config.hosts` is not applied yet.
+    def raw_host_with_port
+      forwarded = forwarded_authority
+      return forwarded unless forwarded.empty?
+      @host.to_s
+    end
+
+    def host
+      raw_host_with_port
+    end
+
+    def host=(value)
+      @host = value.to_s
+    end
+
+    def forwarded_authority
+      return "" unless trusted_forwarded_peer?
+      forwarded = @env.fetch("HTTP_X_FORWARDED_HOST", "").to_s.split(",").last.to_s.strip
+      return "" unless host_authority?(forwarded)
+      forwarded
+    end
+
+    def trusted_forwarded_peer?
+      ip = @remote_ip.to_s
+      # An empty peer is not loopback. Spinel's socket address is still
+      # unimplemented, so `remote_ip` is "" there; trusting that would
+      # honor a client-supplied X-Forwarded-Host on every connection.
+      return false if ip.empty?
+      return true if ip == "127.0.0.1" || ip == "::1" || ip == "localhost"
+      return true if ip.start_with?("10.") || ip.start_with?("192.168.") || ip.start_with?("169.254.")
+      return true if ip.start_with?("fc") || ip.start_with?("fd") || ip.start_with?("fe80:")
+      if ip.start_with?("172.")
+        second = ip.split(".")[1].to_s.to_i
+        return true if second >= 16 && second <= 31
+      end
+      if ip.start_with?("100.")
+        second = ip.split(".")[1].to_s.to_i
+        return true if second >= 64 && second <= 127
+      end
+      false
+    end
+
+    def host_authority?(value)
+      value.match?(/\A(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?)(:[0-9]{1,5})?\z/)
+    end
+
+    def port
+      authority = forwarded_authority
+      if authority.empty?
+        authority = @host.to_s
+        if !@env.key?("HTTP_HOST") && (@env.key?("SERVER_NAME") || !authority.include?(":"))
+          authority = "#{authority}:#{@env.fetch("SERVER_PORT", "").to_s}"
+        end
+      end
+      sep = authority.rindex(":")
+      unless sep.nil?
+        value = authority[(sep + 1)..].to_s
+        return value.to_i if value.match?(/\A[0-9]+\z/)
+      end
+      ssl? ? 443 : 80
+    end
+
+    # `request.protocol` — the scheme WITH its `://`, as Rails spells it.
+    def protocol
+      ssl? ? "https://" : "http://"
+    end
+
+    # Scheme + host, no path — what Rails builds absolute URLs from.
+    # The scheme's standard port is dropped (`host_with_port` writes no
+    # `:443` over TLS or `:80` without it), so the CSRF check compares
+    # it with an Origin the way a browser serializes one.
+    def base_url
+      default = ssl? ? ":443" : ":80"
+      authority = raw_host_with_port
+      host = authority.end_with?(default) ? authority[0, authority.length - default.length].to_s : authority
+      protocol + host
+    end
+
+    # `request.host_with_port` — `base_url` without the scheme. Rails
+    # drops the scheme's standard port, which `base_url` already did.
+    def host_with_port
+      b = base_url
+      p = protocol
+      return "" if b.length < p.length
+      b[p.length..].to_s
+    end
+
+    # The app's default policy, duplicated per request. Nil when the
+    # app configured none (or DISABLE_CONTENT_SECURITY_POLICY). The
+    # first read memoizes so a before_action that narrows the policy
+    # and the later header write see one object.
+    def content_security_policy
+      return @content_security_policy if @csp_ready
+      @csp_ready = true
+      src = Rails.application.content_security_policy
+      @content_security_policy = src.nil? ? nil : src.dup
+      @content_security_policy
+    end
+
+    # Absolute URL of this request. Feed templates interpolate it as
+    # the channel link (lobsters' home/rss.rbuilder), which is why the
+    # spinel tree needs it and not just the CRuby overlay's twin.
+    def original_url
+      base_url + fullpath
+    end
+
+    # Rails' `request.url` is `original_url` — same string, and the name
+    # app code reaches for (campfire's `request_authentication` stores it
+    # as the post-login return path). Kept as its own method rather than
+    # an alias so the strict targets see a real definition.
+    def url
+      original_url
+    end
+
+    def referrer
+      @referer
+    end
+
+    # The User-Agent header. campfire's auth spine records it on every
+    # Session row (`start_new_session_for`) and `deny_bots` filters on
+    # it, so every sign-in reads it. Was a hole we opened ourselves:
+    # the walk's stub ledger carried it as "ours to implement".
+    def user_agent
+      @user_agent
+    end
+
+    def user_agent=(value)
+      @user_agent = value
+    end
+
+    # Retained so `Request.for`'s signature matches the overlay twin's.
+    # No `[]` delegator here: the overlay has one because lobsters
+    # writes `request[:format]`, and adding an untyped-returning reader
+    # nothing calls just spends runtime-typing budget.
+    def params
+      @params
+    end
+
+    def params=(value)
+      @params = value
+    end
+
+    # Rails' `filtered_parameters`: the request's parameters, path
+    # parameters last (with the route's controller and action), with the
+    # value of every key the app's `config.filter_parameters` names
+    # replaced by "[FILTERED]", for an app that logs them itself
+    # (`Rails.logger` does not filter; only Rails' own request log does).
+    def filtered_parameters
+      all = {}
+      @params.each { |k, v| all[k] = v }
+      @path_parameters.to_h.each { |k, v| all[k] = v }
+      ActiveSupport::ParameterFilter.new(Rails.application.config_filter_parameters).filter(all)
+    end
+
+    # Build a request from a CGI/Rack-shaped env hash.
+    #
+    # THE SHARED CONSTRUCTOR. This class and the CRuby overlay's twin
+    # (`runtime/action_dispatch_request.rb`) hold their state
+    # differently — this one in attributes, that one derived from a
+    # retained `@env` — so they cannot share a `new`. They can share
+    # this, which is what lets one caller build a request on either
+    # target. The test harness is that caller; before it existed,
+    # `controller.request` was simply nil in every controller test and
+    # campfire's first filter died on `request.remote_ip`.
+    def self.for(env, params = {})
+      r = new
+      # COPIED IN, not assigned. `@env` is declared
+      # `Hash[String, untyped]` — callers write scratch keys of any type
+      # into it — while a caller's env literal is usually
+      # `Hash[String, String]`. Assigning the narrow hash into the wide
+      # slot is a real type error that a dynamic target simply never
+      # notices; spinel names it exactly
+      # (`assignment to 'sp_StrPolyHash *' from incompatible pointer
+      # type 'sp_StrStrHash *'`). Same reason `stringify_keys` exists
+      # in the test harness rather than a `.dup`.
+      env.each { |k, v| r.env[k] = v }
+      # `params` is copied for the same reason, and additionally because
+      # its own default is an empty literal: a bare `{}` is Symbol-keyed
+      # on a strict target, which is not what `@params` is declared to
+      # hold. `k.to_s` bridges both the default and a Symbol-keyed
+      # caller.
+      params.each { |k, v| r.params[k.to_s] = v }
+      # `.to_s` on every read: `env` holds `untyped` BY CONTRACT (see
+      # above), so a read is a dynamic value, and these attributes are
+      # Strings. A dynamic target coerces on assignment and never
+      # mentions it; spinel refuses the assignment outright (matz's
+      # 91307939 keeps an untyped RBS parameter untyped rather than
+      # narrowing it to whatever the first caller passed, which is what
+      # made this visible). The `|| default` still supplies the value
+      # for a missing key — `nil.to_s` is `""`, not the default.
+      r.request_method = (env["REQUEST_METHOD"] || "GET").to_s
+      r.path = (env["PATH_INFO"] || "/").to_s
+      r.query_string = (env["QUERY_STRING"] || "").to_s
+      r.script_name = (env["SCRIPT_NAME"] || "").to_s
+      r.host = (env["HTTP_HOST"] || env["SERVER_NAME"] || "localhost").to_s
+      r.remote_ip = (env["REMOTE_ADDR"] || "127.0.0.1").to_s
+      r.referer = (env["HTTP_REFERER"] || "").to_s
+      r.user_agent = (env["HTTP_USER_AGENT"] || "").to_s
+      r
+    end
+  end
+end

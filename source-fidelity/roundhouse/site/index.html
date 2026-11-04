@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Roundhouse</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body class="landing">
+  <main class="landing-main">
+    <img src="logo-on-dark.svg" alt="Roundhouse logo" class="logo">
+    <h1>Roundhouse</h1>
+    <p class="tagline">Rails is the specification; deployment is a build flag.</p>
+
+    <p class="blurb">
+      Roundhouse ingests a Ruby on Rails application into a typed intermediate
+      representation and emits equivalent projects in C#, Crystal, Elixir, Go,
+      Kotlin, Python, Rust, Swift, and TypeScript — plus a Ruby round-trip
+      that runs under CRuby, JRuby, or Spinel. Four real apps demonstrate it,
+      each proving something different:
+    </p>
+
+    <div class="app-cards">
+      <a class="app-card blog" href="apps/blog.html">
+        <h2>Blog</h2>
+        <div class="role">Correctness</div>
+        <p>The reference app, small enough to support fully. It's the
+          conformance oracle: every target compiles clean, passes its tests,
+          and matches live Rails.</p>
+        <span class="go">Reference app →</span>
+      </a>
+      <a class="app-card lobsters" href="apps/lobsters.html">
+        <h2>Lobsters</h2>
+        <div class="role">Real-world coverage</div>
+        <p>A real production app — and Ruby's own YJIT benchmark. The proving
+          lane: most of it transpiles, and the gaps show up as live
+          diagnostics.</p>
+        <span class="go">Proving lane →</span>
+      </a>
+      <a class="app-card campfire" href="apps/campfire.html">
+        <h2>Campfire</h2>
+        <div class="role">Live and interactive</div>
+        <p>Basecamp's chat app — the one that pushes instead of just
+          responding. Action Cable channels, model-side broadcasts,
+          turbo_stream: the axis the other three don't test.</p>
+        <span class="go">The live axis →</span>
+      </a>
+      <a class="app-card mastodon" href="apps/mastodon.html">
+        <h2>Mastodon</h2>
+        <div class="role">Scale</div>
+        <p>The moonshot — one of the largest Rails apps, its whole-app types
+          analyzed in ~2s in a browser tab. Work in progress, with the gaps
+          shown.</p>
+        <span class="go">The moonshot →</span>
+      </a>
+    </div>
+
+    <nav class="landing-nav">
+      <a href="docs/guide/">Guide</a>
+      <a href="playground/">Playground</a>
+      <a href="ide/">IDE</a>
+      <a href="studio/">Studio</a>
+      <a href="fractal/">Fractal</a>
+      <a href="browse/">Browse output</a>
+      <a href="bench/">Benchmarks</a>
+      <a href="https://github.com/rubys/roundhouse">GitHub</a>
+    </nav>
+
+    <section class="overview">
+      <p>
+        The emitted projects compile clean and pass their tests. Correctness
+        is a conformance oracle: the same URL fetched from Rails and from
+        each target must produce the same response — enforced by emitted
+        unit tests, a differential compare gate against live Rails, and
+        end-to-end browser tests.
+      </p>
+      <p>
+        No annotations are involved: <code>has_many :comments</code> is a
+        type declaration, and whole-program inference recovers the types
+        Rails' conventions already imply. That inference is a product in its
+        own right — an LSP server, an MCP server, and the
+        <a href="ide/">in-browser IDE</a> answer <em>what's the type here,
+        can this be nil?</em> on unannotated Rails apps, with no app boot
+        and no database: queries answer in milliseconds, and a whole-app
+        pass over Mastodon takes about two seconds, in a browser tab. Point
+        the IDE at a checkout of your own (<em>open folder…</em>) and the
+        same pass runs over it — read from your disk, never uploaded.
+      </p>
+      <p>
+        It's also the performance story: every decision that can't differ
+        between requests is made once, at transpile time. The emitted Ruby
+        serves ~10× the requests of stock Rails on the same CRuby+YJIT,
+        ~74× under JRuby, and the compiled targets go further — ratios from
+        a CPU-bound microbenchmark; caveats in the posts below.
+      </p>
+      <ul class="reading">
+        <li><a href="https://intertwingly.net/blog/2026/06/27/Conformance-vs-Comprehension.html">Conformance vs Comprehension</a> — the project and its oracle</li>
+        <li><a href="https://intertwingly.net/blog/2026/06/25/Live-Types-for-Rails.html">Live Types for Rails</a> — the inference as a live type checker</li>
+        <li><a href="https://intertwingly.net/blog/2026/07/06/An-IDE-You-Dont-Install.html">An IDE You Don't Install</a> — Mastodon analyzed in a browser tab</li>
+        <li><a href="https://intertwingly.net/blog/2026/06/11/The-Ruby-JRuby-Was-Built-to-Run.html">The Ruby JRuby Was Built to Run</a> — the 2×2 performance experiment</li>
+        <li><a href="https://intertwingly.net/blog/2026/05/25/Numbers-Without-Conclusions.html">Numbers Without Conclusions</a> — benchmark methodology and honest caveats</li>
+      </ul>
+    </section>
+
+    <p class="footnote">
+      Successor to <a href="https://github.com/rubys/railcar">railcar</a>.
+      Dual-licensed MIT / Apache-2.0.
+    </p>
+  </main>
+</body>
+</html>

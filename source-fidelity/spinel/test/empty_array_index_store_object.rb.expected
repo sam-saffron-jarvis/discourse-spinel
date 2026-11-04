@@ -1,0 +1,10 @@
+4
+42
+7
+true
+8
+[42, nil, nil, 8]
+3
+5
+1
+index -10 too small for array; minimum: -4

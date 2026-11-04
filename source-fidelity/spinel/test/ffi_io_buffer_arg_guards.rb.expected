@@ -1,0 +1,10 @@
+1
+0
+TypeError: no implicit conversion of Frame into a C pointer
+9
+LockedError: Buffer is locked!
+7
+false
+true
+true
+false

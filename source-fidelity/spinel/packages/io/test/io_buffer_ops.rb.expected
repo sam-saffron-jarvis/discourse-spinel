@@ -1,0 +1,36 @@
+== new/flags ==
+default size: => 65536
+small flags: => "#<IO::Buffer 0xX+8 INTERNAL>"
+null: => [true, true, true, "#<IO::Buffer 0xX+0 NULL>"]
+explicit: => "#<IO::Buffer 0xX+8 INTERNAL READONLY>"
+bad flags: IO::Buffer::AllocationError: Could not allocate buffer!
+external: IO::Buffer::AllocationError: Could not allocate buffer!
+neg size: ArgumentError: Size can't be negative!
+ro write: IO::Buffer::AccessError: Buffer is not writable!
+ro set_string: IO::Buffer::AccessError: Buffer is not writable!
+ro clear: IO::Buffer::AccessError: Buffer is not writable!
+== resize ==
+grow: => [65, 66, 67, 68, 69, 70, 71, 72, 0, 0, 0, 0]
+shrink: => "ABCD"
+zero: => [0, true]
+regrow: => [0, 0, 0, 0]
+neg: ArgumentError: Size can't be negative!
+== clear ==
+clear v: => "AAAAAAAA"
+clear v,o: => "AAAAABBB"
+clear v,o,l: => "AACCABBB"
+clear wrap: => "D"
+clear -1: => [255]
+clear oob: ArgumentError: Specified offset+length is bigger than the buffer size!
+self: => true
+== copy ==
+copy: => [8, "ABCDEFGH"]
+copy o: => [0, 0, 65, 66, 67, 68, 69, 70, 71, 72, 0, 0]
+copy o,l: => [0, 65, 66, 67, 0, 0, 0, 0]
+copy o,l,so: => [0, 69, 70, 71, 0, 0, 0, 0]
+overlap: => "ABABCDGH"
+dst oob: ArgumentError: Specified offset+length is bigger than the buffer size!
+src oob: ArgumentError: The computed source range exceeds the size of the source buffer!
+string src: TypeError: wrong argument type String (expected IO::Buffer)
+int src: TypeError: wrong argument type Integer (expected IO::Buffer)
+ro dst: IO::Buffer::AccessError: Buffer is not writable!

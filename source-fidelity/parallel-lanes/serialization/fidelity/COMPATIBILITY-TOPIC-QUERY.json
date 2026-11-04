@@ -1,0 +1,215 @@
+{
+  "ticket": "019-source-fidelity-topic-query",
+  "status": "NOT PASSED: strict anonymous compat/Rails parity and pure YAML/default dependency proof hold; original native settings declaration/effects/User closure remains incomplete",
+  "scope": "Audited PARTIAL TopicQuery security expression, NOT complete default_results, latest_results, create_list, list_latest, or F2",
+  "original_executable_projection": [
+    {
+      "source": "lib/topic_query.rb:834",
+      "selection": "result = Topic.includes(:category)"
+    },
+    {
+      "source": "lib/topic_query.rb:890-895",
+      "selection": "original all_listable_topics assignment / Guardian composition"
+    },
+    {
+      "source": "lib/topic_query.rb:905",
+      "selection": "original non-PM merge assignment"
+    },
+    {
+      "source": "lib/guardian/topic_guardian.rb:272-286",
+      "selection": "entire filter_allowed_categories method, including admin setting send and references"
+    },
+    {
+      "source": "lib/guardian/category_guardian.rb:56-67",
+      "selection": "entire secure_category_ids and allowed_category_ids methods"
+    },
+    {
+      "source": "lib/guardian.rb:122-125,140-142,40-46,80-82",
+      "selection": "original initialization/admin predicate and AnonymousUser blank/admin/secure IDs"
+    }
+  ],
+  "projection_policy": {
+    "tool": "tools/project_topic_query.rb",
+    "complete_files": "SOURCE_LOCK.json: 36 complete byte-identical pinned inputs; bounded complete settings dependencies and boot inventories are diagnostic-only, not native security inputs",
+    "spans": "per-run input/projection-map.json: original byte/line offsets and per-span SHA256",
+    "omissions": "Explicit declaration/method projection: all unselected bytes become spaces. Partial TopicQuery method retains its original signature and only the three selected statements. Test assigns Guardian via original attr_accessor. No full original initializer or other default_results behavior claimed.",
+    "oracle": "Separate unchanged full Rails boot; evaluates the same byte-audited three original statements on a fully initialized original TopicQuery. Does NOT redefine original default_results or permission methods.",
+    "application_body_rewrites": [],
+    "unsupported_ruby_transforms": "No new unsupported-Ruby application transform. Existing scope/Concern/attr macros use Roundhouse expansion and retain source locations. Dynamic settings macros remain refused, not replaced."
+  },
+  "reusable_runtime_changes": [
+    {
+      "owner": "roundhouse/runtime/ruby/active_record/relation.rb + relation.rbs",
+      "contract": "Copy-on-write references state survives same-table filter-scope merge; includes/references meet at SQL render across method boundaries; preload remains separate; supported direct belongs_to uses filtering outer join plus existing batched preload"
+    },
+    {
+      "owner": "roundhouse/src/lower/model_to_library/reference_joins.rs",
+      "contract": "Declaration-derived association join metadata reuses existing AssocRegistry; shared across Ruby-family targets; explicit refusal for collection/polymorphic/scoped-target/alias-tracker shapes"
+    },
+    {
+      "owner": "roundhouse/runtime/ruby/active_record/relation.rb",
+      "contract": "Positional IN (?) arrays are quoted lists; empty positional/named arrays become NULL, not quoted Ruby arrays or empty SQL"
+    },
+    {
+      "owner": "roundhouse/src/lower/projected_reads.rs + schema/slot/hydration seams",
+      "contract": "Separate possible result-row NULL from physical NOT NULL constraints. Raw FROM read shapes widen non-primary-key Row/model scalar slots; storage readers/writers preserve nil. Physical Column::nullable, schema DDL and constraints are unchanged. Unknown FROM receivers conservatively widen possible model tables."
+    },
+    {
+      "owner": "roundhouse/src/ingest/class_macros.rs",
+      "contract": "Literal String#sub(pattern, replacement).to_sym declaration names, scalar captures and optional arguments; first substitution only, no replacement-backreference guessing, no mutable sub-result folding. This does NOT expand the complete original settings declaration."
+    },
+    {
+      "owner": "roundhouse/runtime/ruby/hash_transform_keys.rb + shared symbolize_keys/config_reader lowering",
+      "contract": "Destructive recursive String-key conversion on proven Hash receivers, preserving aliases, delete/store collision order, nested arrays and primitive keys. Conservative transitive wrapper/alias key-evidence invalidation. Custom key conversion explicitly refuses. Native YAML-produced open containers execute; nested statically String-keyed literal rekeying remains an explicit Spinel TypeError boundary."
+    },
+    {
+      "owner": "roundhouse/src/ingest/class_macros.rs + existing app_extension_calls resolver",
+      "contract": "Guarded ordinary app-module declaration lookup on one stateless root-class opening, otherwise only declaration calls, and a sole stateless top-level module, installation-order checked and immutable captures only. Inheritance/mixins/class state, class/module callbacks, core-class reopens, unrelated load observations, lexical state, other uses/reopens, mutable captures and runtime evaluation before extend remain refused. CRuby preserves original replay for those cases, including a pinned pre-declaration reader observation. Full stateful SiteSettingExtension/model declarations are NOT covered."
+    },
+    {
+      "owner": "roundhouse/src/emit/ruby/expr.rs + library.rs + shared Expr provenance flag",
+      "contract": "Plain Hash typed Symbol keys retain identity for reads/writes/fetch/key?/delete/dig even when inferred storage keys are String. Only proven request params normalize; explicit params provenance survives the view/controller bridge. Original DefaultsProvider/registry integration exposed this bug without any application-body rewrite."
+    },
+    {
+      "owner": "roundhouse/src/ingest/class_macros.rs + shared Expr DeclarationStep + Ruby-family class-body ordering",
+      "contract": "Existing class-owned/inherited declaration captures retain String allocation identity (aliases share; equal text and repeated loop evaluations do not merge). Folded String-producing operations keep mutable intent. Explicit call-site/ordinal metadata orders runtime capture evaluation exactly once at each declaration while retaining original definer spans. Native fixed method-presence/install timing, model-owned runtime definers and full stateful SiteSettingExtension remain unproved; ordinary-module guards are unchanged. Targets without ordered class execution explicitly refuse capture initializers."
+    },
+    {
+      "owner": "roundhouse/src/ingest/library_class.rs + LibraryClass source-initializer predicate + Ruby-family ordering + Spinel native-syntax admission",
+      "contract": "Preserve direct native @@ constructor initializer expressions/spans and execute them once in source order with constants and ordinary class-side calls. Verified native lexical module ownership, inherited shared storage, aliases and subclass reassignment. Synthetic mattr/cattr seed policy, unpositioned include/default guards and runtime defined? refusal remain separate. This advances the actual original full-registry dependency beyond its non-literal initializer ingest failure, not dynamic declaration/getter support."
+    },
+    {
+      "owner": "roundhouse/src/ingest/class_macros.rs + existing core-class method audit",
+      "contract": "Single root-owned data-only declaration contexts answer respond_to? from staged source/public-private methods and prior successful definitions, never the native final table. Primitive root state events retain explicit ordinals; literal class-self ivar reflection canonicalizes to typed Ivar/Assign only without overrides and outside nested blocks. Opaque/callback/core-uncertain/inherited/namespaced/composite-literal capture cases remain refused. Native duplicate/false registration, class-constructor capture, cache identity and instance shortcuts execute; full original filtered aliases/module/model/runtime-name installation remain unproved."
+    }
+  ],
+  "owning_regressions": [
+    "roundhouse/tests/referenced_includes_merge.rs: emitted CRuby execution",
+    "roundhouse/tests/referenced_includes_merge.rs: separately enabled native Spinel execution with emitted signatures on SQLite memory",
+    "framework runtime fully-typed invariant and Ruby unit suite",
+    "existing make verify: fresh original018 native/compat/actual-Rails proof remains passing",
+    "roundhouse/tests/projected_null_reads.rs: emitted CRuby and separately enabled native scalar NULL/false/zero/empty/value reads, lazy cache, and actual SQLite-memory NOT NULL rejection",
+    "roundhouse/tests/extended_declaration_macros.rs: emitted/native immutable captures and explicit effect/order/other-use/runtime-capture refusal cases",
+    "roundhouse/tests/plain_typed_symbol_hash_key.rs: emitted/native plain Hash identity; existing plain/untyped keys, params, view bindings and session regressions preserved",
+    "roundhouse/tests/declaration_capture_runtime.rs: actual original Ruby, same lowered Spinel Ruby under CRuby, native capture alias/mutation/loop allocation and once-only per-call state; inherited foreign-file provenance, model refusal and non-Ruby-family refusal controls",
+    "roundhouse/tests/runtime_class_variable_initializers.rs: original CRuby, emitted Ruby and actual native constructor/order/shared storage/module lexical owner; existing class-state/mattr/alias regressions and unpositioned-default refusal",
+    "roundhouse/tests/guarded_declaration_state.rs: original/same-lowered CRuby plus native guard/state and class-constructor/cache/shortcut controls; private visibility, reflection-override preservation and observer/core/opaque/composite refusal controls",
+    "roundhouse/tests/literal_declaration_callbacks.rs: original/lowered/native current-frame block restore, duplicate callback skip, fixed yielded class versus inherited getter receiver;15effect/syntax/lifecycle refusal inputs"
+  ],
+  "actual_partial_observations": {
+    "anonymous_input": "Guardian.new(nil); original AnonymousUser fallback, no fake permission object",
+    "live_rows": "Five nonempty live rows; compat and actual Rails values agree on those rows",
+    "derived_cases": "13 SELECT-only inputs; seven returned IDs; strict compat/Rails values/types/NULL now agree, including case107 nil; NULL/dangling category associations remain loaded nil; restricted case111 excluded",
+    "negative_control": "Actually execute wrong TEST consumer omitting category filtering under CRuby. Both ID-list and full strict-record comparators reject leaked restricted case111 against the strictly matching Rails baseline. NOT a native negative control.",
+    "identity_admin": "Actual Rails separately executes anonymous, real non-admin and real admin identities and reads the real setting. User callbacks/plugins remain enabled. These authenticated/admin results are Rails-only, NOT compat/native support.",
+    "laziness": "One real permission-discovery query at composition; no topic materialization until terminal; permission/relation/association memoization checked",
+    "preload_difference": "Compat two queries (filtering parent join + batched category preload), Rails one joined eager-hydration query. Not asserted equivalent. Full joined-row hydration remains a contract gap.",
+    "same_lowered_input": "Hash-checked identical emitted Ruby attempted under Spinel and executed under CRuby, except existing platform pg_driver shim. Native compilation refuses; no original-path ELF or direct-PG execution claim.",
+    "cold_settings": "Actual Rails only: evict process-local current settings memoization, invoke original getter, preserve original refresh/plugin/callback/logging/cache effects; filter effects by original getter and test-invoker stack frames. This is neither a setting mutation nor a native support claim."
+  },
+  "precise_blockers": [
+    {
+      "source": "lib/guardian/topic_guardian.rb:273",
+      "failure": "Native NoMethodError/refusal: SiteSetting.suppress_secured_categories_from_admin has no expanded class method",
+      "owning_declaration": "app/models/site_setting.rb:83,109; lib/site_setting_extension.rb:243-249,1143-1189,1318+",
+      "measured_full_source_repro": "Separate diagnostic emits17 complete original Ruby inputs plus2 resources (332105 bytes), with byte/hash audit before/after. Original config/application.rb and005-site_settings.rb remain boot inventory ONLY, never partial bootstrap inputs. First full-registry ingest failure at @@register_names = Set.new is fixed through generic native class-variable initialization/order. Output still reports original computed-name define_singleton_method1143 and registry runtime guards; it is NEVER executed or accepted with warnings. Guarded root declaration support now emits actual original unfiltered registry getters/state at original25/29; first filtered-register failures advance to singleton_class.alias_method at original84+; SSE1143 remains refused.",
+      "next_contract": "String capture identity and explicit declaration execution-site ordering are fixed for the existing class-owned/inherited subset. Continue actual MODEL/module extension lookup, source lexical scope, callbacks/hooks, runtime YAML-driven declaration/type/default/provider/cache/plugin closure. Do not substitute a settings getter or bake in false."
+    },
+    {
+      "source": "lib/site_setting_extension.rb:1165,595-680,1043-1047; app/models/site_setting.rb:441; app/models/theme.rb:332-340; app/models/site.rb:310-314",
+      "failure": "The ORIGINAL cold getter invokes real refresh/cache invalidation and MessageBus publication. Actual Rails evidence records getter-attributed DEL/EVALSHA and logging on owned disposable Valkey. Native/compat original settings effects remain unexecuted, not forbidden by the superseding scoped authorization.",
+      "next_contract": "Execute the actual native/compat getter in separately owned guarded disposable fixtures when declaration/body typing closes. Reject shared/unknown endpoints before dispatch and prove actual effects/order/cleanup. No permission pause, callback suppression, warm snapshots, omitted plugins or getter stubs."
+    },
+    {
+      "source": "Original computed-name singleton definitions and their receiver-bound self",
+      "failure": "A candidate generic typed Proc-store strategy passes simple captures but native stored capturing Proc instance_exec/instance_eval refuses self rebinding. Inherited define_singleton_method runs with the receiving subclass as self in the actual CRuby control. No plain Proc.call replacement is installed.",
+      "evidence": "fidelity/build/dynamic-declaration-capability-20261103-144506/self-rebinding/REPORT.md; current compiler86eb801ad, preserved native NotImplementedError and frozen-mode original controls",
+      "next_contract": "Continue honest source-backed declaration/lifecycle/alias handling or implement an equivalent reusable typed lowering; do not replace original getters or suppress callbacks/inheritance semantics."
+    }
+  ],
+  "additional_remaining_closure": [
+    "Original User secure_category_ids, group/category through associations, subqueries/or, applicable after_initialize and plugin behavior under compat/native",
+    "Empty allowed-category set branch needs a source-driven SELECT-only proof; current live unrestricted categories make it unreachable without generic scoped fixture context",
+    "Admin suppression=true branch not tested; live effective setting is false and was not mutated",
+    "Guardian anonymous?/authenticated? are outside the executed filter closure; typed present? delegation for an app class defining only blank? is an observed additional unsupported path, not silently counted as supported",
+    "Broader Rails merge semantics and joined-row eager hydration",
+    "Rest of default_results, latest_results, create_list, list_latest; original serializers/controller/document/browser",
+    "Measured runtime-name event boundary: runtime-name-install-boundary-20261103-191008 original controls pass, native literal-call/ARGV name consumers refuse undefined installed method. explicit-receiver-capture-capability-20261103-191723 original/native positive ABI only; a reusable typed runtime definition-event family must still preserve install-time presence, capture/self, aliases/visibility/callbacks and original resource/provider semantics. No original getter replaced."
+  ],
+  "safety": "Nov3 23:12 superseding run/NATIVE_COMPAT_SANDBOX_AUTHORIZATION.json permits native Spinel, same-lowered CRuby and separate actual Rails real cache/log writes ONLY in separately owned guarded disposable fixtures, with endpoint rejection/effects/order/cleanup proof. Earlier oracle-only scope is historical and superseded ONLY in that scope. PG5499/sharedValkey6399 remain protected/read-only; no external/public actions. No native/compat cache-service effects have yet executed.",
+  "gate": "make verify-topic-query always returns nonzero for the current incomplete proof, even after successful partial oracle observations. A successful018 rerun or future compile-only success cannot pass019.",
+  "resolved_contracts": [
+    {
+      "prior_failure": "Case107 physically NOT NULL boolean read from derived SQL NULL became false instead of nil",
+      "fix": "Lowering read-shape evidence widens Row/model storage types, not physical constraints; original fixture and all fields remain unchanged",
+      "evidence": "projected_null_reads emitted/native regressions and strict original-fragment CRuby/actual-Rails comparison"
+    },
+    {
+      "prior_failure": "Original-style filtered registry staging refused singleton_class.alias_method; a later native snapshot control returned original __callee__ rather than alias name",
+      "fix": "Guarded one-version same-run old/alias/new semantic snapshot IR, actual ordered native alias replay and narrowly proved duplicate handling; independently reproduced Spinel named-captured-alias callee fallback fixed in d4415155b",
+      "evidence": "staged-alias-before-20261103-165018; staged-alias-identity-20261103-170032; staged-alias-final-regressions.log; staged-alias-native-fixed.log (two consumers118.12s); staged-alias-spinel-focused; staged-alias-original-20261103-172634 diagnostic NEVER executed",
+      "limitation": "Actual full registry still refuses declaration-frame block_given?/yield callbacks. Missing replacement, alias chains/multiple aliases per version, preexisting source and lifecycle observers remain refused. No production settings/getter/plugin/security execution claim."
+    },
+    {
+      "prior_failure": "Actual original filtered registry body could not answer helper-frame block_given? or invoke the original reviewable-types yield(self) declaration callback",
+      "fix": "Guarded root literal declaration-only callbacks use current-frame block presence, restored across nested helpers; bind yielded parameter to fixed declaring class while method self remains receiver-bound. Spinel ecc1813f0 separately fixes proven inherited literal reflective-send class-ivar specialization and source-defined class send ownership/liveness.",
+      "evidence": "declaration-callback-native-before; inherited-class-send-before-20261103-175429; declaration-callback-final-regressions.log (53passed/7ignored); declaration-callback-native-committed-spinel.log (callback47.08s plus two alias consumers92.91s); declaration-callback-invariant.log; inherited-class-send-spinel-focused (10native controls); declaration-callback-original-20261103-181446 (17original file audit; output NEVER executed)",
+      "limitation": "Actual reviewable_types_lookup original callback emits, but Plugin::Instance original1037 retains dynamic registry factory runtime edges and original helper refusals. SSE1143, stateful model/YAML/production plugin/settings/User/security closure remain unproved; no native/compat fixture writes."
+    },
+    {
+      "prior_failure": "Pure original-style extended(receiver) lifecycle preserved in output, but following class/module-body initializer @events.dup had no known ivar type; empty and seeded traces both refused",
+      "fix": "Class-body initializers type as class-side and retype using nil-widened storage joins of original initializer and class-receiver writes only. Preserve callback nil/type-changing writes and exclude instance state; do not assume pre-callback initializer truthiness. Existing runtime extension hook remains actual source execution.",
+      "evidence": "extension-lifecycle-first-default.log and first-native.log; extension-lifecycle-typed-event-default.log/native.log; extension-lifecycle-final-regressions.log (55passed/8ignored); extension-lifecycle-empty-and-joined.log; extension-lifecycle-native-storage-join.log (two native consumers87.10s); extension-lifecycle-invariant.log; extension-lifecycle-original-20261103-185523 (original hook/extend/getter refusal retained; diagnostic output NEVER executed)",
+      "limitation": "Root class/module lifecycle prerequisite only. Actual SiteSetting AR-model bootstrap/GlobalSetting config/runtime resource names/declaration/default/provider/plugin/cache/User/security closure not executed or claimed. Ordinary stateful module/model declaration guards unchanged."
+    },
+    {
+      "prior_failure": "Actual AR-model extension bootstrap had no owning emitted/native proof separate from whole dynamic settings service",
+      "fix": "Existing real runtime extend/extended replay installs an extension protected method before its callback invokes it by send; following model-body initializer observes callback once. No lifecycle stub, omission or new dispatcher.",
+      "evidence": "model-extension-bootstrap-20261103-190049: actual ActiveRecord gem original reference, same lowered CRuby/native PASS; model-extension-bootstrap-owning-default.log3passed/1ignored; model-extension-bootstrap-owning-native.log three native lifecycle consumers123.34s",
+      "limitation": "Synthetic bootstrap owning fixture only; actual GlobalSetting configuration/resource-dependent getter names and SiteSetting model/provider/plugin/cache/User/security boot remain unproved. No database or cache operations in this control."
+    },
+    {
+      "prior_failure": "A guarded declaration captured self as a body SelfRef, incorrectly returning the subclass from an inherited captured-owner getter",
+      "fix": "Guarded explicit and yielded declaration class captures share an ordered self slot; method-body self remains dynamic. Constant-added observers remain refused. Ordinary module/model guards unchanged.",
+      "evidence": "declaration-self-capture-before.log; declaration-self-capture-final-default.log58passed/9ignored; declaration-self-capture-shared-native.log46.97s and47.18s; declaration-self-capture-invariant.log; declaration-self-original diagnostic NEVER executed",
+      "limitation": "Separate direct class-method return-self RBS/ABI gap preserved in declaration-self-capture-native.log and declaration-self-return-abi-before; isolated self.name receiver control does not claim that return shape works. Full runtime names/settings/native019 still unproved."
+    },
+    {
+      "prior_failure": "Restored stronger captured-self control reached C compilation failure because class-method return self was advertised as an instance pointer",
+      "fix": "Existing all-class-object return harvest now accepts class-receiver self, yielding Class[C]/singleton(C) signatures. Instance-method self remains an instance; stronger direct return/inherited identity and instance-self controls restored.",
+      "evidence": "declaration-self-capture-native.log and declaration-self-return-abi-before preserve original C/signature failure; declaration-self-return-final-default.log62passed/9ignored; declaration-self-return-final-native.log46.82s; declaration-self-return-invariant.log",
+      "limitation": "All-class-object tails only, preserving existing mixed-return/off-tail boundary. Actual runtime method installation and native settings/security remain unproved."
+    }
+  ],
+  "pure_dependency_proof": {
+    "command": "make verify-settings-pure",
+    "source": "Original complete locked YamlLoader projected with all methods/private visibility; original pure DefaultsProvider initialize/load_setting/all_clean/has_setting?/has_key? and constants only",
+    "execution": "Identical emitted Ruby under CRuby and Spinel; unlowered original projection using actual bundled ActiveSupport/Psych library reference; zero network connections in all three traces; deliberately wrong native expectation rejects",
+    "checks": "false/zero/empty/nil/types, aliases, category/value/metadata yield, missing-default and validator-conflict errors, locale overrides/fallback, copied defaults and membership; projection/source/emitted hashes checked before/after",
+    "limitation": "Synthetic pure fixtures, NOT production settings snapshots or getter boot. Separate pure modifier/default-provider composition target exercises additional original code; production service/plugin/User/declaration/cache and019 closure remain unproved."
+  },
+  "pure_modifier_dependency_proof": {
+    "command": "make verify-plugin-pure",
+    "source": "Original DiscoursePluginRegistry.register_modifier/apply_modifier; actual Plugin::Instance initialize/configurable?/enabled?/enabled_site_setting; DefaultsProvider initialize/load_setting/all_clean/all/activate/deactivate; original upcoming metadata getter borrowed through generic instance_method macro by TEST consumer",
+    "plugin_scope": "Real unconfigured fixture plugin, no enabled? stub. Configured and disabled production plugin behavior unproved; the real enabled_site_setting API drives explicit native/reference SiteSetting NameError controls. Original SiteSetting class declaration is analysis-only, not loaded; no getter fabricated.",
+    "metadata_scope": "Synthetic in-memory metadata on a TEST consumer borrowing the exact original metadata method, not a SiteSetting instance or value getter; no extend event/hook is performed or suppressed. No production snapshots, cache warms or settings values.",
+    "execution": "Identical emitted Ruby native/CRuby and unlowered original reference; callbacks/length snapshot/forwarded args/mutation/replacement/exceptions, locale/default types, activation/deactivation/opt-out and modifier order; zero connections and one native execve; wrong native expectation rejected",
+    "limitation": "Not actual installed plugin startup, configured/disabled plugins, actual SiteSetting service/declaration/getter or ticket019 native security acceptance."
+  },
+  "source_runtime_extension_checkpoint": {
+    "whole_original_code_files": 21,
+    "original_resource_files": 3,
+    "bytes": 406327,
+    "additional_whole_pinned_dependencies": [
+      "lib/upcoming_changes.rb",
+      "lib/discourse.rb",
+      "app/models/theme_site_setting.rb",
+      "lib/plugin/metadata.rb",
+      "config/official_plugins.json"
+    ],
+    "shared_ir": "Actual SiteSetting extension event and SSE owner/storage typing; original callback and ordered source effects retained. Original themeable reader Hash[Symbol,bool] from registration write; callback Class argument and load_settings String argument inferred.",
+    "original_getter_unknown_nodes": 51,
+    "remaining": "Original SSE1143 optional argument/return-frame/current/theme/plugin/YAML-yield contracts and full dependency closure; original Discourse conditional_definition212 also remains unsupported.",
+    "limitation": "Diagnostic-only output NEVER executed. Reduced original/lowered/native controls are prerequisites, NOT native getter/security/PG/019 acceptance."
+  }
+}

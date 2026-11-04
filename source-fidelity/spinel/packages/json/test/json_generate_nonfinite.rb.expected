@@ -1,0 +1,4 @@
+JSON::GeneratorError: Infinity not allowed in JSON
+JSON::GeneratorError: -Infinity not allowed in JSON
+JSON::GeneratorError
+"[1.5,-0.25]"

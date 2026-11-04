@@ -1,0 +1,1160 @@
+//! ActiveSupport blank-predicate lowering: ground `blank?` /
+//! `present?` / `presence` by the receiver's *static* type so every
+//! target compiles the site without an `Object` monkey-patch.
+//!
+//! ActiveSupport ships these as core_ext reopens of `Object`/`String`
+//! (`respond_to?(:empty?) ? !!empty? : !self`) — a shape only the
+//! CRuby overlay can host. Every other target either can't reopen
+//! builtins (transpiled runtimes) or can't dispatch a user-defined
+//! method on an untyped value at all (spinel AOT). The types the
+//! analyzer already stamped make the dynamic dispatch unnecessary at
+//! almost every site, so this pass rewrites, per receiver type:
+//!
+//!   String        blank? → `(r || "").strip.empty?` (see below)
+//!   Array/Hash    blank? → `r.empty?`
+//!   Class w/ own  left as-is when the app class defines the
+//!   definition    predicate itself; grounded via `empty?` when it
+//!                 defines that (`ActiveRecord::Relation` included)
+//!   other Class / blank? → `false` (a non-nil value with no `empty?`
+//!   Int/Float/    is never blank — matches AS, where `0` and
+//!   Sym/Time      `Time.now` are present)
+//!   Bool          blank? → `!r` (`false` is blank)
+//!   T | Nil       nil-check composed with the T grounding
+//!
+//! `present?` is the negation; `presence` is `blank? ? nil : r`
+//! (an `If` node), or just `r` where T is never blank.
+//!
+//! ## Why the String case strips first
+//!
+//! ActiveSupport's `String#blank?` is a whitespace match — the regex is
+//! `\A[[:space:]]*\z` — and not `empty?`, so `" ".blank?` is TRUE in
+//! Rails where a bare `empty?` answers false. campfire's bot API is the
+//! site that priced it: a boost posted with a body of three spaces was
+//! accepted and stored where Rails answers 422.
+//!
+//! `strip` rather than the regex because every target emitter carries
+//! it and a POSIX character class is not a shape every regex backend
+//! shares. The divergence that leaves is NON-ASCII whitespace: Ruby's
+//! `String#strip` takes ASCII space plus NUL, where `[[:space:]]` also
+//! takes U+00A0 and friends. No corpus app has one, and the targets
+//! disagree there among themselves anyway — Python's `.strip()` and
+//! JavaScript's `.trim()` do take them.
+//!
+//! The nil guard is this `|| ""`, and it is already in the IR. A column
+//! typed `String` can still be nil once nullable hydration runs, and
+//! `nil.strip` would raise before any later wrap could answer. The
+//! guard sits on the value, so the form is `(r || "").strip.empty?`.
+//! Emitters print that node. Ruby does not wrap `empty?` again on the
+//! way out.
+//!
+//! View conditions have no receiver type, so they do not call this
+//! string form. `blank?` / `present?` there become `(recv || "").empty?`
+//! — the same nil guard, without `strip`, because an array, hash, or
+//! relation answers `blank?` with `empty?` and has no `strip`. `any?`,
+//! `empty?` and `none?` stay a collection `empty?`. This pass still
+//! does not walk view bodies. The other view emitters match the
+//! original predicate names.
+//!
+//! Residue policy: a receiver the pass can't ground — `untyped`, an
+//! open inference var, a multi-variant union — keeps its dynamic call
+//! and gets a `blank_unlowered` warning naming the site. That list is
+//! the ledger: on CRuby the overlay still serves the call at runtime;
+//! on AOT/strict targets each entry is a named per-target gap instead
+//! of a silent compile error. Same policy when a form that must
+//! re-evaluate (or drop) the receiver meets a receiver with effects:
+//! skip and report rather than change evaluation order.
+//!
+//! Test-module and fixture bodies are not walked (they run on CRuby
+//! where the overlay serves the dynamic call); extendable when a
+//! strict-target test lane needs it. View bodies are not walked
+//! either — see the note in [`apply_blank_lowering`].
+
+use crate::app::App;
+use crate::diagnostic::{Diagnostic, DiagnosticKind};
+use crate::expr::{Expr, ExprNode, LValue, Literal};
+use crate::ident::{Symbol, VarId};
+use crate::ty::Ty;
+use crate::det::HashSet;
+
+/// Rewrite blank-predicate sends across every typed body in the app.
+/// Runs after `Analyzer::analyze` (receiver types must be stamped) and
+/// before any emitter. Returns the residue diagnostics — sites left as
+/// dynamic dispatch, with the reason.
+pub fn apply_blank_lowering(app: &mut App) -> Vec<Diagnostic> {
+    let defs = AppDefinitions::collect(app);
+    let mut diags = Vec::new();
+
+    // View bodies are deliberately NOT walked (`for_each_hook_body`
+    // excludes them). `view_to_library::predicates` builds
+    // `(recv || "").empty?` for `blank?` / `present?` with no `strip`:
+    // a template receiver is untyped, and `strip` on an array raises.
+    // The python/rust view emitters still match the ORIGINAL names;
+    // rewriting under them breaks the ones with closed vocabularies
+    // (python's unemittable-cond fallback is a silent `False`; the
+    // flash-notice smoke caught it).
+    super::for_each_hook_body(app, &mut |body| {
+        walk(body, &received_vars(body), &defs, &mut diags);
+    });
+
+    // TEST BODIES TOO, asked for by name — the widening
+    // `for_each_test_body` exists to make reviewable.
+    //
+    // campfire's `sign_in` helper ends
+    // `assert cookies[:session_token].present?`, and that site reaches
+    // roughly twenty controller test files through their `setup`. Left
+    // dynamic it is `undefined method 'present?' for an instance of
+    // String` on every one of them — 58 of the spinel suite lane's 288
+    // tests, all inside the helper that gates every authenticated
+    // request, so the tests behind it had never run at all.
+    //
+    // The receiver types in a test body are the ones the analyzer
+    // already stamped, so this grounds through exactly the same rules as
+    // an app body; there is no test-specific vocabulary here. On CRuby
+    // the overlay served these already and the rewrite is neutral — it
+    // is the AOT and strict targets that could not dispatch them.
+    super::for_each_test_body(app, &mut |body| {
+        walk(body, &received_vars(body), &defs, &mut diags);
+    });
+
+    diags
+}
+
+/// Ground the blank predicates in ONE already-typed body.
+///
+/// The app-wide pass above cannot serve test bodies: a test body is
+/// typed by `lower::test_module_to_library`, which runs at EMIT time
+/// against a registry it builds itself (fixture helpers, route
+/// helpers, the Minitest surface), so when `apply_blank_lowering` runs
+/// every receiver in a test body is still `Untyped` and every site can
+/// only be declined. Walking them there produced 34 honest declines
+/// and not one grounding. This entry point is how the test lowering
+/// asks the same question at the point where the answer exists.
+///
+/// Diagnostics go to the emit-time sink, the way every other lowering
+/// that runs this late reports (`lower::time_current`,
+/// `view_to_library`).
+pub(crate) fn ground_body(body: &mut Expr, defs: &AppDefinitions) -> bool {
+    let mut diags = Vec::new();
+    let changed = walk(body, &received_vars(body), defs, &mut diags);
+    for d in diags {
+        crate::emit::diagnostics::push(d);
+    }
+    changed
+}
+
+/// Ground the predicates in the VALUE positions of one lowered,
+/// already-typed jbuilder body (`json.note(widget.note.presence ||
+/// "none")`).
+///
+/// [`apply_blank_lowering`] walks no view body, so a predicate in a
+/// jbuilder value stayed a dynamic call: on CRuby the overlay serves
+/// it, on Spinel it raised `undefined method 'presence' for nil`. The
+/// grounding is the one every app body gets, `Runtime` arm included,
+/// so an untyped receiver becomes `ActiveSupport.presence(x)`.
+///
+/// Everything inside a value counts, the condition of a ternary or an
+/// `if` there included (`json.flag(note.present? ? "y" : "n")`): the
+/// grounded predicate answers a Boolean, which any condition takes.
+/// Template-level `if` / `unless` conditions are grounded the same way:
+/// jbuilder never runs the ERB view-condition rewrite
+/// (`view_to_library::predicates`), and Spinel has no `String#present?`
+/// / `NilClass#present?`, so leaving the call dynamic is a NameError.
+pub(crate) fn ground_jbuilder_values(body: &mut Expr, defs: &AppDefinitions) -> bool {
+    fn walk(
+        expr: &mut Expr,
+        in_value: bool,
+        received: &HashSet<VarId>,
+        defs: &AppDefinitions,
+        diags: &mut Vec<Diagnostic>,
+    ) -> bool {
+        if !in_value {
+            match &mut *expr.node {
+                ExprNode::If { cond, then_branch, else_branch } => {
+                    // Condition is a value for blank predicates; branches
+                    // stay template-shaped (pairs / nested ifs).
+                    let cond_changed = walk(cond, true, received, defs, diags);
+                    let then_changed = walk(then_branch, false, received, defs, diags);
+                    let else_changed = walk(else_branch, false, received, defs, diags);
+                    return cond_changed || then_changed || else_changed;
+                }
+                ExprNode::Seq { exprs } => {
+                    let mut changed = false;
+                    for e in exprs {
+                        changed |= walk(e, false, received, defs, diags);
+                    }
+                    return changed;
+                }
+                _ => {}
+            }
+        }
+        let mut changed = false;
+        expr.node.for_each_child_mut(&mut |c| {
+            if walk(c, true, received, defs, diags) {
+                changed = true;
+            }
+        });
+        if try_rewrite(expr, received, defs, diags) {
+            changed = true;
+        }
+        changed
+    }
+    let mut diags = Vec::new();
+    let received = received_vars(body);
+    let changed = walk(body, false, &received, defs, &mut diags);
+    for d in diags {
+        crate::emit::diagnostics::push(d);
+    }
+    changed
+}
+
+/// Which classes define their own `blank?`/`present?`/`presence`
+/// (leave the dispatch alone) or an `empty?` (ground through it).
+/// Keyed by the class name's last segment — the same resolution
+/// `Ty::Class` receivers get elsewhere.
+pub(crate) struct AppDefinitions {
+    own_predicate: HashSet<String>,
+    own_empty: HashSet<String>,
+}
+
+impl AppDefinitions {
+    /// Same question asked of a class REGISTRY rather than an `App` —
+    /// which class defines its own blank-predicate (leave the dispatch
+    /// alone) or its own `empty?` (ground through it).
+    ///
+    /// The test lowering needs this because it has no `App`: it builds
+    /// its registry itself, at emit time, and that is also the first
+    /// moment a test body HAS types (see `ground_body`).
+    pub(crate) fn from_class_registry(
+        classes: &crate::det::HashMap<crate::ident::ClassId, crate::analyze::ClassInfo>,
+    ) -> Self {
+        let mut own_predicate = HashSet::default();
+        let mut own_empty = HashSet::default();
+        for (id, info) in classes {
+            let last = id.0.as_str().rsplit("::").next().unwrap_or(id.0.as_str()).to_string();
+            for name in info.instance_methods.keys() {
+                match name.as_str() {
+                    "blank?" | "present?" | "presence" => {
+                        own_predicate.insert(last.clone());
+                    }
+                    "empty?" => {
+                        own_empty.insert(last.clone());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Self { own_predicate, own_empty }
+    }
+
+    pub(crate) fn collect(app: &App) -> Self {
+        let mut own_predicate = HashSet::default();
+        let mut own_empty = HashSet::default();
+        let mut note = |class: &str, method: &str| {
+            let last = class.rsplit("::").next().unwrap_or(class).to_string();
+            match method {
+                "blank?" | "present?" | "presence" => {
+                    own_predicate.insert(last);
+                }
+                "empty?" => {
+                    own_empty.insert(last);
+                }
+                _ => {}
+            }
+        };
+        for model in &app.models {
+            for method in model.methods() {
+                note(model.name.0.as_str(), method.name.as_str());
+            }
+        }
+        for lc in &app.library_classes {
+            for method in &lc.methods {
+                note(lc.name.0.as_str(), method.name.as_str());
+            }
+        }
+        Self { own_predicate, own_empty }
+    }
+}
+
+/// How a receiver type grounds the predicate.
+enum Grounding {
+    /// `empty?` applies (strings and collections). `whitespace` marks
+    /// the STRING case, whose emptiness test is `strip.empty?` — see
+    /// the module header. A collection's is not: `[nil].blank?` is
+    /// false in Rails and `" ".blank?` is true, and one `empty_form`
+    /// for both would have to be wrong about one of them.
+    Container { nilable: bool, whitespace: bool },
+    /// Never blank when non-nil (numbers, symbols, times, plain
+    /// objects without `empty?`).
+    NeverBlank { nilable: bool },
+    /// Truthiness is the answer (`false` is blank).
+    BoolLike,
+    /// The receiver is statically nil.
+    AlwaysNil,
+    /// The class defines the predicate itself — normal dispatch.
+    OwnDispatch,
+    /// No static type to ground on: hand the value to the ruby-family
+    /// runtime predicate, which branches on the value instead. The
+    /// receiver becomes an argument, so it is evaluated exactly once —
+    /// that is why this arm needs no effect-free gate.
+    Runtime,
+    /// Can't ground; leave the call and report.
+    Skip(&'static str),
+}
+
+/// `params[:x]` / `@params["x"]` — one index read off the request
+/// parameters, whatever spelling the lowering has left it in.
+fn is_params_read(r: &Expr) -> bool {
+    let ExprNode::Send { recv: Some(inner), method, args, block: None, .. } = &*r.node else {
+        return false;
+    };
+    if method.as_str() != "[]" || args.len() != 1 {
+        return false;
+    }
+    match &*inner.node {
+        ExprNode::Ivar { name } => name.as_str() == "params",
+        ExprNode::Send { recv: None, method, args, block: None, .. } => {
+            method.as_str() == "params" && args.is_empty()
+        }
+        _ => false,
+    }
+}
+
+fn classify(ty: Option<&Ty>, defs: &AppDefinitions) -> Grounding {
+    use Grounding::*;
+    // An UNSTAMPED receiver is the same ignorance as an `untyped` one,
+    // and takes the same answer: the runtime predicate branches on the
+    // value. A has_many extension method's parameter is the case —
+    // campfire's `revise(granted: [], revoked: [])` reads
+    // `granted.present?`, its typer never runs over the extension's
+    // body, and a bare User handed in by the test had no `present?`
+    // arm on spinel ("undefined method 'present?' for an instance of
+    // User") where `ActiveSupport.present?` answers true, as Rails'
+    // `Object#present?` does for any record.
+    let Some(t) = ty else { return Runtime };
+    match t {
+        Ty::Str => Container { nilable: false, whitespace: true },
+        Ty::Array { .. } | Ty::Hash { .. } | Ty::Tuple { .. } => {
+            Container { nilable: false, whitespace: false }
+        }
+        Ty::Int | Ty::Float | Ty::Sym | Ty::Time | Ty::Record { .. } => {
+            NeverBlank { nilable: false }
+        }
+        Ty::Bool => BoolLike,
+        Ty::Nil => AlwaysNil,
+        Ty::Class { id, .. } => {
+            let raw = id.0.as_str();
+            let last = raw.rsplit("::").next().unwrap_or(raw);
+            if defs.own_predicate.contains(last) || raw == "ActionText::Content" {
+                // `ActionText::Content#blank?` is a RUNTIME method that
+                // tracks plain text, not markup. The app's class
+                // registry often misses it when a single runtime file
+                // is the fixture under test (framework_tests_ruby), and
+                // folding to NeverBlank made `content.blank?` emit as
+                // `false` — wrong for an empty `<div></div>` body.
+                OwnDispatch
+            } else if last == "Relation" || last == "Errors" || defs.own_empty.contains(last) {
+                // Registry classes the analyzer types but the app
+                // doesn't define: ActiveRecord::Relation and
+                // ActiveModel::Errors both answer `empty?` (the
+                // transpiled runtime's `errors` reader is an Array).
+                // Folding either to never-blank would render
+                // errors_for-style guards unconditionally.
+                Container { nilable: false, whitespace: false }
+            } else if last == "ParamValue" {
+                // Not a fold nor the method: a request value is a string, a hash or an array, and only the runtime predicate answers all three.
+                Runtime
+            } else {
+                NeverBlank { nilable: false }
+            }
+        }
+        Ty::Union { variants } => {
+            // `String | Content` used to fall through to Runtime, and
+            // `compact_blank` then rejected through `ActiveSupport.blank?`,
+            // which does not call `Content#blank?`. Any arm that owns the
+            // predicate keeps the dynamic path, including a nilable
+            // `Content | Nil`.
+            if variants.iter().any(|v| {
+                !matches!(v, Ty::Nil)
+                    && matches!(classify(Some(v), defs), OwnDispatch | Skip(_))
+            }) {
+                return Skip("union includes a class with its own predicate");
+            }
+            let has_nil = variants.iter().any(|v| matches!(v, Ty::Nil));
+            let non_nil: Vec<&Ty> = variants.iter().filter(|v| !matches!(v, Ty::Nil)).collect();
+            if !has_nil || non_nil.len() != 1 {
+                return Runtime;
+            }
+            match classify(Some(non_nil[0]), defs) {
+                Container { whitespace, .. } => Container { nilable: true, whitespace },
+                NeverBlank { .. } => NeverBlank { nilable: true },
+                // `Bool | Nil`: `!r` and `r ? true : nil` already
+                // treat nil and false alike, so plain BoolLike forms
+                // stay correct.
+                BoolLike => BoolLike,
+                AlwaysNil => AlwaysNil,
+                Runtime => Runtime,
+                OwnDispatch | Skip(_) => unreachable!("own-predicate unions returned above"),
+            }
+        }
+        Ty::Untyped | Ty::Var { .. } => Runtime,
+        _ => Runtime,
+    }
+}
+
+/// A receiver that is safe to re-evaluate or drop: an effect-free
+/// chain of reads. Zero-arg sends ride the analyzer's effect
+/// annotations — an AR write (`save`, `destroy`) carries effects and
+/// fails this test, a memoized column reader doesn't. Shared purity
+/// gate for the hook passes (blank grounding, update-kwargs inlining).
+pub(crate) fn is_effect_free_reader(e: &Expr) -> bool {
+    if !e.effects.is_pure() {
+        return false;
+    }
+    match &*e.node {
+        ExprNode::Lit { .. }
+        | ExprNode::Var { .. }
+        | ExprNode::Ivar { .. }
+        | ExprNode::SelfRef
+        | ExprNode::Const { .. } => true,
+        ExprNode::Send { recv, args, block: None, .. } if args.is_empty() => {
+            recv.as_ref().map_or(true, is_effect_free_reader)
+        }
+        // Indexed reads (`params[:preview]`, `cookies[COOKIE]`) are
+        // reads all the same — pure receiver + pure index re-evaluate
+        // safely. Other with-args sends stay conservative.
+        ExprNode::Send { recv, args, block: None, method, .. }
+            if method.as_str() == "[]" =>
+        {
+            recv.as_ref().map_or(true, is_effect_free_reader)
+                && args.iter().all(is_effect_free_reader)
+        }
+        _ => false,
+    }
+}
+
+/// The locals of one body whose first occurrence in source order is a read,
+/// not an assignment: a parameter (method or block), even one the body later
+/// reassigns (`raw = [raw] if raw.is_a?(String)`). An assignment binds its
+/// name after its value ran; a multiple assignment and an `||=` bind it too.
+fn received_vars(body: &Expr) -> HashSet<VarId> {
+    fn visit(e: &Expr, seen: &mut HashSet<VarId>, out: &mut HashSet<VarId>) {
+        match &*e.node {
+            ExprNode::Var { id, .. } => {
+                if seen.insert(*id) {
+                    out.insert(*id);
+                }
+            }
+            ExprNode::Assign { target, value } | ExprNode::OpAssign { target, value, .. } => {
+                visit(value, seen, out);
+                if let LValue::Var { id, .. } = target {
+                    seen.insert(*id);
+                }
+            }
+            ExprNode::MultiAssign { targets, value } => {
+                visit(value, seen, out);
+                for t in targets {
+                    if let LValue::Var { id, .. } = t {
+                        seen.insert(*id);
+                    }
+                }
+            }
+            _ => e.node.for_each_child(&mut |c| visit(c, seen, out)),
+        }
+    }
+    let mut out = HashSet::default();
+    visit(body, &mut HashSet::default(), &mut out);
+    out
+}
+
+fn walk(expr: &mut Expr, received: &HashSet<VarId>, defs: &AppDefinitions, diags: &mut Vec<Diagnostic>) -> bool {
+    let mut changed = false;
+    expr.node.for_each_child_mut(&mut |c| {
+        if walk(c, received, defs, diags) {
+            changed = true;
+        }
+    });
+    if try_rewrite(expr, received, defs, diags) {
+        changed = true;
+    }
+    if try_rewrite_compact_blank(expr, defs, diags) {
+        changed = true;
+    }
+    changed
+}
+
+/// The three predicates, owned so no borrow of the Send node outlives
+/// the decision phase.
+#[derive(Clone, Copy, PartialEq)]
+enum Pred {
+    Blank,
+    Present,
+    Presence,
+}
+
+fn try_rewrite(expr: &mut Expr, received: &HashSet<VarId>, defs: &AppDefinitions, diags: &mut Vec<Diagnostic>) -> bool {
+    use Grounding::*;
+
+    // Decision phase: everything read out of the node is owned before
+    // any mutation.
+    let (pred, grounding, recv_ty, pure_recv) = {
+        let ExprNode::Send { recv: Some(r), method, args, block, .. } = &*expr.node else {
+            return false;
+        };
+        let pred = match method.as_str() {
+            "blank?" => Pred::Blank,
+            "present?" => Pred::Present,
+            "presence" => Pred::Presence,
+            _ => return false,
+        };
+        if !args.is_empty() || block.is_some() {
+            return false;
+        }
+        // A `params[:x]` read is typed `String?`, and for a form field
+        // that is what it is — but campfire's `params[:attachment]` is
+        // an UploadedFile when a file was posted, and the String
+        // grounding's `strip` on one is a NoMethodError. Rails'
+        // `Object#blank?` branches on the VALUE, and so does the
+        // runtime predicate: hand it the read.
+        let grounding = if is_params_read(r) { Grounding::Runtime } else { classify(r.ty.as_ref(), defs) };
+        // An IVAR read keeps its nil arm whatever its stamp says. An
+        // unassigned ivar reads nil, and the controller-wide ivar
+        // environment strips Nil on purpose (the find-then-guard idiom,
+        // `analyze/mod.rs`), so a non-nil stamp there is not a proof.
+        // A blank predicate is how the app spells that nil guard:
+        // campfire's `CachedResponses#perform_caching` reads
+        // `@response_cache_version.present?`, which a detached
+        // `ApplicationController.new` never assigned, and grounding it
+        // as `!@response_cache_version.empty?` raised on nil.
+        let grounding = match (grounding, &*r.node) {
+            (Grounding::Container { nilable: false, whitespace }, ExprNode::Ivar { .. }) => {
+                Grounding::Container { nilable: true, whitespace }
+            }
+            (Grounding::NeverBlank { nilable: false }, ExprNode::Ivar { .. }) => {
+                Grounding::NeverBlank { nilable: true }
+            }
+            (g, _) => g,
+        };
+        // A RECEIVED variable keeps its nil arm too. A parameter's type is
+        // the join of the argument types the analyzer typed at its call
+        // sites, and an argument it could not type adds nothing to it: when
+        // one caller passes `Array(x)` and another passes `body["errors"]`,
+        // the parameter is `Array`, and `raw.present?` folded to
+        // `!raw.empty?` raises on the nil the second hands in.
+        let received_var = matches!(&*r.node, ExprNode::Var { id, .. } if received.contains(id));
+        let grounding = match (grounding, received_var) {
+            (Grounding::Container { nilable: false, whitespace }, true) => {
+                Grounding::Container { nilable: true, whitespace }
+            }
+            (g, _) => g,
+        };
+        (pred, grounding, r.ty.clone(), is_effect_free_reader(r))
+    };
+    // An ASSIGNMENT receiver — lobsters' login does
+    // `if (rd = session[:redirect_to]).present?` — is not re-evaluable,
+    // but it does not need to be. The multi-occurrence groundings all
+    // short-circuit (`!x.nil? && !x.empty?`), so the assignment can run
+    // once in the FIRST position and every later position can read the
+    // name it just bound. Only when the assigned VALUE is itself an
+    // effect-free reader: `(x = save!).present?` must still refuse.
+    let assign_handle: Option<Expr> = {
+        let ExprNode::Send { recv: Some(r), .. } = &*expr.node else { return false };
+        match &*r.node {
+            ExprNode::Assign { target, value } if is_effect_free_reader(value) => match target {
+                LValue::Var { id, name } => Some(mk(
+                    r.span,
+                    ExprNode::Var { id: *id, name: name.clone() },
+                    r.ty.clone().unwrap_or(Ty::Untyped),
+                )),
+                LValue::Ivar { name } => Some(mk(
+                    r.span,
+                    ExprNode::Ivar { name: name.clone() },
+                    r.ty.clone().unwrap_or(Ty::Untyped),
+                )),
+                _ => None,
+            },
+            _ => None,
+        }
+    };
+    let pure_recv = pure_recv || assign_handle.is_some();
+    let method_name = match pred {
+        Pred::Blank => "blank?",
+        Pred::Present => "present?",
+        Pred::Presence => "presence",
+    };
+
+    match &grounding {
+        OwnDispatch => return false,
+        Skip(reason) => {
+            diags.push(unlowered(expr, recv_ty.as_ref(), method_name, reason));
+            return false;
+        }
+        // The receiver moves into argument position, so it is read once
+        // however impure it is — the effect-free gate below does not
+        // apply and neither does the assignment-receiver handle.
+        Runtime => {
+            let span = expr.span;
+            let leading_blank_line = expr.leading_blank_line;
+            let old = std::mem::replace(&mut *expr.node, ExprNode::SelfRef);
+            let ExprNode::Send { recv: Some(r), .. } = old else { unreachable!() };
+            let ret = match pred {
+                Pred::Blank | Pred::Present => Ty::Bool,
+                Pred::Presence => nullable(non_nil_ty(&r)),
+            };
+            *expr = runtime_predicate(span, r, pred, ret);
+            expr.leading_blank_line = leading_blank_line;
+            return true;
+        }
+        _ => {}
+    }
+
+    // Forms that evaluate the receiver more than once (or fold it
+    // away) demand an effect-free reader; the single-eval forms
+    // (`(r || "").strip.empty?`, `r.nil?`, `!r`, `r ? true : nil`, plain `r`)
+    // don't.
+    let needs_pure = match (&grounding, pred) {
+        (Container { .. }, Pred::Presence) => true,
+        (Container { nilable: true, .. }, _) => true,
+        (NeverBlank { nilable: false }, Pred::Blank | Pred::Present) => true,
+        (AlwaysNil, _) => true,
+        _ => false,
+    };
+    // An effectful receiver of a BUILTIN grounding — campfire's
+    // `room.users.without(u).pluck(:name).to_sentence.presence`, a DB
+    // read typed Str — cannot be spelled twice, and used to be left as
+    // the dynamic dispatch the strict targets have no answer for. It
+    // takes the RUNTIME form instead: the receiver moves into argument
+    // position, read once, and `ActiveSupport.presence` branches on the
+    // value — the same answer the typed rewrite would give, one call
+    // slower, never wrong for a String, Array, Hash, number or nil.
+    //
+    // NOT for a receiver typed as a CLASS. Its `NeverBlank` is the
+    // guess that the class has no predicate of its own, made from the
+    // app's definitions alone — and a RUNTIME class can have one:
+    // `ActionText::Content#blank?` tracks the plain text, where the
+    // runtime helper's `to_s.strip.empty?` would read the markup and
+    // call `<div></div>` present. Such a receiver keeps the dispatch it
+    // always had, which on the ruby family reaches the real method.
+    let builtin_recv = !matches!(
+        recv_ty.as_ref().map(non_nil_of),
+        Some(Ty::Class { .. }) | None
+    );
+    if needs_pure && !pure_recv && builtin_recv {
+        let span = expr.span;
+        let leading_blank_line = expr.leading_blank_line;
+        let old = std::mem::replace(&mut *expr.node, ExprNode::SelfRef);
+        let ExprNode::Send { recv: Some(r), .. } = old else { unreachable!() };
+        let ret = match pred {
+            Pred::Blank | Pred::Present => Ty::Bool,
+            Pred::Presence => nullable(non_nil_ty(&r)),
+        };
+        *expr = runtime_predicate(span, r, pred, ret);
+        expr.leading_blank_line = leading_blank_line;
+        return true;
+    }
+    if needs_pure && !pure_recv {
+        diags.push(unlowered(
+            expr,
+            recv_ty.as_ref(),
+            method_name,
+            "receiver has effects; not safely re-evaluable",
+        ));
+        return false;
+    }
+
+    // Take ownership of the receiver; the placeholder node is
+    // immediately overwritten below.
+    let span = expr.span;
+    let leading_blank_line = expr.leading_blank_line;
+    let old = std::mem::replace(&mut *expr.node, ExprNode::SelfRef);
+    let ExprNode::Send { recv: Some(r), .. } = old else { unreachable!() };
+
+    // Occurrences after the first read `later` — the same expression for a
+    // pure receiver, the assigned NAME for an assignment receiver.
+    let later = assign_handle.unwrap_or_else(|| r.clone());
+    let replacement = match grounding {
+        Container { nilable, whitespace } => {
+            rewrite_emptyable(span, r, later, pred, nilable, whitespace)
+        }
+        NeverBlank { nilable } => rewrite_never_blank(span, r, pred, nilable),
+        BoolLike => rewrite_bool(span, r, pred),
+        AlwaysNil => match pred {
+            Pred::Blank => lit_bool(span, true),
+            Pred::Present => lit_bool(span, false),
+            Pred::Presence => lit_nil(span),
+        },
+        OwnDispatch | Runtime | Skip(_) => unreachable!(),
+    };
+
+    *expr = replacement;
+    expr.span = span;
+    expr.leading_blank_line = leading_blank_line;
+    true
+}
+
+/// `Array#compact_blank` / `Hash#compact_blank` — ActiveSupport's
+/// `reject(&:blank?)` (Array) and `reject { |_k, v| v.blank? }` (Hash).
+/// Same problem the three predicates have: a core_ext reopen only the
+/// CRuby overlay could host.
+///
+/// An Array grounds through the ELEMENT type, a Hash through the VALUE
+/// type, using the answer `classify` gives so `[a, b].compact_blank`
+/// and `a.blank?` cannot disagree. campfire's `User#title` is
+/// `[ name, bio ].compact_blank.join(" – ")`; its
+/// `SetCurrentRequest#default_url_options` is
+/// `{ host:, protocol: }.compact_blank` — a Hash of nilable Strings,
+/// which used to file residue ("receiver is not a typed Array") and
+/// then fail AOT (`unsupported call: compact_blank`).
+///
+/// An element/value type with no `empty?` grounding (an open inference
+/// var, untyped, a multi-variant union) still rewrites: the reject
+/// body calls `ActiveSupport.blank?`, the same runtime predicate an
+/// untyped `blank?` send already takes. A class with its own
+/// predicate keeps residue — `ActiveSupport.blank?` would read
+/// markup where `ActionText::Content#blank?` reads plain text.
+fn try_rewrite_compact_blank(
+    expr: &mut Expr,
+    defs: &AppDefinitions,
+    diags: &mut Vec<Diagnostic>,
+) -> bool {
+    enum Shape {
+        Array { elem: Ty },
+        Hash { key: Ty, value: Ty },
+    }
+    let (shape, grounding, recv_ty) = {
+        let ExprNode::Send { recv: Some(r), method, args, block: None, .. } = &*expr.node else {
+            return false;
+        };
+        if method.as_str() != "compact_blank" || !args.is_empty() {
+            return false;
+        }
+        let shape = match r.ty.as_ref() {
+            Some(Ty::Array { elem }) => Shape::Array { elem: (**elem).clone() },
+            Some(Ty::Hash { key, value }) => Shape::Hash {
+                key: (**key).clone(),
+                value: (**value).clone(),
+            },
+            _ => {
+                diags.push(unlowered(
+                    expr,
+                    r.ty.as_ref(),
+                    "compact_blank",
+                    "receiver is not a typed Array or Hash",
+                ));
+                return false;
+            }
+        };
+        let inner = match &shape {
+            Shape::Array { elem } => elem.clone(),
+            Shape::Hash { value, .. } => value.clone(),
+        };
+        (shape, classify(Some(&inner), defs), r.ty.clone())
+    };
+
+    let inner_ty = match &shape {
+        Shape::Array { elem } => elem.clone(),
+        Shape::Hash { value, .. } => value.clone(),
+    };
+    let cond_body = match grounding {
+        Grounding::Container { nilable, whitespace } => {
+            compact_blank_container_cond(expr.span, inner_ty.clone(), nilable, whitespace)
+        }
+        Grounding::OwnDispatch | Grounding::Skip(_) => {
+            diags.push(unlowered(
+                expr,
+                recv_ty.as_ref(),
+                "compact_blank",
+                "element type has no `empty?` grounding",
+            ));
+            return false;
+        }
+        _ => {
+            // Untyped / open-var / never-blank / bool: the runtime
+            // predicate branches on the value. campfire's helper
+            // `[ author.name, author.bio ].compact_blank` is an Array
+            // whose element is still an inference var.
+            runtime_predicate(
+                expr.span,
+                compact_blank_value_var(expr.span, inner_ty.clone()),
+                Pred::Blank,
+                Ty::Bool,
+            )
+        }
+    };
+
+    let span = expr.span;
+    let leading_blank_line = expr.leading_blank_line;
+    let old = std::mem::replace(&mut *expr.node, ExprNode::SelfRef);
+    let ExprNode::Send { recv: Some(r), .. } = old else { unreachable!() };
+
+    let (params, out_ty) = match shape {
+        Shape::Array { elem } => (
+            vec![Symbol::new("__cb")],
+            Ty::Array { elem: std::sync::Arc::new(non_nil(&elem)) },
+        ),
+        Shape::Hash { key, value } => (
+            vec![Symbol::new("_k"), Symbol::new("__cb")],
+            Ty::Hash { key: std::sync::Arc::new(key), value: std::sync::Arc::new(non_nil(&value)) },
+        ),
+    };
+    let block = mk(
+        span,
+        ExprNode::Lambda { extra_params: Vec::new(), rest_param: None,
+            params,
+            block_param: None,
+            body: cond_body,
+            block_style: Default::default(),
+        },
+        Ty::Untyped,
+    );
+    *expr = mk(
+        span,
+        ExprNode::Send {
+            recv: Some(r),
+            method: Symbol::new("reject"),
+            args: vec![],
+            block: Some(block),
+            parenthesized: false,
+        },
+        out_ty,
+    );
+    expr.leading_blank_line = leading_blank_line;
+    true
+}
+
+fn compact_blank_value_var(span: crate::span::Span, ty: Ty) -> Expr {
+    mk(
+        span,
+        ExprNode::Var { id: crate::ident::VarId(0), name: Symbol::new("__cb") },
+        ty,
+    )
+}
+
+/// The ELEMENT/VALUE emptiness test, by the same rule `a.blank?` takes —
+/// `compact_blank` is documented as `reject(&:blank?)`, so an Array of
+/// Strings must reject a whitespace-only one. campfire's `User#title`
+/// is `[ name, bio ].compact_blank.join(" – ")`.
+fn compact_blank_container_cond(
+    span: crate::span::Span,
+    elem_ty: Ty,
+    nilable: bool,
+    whitespace: bool,
+) -> Expr {
+    let param = |ty: Ty| compact_blank_value_var(span, ty);
+    let empty_form = if whitespace { blank_str } else { plain_empty };
+    if nilable {
+        bool_op(
+            span,
+            crate::expr::BoolOpKind::Or,
+            nil_check(span, param(elem_ty.clone())),
+            empty_form(span, param(non_nil(&elem_ty))),
+        )
+    } else {
+        empty_form(span, param(elem_ty))
+    }
+}
+
+/// The non-nil half of a nilable type — what survives the reject.
+fn non_nil(t: &Ty) -> Ty {
+    match t {
+        Ty::Union { variants } => {
+            let mut kept: Vec<Ty> =
+                variants.iter().filter(|v| !matches!(v, Ty::Nil)).cloned().collect();
+            match kept.len() {
+                0 => Ty::Untyped,
+                1 => kept.remove(0),
+                _ => Ty::Union { variants: kept.into() },
+            }
+        }
+        other => other.clone(),
+    }
+}
+
+/// Shared shape for the two `empty?`-style groundings. `empty_form`
+/// builds the "is empty" test for a non-nil receiver.
+fn rewrite_emptyable(
+    span: crate::span::Span,
+    r: Expr,
+    later: Expr,
+    pred: Pred,
+    nilable: bool,
+    whitespace: bool,
+) -> Expr {
+    let empty_form = if whitespace { blank_str } else { plain_empty };
+    let value_ty = non_nil_ty(&r);
+    match (pred, nilable) {
+        (Pred::Blank, false) => empty_form(span, r),
+        (Pred::Present, false) => not(span, empty_form(span, r)),
+        (Pred::Blank, true) => bool_op(
+            span,
+            crate::expr::BoolOpKind::Or,
+            nil_check(span, r),
+            empty_form(span, later),
+        ),
+        // `!r.nil? && !((r || "").strip.empty?)` — the `!` is a unary
+        // send around the string form, so no `!`-around-`||` precedence
+        // hazard reaches any emitter.
+        (Pred::Present, true) => bool_op(
+            span,
+            crate::expr::BoolOpKind::And,
+            not(span, nil_check(span, r)),
+            not(span, empty_form(span, later)),
+        ),
+        // presence: `<blank-form> ? nil : r`
+        (Pred::Presence, false) => {
+            let cond = empty_form(span, r);
+            if_expr(span, cond, lit_nil(span), later, nullable(value_ty))
+        }
+        (Pred::Presence, true) => {
+            let cond = bool_op(
+                span,
+                crate::expr::BoolOpKind::Or,
+                nil_check(span, r),
+                empty_form(span, later.clone()),
+            );
+            if_expr(span, cond, lit_nil(span), later, nullable(value_ty))
+        }
+    }
+}
+
+fn rewrite_never_blank(span: crate::span::Span, r: Expr, pred: Pred, nilable: bool) -> Expr {
+    match (pred, nilable) {
+        // Purity was already required for the folds.
+        (Pred::Blank, false) => lit_bool(span, false),
+        (Pred::Present, false) => lit_bool(span, true),
+        (Pred::Blank, true) => nil_check(span, r),
+        (Pred::Present, true) => not(span, nil_check(span, r)),
+        // presence of a never-blank value is the value itself —
+        // nil stays nil, everything else is present.
+        (Pred::Presence, _) => r,
+    }
+}
+
+fn rewrite_bool(span: crate::span::Span, r: Expr, pred: Pred) -> Expr {
+    match pred {
+        // `false.blank?` is true in AS; `!r` also sends nil (the
+        // nilable case) to true.
+        Pred::Blank => not(span, r),
+        Pred::Present => {
+            let inner = not(span, r);
+            not(span, inner)
+        }
+        // presence: only `true` is present, so the kept value is the
+        // literal — single evaluation.
+        Pred::Presence => {
+            let value_ty = nullable(Ty::Bool);
+            if_expr(span, r, lit_bool(span, true), lit_nil(span), value_ty)
+        }
+    }
+}
+
+/// `ActiveSupport.<pred>(<recv>)` — the value-branching predicate the
+/// ruby-family runtime supplies (`runtime/ruby/active_support_ext.rb`)
+/// for receivers with no static type to ground on.
+/// The type with its `nil` variant removed — `T` for `T | nil`, the
+/// type itself otherwise. What a grounding was classified from.
+fn non_nil_of(ty: &Ty) -> Ty {
+    match ty {
+        Ty::Union { variants } => {
+            let non_nil: Vec<&Ty> = variants.iter().filter(|v| !matches!(v, Ty::Nil)).collect();
+            if non_nil.len() == 1 { non_nil[0].clone() } else { ty.clone() }
+        }
+        other => other.clone(),
+    }
+}
+
+fn runtime_predicate(span: crate::span::Span, r: Expr, pred: Pred, ret: Ty) -> Expr {
+    let name = match pred {
+        Pred::Blank => "blank?",
+        Pred::Present => "present?",
+        Pred::Presence => "presence",
+    };
+    let recv = mk(
+        span,
+        ExprNode::Const { path: vec![Symbol::new("ActiveSupport")] },
+        Ty::Untyped,
+    );
+    mk(
+        span,
+        ExprNode::Send {
+            recv: Some(recv),
+            method: Symbol::new(name),
+            args: vec![r],
+            block: None,
+            parenthesized: true,
+        },
+        ret,
+    )
+}
+
+// ---- node builders ------------------------------------------------------
+
+fn mk(span: crate::span::Span, node: ExprNode, ty: Ty) -> Expr {
+    let mut e = Expr::new(span, node);
+    e.ty = Some(ty);
+    e
+}
+
+fn send0(span: crate::span::Span, recv: Expr, name: &str, ty: Ty) -> Expr {
+    mk(
+        span,
+        ExprNode::Send {
+            recv: Some(recv),
+            method: Symbol::new(name),
+            args: vec![],
+            block: None,
+            parenthesized: false,
+        },
+        ty,
+    )
+}
+
+fn plain_empty(span: crate::span::Span, r: Expr) -> Expr {
+    send0(span, r, "empty?", Ty::Bool)
+}
+
+/// `(left || "")`. `result_ty` is `String` on the typed string arm,
+/// where the value after the guard is a string. A view passes
+/// `Untyped`: the receiver may be an array, and a `String` stamp would
+/// describe a collection as a string.
+pub(crate) fn or_empty_string(span: crate::span::Span, left: Expr, result_ty: Ty) -> Expr {
+    mk(
+        span,
+        ExprNode::BoolOp {
+            op: crate::expr::BoolOpKind::Or,
+            surface: crate::expr::BoolOpSurface::Symbol,
+            left,
+            right: mk(
+                span,
+                ExprNode::Lit { value: Literal::Str { value: String::new() } },
+                Ty::Str,
+            ),
+        },
+        result_ty,
+    )
+}
+
+/// `(r || "").strip.empty?` — ActiveSupport's `String#blank?`, which is a
+/// whitespace match and not `empty?`. See the module header for why it
+/// is `strip` rather than the `/\A[[:space:]]*\z/` Rails writes, and
+/// for the one divergence that leaves.
+///
+/// The `|| ""` is the nil guard. It belongs on the value, before
+/// `strip`: `(r.strip || "").empty?` would raise `nil.strip` before the
+/// guard could answer. The `BoolOp` is stamped `String` because that is
+/// what the guard yields, and `strip` resolves on that stamp. The left
+/// operand keeps the receiver's own type, so a nilable string stays
+/// nilable for an emitter that lowers `||` through `Option`.
+fn blank_str(span: crate::span::Span, r: Expr) -> Expr {
+    let guarded = or_empty_string(span, r, Ty::Str);
+    plain_empty(span, send0(span, guarded, "strip", Ty::Str))
+}
+
+/// The grounded form a LATER pass must synthesize instead of spelling
+/// `blank?` itself, for a blankness guard on a string COLUMN.
+///
+/// THIS PASS HAS ALREADY RUN by the time `model_to_library` synthesizes
+/// a method body, so a `blank?` send built there is never grounded and
+/// never reported either — `blank_unlowered` only names sites this pass
+/// walked. It reaches the emitters as a bare dynamic dispatch: harmless
+/// on the CRuby overlay, which monkey-patches `Object`, and a runtime
+/// `NoMethodError: undefined method 'blank?' for an instance of String`
+/// on spinel, where it compiled fine and failed on the first request
+/// that ran the callback.
+///
+/// Two callers, both guarding a column the schema types `Ty::Str`:
+///
+/// * `lower::secure_token` — `has_secure_token`'s `before_create`.
+/// * `model_to_library::markers::rewrite_column_or_assign` — a
+///   `self.<col> ||= v` on a string column.
+///
+/// ## Why the RUNTIME predicate and not `blank_str`
+///
+/// Because a string column does not mean a String value here. Rails
+/// type-casts on assignment, so `create!(client_message_id: 999)` into
+/// a `t.string` stores `"999"`; this runtime's generated writer is a
+/// bare `@col = value`, so the attribute still holds the Integer when
+/// `before_create` runs. campfire's own suite does exactly that
+/// (`users/sidebars_controller_test.rb:17`), and grounding this guard
+/// to `blank_str`'s `(r || "").strip.empty?` turned that into
+/// `undefined method 'strip' for an instance of Integer` — a test that
+/// had been green.
+///
+/// **A schema type describes the COLUMN, not what the attribute holds
+/// before the INSERT.** The bare `blank?` tolerated the Integer only
+/// because ActiveSupport reopens `Object`; `ActiveSupport.blank?` is
+/// that same value-branching predicate as a call the strict targets can
+/// resolve, and it carries the identical whitespace rule (`" "` is
+/// blank), so a synthesized site and a source-written one still agree.
+///
+/// The uncast attribute is a divergence in its own right and is
+/// ledgered separately — fixing it belongs in the writer, not here.
+pub(crate) fn synthesized_string_blank(span: crate::span::Span, recv: Expr) -> Expr {
+    runtime_predicate(span, recv, Pred::Blank, Ty::Bool)
+}
+
+fn nil_check(span: crate::span::Span, r: Expr) -> Expr {
+    send0(span, r, "nil?", Ty::Bool)
+}
+
+fn not(span: crate::span::Span, e: Expr) -> Expr {
+    send0(span, e, "!", Ty::Bool)
+}
+
+fn bool_op(span: crate::span::Span, op: crate::expr::BoolOpKind, l: Expr, r: Expr) -> Expr {
+    mk(
+        span,
+        ExprNode::BoolOp { op, surface: Default::default(), left: l, right: r },
+        Ty::Bool,
+    )
+}
+
+fn if_expr(span: crate::span::Span, cond: Expr, t: Expr, e: Expr, ty: Ty) -> Expr {
+    mk(span, ExprNode::If { cond, then_branch: t, else_branch: e }, ty)
+}
+
+fn lit_bool(span: crate::span::Span, value: bool) -> Expr {
+    mk(span, ExprNode::Lit { value: Literal::Bool { value } }, Ty::Bool)
+}
+
+fn lit_nil(span: crate::span::Span) -> Expr {
+    mk(span, ExprNode::Lit { value: Literal::Nil }, Ty::Nil)
+}
+
+/// The receiver's type with the `Nil` variant stripped — what
+/// `presence` yields on the kept branch.
+fn non_nil_ty(r: &Expr) -> Ty {
+    match r.ty.as_ref() {
+        Some(Ty::Union { variants }) => {
+            let non_nil: Vec<Ty> =
+                variants.iter().filter(|v| !matches!(v, Ty::Nil)).cloned().collect();
+            match non_nil.len() {
+                1 => non_nil.into_iter().next().unwrap(),
+                _ => Ty::Union { variants: non_nil.into() },
+            }
+        }
+        Some(t) => t.clone(),
+        None => Ty::Untyped,
+    }
+}
+
+fn nullable(t: Ty) -> Ty {
+    crate::analyze::union_of(t, Ty::Nil)
+}
+
+fn unlowered(expr: &Expr, recv_ty: Option<&Ty>, method: &str, reason: &str) -> Diagnostic {
+    let recv_ty = recv_ty.cloned().unwrap_or(Ty::Untyped);
+    let kind = DiagnosticKind::BlankUnlowered {
+        method: Symbol::new(method),
+        recv_ty: recv_ty.clone(),
+        reason: Symbol::new(reason),
+    };
+    Diagnostic {
+        span: expr.span,
+        severity: Diagnostic::default_severity(&kind),
+        kind,
+        message: format!(
+            "`{method}` on receiver typed {recv_ty:?} left as dynamic dispatch ({reason}) — \
+             the CRuby overlay serves it at runtime; AOT/strict targets cannot compile it"
+        ),
+    }
+}

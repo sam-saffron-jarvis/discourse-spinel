@@ -1,0 +1,8 @@
+class NullableStoredOwner
+ def self.seed: (Hash[Symbol, Integer] values) -> Hash[Symbol, Integer]
+end
+class NullableStoredBody
+ @body: ^(singleton(::NullableStoredOwner)) -> Integer?
+ def initialize: (^(singleton(::NullableStoredOwner)) -> Integer? body) -> void
+ def invoke: (singleton(::NullableStoredOwner) receiver) -> Integer?
+end

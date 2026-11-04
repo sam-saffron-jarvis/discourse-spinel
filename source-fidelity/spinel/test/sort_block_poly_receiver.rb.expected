@@ -1,0 +1,12 @@
+[1, 2, 3]
+["banana", "fig", "pear"]
+[3, 2, 1]
+["pear", "fig", "banana"]
+["fig", "pear", "banana"]
+1
+"banana"
+3
+"pear"
+[1, 2, 3]
+["banana", "fig", "pear"]
+[]

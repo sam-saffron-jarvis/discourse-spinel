@@ -1,0 +1,13 @@
+example.test:hello
+other:hello
+cb example.test:hello
+example.test:hello
+l1
+l2
+o
+LocalJumpError: no block given (yield)
+x:hello
+"1"
+"dflt"
+"k:0:x"
+"k:1:y"

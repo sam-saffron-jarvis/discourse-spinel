@@ -1,0 +1,8 @@
+["set_default_paths", "ok"]
+["ctx.cert_store after set", true]
+["ctx2.cert_store default", true]
+["ctx2.verify_mode before store", 1]
+["ctx2.verify_mode after store", 1]
+["ctx2.cert_store after set", true]
+["ctx3 shares store", true]
+end

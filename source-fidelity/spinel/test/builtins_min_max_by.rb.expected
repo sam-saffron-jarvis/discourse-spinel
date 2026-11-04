@@ -1,0 +1,44 @@
+1
+9
+9
+9
+[1, 1, 2]
+[9, 6, 5]
+nil
+nil
+"fig"
+"banana"
+"banana"
+["pear", "kiwi"]
+"fig"
+[:b, 1]
+[:a, 3]
+[:b, 1]
+5
+3
+[3, 1]
+9
+Enumerator
+1
+5
+(3,2)
+(3,2)
+9
+[:a, 3]
+["fig", "pear"]
+3
+ArgumentError
+3
+9
+[1, 9]
+[9, 1]
+[4, 9]
+[nil, nil]
+[7, 7]
+["fig", "banana"]
+["banana", "pear"]
+[[:b, 1], [:a, 3]]
+[5, 10]
+[4, 3]
+[9, 1]
+[1, 9]

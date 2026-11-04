@@ -1,0 +1,170 @@
+Integer(IntAnswer) => 7
+   calls: [:to_int]
+Integer(BigAnswer) => 1180591620717411303424
+   calls: [:to_int]
+Integer(NilAnswer) => TypeError: can't convert NilAnswer into Integer
+   calls: [:to_int]
+Integer(NilThenToI) => 5
+   calls: [:to_int, :to_i]
+Integer(StrAnswer) => TypeError: can't convert StrAnswer into Integer
+   calls: [:to_int]
+Integer(StrThenToI) => 5
+   calls: [:to_int, :to_i]
+Integer(RaisesToInt) => TypeError: can't convert RaisesToInt into Integer
+   calls: [:to_int]
+Integer(RaiseThenToI) => 5
+   calls: [:to_int, :to_i]
+Integer(ToIOnly) => 5
+   calls: [:to_i]
+Integer(ToIBig) => 1180591620717411303424
+   calls: [:to_i]
+Integer(ToIString) => TypeError: can't convert ToIString to Integer (ToIString#to_i gives String)
+   calls: [:to_i]
+Integer(ToINil) => TypeError: can't convert ToINil to Integer (ToINil#to_i gives NilClass)
+   calls: [:to_i]
+Integer(ToIRaises) => RuntimeError: boom
+   calls: [:to_i]
+Integer(StrConv) => 12
+   calls: [:to_str]
+Integer(BadStrConv) => ArgumentError: invalid value for Integer(): "zz"
+   calls: [:to_str]
+Integer(StrAndToI) => 12
+   calls: [:to_str]
+Integer(WrongStrConv) => TypeError: can't convert WrongStrConv to String (WrongStrConv#to_str gives Integer)
+   calls: [:to_str]
+Integer(Plain) => TypeError: can't convert Plain into Integer
+--- exception: false
+Integer(IntAnswer, exception: false) => 7
+   calls: [:to_int]
+Integer(BigAnswer, exception: false) => 1180591620717411303424
+   calls: [:to_int]
+Integer(StrAnswer, exception: false) => nil
+   calls: [:to_int]
+Integer(RaisesToInt, exception: false) => nil
+   calls: [:to_int]
+Integer(RaiseThenToI, exception: false) => 5
+   calls: [:to_int, :to_i]
+Integer(ToIString, exception: false) => nil
+   calls: [:to_i]
+Integer(ToIRaises, exception: false) => nil
+   calls: [:to_i]
+Integer(StrConv, exception: false) => 12
+   calls: [:to_str]
+Integer(BadStrConv, exception: false) => nil
+   calls: [:to_str]
+Integer(Plain, exception: false) => nil
+--- with a base
+Integer(StrConv, 16) => 18
+   calls: [:to_str]
+Integer(StrConv, 10, exception: false) => 12
+   calls: [:to_str]
+Integer(IntAnswer, 16) => ArgumentError: base specified for non string value
+Integer(IntAnswer, 16, exception: false) => nil
+Integer(Plain, 10) => ArgumentError: base specified for non string value
+--- Float
+Float(FltAnswer) => 2.5
+   calls: [:to_f]
+Float(FltIntAnswer) => TypeError: can't convert FltIntAnswer to Float (FltIntAnswer#to_f gives Integer)
+   calls: [:to_f]
+Float(FltStrAnswer) => TypeError: can't convert FltStrAnswer to Float (FltStrAnswer#to_f gives String)
+   calls: [:to_f]
+Float(FltNilAnswer) => TypeError: can't convert FltNilAnswer to Float (FltNilAnswer#to_f gives NilClass)
+   calls: [:to_f]
+Float(FltRaises) => RuntimeError: boom
+   calls: [:to_f]
+Float(FltStrOnly) => TypeError: can't convert FltStrOnly into Float
+Float(FltIntOnly) => TypeError: can't convert FltIntOnly into Float
+Float(Plain) => TypeError: can't convert Plain into Float
+Float(FltAnswer, exception: false) => 2.5
+   calls: [:to_f]
+Float(FltIntAnswer, exception: false) => nil
+   calls: [:to_f]
+Float(FltRaises, exception: false) => nil
+   calls: [:to_f]
+Float(Plain, exception: false) => nil
+--- through a container
+Integer(mixed[0]) => 7
+   calls: [:to_int]
+Integer(mixed[0], exception: false) => 7
+   calls: [:to_int]
+Float(mixed[0], exception: false) => nil
+Integer(mixed[1]) => 12
+   calls: [:to_str]
+Integer(mixed[1], exception: false) => 12
+   calls: [:to_str]
+Float(mixed[1], exception: false) => nil
+Integer(mixed[2]) => TypeError: can't convert Plain into Integer
+Integer(mixed[2], exception: false) => nil
+Float(mixed[2], exception: false) => nil
+Integer(mixed[3]) => 42
+Integer(mixed[3], exception: false) => 42
+Float(mixed[3], exception: false) => 42.0
+Integer(mixed[4]) => 9
+Integer(mixed[4], exception: false) => 9
+Float(mixed[4], exception: false) => 9.0
+Integer(mixed[5]) => 2
+Integer(mixed[5], exception: false) => 2
+Float(mixed[5], exception: false) => 2.75
+Integer(mixed[6]) => TypeError: can't convert nil into Integer
+Integer(mixed[6], exception: false) => nil
+Float(mixed[6], exception: false) => nil
+Integer(mixed[7]) => TypeError: can't convert FltAnswer into Integer
+Integer(mixed[7], exception: false) => nil
+Float(mixed[7], exception: false) => 2.5
+   calls: [:to_f]
+Integer(mixed[1], 16) => 18
+   calls: [:to_str]
+Integer(mixed[3], 16) => 66
+Integer(mixed[4], 16) => ArgumentError: base specified for non string value
+Integer(mixed[4], 16, exception: false) => nil
+--- the answer is carried
+1180591620717411303425
+Integer
+8
+5.0
+--- a throw, a break or a proc return out of a probed conversion
+nil
+:body
+:ensure
+7
+55
+7
+:fell_through
+7
+7
+:done
+:body
+:ensure
+:after
+--- an answer the analysis cannot pin down
+Sometimes (true) => 7
+Sometimes ef (true) => 7
+SometimesBig (true): the Bignum or the RangeError
+SometimesBig ef (true) => 1180591620717411303424
+SometimesToI (true): the Bignum or the RangeError
+SometimesToI ef (true) => 1180591620717411303424
+[Integer, 1180591620717411303425]
+Sometimes (false) => TypeError: can't convert Sometimes into Integer
+Sometimes ef (false) => nil
+SometimesBig (false): can't convert SometimesBig into Integer
+SometimesBig ef (false) => nil
+SometimesToI (false): 3
+SometimesToI ef (false) => 3
+[NilClass, nil]
+--- a conversion method declared with a block parameter is called with none
+[5, nil]
+[9.5, nil]
+[3, nil]
+5
+9.5
+--- a plain Bignum read out of a container
+Integer(boxed Bignum): the Bignum or the RangeError
+true
+--- a Float argument
+Integer(NaN): FloatDomainError: NaN
+Integer(-Infinity): FloatDomainError: -Infinity
+2
+--- the implicit-conversion bridge with a block parameter, and to_str with a base
+20
+to_str answering an Integer, with a base: can't convert WrongStrBase to String (WrongStrBase#to_str gives Integer)
+with exception false: TypeError

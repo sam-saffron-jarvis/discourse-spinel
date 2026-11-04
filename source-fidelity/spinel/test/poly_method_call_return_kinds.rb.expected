@@ -1,0 +1,19 @@
+[0, 1, 1, 0]
+[0, 1, 0, 0]
+[0, 1, 0, 0]
+true
+false
+:zero
+:some
+nil
+[9]
+"odd"
+4
+Leaf(1)
+Sub(1)
+Node(0)
+["a", "a"]
+true
+:some
+[0, 1, 1, 0]
+false

@@ -1,0 +1,3 @@
+model ok
+post /session dave
+NoMethodError

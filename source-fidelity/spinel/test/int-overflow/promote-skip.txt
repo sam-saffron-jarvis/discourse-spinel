@@ -1,0 +1,21 @@
+# Tests the corpus does not run under --int-overflow=promote (#8331).
+# The tests that pin raise mode's answers are left out in the Makefile.
+#
+# Gaps found when the lane began, at bcce09575: a wrong answer or C that
+# does not build. A gap leaves this list with its fix.
+#
+# A Range whose ends are boxed keeps the Integer representation under
+# promote, where every Integer slot is boxed and that representation keeps
+# a Range of them fast (infer_type's RangeNode arm). An end that reads an
+# element of a container of boxed values is boxed there too. A String or
+# Float end that arrives through a method's answer or a local is not: the
+# Range raises ArgumentError or NotImplementedError where CRuby walks it.
+test/poly_range_bsearch_float_arm.rb
+test/range_boxed_endpoints.rb
+
+# Date#to_s appends its month-and-day suffix to the year's to_s, which
+# promote boxes: that String route is refused as shared and changed in place
+# (#9258), so a test that requires date does not compile under promote. The
+# one-String mode carries it; a test leaves with that mode as the default.
+test/date_plus_inherited_by_datetime.rb
+test/alias_date_compare_without_coercion.rb

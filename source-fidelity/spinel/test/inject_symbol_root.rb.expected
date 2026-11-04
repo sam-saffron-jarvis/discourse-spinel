@@ -1,0 +1,15 @@
+inject sym len=111 head=a1a2a3 tail=a39a40
+reduce sym len=111 head=a1a2a3 tail=a39a40
+inject block-sym len=111 head=a1a2a3 tail=a39a40
+reduce block-sym len=111 head=a1a2a3 tail=a39a40
+inject seed sym len=112 head=za1a2a tail=a39a40
+reduce seed block-sym len=112 head=za1a2a tail=a39a40
+inject big len=16893 head=s1-s2- tail=s3000-
+inject big seed len=16894 head=Zs1-s2 tail=s3000-
+inject empty nil
+inject empty seed len=1 head=e tail=
+inject one len=2 head=a1 tail=
+inject ints 2460 -2454
+inject floats 410.0 412.0
+control inject sym len=111 head=a1a2a3 tail=a39a40
+control inject big len=16893 head=s1-s2- tail=s3000-

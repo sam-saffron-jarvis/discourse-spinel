@@ -1,0 +1,179 @@
+module ActiveSupport
+  module JSON
+    def self.encode: (untyped value) -> String
+    def self.encode_without_escape: (untyped value) -> String
+    def self.decode: (String text) -> untyped
+    def self.jsonable: (untyped value) -> untyped
+    def self.time_json: (::Time t) -> String
+    def self.time_fragment: (::Time? t) -> String
+    def self.written: (String text) -> String
+    def self.utc_zone?: () -> bool
+    def self.utc_zone_name?: (String name) -> bool
+    UTC_ZONE_NAMES: Array[String]
+  end
+  def self.deep_dup: (untyped value) -> untyped
+  def self.blank?: (untyped value) -> bool
+
+  def self.present?: (untyped value) -> bool
+  def self.to_param: (untyped value) -> String
+
+  # Any key, as Rails' `Hash#to_query` (each is `to_s`'d): a literal
+  # `{ page: 2, q: params[:q] }.to_query` passes Symbols, and spinel
+  # refuses a Symbol-keyed Hash against a declared `Hash[String, _]`.
+  def self.to_query: (Hash[untyped, Roundhouse::ParamValue] value) -> String
+  def self.query_pairs: (Hash[untyped, Roundhouse::ParamValue] hash, String namespace) -> String
+  def self.query_escape: (String text) -> String
+  def self.query_value: (String name, Roundhouse::ParamValue item) -> String
+  def self.presence: (untyped value) -> untyped
+  def self.presence_in: (untyped value, Array[String] list) -> untyped
+
+  # `errors[:field]` -> the messages added on that attribute, prefix stripped.
+
+  # `errors.to_hash` -> each attribute to its messages, from the error details.
+  def self.errors_to_hash: (Array[ActiveRecord::ErrorDetail] details) -> Hash[Symbol, Array[String]]
+  def self.errors_messages: (Array[ActiveRecord::ErrorDetail] details) -> Hash[Symbol, Array[String]]
+  def self.errors_attribute_names: (Array[ActiveRecord::ErrorDetail] details) -> Array[Symbol]
+  def self.errors_delete: (Array[String] errors, Array[ActiveRecord::ErrorDetail] details, String attribute) -> Array[String]?
+  def self.errors_details: (Array[ActiveRecord::ErrorDetail] details) -> Hash[Symbol, Array[ActiveRecord::ErrorDetail]]
+  def self.errors_import: (Array[String] errors, Array[ActiveRecord::ErrorDetail] details, ActiveRecord::ErrorDetail error, String? attribute, Hash[String, String] names, String before, String between, String after) -> Array[ActiveRecord::ErrorDetail]
+  def self.error_detail: (String name, String? kind, String? message, Hash[String, String] options, Hash[String, String] site, Hash[String, String] names, Hash[String, String] overrides, String before, String between, String after) -> ActiveRecord::ErrorDetail
+  def self.error_template: (Hash[String, String] table, String key, String? count) -> String?
+  def self.interpolate: (String template, Hash[String, String] values) -> String
+  def self.errors_merge: (Array[String] errors, Array[ActiveRecord::ErrorDetail] details, Array[ActiveRecord::ErrorDetail] others, Hash[String, String] names, String before, String between, String after) -> Array[ActiveRecord::ErrorDetail]
+
+  # Rails' name for "this signed value does not verify" — see the .rb.
+  class MessageVerifier
+    class InvalidSignature < StandardError
+      def initialize: (?String message) -> void
+    end
+  end
+  def self.index_by: (untyped list) { (untyped) -> untyped } -> Hash[untyped, untyped]
+  def self.excluding: [A] (Array[A] list, *A elements) -> Array[A]
+  def self.pluck: (untyped list, *(Symbol | String | Integer) keys) -> Array[untyped]
+  # The lowerer routes Array receivers here, Relation receivers to
+  # `size > 1` (campfire `@room.users.many?`), and Array/Relation unions
+  # the same way. An Array contract cannot coerce an association into
+  # Spinel's poly-array representation because those sites never reach
+  # this helper.
+  def self.many?: (Array[Object] list) ?{ (Object item) -> Object } -> bool
+  def self.to_sentence: (Array[untyped] list, String words_connector, String two_words_connector, String last_word_connector) -> String
+  def self.symbolize_keys: (Hash[String, untyped] hash) -> Hash[Symbol, untyped]
+  def self.stringify_keys: (Hash[Symbol, untyped] hash) -> Hash[String, untyped]
+  def self.indifferent: (untyped hash) -> Hash[untyped, untyped]
+  def self.indifferent_value: (untyped value, bool in_place) -> untyped
+  def self.indifferent_key: (untyped key) -> untyped
+  def self.indifferent_keys: (Array[untyped] keys) -> Array[untyped]
+  def self.indifferent_to_hash: (untyped value) -> untyped
+  def self.cast_boolean: (untyped value) -> bool?
+  # Any object or nil. The body calls `nil?`, `==`, `is_a?`, `to_s`, and
+  # `class` on that object, and `is_a?` narrows a branch to String, Integer,
+  # or Float before the cast uses that class.
+  def self.cast_string: (::Object? value) -> String?
+  def self.cast_integer: (::Object? value) -> Integer?
+  def self.integer_from_string: (String value) -> Integer?
+  def self.cast_float: (::Object? value) -> Float?
+  def self.cast_decimal: (::Object? value) -> Float?
+  def self.numeric_blank?: (::Object? value) -> bool
+  def self.numericality_number: (::Object? raw, ::Object? value) -> (Integer | Float)?
+  def self.float_from_string: (String value) -> Float?
+  def self.integer_from_bytes: (Array[Integer] raw) -> Integer
+  def self.string_first: (String text, Integer limit) -> String
+  def self.string_last: (String text, Integer limit) -> String
+  def self.squish: (String text) -> String
+  def self.squish!: (String text) -> String
+  def self.truncate: (String text, Integer truncate_to, String? omission, String? separator) -> String
+  def self.word_space_byte?: (Integer b) -> bool
+  def self.truncate_words: (String text, Integer words_count, String? omission) -> String
+  # `untyped`, and this one was learned the hard way: it said
+  # `Array[untyped]` for a day, on the reasoning that the only receiver
+  # is a channel's `streams`, a plain Array. It is — an
+  # `Array[String]`, and spinel refuses that against a DECLARED
+  # `Array[untyped]`: "a seed is trusted, so the emitted code would
+  # reinterpret the value rather than convert it". The whole
+  # `unread_rooms_channel_test` stopped linking, which only the
+  # compiled lane can say. Exactly the over-claim the `many?` note
+  # above describes, made anyway because the narrower declaration saved
+  # nine sites against the untyped ceiling — which is not a reason.
+  def self.sole: (untyped list) -> untyped
+  def self.civil_days: (Integer y, Integer m, Integer d) -> Integer
+  def self.local_on: (Integer days, Integer hour, Integer min, Integer sec, Integer nsec) -> Time
+  def self.days_in_month: (Integer y, Integer m) -> Integer
+  def self.days_since: (Time t, ?Integer n) -> Time
+  def self.days_ago: (Time t, ?Integer n) -> Time
+  def self.yesterday: (Time t) -> Time
+  def self.tomorrow: (Time t) -> Time
+  def self.weeks_since: (Time t, ?Integer n) -> Time
+  def self.weeks_ago: (Time t, ?Integer n) -> Time
+  def self.months_since: (Time t, ?Integer n) -> Time
+  def self.months_ago: (Time t, ?Integer n) -> Time
+  def self.years_since: (Time t, ?Integer n) -> Time
+  def self.years_ago: (Time t, ?Integer n) -> Time
+  def self.change_time_usec: (Time time, Integer usec) -> Time
+  def self.beginning_of_minute: (Time t) -> Time
+  def self.end_of_minute: (Time t) -> Time
+  def self.beginning_of_hour: (Time t) -> Time
+  def self.end_of_hour: (Time t) -> Time
+  def self.beginning_of_day: (Time t) -> Time
+  def self.end_of_day: (Time t) -> Time
+  def self.noon: (Time t) -> Time
+  def self.beginning_of_week: (Time t, ?Integer start) -> Time
+  def self.end_of_week: (Time t, ?Integer start) -> Time
+  def self.float_decimal_text: (Float f) -> String
+  def self.next_week: (Time t) -> Time
+  def self.prev_week: (Time t) -> Time
+  def self.beginning_of_month: (Time t) -> Time
+  def self.end_of_month: (Time t) -> Time
+  def self.beginning_of_year: (Time t) -> Time
+  def self.end_of_year: (Time t) -> Time
+  def self.same_day?: (Time a, Time b) -> bool
+  def self.today?: (Time t, Time now) -> bool
+  def self.yesterday?: (Time t, Time now) -> bool
+  def self.tomorrow?: (Time t, Time now) -> bool
+  def self.past?: (Time t, Time now) -> bool
+  def self.future?: (Time t, Time now) -> bool
+  def self.on_weekend?: (Time t) -> bool
+  def self.on_weekday?: (Time t) -> bool
+  def self.on_wday?: (Time t, Integer wday) -> bool
+  ZONE_NAMES: Hash[String, String]
+  class TimeZoneData
+    def name: () -> String
+    def initialize: (String name, Array[Integer] transitions, Array[Integer] offsets, Integer initial_offset, Array[Integer] rule, Array[bool] dsts) -> void
+    def offset_at: (Integer epoch) -> Integer
+    def base_offset_at: (Integer epoch) -> Integer
+    def rule_or: (Integer epoch, Integer fallback) -> Integer
+  end
+  def self.rule_instant: (Integer year, Integer month, Integer week, Integer wday, Integer secs) -> Integer
+  def self.be32: (Array[Integer] b, Integer i) -> Integer
+  def self.find_zone!: (String? zone) -> TimeZoneData
+  def self.rails_zone_names: () -> Array[String]
+  def self.formatted_offset: (Time t) -> String
+  def self.seconds_to_utc_offset: (Integer seconds) -> String
+  class TimeZone
+    def name: () -> String
+    def initialize: (String name, TimeZoneData data) -> void
+    def self.lookup: (String? name) -> TimeZone?
+    def self.all: () -> Array[TimeZone]
+    def compare: (TimeZone other) -> Integer
+    def utc_offset: () -> Integer
+    def formatted_offset: () -> String
+    def to_s: () -> String
+    def now: () -> Time
+  end
+  def self.parse_tz_rule: (String spec) -> Array[Integer]
+  def self.posix_seconds: (String text) -> Integer
+  DEFAULT_ZONE: Array[TimeZoneData]
+  def self.set_default_zone: (String name) -> nil
+  def self.current_zone: () -> TimeZoneData?
+  def self.use_zone: (String? zone) { () -> untyped } -> untyped
+  def self.present: (Time t) -> Time
+  def self.present_in_zone: (Time t, TimeZoneData zone) -> Time
+  def self.present_db: (Time? t) -> Time?
+  def self.in_time_zone: (Time t, String? zone) -> Time
+  def self.zone_name: (TimeZone? zone) -> String?
+  def self.time_at_epoch: (Integer n) -> Time
+  def self.local_time: (Integer y, Integer mo, Integer d, Integer h, Integer mi, Integer s, Integer nsec) -> Time
+  def self.number_delimited: (Integer | Float number) -> String
+  # underscore / remove / demodulize / singularize / humanize / titleize
+  # — declared on active_support_inflections.rbs (Ruby/Spinel scaffold;
+  # strict targets literalize controller_name/path instead).
+end

@@ -1,0 +1,4 @@
+module ActiveSupport
+  def self.deep_symbolize_keys!: (Hash[Object, Object] hash) -> Hash[Object, Object]
+  def self.deep_symbolize_value!: (Hash[Object, Object] | Array[Object] | Object value) -> (Hash[Object, Object] | Array[Object] | Object)
+end

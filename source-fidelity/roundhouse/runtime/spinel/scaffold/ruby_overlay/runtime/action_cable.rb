@@ -1,0 +1,749 @@
+# frozen_string_literal: true
+# ActionCable — the framework surface an app's OWN channels sit on, plus
+# the low-level publish API that model code calls directly.
+#
+# Two surfaces, at opposite ends of the same wire.
+#
+# 1. `ActionCable.server.broadcast(stream, payload)`. This is NOT the
+#    Turbo Stream family (`broadcast_append_to` and friends, which lower
+#    onto `Broadcasts.append`): those ship an HTML fragment for Turbo to
+#    splice into the DOM, this ships an arbitrary payload for the app's
+#    own channel JS to read. campfire uses both, one line apart — a new
+#    message rides Turbo, the unread-room badge beside it rides this.
+#
+#    The payload stays a Ruby Hash the whole way to
+#    `Cable::Registry.deliver`, and that is what makes the envelope right.
+#    Action Cable's `message` field carries the VALUE, so `{roomId: 1}`
+#    has to arrive as a JSON object; pre-serializing it to a String here
+#    would ship `"message":"{\"roomId\":1}"` — valid JSON, wrong shape,
+#    and wrong in the silent way, because `JSON.generate` accepts either
+#    happily and only the browser notices.
+#
+# 2. `Channel::Base` / `Connection::Base` — what `app/channels/*.rb`
+#    subclasses. Channels are ingested as ordinary app classes, so these
+#    exist to make those files LOAD, and to carry the half of a channel
+#    that works with no socket at all: `UnreadRoomsChannel
+#    .stream_name_for(user_id)` is a pure class method, and the model
+#    doing the broadcasting is what calls it.
+#
+# SUBSCRIPTION DISPATCH, and the shape of it. A subscribe frame carries
+# an identifier naming a channel (`{"channel":"RoomMessagesChannel",
+# "signed_stream_name":"…"}`); `Cable::Dispatch` looks the class up in
+# `Channel::Base::REGISTRY`, instantiates it against this connection and
+# those params, and runs the app's own `subscribed`. Whatever that method
+# asked for through `stream_from`/`stream_for` is what gets registered —
+# and if it called `reject`, nothing is.
+#
+# BY REGISTRY, NOT BY `const_get`. The channel name is a string off the
+# wire. Rails resolves it with `safe_constantize` and then checks the
+# result descends from `Channel::Base`; here the only names that resolve
+# are the ones that registered themselves by being defined, so a crafted
+# identifier cannot reach a constant that is not a channel in the first
+# place. It is also the rule this runtime already follows: a name
+# computed at runtime is not statically resolvable, and eight of the
+# targets have no way to honour one.
+#
+# WHAT THIS BUYS, in one line: the app's authorization runs. campfire
+# prepends `RoomStreamsAreAuthorized` onto `Turbo::StreamsChannel` so the
+# stock channel refuses `:messages` streams, leaving
+# `RoomMessagesChannel` — which checks membership — as the only door onto
+# them. Neither ran while subscribes bypassed channels entirely.
+#
+# CRuby/JRuby only, like the `cable.rb` it publishes through. Spinel's
+# Action Cable rides tep and is a separate substrate.
+require "json"
+require_relative "broadcasts"
+
+module ActionCable
+  # The `ActionCable.server` singleton. Only `broadcast` is modeled;
+  # `server.config`'s one reachable reader (`mount_path`) is folded to
+  # its literal at compile time by `lower::config_reader`, so nothing
+  # asks for it here.
+  class Server
+    # `stream` is the name a subscriber gave (`user_7_unreads`);
+    # `payload` is whatever the app wants delivered under `message`.
+    #
+    # Reaching `Broadcasts::TRANSPORTS` directly rather than adding a
+    # `Broadcasts.publish` to broadcasts.rb is deliberate: that file is
+    # SHARED with spinel, which compiles it whole. A `payload` parameter
+    # with no spinel caller types as int and then poisons the
+    # `broadcast(String, String)` dispatch below it — the same trap
+    # `SeedTransport` exists to document. This file is overlay-only, so
+    # it can hand a Hash across that seam.
+    #
+    # RECORDED IN `Broadcasts::LOG`, and this file used to carry the
+    # opposite conclusion: that LOG's `action`/`target`/`html` shape is
+    # the turbo-FRAGMENT contract and a raw payload is not a fragment.
+    # True about the shape, wrong about the log. `ActionCable::TestHelper
+    # #assert_broadcasts` reads LOG and exists precisely to count raw
+    # publishes on an app-named stream — Rails' own reads the test
+    # adapter's pubsub queue, which carries whatever was published. With
+    # only the dispatch here, campfire's "creating a message broadcasts
+    # unread room to each member" counted 0 against a broadcast that had
+    # in fact happened: the two halves of the harness were never joined.
+    #
+    # Logged under `payload:` rather than squeezed into `html:`, so an
+    # entry never claims to be markup it is not. `action: :message` is
+    # what tells the two kinds of entry apart; both readers of the log
+    # (`capture_broadcasts_on`, `capture_turbo_stream_broadcasts`) filter
+    # on `:stream` alone, so the extra key costs them nothing.
+    #
+    # LOG FIRST, then dispatch — the order `Broadcasts.record` uses, so a
+    # transport that raises cannot lose the record of the attempt.
+    #
+    # `coder: nil` — Rails' "the payload is already encoded": campfire
+    # encodes the unread notice once and hands every member the same
+    # text (basecamp/once-campfire#292). This side carries the Hash, so
+    # the text is read back into one and travels the same path.
+    def broadcast(stream, payload, coder: :json)
+      payload = JSON.parse(payload) if coder.nil?
+      Broadcasts.log_append({ action: :message, stream: stream, payload: payload })
+      Broadcasts::TRANSPORTS[0].broadcast(stream, payload)
+      nil
+    end
+
+    # `ActionCable.server.remote_connections.where(current_user: user)
+    # .disconnect(reconnect:)` — Rails' "kick this user's sockets"
+    # API. campfire calls it from `User#deactivate` and
+    # `User#reset_remote_connections`.
+    #
+    # As Rails does it: `disconnect` broadcasts on the selected
+    # identifier's internal channel (`RemoteConnection` below), and each
+    # identified `Cable::Connection` subscribed to its own internal
+    # channel when it started, so the message closes exactly the sockets
+    # of that user. The membership check in `RoomMessagesChannel` runs at
+    # SUBSCRIBE time, and this close is what makes the client replay its
+    # subscriptions through it ("revoking a membership disconnects the
+    # user with reconnect: true", campfire's own comment).
+    def remote_connections
+      raise STUB_RAISE[0] if STUB_RAISE_ON[0]
+      RemoteConnections.new
+    end
+
+    # Test stub slot — `lower::mocha` rewrites `ActionCable.server
+    # .stubs(:remote_connections).raises(e)` to `stub_remote_connections
+    # _raises(e)`: every `remote_connections` then raises `e`, the
+    # exception object the test wrote, until the helper's setup clears
+    # it. campfire's sign-out test proves the session still ends when
+    # the realtime service is down.
+    STUB_RAISE = [ StandardError.new("") ]
+    STUB_RAISE_ON = [ false ]
+
+    def stub_remote_connections_raises(error)
+      STUB_RAISE[0] = error
+      STUB_RAISE_ON[0] = true
+      nil
+    end
+
+    # `ActionCable.server.stubs(:remote_connections).returns(<mock graph>)`
+    # — `lower::mocha` folds a graph spelling `where(current_user: u)
+    # .disconnect(reconnect: r)` into this one call. `where` then admits
+    # only `u` and `disconnect` only `r` (any other argument is mocha's
+    # unexpected invocation, raised at the call), and the helper's
+    # teardown verify wants `disconnect` reached `count` times.
+    # campfire's sign-out test proves a signed-out user's live sockets
+    # are told to reconnect.
+    #
+    # EXPECT_USERS is unseeded, as `TcpSocketStub::EXPECT_PREDS` is: its
+    # element type is the app's own user class, which the lowered test
+    # pushes.
+    EXPECT_USERS = []
+    EXPECT_RECONNECT = [ false ]
+    EXPECT_COUNT = [ -1 ]
+    EXPECT_CALLS = [ 0 ]
+
+    def expect_remote_connections_where_disconnect(count, current_user, reconnect)
+      EXPECT_USERS.clear
+      EXPECT_USERS << current_user
+      EXPECT_RECONNECT[0] = reconnect
+      EXPECT_COUNT[0] = count
+      EXPECT_CALLS[0] = 0
+      nil
+    end
+
+    def verify_remote_connections_expectations
+      expected = EXPECT_COUNT[0]
+      return nil if expected < 0
+      got = EXPECT_CALLS[0]
+      EXPECT_COUNT[0] = -1
+      if got != expected
+        raise "remote_connections.where(current_user: …).disconnect(reconnect: …) was expected #{expected} time(s), got #{got}"
+      end
+      nil
+    end
+
+    def clear_remote_connections_stubs
+      STUB_RAISE_ON[0] = false
+      EXPECT_USERS.clear
+      EXPECT_COUNT[0] = -1
+      EXPECT_CALLS[0] = 0
+      nil
+    end
+
+    # `ActionCable.server.pubsub` — the queue an app's OWN test asks what
+    # was published.
+    #
+    # WHY IT EXISTS: this is not our seam, it is Rails'. campfire's
+    # `turbo_test_helper` reads it directly —
+    #
+    #   ActionCable.server.pubsub.broadcasts(name).collect { JSON.parse(_1) }
+    #
+    # — so `test_creating_a_message_broadcasts_the_message_to_the_room`
+    # could not reach its assertion without one. Our own emitted helper
+    # reads `Broadcasts::LOG` instead; both are views of the same log,
+    # and the app's is the one that matters because the app wrote it.
+    def pubsub
+      Pubsub.new
+    end
+  end
+
+  # Rails' test subscription adapter, on the log this runtime already
+  # keeps. `broadcasts(stream)` answers what was published on that
+  # stream, JSON-ENCODED — which is what Rails stores:
+  # `Server::Broadcasting#broadcast` does
+  # `pubsub.broadcast channel, ActiveSupport::JSON.encode(message)`, so
+  # the caller's `JSON.parse` gets the payload back. Encoding here rather
+  # than handing the value over raw is what makes the app's
+  # `collect { JSON.parse(_1) }` mean something instead of raising.
+  class Pubsub
+    # `ActionCable.server.pubsub.clear` — the test adapter's reset,
+    # which campfire's `test_helper` runs in every test's setup. The
+    # same log our own `TestBase#setup` already empties, so under the
+    # emitted harness it is a second, idempotent reset of one store.
+    def clear
+      Broadcasts.reset_log!
+      nil
+    end
+
+    def broadcasts(stream)
+      Broadcasts.log.select { |entry| entry[:stream] == stream }.map do |entry|
+        JsonBuilder.escape_html_entities(JSON.generate(payload_of(entry)))
+      end
+    end
+
+    # A turbo entry is rebuilt into the fragment it dispatched — through
+    # `Broadcasts.render_fragment`, the same function `record` used, so
+    # there is one spelling of the markup rather than a second one here
+    # that drifts. A raw publish (`action: :message`) carries its own
+    # payload and is handed back as it was given.
+    def payload_of(entry)
+      return entry[:payload] if entry[:action] == :message
+
+      Broadcasts.render_fragment(
+        action: entry[:action],
+        target: entry[:target],
+        html: entry[:html],
+        attributes: entry[:attributes].to_s,
+      )
+    end
+  end
+
+  # The `where(…)` half of the above: a selection over connections
+  # identified by their connection identifiers. The selection is a NAME,
+  # as in Rails — the identifier text — not a set of sockets.
+  class RemoteConnections
+    def where(identifiers)
+      if Server::EXPECT_COUNT[0] >= 0
+        current_user = identifiers[:current_user]
+        admitted = Server::EXPECT_USERS.length == 1 && current_user == Server::EXPECT_USERS[0]
+        raise "unexpected invocation: remote_connections.where(current_user: #{current_user&.id})" unless admitted
+      end
+      RemoteConnection.new(ActionCable.connection_identifier(identifiers.values))
+    end
+  end
+
+  # Rails' `RemoteConnection#disconnect` broadcasts
+  # `{ type: "disconnect", reconnect: }` on the selected connections'
+  # INTERNAL CHANNEL, `action_cable/<connection identifier>`; every live
+  # connection subscribed to its own internal channel when it connected,
+  # and closes itself on that message. Both halves are on this lane: the
+  # broadcast here, the subscription and the close in `cable.rb`
+  # (`Cable::Connection#start`, `Cable::Registry.deliver`).
+  class RemoteConnection
+    def initialize(identifier = "")
+      @identifier = identifier
+    end
+
+    def internal_channel
+      "action_cable/#{@identifier}"
+    end
+
+    def disconnect(reconnect: false)
+      if Server::EXPECT_COUNT[0] >= 0
+        if reconnect != Server::EXPECT_RECONNECT[0]
+          raise "unexpected invocation: remote_connection.disconnect(reconnect: #{reconnect})"
+        end
+        Server::EXPECT_CALLS[0] += 1
+        # A mocked graph stands in for the real object, as under mocha:
+        # the expectation is the whole effect.
+        return nil
+      end
+      ActionCable.server.broadcast(internal_channel, { type: "disconnect", reconnect: reconnect })
+      nil
+    end
+  end
+
+  # Rails' `Connection::Identification#connection_gid`: each identifier
+  # that is set, as its GlobalID param when it has one, sorted and joined
+  # by ":". The same text names a connection's internal channel on the
+  # socket side and the selection on the broadcasting side.
+  # Rails' `ActionCable::INTERNAL`, the two tables an app reads:
+  # campfire closes a connection whose session has ended with
+  # `close reason: ActionCable::INTERNAL[:disconnect_reasons][:unauthorized]`.
+  # Rails' scalar entries (`default_mount_path`, `protocols`) are left out,
+  # so every value is a table of Strings; an app reading one is an error.
+  INTERNAL = {
+    message_types: {
+      welcome: "welcome",
+      disconnect: "disconnect",
+      ping: "ping",
+      confirmation: "confirm_subscription",
+      rejection: "reject_subscription"
+    }.freeze,
+    disconnect_reasons: {
+      unauthorized: "unauthorized",
+      invalid_request: "invalid_request",
+      server_restart: "server_restart",
+      remote: "remote"
+    }.freeze
+  }.freeze
+
+  def self.connection_identifier(values)
+    values.compact.map { |o| o.respond_to?(:to_gid_param) ? o.to_gid_param : o.to_s }.sort.join(":")
+  end
+
+  SERVER = Server.new
+
+  def self.server
+    SERVER
+  end
+
+  module Channel
+    # The base every `app/channels/*.rb` class subclasses, and the half
+    # of a subscription that is not the socket: params, identity, and
+    # the list of streams a `subscribed` asked for.
+    #
+    # NOTHING HERE TOUCHES A SOCKET. `Cable::Dispatch` builds one of
+    # these on a worker thread, runs `subscribed`, and reads
+    # `streams`/`subscription_rejected?` back off it; the reactor thread
+    # is what turns that answer into registry entries and a
+    # `confirm_subscription` frame. So a channel is an ordinary object
+    # with no thread affinity, which is also what makes it testable
+    # without a reactor.
+    class Base
+      # Channel name -> class, populated by `inherited`. THE ONLY WAY a
+      # name off the wire resolves: see the file header on why this is a
+      # registry and not `const_get`.
+      REGISTRY = {}
+
+      # Ruby assigns the constant before calling `inherited`, so `sub.name`
+      # is already the real name here. An anonymous subclass (there are
+      # none in an ingested tree, but `Class.new(Base)` in a test is one)
+      # has a nil name and simply does not register.
+      def self.inherited(sub)
+        super
+        REGISTRY[sub.name] = sub if sub.name
+      end
+
+      # nil for a name nothing defined. The caller answers that with
+      # `reject_subscription`, which is what Action Cable's client
+      # expects for an unknown channel.
+      def self.lookup(channel_name)
+        REGISTRY[channel_name.to_s]
+      end
+
+      # `RoomChannel` -> `"room"`; `Turbo::StreamsChannel` ->
+      # `"turbo:streams"`. actioncable 8.0:
+      #
+      #   @channel_name ||= name.sub(/Channel$/, "").gsub("::", ":").underscore
+      def self.channel_name
+        @channel_name ||= Base.underscore(name.sub(/Channel\z/, "").gsub("::", ":"))
+      end
+
+      # `broadcasting_for([channel_name, record])` — the stream name
+      # `stream_for` subscribes to and `broadcast_to` publishes on, so
+      # the two must be spelled once. actioncable's `serialize_broadcasting`
+      # asks the record for `to_gid_param` and falls back to `to_param`;
+      # every lowered model is given a `to_gid_param` (see
+      # `lower::broadcasts`), so there is nothing to fall back FROM and no
+      # `respond_to?` here.
+      def self.broadcasting_for(record)
+        channel_name + ":" + record.to_gid_param
+      end
+
+      # Class names only — `RoomsController` shapes, never a path or a
+      # word with digits. activesupport's `underscore` also swaps "::"
+      # for "/" and strips inflector acronyms; the caller above has
+      # already replaced "::" and no channel name in the corpus carries
+      # an acronym, so this is the CamelCase-to-snake_case half alone.
+      def self.underscore(text)
+        out = +""
+        i = 0
+        while i < text.length
+          c = text[i]
+          if c >= "A" && c <= "Z"
+            out << "_" unless i.zero? || out.end_with?("_") || out.end_with?(":")
+            out << c.downcase
+          else
+            out << c
+          end
+          i += 1
+        end
+        out
+      end
+
+      attr_reader :connection, :identifier, :params, :streams
+
+      # Rails 8.2's channel tests read the stream names off the
+      # subscription (`subscription.stream_names`); `streams` beside it
+      # became private there. Here they are the same list.
+      def stream_names
+        @streams
+      end
+
+      # `identifier` is the identifier JSON STRING exactly as the client
+      # sent it, because every frame back to that client has to echo it
+      # byte for byte — the client keys its subscription table on it.
+      def initialize(connection, identifier, params)
+        @connection = connection
+        @identifier = identifier
+        @params = params
+        @streams = []
+        @rejected = false
+      end
+
+      # The connection identifier campfire's channels read. Spelled out
+      # rather than generated from `identified_by`, for the reason
+      # `runtime/spinel/action_cable.rb` gives one level down: one name
+      # is what `identified_by` has ever been given, and a computed
+      # accessor is not statically resolvable.
+      #
+      # nil on an ANONYMOUS connection (an app with no
+      # `ApplicationCable::Connection` at all). A channel that reads it
+      # will `NoMethodError` on nil — which is the honest outcome: an
+      # app whose channels need a user and whose connection class does
+      # not identify one has a hole, and swallowing it here would hide
+      # the hole rather than the error.
+      #
+      # ASKED OF THE CONNECTION, whichever kind it is: `Cable::Connection`
+      # (the socket wrapper, which answers off the identity it was
+      # upgraded with) or the app's own `ApplicationCable::Connection`
+      # directly, which is what `Channel::TestCase#stub_connection`
+      # hands a channel — the same object the spinel lane's channels
+      # hold. One question, two answerers, so the harness needs no
+      # stand-in with an `identity` of its own.
+      def current_user
+        @connection&.current_user
+      end
+
+      def stream_from(broadcasting)
+        @streams << broadcasting.to_s
+        nil
+      end
+
+      def transmit(data)
+        @connection.transmit({ identifier: @identifier, message: data })
+        nil
+      end
+      private :transmit
+
+      def stream_for(record)
+        stream_from(broadcasting_for(record))
+      end
+
+      # THE INSTANCE'S name, not `self.class.channel_name`: inside this
+      # base class `self.class` is the one dynamic read a strict target
+      # resolves to the class the method is written ON, so every
+      # channel's `stream_for` registered `action_cable:channel:base:…`
+      # — one name shared by all of them, the collision `channel_name`
+      # exists to prevent. `ingest::channel_callbacks::lower_channel_names`
+      # bakes `def channel_name; "presence"; end` into every app channel
+      # (Rails' spelling, computed at ingest); this default is what a
+      # channel with nothing baked in — none in an emitted tree — would
+      # read, and on CRuby it is the dynamic answer.
+      def channel_name
+        self.class.channel_name
+      end
+
+      # `broadcasting_for` on the INSTANCE, so `stream_for` (subscribe)
+      # and `broadcast_to` (publish) spell one name from one method;
+      # the class-level twin below is for a caller that names the class
+      # — `PresenceChannel.broadcasting_for(room)` in a test.
+      def broadcasting_for(record)
+        channel_name + ":" + record.to_gid_param
+      end
+
+      # The PUBLISH half. Now that `stream_for` really subscribes,
+      # `broadcasting_for(record)` has subscribers and this delivers to
+      # them — the reason it used to raise is gone.
+      def broadcast_to(record, message)
+        ActionCable.server.broadcast(broadcasting_for(record), message)
+      end
+
+      # Refusing is a RECORDED decision rather than a raise: campfire's
+      # `PresenceChannel` asks `subscription_rejected?` in an
+      # `on_subscribe … unless:` guard, so the answer has to survive the
+      # call that produced it.
+      def reject
+        @rejected = true
+        nil
+      end
+
+      def subscription_rejected?
+        @rejected
+      end
+
+      # What Rails' `Channel::TestCase` mixes into the channel it built
+      # (`ChannelStub#confirmed?`/`#rejected?`): the verdict `subscribed`
+      # left. `confirmed?` is "the confirmation was sent", which
+      # `subscribe_to_channel` does for every subscription it did not
+      # reject. On the class rather than the harness, as the spinel
+      # sibling has them.
+      def confirmed?
+        !@rejected
+      end
+
+      def rejected?
+        @rejected
+      end
+
+      # Rails' Base defines neither; a channel that wants either does.
+      # Defining them here means the dispatcher can call both
+      # unconditionally.
+      def subscribed
+        nil
+      end
+
+      def unsubscribed
+        nil
+      end
+
+      # The callback hooks Rails spells as an `ActiveSupport::Callbacks`
+      # chain (`on_subscribe :present, unless: :subscription_rejected?`).
+      # `ingest::channel_callbacks` inlines the chain into one generated
+      # method per hook on each channel that declares any; these are the
+      # no-ops that let `Cable::Dispatch` call both unconditionally, the
+      # same shape `subscribed`/`unsubscribed` above already have.
+      #
+      # BOTH RUN ON THIS LANE. `Dispatch` keeps the channel object for
+      # the life of the subscription, so the unsubscribe half has
+      # somewhere to run; the spinel lane throws the channel away with
+      # the subscribe frame and calls only the first (a divergence in
+      # docs/pipeline/runtime.md).
+      def after_subscribe
+        nil
+      end
+
+      def after_unsubscribe
+        nil
+      end
+
+      # Rails' `Channel::Base` public instance methods (actioncable 8.1,
+      # less Object's). An inherited method of one of these names is not
+      # an action. The same list is `CABLE_BASE_PUBLIC_METHODS` in
+      # `src/project.rs`, which writes the spinel lane's dispatch - the
+      # two lanes must agree on what a client can call.
+      RAILS_BASE_PUBLIC_METHODS = %w[
+        __callbacks _run_subscribe_callbacks _run_subscribe_callbacks!
+        _run_unsubscribe_callbacks _run_unsubscribe_callbacks! _subscribe_callbacks
+        _unsubscribe_callbacks broadcast_to broadcasting_for channel_name connection
+        handler_for_rescue identifier logger params perform_action periodic_timers=
+        pubsub rescue_handlers rescue_handlers= rescue_handlers? rescue_with_handler
+        run_callbacks stop_all_streams stop_stream_for stop_stream_from stream_for
+        stream_from stream_or_reject_for subscribe_to_channel unsubscribe_from_channel
+        unsubscribed?
+      ].freeze
+
+      # Written into every channel by `ingest::channel_callbacks`; class
+      # machinery in Rails, never an action (`CABLE_SYNTHESIZED_METHODS`).
+      SYNTHESIZED_METHODS = %w[after_subscribe after_unsubscribe channel_name].freeze
+
+      # Rails' `action_methods`: the channel's public methods with its
+      # ancestors' and mixins', less this base's (and Rails' base's),
+      # plus the ones the class defines itself.
+      def self.action_methods
+        @action_methods ||= begin
+          inherited = public_instance_methods(true) - ActionCable::Channel::Base.public_instance_methods(true)
+          names = (inherited.map(&:to_s) - RAILS_BASE_PUBLIC_METHODS) + public_instance_methods(false).map(&:to_s)
+          (names.uniq - SYNTHESIZED_METHODS).freeze
+        end
+      end
+
+      # Rails' `perform_action`: the client's `perform("start", {...})`,
+      # with Rails' own calling rule - a method of arity exactly 1 gets
+      # `data` (its `"action"` key still in it), anything else is called
+      # with no arguments. A rejected subscription and an action the
+      # channel does not answer run nothing and are logged; a raise
+      # propagates to `Cable::Dispatch.perform`, which reports it.
+      def perform_action(data)
+        name = data["action"].to_s
+        action = name.empty? ? "receive" : name
+        if !@rejected && self.class.action_methods.include?(action)
+          method(action).arity == 1 ? public_send(action, data) : public_send(action)
+        else
+          warn "[cable] Unable to process #{self.class}##{action}"
+        end
+        nil
+      end
+    end
+
+    # THE CHANNEL A NAME RESOLVES TO — the spinel sibling's generated
+    # arm factory, answered here from the registry `inherited` filled.
+    # `identifier` is the frame's JSON text, as the spinel factory takes
+    # it; `Parameters` on this lane reads a parsed Hash, so the parse is
+    # here. Shared by `Cable::Dispatch` and `Channel::TestCase
+    # #subscribe`, which builds a channel the way a frame would with no
+    # socket under it. nil for a name nothing registered.
+    def self.build(name, connection, identifier)
+      klass = Base.lookup(name)
+      return nil if klass.nil?
+      klass.new(connection, identifier, Parameters.new(JSON.parse(identifier)))
+    end
+
+    # The subscribe frame's identifier, read the way a channel body
+    # reads it: `params[:room_id]`, symbol key, against JSON that has
+    # only string ones.
+    #
+    # A two-method value object rather than
+    # `ActiveSupport::HashWithIndifferentAccess`: the whole demand is
+    # `[]`, and the wide class would arrive with `with_indifferent_access`
+    # on every Hash in the tree for one call site.
+    class Parameters
+      def initialize(raw)
+        @raw = raw
+      end
+
+      def [](key)
+        @raw[key.to_s]
+      end
+
+      def key?(key)
+        @raw.key?(key.to_s)
+      end
+
+      def to_h
+        @raw
+      end
+    end
+  end
+
+  module Connection
+    # THE APP'S OWN `ApplicationCable::Connection` over a cookie jar, or
+    # an anonymous `Base` when the app declares none — the spinel
+    # sibling's generated arm, answered here by `defined?`. Shared by
+    # `Cable.identify` (the handshake's jar) and
+    # `Connection::TestCase#connect` (the jar the test seeded).
+    def self.build(cookies)
+      return ApplicationCable::Connection.new(cookies) if defined?(ApplicationCable::Connection)
+      Base.new(cookies)
+    end
+
+    # What `reject_unauthorized_connection` raises. Rails names it the
+    # same way, and `Cable.upgrade` is the one place that rescues it:
+    # an unauthorized handshake is answered 401 and never hijacked, so
+    # the socket is closed by Puma rather than parked in the reactor.
+    module Authorization
+      class UnauthorizedError < StandardError
+      end
+    end
+
+    class Base
+      # WHAT `identified_by :current_user` WOULD HAVE WRITTEN.
+      #
+      # Ingest DROPS that line — it defines an accessor from a computed
+      # name, which is the shape a strict target cannot compile — so the
+      # emitted `ApplicationCable::Connection` has no `current_user=` of
+      # its own and campfire's `connect` (`self.current_user =
+      # find_verified_user`) is a `NoMethodError` on the first handshake.
+      # Declared here instead, exactly as the spinel sibling declares it.
+      # One name, because one is what `identified_by` has ever been given.
+      #
+      # This file used to answer it the other way, with a class method
+      # that defined accessors from the argument list — correct for an
+      # app whose `identified_by` call survived to the emit, and no app's
+      # does. It was never reached, and the unit test did not notice
+      # because its fixture was campfire's SOURCE, which still has the
+      # line the emit does not. The fixture is the emitted form now.
+      attr_accessor :current_user
+
+      # THE COOKIE JAR OF THE HANDSHAKE REQUEST, and the whole reason
+      # identity works: a WebSocket upgrade is an ordinary HTTP GET, so
+      # it carries the same `Cookie:` header the app's controllers
+      # authenticate from. campfire's `ApplicationCable::Connection`
+      # includes `Authentication::SessionLookup` and calls
+      # `cookies.signed[:session_token]` — the SAME method object its
+      # controllers use. Handing it a real signed jar is what makes
+      # `connect` the app's code rather than a reimplementation of it.
+      attr_reader :cookies
+
+      def initialize(cookies)
+        @cookies = cookies
+      end
+
+      # Rails' Base does not define `connect`; a subclass that wants
+      # identity does. Defining a no-op here means `Cable.upgrade` can
+      # call it unconditionally, so an app whose Connection declares no
+      # identifiers connects anonymously instead of erroring.
+      def connect
+        nil
+      end
+
+      # Rails' `connection_identifier`, over the one identifier there is:
+      # "" for an anonymous connection, which then has no internal channel.
+      def connection_identifier
+        ActionCable.connection_identifier([ current_user ])
+      end
+
+      def reject_unauthorized_connection
+        raise Authorization::UnauthorizedError,
+              "ActionCable::Connection: the handshake carried no identified user"
+      end
+
+      # Rails' `socket`: the live connection this one was accepted on
+      # (`Cable::Connection` sets it), or `Connection::TestCase`'s
+      # `TestSocket`. Rails 8.2 hands both `close` and `perform_work` to
+      # the socket, and so does this: what a test asserts is what the
+      # socket was told.
+      attr_accessor :transport
+
+      def transmit(data)
+        @transport.transmit(data) unless @transport.nil?
+        nil
+      end
+
+      # Rails' `beat`, called on every server heartbeat. Rails' transmits
+      # the ping; here the server's shared heartbeat writes it, so the base
+      # does nothing else and an app's override (campfire's session check)
+      # runs after it.
+      def beat
+        nil
+      end
+
+      # Rails' `perform_work(receiver, method)`, delegated to the socket as
+      # Rails 8.2 delegates it: the live one runs it on a worker rather
+      # than the heartbeat's thread, with a database connection; a test's
+      # runs it inline. With no socket, inline. Modeled for a callable and
+      # `:call`, the one shape an app passes.
+      def perform_work(receiver, method_name)
+        unless method_name.to_s == "call"
+          raise ArgumentError, "ActionCable perform_work: only (callable, :call) is modeled"
+        end
+        live = @transport
+        if live.nil?
+          receiver.call
+        else
+          live.perform_work(receiver)
+        end
+        nil
+      end
+
+      # Rails' `close(reason:, reconnect:)`: tell the client why and whether
+      # to come back, then close the socket.
+      def close(reason: nil, reconnect: true)
+        live = @transport
+        live.close_with_reason(reason, reconnect) unless live.nil?
+        nil
+      end
+    end
+  end
+end

@@ -1,0 +1,33 @@
+[:a, 1]
+{b: 2, c: nil}
+{z: 3, y: 4}
+{z: 3, y: 4}
+{zz: 3, yy: 4}
+{zz: 3, yy: 4}
+{zz: 30, yy: 40}
+{zz: 30, yy: 40}
+true
+[7, 7, 7, 7]
+{zz: 30, yy: 40}
+nil
+["a", 1]
+{}
+[5, 5]
+"missing"
+[{q: 1}, 1]
+[{m: 5}, 5, 5]
+{m: 5}
+replace_other_kind: TypeError
+[:m, 5]
+[{a: 1}, {a: 200}, 0]
+shift_with_count: ArgumentError
+1
+NoMethodError
+[3]
+"cd"
+{j: 2}
+frozen_shift: FrozenError
+frozen_replace: FrozenError
+frozen_default=: FrozenError
+nil_shift: NoMethodError
+nil_default: NoMethodError

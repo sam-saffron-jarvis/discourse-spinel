@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+# scripts/campfire-walk — transpile ONCE Campfire and walk the milestone path.
+#
+# Emits the app for the `ruby` target, prepares a fresh database, and drives
+# it IN-PROCESS through sign-up → room → post a message (see
+# scripts/campfire-walk-drive.rb). Each step prints as it happens, so a walk
+# that dies halfway has still reported everything before the wall.
+#
+# This exists because campfire is not yet a fixture: it has no compare
+# oracle and no test suite we can run, so "how far does it get" is the only
+# measurement available — and until now that measurement lived in a scratch
+# tree that died with the session.
+#
+# STUB LEDGER: when `scripts/campfire-walk-stubs.rb` exists it is spliced
+# ahead of the app (one `# GAP` entry per unmodeled wall). Tip Campfire
+# cleared every entry (#818); the file is gone and the splice is skipped.
+# Never fix a compiler bug by adding a stub.
+#
+# Usage:  scripts/campfire-walk [options] [APP_PATH]
+#
+#   APP_PATH   Rails app to transpile. Default: ~/git/once-campfire
+#
+# Options:
+#   --out DIR   Emit into DIR and keep it (default: a temp dir, removed).
+#   --keep      Keep the temp emit and print its path.
+#   --no-stubs  Splice nothing; walk the emit exactly as shipped. Every gap
+#               in the ledger becomes a wall, which is how you check whether
+#               a stub is still earning its place.
+#
+# Requires: cargo, ruby, the sqlite3 CLI.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+. "$REPO_ROOT/scripts/lib/roundhouse-bin.sh"
+
+APP="$HOME/git/once-campfire"
+OUT=""
+KEEP=0
+STUBS=1
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --out)       OUT="$2"; KEEP=1; shift 2 ;;
+        --keep)      KEEP=1;   shift ;;
+        --no-stubs)  STUBS=0;  shift ;;
+        -h|--help)   sed -n '2,/^$/p' "$0" | sed 's/^# \?//'; exit 0 ;;
+        -*)          echo "unknown flag: $1" >&2; exit 2 ;;
+        *)           APP="$1"; shift ;;
+    esac
+done
+
+# Resolve relative APP/--out against the caller's cwd before any work, so
+# ROUNDHOUSE_BIN and the cargo fallback (both run under REPO_ROOT) see the
+# same absolute paths the shell will open after emit.
+abs_path() {
+    local p="$1" d b
+    [[ -z "$p" || "$p" = /* ]] && { printf '%s' "$p"; return 0; }
+    d="$(dirname "$p")"
+    b="$(basename "$p")"
+    mkdir -p "$d" 2>/dev/null || true
+    printf '%s/%s' "$(cd "$d" && pwd)" "$b"
+}
+APP="$(abs_path "$APP")"
+OUT="$(abs_path "$OUT")"
+
+[[ -d "$APP" ]] || { echo "campfire-walk: no app at $APP" >&2; exit 2; }
+command -v sqlite3 >/dev/null || { echo "campfire-walk: needs the sqlite3 CLI" >&2; exit 2; }
+
+step() { printf '\n\033[1;34m==>\033[0m %s\n' "$*"; }
+
+if [[ -z "$OUT" ]]; then
+    OUT="$(mktemp -d -t roundhouse-campfire-walk.XXXXXX)"
+fi
+cleanup() {
+    local code=$?
+    if (( KEEP )); then
+        echo ""
+        echo "emit retained at $OUT"
+    else
+        rm -rf "$OUT"
+    fi
+    exit "$code"
+}
+trap cleanup EXIT INT TERM
+
+# -------- 1. transpile --------
+#
+# `--allow-unsupported` because campfire is a ledger app, not a green one:
+# the point is to walk what DOES work. Emit diagnostics go to a file so the
+# walk transcript stays readable; the path is printed for follow-up.
+
+step "transpiling $APP → $OUT (target: ruby)"
+rm -rf "$OUT"
+roundhouse_run \
+    --target ruby "$APP" -o "$OUT" --allow-unsupported 2>"$OUT.log" |
+    tail -1
+echo "  emit diagnostics: $OUT.log"
+
+# -------- 2. database --------
+#
+# campfire ships no seeds, so `db/seed.sql` is its schema and nothing else —
+# which is the correct starting state here. A fresh campfire has no account,
+# and that is exactly what sends the first request to /first_run.
+
+step "preparing storage/development.sqlite3 from db/seed.sql"
+mkdir -p "$OUT/storage"
+sqlite3 "$OUT/storage/development.sqlite3" < "$OUT/db/seed.sql"
+echo "  $(sqlite3 "$OUT/storage/development.sqlite3" \
+    "select count(*) from sqlite_master where type='table'") tables, no rows"
+
+# -------- 3. splice the ledger + drive --------
+
+cp "$REPO_ROOT/scripts/campfire-walk-drive.rb" "$OUT/walk_drive.rb"
+
+if (( STUBS )) && [[ -f "$REPO_ROOT/scripts/campfire-walk-stubs.rb" ]]; then
+    cp "$REPO_ROOT/scripts/campfire-walk-stubs.rb" "$OUT/walk_stubs.rb"
+    # Into BOOT.rb, not main.rb: 78b9ca0a moved the require chain there
+    # (main.rb is boot plus the server), taking `app/models` — the first
+    # emitted code to reference an unmodeled base class at LOAD time,
+    # which the stubs have to precede — out of the file this used to
+    # patch. Same splice scripts/campfire-suite makes, for the same reason.
+    ruby -e '
+      path = ARGV[0]
+      src = File.read(path)
+      anchor = %(require_relative "app/models")
+      abort "campfire-walk: no #{anchor} in boot.rb" unless src.include?(anchor)
+      File.write(path, src.sub(anchor, %(require_relative "walk_stubs"\n) + anchor))
+    ' "$OUT/boot.rb"
+    echo "  spliced walk_stubs.rb ($(grep -c '^# GAP' "$OUT/walk_stubs.rb") ledger entries) into boot.rb"
+elif (( STUBS )); then
+    step "ledger empty — no walk_stubs.rb to splice"
+else
+    step "walking WITHOUT stubs"
+fi
+
+step "walking the milestone path"
+cd "$OUT"
+SECRET_KEY_BASE="${SECRET_KEY_BASE:-campfire-walk-secret}" ruby walk_drive.rb

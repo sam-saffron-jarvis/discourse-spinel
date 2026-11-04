@@ -1,0 +1,118 @@
+//! `Db.escape_string` writes BYTES as a hex BLOB literal.
+//!
+//! lobsters' `comments.confidence_order` is a `t.binary` holding
+//! `[a, b, c].pack("CCC")`. Quoted as text, a NUL byte ended the SQL
+//! ("unrecognized token: \"'\"") on every comment insert, which stopped
+//! 73 of its model specs; and a non-NUL binary value stored as TEXT
+//! sorts before every BLOB, so the column would order wrong once it held
+//! both. Bytes = any NUL, or a BINARY-encoded string that is not plain
+//! ASCII. An ASCII-only BINARY string stays text, as it always was.
+//!
+//! Both ruby-family SQL-literal shims carry the rule (the gem-backed
+//! one and the JDBC one). The method is evaluated alone, because loading
+//! the whole shim requires the sqlite3 gem, which the unit job does not
+//! install.
+
+use std::process::Command;
+
+fn check(shim: &str) {
+    let script = format!(
+        r##"
+src = File.read("{shim}")
+defn = src[/^  def self\.escape_string\(s\)\n.*?^  end\n/m] or abort "no escape_string in {shim}"
+module Db; end
+Db.module_eval(defn)
+cases = {{
+  [0, 0, 0].pack("CCC")   => "X'000000'",
+  [200, 1, 7].pack("CCC") => "X'c80107'",
+  "a\0b"                  => "X'610062'",
+  "it's"                  => "'it''s'",
+  "abc".b                 => "'abc'",
+  "héllo"                 => "'héllo'",
+  nil                     => "''",
+}}
+bad = cases.filter_map {{ |v, want| got = Db.escape_string(v); "#{{v.inspect}} -> #{{got}} (want #{{want}})" if got != want }}
+print bad.empty? ? "OK" : bad.join("; ")
+"##
+    );
+    let out = Command::new("ruby")
+        .arg("-e")
+        .arg(&script)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("ruby");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        stdout.trim(),
+        "OK",
+        "{shim}: stdout={stdout}\nstderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn the_cruby_shim_writes_bytes_as_a_blob_literal() {
+    check("runtime/spinel/db_cruby.rb");
+}
+
+#[test]
+fn the_jruby_shim_writes_bytes_as_a_blob_literal() {
+    check("runtime/spinel/db_jruby.rb");
+}
+
+#[test]
+fn the_jruby_text_binder_selects_the_writers_storage_class() {
+    // Exercise the JDBC call boundary without requiring a JDK in the unit
+    // job. Actual JDBC execution belongs to the JRuby runtime lane.
+    let script = r##"
+src = File.read("runtime/spinel/db_jruby.rb")
+defn = src[/^  def self\.bind_text\(stmt, idx, value\)\n.*?^  end\n/m] or abort "no bind_text"
+module Db; end
+Db.module_eval(defn)
+def Db.statement_failed(_stmt, _operation, error); raise error; end
+class String
+  def to_java_bytes; bytes; end
+end
+class JdbcBindRecorder
+  attr_reader :call
+  def set_bytes(index, value); @call = [:blob, index, value]; end
+  def set_string(index, value); @call = [:text, index, value.bytes]; end
+end
+Handle = Struct.new(:pstmt, :executed)
+cases = [
+  ["a\0b", :blob],
+  ["a\0b".b, :blob],
+  [[255, 254, 39].pack("C*"), :blob],
+  ["café".b, :blob],
+  ["abc".b, :text],
+  ["".b, :text],
+  ["it's", :text],
+  ["雪 café", :text],
+]
+recorder = JdbcBindRecorder.new
+handle = Handle.new(recorder)
+cases.each do |value, storage|
+  Db.bind_text(handle, 3, value)
+  expected = [storage, 3, value.bytes]
+  abort "#{value.inspect}: #{recorder.call.inspect} != #{expected.inspect}" if recorder.call != expected
+end
+begin
+  Db.bind_text(Handle.new(nil, false), 1, "unused")
+  abort "released statement accepted a bind"
+rescue RuntimeError => error
+  raise unless error.message == "statement is not bindable"
+end
+print "OK"
+"##;
+    let out = Command::new("ruby")
+        .args(["-e", script])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("ruby");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "OK");
+}

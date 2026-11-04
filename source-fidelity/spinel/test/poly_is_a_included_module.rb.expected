@@ -1,0 +1,11 @@
+true
+[true, true, true, true]
+greet
+[true, true, true, false]
+greet
+[false, false, false, false]
+other
+[false, false, false, false]
+other
+[false, false, false, false]
+other

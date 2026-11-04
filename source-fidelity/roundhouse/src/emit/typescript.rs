@@ -1,0 +1,3269 @@
+//! TypeScript emitter — kind-agnostic LibraryClass walker.
+//!
+//! Phase B of the rewrite (2026-04-30): the emitter no longer knows
+//! about views, controllers, models, schema, routes, or fixtures as
+//! distinct output kinds. Every input flows through the lowerer
+//! pipeline into `LibraryClass` and is rendered by
+//! `library::emit_class_file`. Per-target surface = `expr.rs` (Expr →
+//! TS syntax) + `ty.rs` (Ty → TS type) + `library.rs` (LibraryClass
+//! walker) + ecosystem files (`package.json`, `tsconfig.json`,
+//! `juntos.ts` runtime stub).
+//!
+//! Outputs not yet covered: controllers, schema, routes, importmap,
+//! fixtures, specs. Each is a missing `*_to_library` lowerer (see
+//! `project_universal_post_lowering_ir`); when the lowerer lands the
+//! output joins the walker without changes here.
+
+use std::path::PathBuf;
+
+use super::EmittedFile;
+use crate::App;
+use crate::ty::Ty;
+
+const JUNTOS_SQLITE_SOURCE: &str = include_str!("../../runtime/typescript/juntos.ts");
+const JUNTOS_LIBSQL_SOURCE: &str = include_str!("../../runtime/typescript/juntos-libsql.ts");
+const JUNTOS_WORKER_SOURCE: &str = include_str!("../../runtime/typescript/juntos-worker.ts");
+const SERVER_SQLITE_SOURCE: &str = include_str!("../../runtime/typescript/server.ts");
+const SERVER_LIBSQL_SOURCE: &str = include_str!("../../runtime/typescript/server-libsql.ts");
+const SERVER_WORKER_SOURCE: &str = include_str!("../../runtime/typescript/server-worker.ts");
+const CLIENT_WORKER_SOURCE: &str = include_str!("../../runtime/typescript/client.ts");
+const DB_WORKER_SOURCE: &str = include_str!("../../runtime/typescript/db_worker.ts");
+const SQLITE_WASM_ENGINE_SOURCE: &str =
+    include_str!("../../runtime/typescript/sqlite_wasm_engine.ts");
+const BROADCASTS_SOURCE: &str = include_str!("../../runtime/typescript/broadcasts.ts");
+// Native-`Date` seam for temporal columns: `RhDateTime.parse` (stored
+// ISO-8601 text → Date, the `parse_db_time` intrinsic target). The
+// `JsonBuilder.encode_datetime` Date branch is injected into the
+// transpiled json_builder unit (see `patch_json_builder_datetime`).
+const DATETIME_SOURCE: &str = include_str!("../../runtime/typescript/datetime.ts");
+const I18N_HOST_SOURCE: &str = include_str!("../../runtime/typescript/i18n_host.ts");
+const DB_SOURCE: &str = include_str!("../../runtime/typescript/db.ts");
+const PARAM_VALUE_SOURCE: &str = include_str!("../../runtime/typescript/param_value.ts");
+const PARAMS_SOURCE: &str = include_str!("../../runtime/typescript/params.ts");
+const DB_LIBSQL_SOURCE: &str = include_str!("../../runtime/typescript/db-libsql.ts");
+const DB_WORKER_PROXY_SOURCE: &str =
+    include_str!("../../runtime/typescript/db-worker-proxy.ts");
+const MINITEST_RUNTIME_SOURCE: &str = include_str!("../../runtime/typescript/minitest.ts");
+const MINITEST_ASYNC_RUNTIME_SOURCE: &str =
+    include_str!("../../runtime/typescript/minitest-async.ts");
+
+/// Pick the `minitest.ts` test-runtime variant for the active
+/// deployment profile. Same selection rule as the juntos / server
+/// pickers — async profiles get the variant whose
+/// `dispatch`/`get`/`post`/etc. await `process_action`.
+fn minitest_source_for_active_profile() -> &'static str {
+    if crate::analyze::async_color::active_extern_async_names().is_empty() {
+        MINITEST_RUNTIME_SOURCE
+    } else {
+        MINITEST_ASYNC_RUNTIME_SOURCE
+    }
+}
+
+/// Pick the `juntos.ts` runtime variant for the active deployment
+/// profile. Selection has two axes:
+///   - `http_shim == SharedWorker` → `juntos-worker.ts` (MessagePort-
+///     proxied AR adapter, BroadcastChannel-backed broadcaster).
+///   - Otherwise: sync profiles (`node-sync`) get better-sqlite3-
+///     backed adapter; async profiles (`node-async`, future server
+///     variants) get the libsql-backed adapter. Keyed on
+///     `active_extern_async_names()` being non-empty.
+fn juntos_source_for_active_profile() -> &'static str {
+    if crate::profile::active_http_shim() == crate::profile::HttpShim::SharedWorker {
+        return JUNTOS_WORKER_SOURCE;
+    }
+    if crate::analyze::async_color::active_extern_async_names().is_empty() {
+        JUNTOS_SQLITE_SOURCE
+    } else {
+        JUNTOS_LIBSQL_SOURCE
+    }
+}
+
+/// Pick the `db.ts` runtime variant for the active profile. The
+/// SharedWorker target gets the MessagePort proxy (the application
+/// tier runs in a SharedWorkerGlobalScope where neither Node sqlite
+/// binding loads; the real sqlite-wasm lives in the dedicated
+/// `db_worker.ts`). Otherwise: sync profiles get the better-sqlite3
+/// wrap; async (libsql) profiles get the @libsql/client wrap whose
+/// `exec`/`prepare` return Promises. Same SharedWorker-first / async
+/// selection rule as the juntos / server pickers above.
+fn db_source_for_active_profile() -> &'static str {
+    if crate::profile::active_http_shim() == crate::profile::HttpShim::SharedWorker {
+        return DB_WORKER_PROXY_SOURCE;
+    }
+    if crate::analyze::async_color::active_extern_async_names().is_empty() {
+        DB_SOURCE
+    } else {
+        DB_LIBSQL_SOURCE
+    }
+}
+
+/// Pick the `server.ts` runtime variant for the active profile —
+/// same selection rule as `juntos_source_for_active_profile`.
+fn server_source_for_active_profile() -> &'static str {
+    if crate::profile::active_http_shim() == crate::profile::HttpShim::SharedWorker {
+        return SERVER_WORKER_SOURCE;
+    }
+    if crate::analyze::async_color::active_extern_async_names().is_empty() {
+        SERVER_SQLITE_SOURCE
+    } else {
+        SERVER_LIBSQL_SOURCE
+    }
+}
+
+mod char_set;
+mod expr;
+pub(crate) use expr::{array_method_handled, numeric_method_handled, string_method_handled};
+pub mod js_ast;
+mod library;
+mod naming;
+mod package;
+pub mod printer;
+mod sourcemap;
+mod ty;
+
+pub use ty::{ts_async_return_ty, ts_return_ty, ts_ty};
+
+/// Public re-export so `runtime_loader` can render module-level
+/// constant values (`HTML_ESCAPES = { ... }.freeze` from
+/// `view_helpers.rb`) as top-level `const NAME = ...;` declarations
+/// in the transpiled output. The constant body uses the same
+/// expression emitter every method body does.
+pub fn emit_expr_for_runtime(e: &crate::expr::Expr) -> String {
+    expr::emit_expr(e)
+}
+
+/// Emit a TypeScript project for `app` under the named deployment
+/// `profile`. The profile selects the DB adapter and HTTP shim;
+/// `node_sync` (the implicit profile that `emit(app)` uses) leaves
+/// emit byte-equivalent to pre-Phase-3 — no `async`, no `await`.
+/// `node_async` (or any profile whose adapter has a non-empty
+/// `async_seed_methods()` list) runs propagation across lowered
+/// classes and emits `async`/`await` at the colored sites.
+pub fn emit_with_profile(
+    app: &App,
+    profile: &crate::profile::DeploymentProfile,
+) -> Vec<EmittedFile> {
+    use crate::det::HashSet;
+    let extern_names: Vec<&'static str> = profile.adapter().async_seed_methods().to_vec();
+    let async_set: HashSet<crate::ident::Symbol> = extern_names
+        .iter()
+        .map(|s| crate::ident::Symbol::from(*s))
+        .collect();
+    crate::profile::with_active_profile(*profile, || {
+        crate::analyze::async_color::with_extern_async_names(extern_names, || {
+            expr::with_async_methods(async_set, || emit(app))
+        })
+    })
+}
+
+/// Inject a `Date` branch into the transpiled
+/// `JsonBuilder.encode_datetime`. The transpiled body (from
+/// `runtime/ruby/json_builder.rb`) handles the stored ISO-8601 STRING
+/// form; a temporal-column reader now yields a native `Date`, which the
+/// jbuilder views pass here. `Date.prototype.toISOString()` already
+/// produces Rails' canonical UTC millisecond `...Z` shape
+/// (`2026-05-15T21:14:56.300Z`), so the branch is a one-liner. Anchored on
+/// the `s`-named null guard (unique to `encode_datetime`; `encode_value`
+/// uses `v`). The transpiled param is `any`, so no signature widening is
+/// needed for a `Date` argument to type-check.
+fn patch_json_builder_datetime(content: String) -> String {
+    const ANCHOR: &str = "if (s == null) { return \"null\"; }";
+    const INJECT: &str = "if (s == null) { return \"null\"; }\n  if (s instanceof Date) { return `\"${s.toISOString()}\"`; }";
+    debug_assert!(
+        content.contains(ANCHOR),
+        "json_builder.ts encode_datetime null-guard anchor not found — \
+         the transpiled shape changed; update patch_json_builder_datetime",
+    );
+    content.replacen(ANCHOR, INJECT, 1)
+}
+
+/// Emit a TypeScript project for `app`. Every artifact (models,
+/// views, controllers, fixtures, tests, schema) flows through the
+/// universal walker. A single shared class registry is threaded
+/// through all lowerings so cross-class dispatch (`Article.find(...)`
+/// from a controller body, `ArticlesFixtures.one()` from a test)
+/// types end-to-end.
+pub fn emit(app: &App) -> Vec<EmittedFile> {
+    let mut files = Vec::new();
+
+    files.push(package::emit_package_json());
+    files.push(package::emit_tsconfig_json(app));
+    files.push(EmittedFile {
+        path: PathBuf::from("src/juntos.ts"),
+        content: juntos_source_for_active_profile().to_string(),
+    });
+
+    // Framework runtime files: hand-written TS primitives (HTTP
+    // server, DB adapter shim, test runner glue) are inlined as-is
+    // from `runtime/typescript/`. Layout: flat under `src/`;
+    // internal cross-imports use `./<name>.js`. server.ts swaps
+    // between the better-sqlite3 + libsql variants based on the
+    // active profile (same selection rule as juntos.ts).
+    // ParamValue — recursive `string | { [k]: ParamValue } |
+    // ParamValue[]` type the RBS references for `@params`. The
+    // emitter renders `Roundhouse::ParamValue` Class refs as bare
+    // `ParamValue` (per ts_class_ty's last-segment rule); imports
+    // pull it into the controller-base file. See
+    // `runtime/typescript/param_value.ts` and the cross-target
+    // declaration in `runtime/crystal/param_value.cr`.
+    files.push(EmittedFile {
+        path: PathBuf::from("src/param_value.ts"),
+        content: PARAM_VALUE_SOURCE.to_string(),
+    });
+    files.push(EmittedFile {
+        path: PathBuf::from("src/params.ts"),
+        content: PARAMS_SOURCE.to_string(),
+    });
+    files.push(EmittedFile {
+        path: PathBuf::from("src/broadcasts.ts"),
+        content: BROADCASTS_SOURCE.to_string(),
+    });
+    files.push(EmittedFile {
+        path: PathBuf::from("src/i18n_host.ts"),
+        content: I18N_HOST_SOURCE.to_string(),
+    });
+    // Datetime seam — `RhDateTime.parse` for temporal-column getters.
+    files.push(EmittedFile {
+        path: PathBuf::from("src/datetime.ts"),
+        content: DATETIME_SOURCE.to_string(),
+    });
+    // Db primitive surface — profile-selected. Sync profiles get
+    // the better-sqlite3 wrap (`db.ts`); async (libsql) profiles
+    // get the @libsql/client wrap (`db-libsql.ts`) whose
+    // `exec`/`prepare` return Promises. Lowerer-emitted per-model
+    // `_adapter_*` methods (and the Arel pass's inline SELECT
+    // expansions) reach the database via this single namespace
+    // export. See project_arel_compile_time_first.md.
+    files.push(EmittedFile {
+        path: PathBuf::from("src/db.ts"),
+        content: db_source_for_active_profile().to_string(),
+    });
+    files.push(EmittedFile {
+        path: PathBuf::from("src/server.ts"),
+        content: server_source_for_active_profile().to_string(),
+    });
+
+    // SharedWorker target: three additional runtime files reach the
+    // output. `client.ts` is the main-thread Turbo intercept bridge
+    // (loaded by the emitted `main.ts` entry); `db_worker.ts` runs
+    // inside the dedicated DB Worker; `sqlite_wasm_engine.ts` is
+    // its sqlite-wasm + opfs-sahpool backend. None are referenced
+    // by node-target builds.
+    if crate::profile::active_http_shim() == crate::profile::HttpShim::SharedWorker {
+        files.push(EmittedFile {
+            path: PathBuf::from("src/client.ts"),
+            content: CLIENT_WORKER_SOURCE.to_string(),
+        });
+        // Tailwind entry (issue #6). `@tailwindcss/vite` compiles this
+        // at build time, scanning the emitted templates (`@source`) for
+        // class names; `main.ts` imports it so Vite bundles +
+        // fingerprints + base-prefixes the result. `../app` holds the
+        // emitted views/layout where the utility classes live as string
+        // literals; `../src` covers any helper-rendered markup.
+        files.push(EmittedFile {
+            path: PathBuf::from("src/styles.css"),
+            content: "@import \"tailwindcss\";\n@source \"../app\";\n@source \"../src\";\n"
+                .to_string(),
+        });
+        files.push(EmittedFile {
+            path: PathBuf::from("src/db_worker.ts"),
+            content: DB_WORKER_SOURCE.to_string(),
+        });
+        files.push(EmittedFile {
+            path: PathBuf::from("src/sqlite_wasm_engine.ts"),
+            content: SQLITE_WASM_ENGINE_SOURCE.to_string(),
+        });
+    }
+
+    // (Transpile-from-Ruby runtime emit deferred to AFTER the
+    // lowering pipeline so the tree-shake walker can use the
+    // lowered app classes as reachability roots.)
+
+    // ── Lowering pipeline ───────────────────────────────────────────
+    // Order matters because each step's output feeds the next's
+    // shared registry. Views are lowered untyped first so models can
+    // dispatch on Views::* signatures, then the same LibraryClasses
+    // are body-typed with the full model registry.
+
+    let vctx = crate::lower::ViewLowerCtx::new(app);
+    let mut view_lcs = crate::lower::preliminary_view_classes(&app.views, &vctx);
+    let view_extras = library::extras_from_lcs(&view_lcs);
+
+    let route_helper_funcs = crate::lower::lower_routes_to_library_functions(app);
+    let route_helper_extras = library::extras_from_funcs(&route_helper_funcs);
+
+    // Collect controller `permit(...)` declarations once so the model
+    // lowerer can synthesize `from_params(p: <Resource>Params)` factories
+    // matching the permitted-fields list. The same specs feed the
+    // controller lowerer below — both call sites need the same view
+    // of the controller-derived metadata.
+    let params_specs =
+        crate::lower::controller_to_library::params::collect_specs(&app.controllers);
+    let (mut model_lcs, model_registry) = crate::lower::lower_models_with_registry_params_and_views(
+        &app.models,
+        &app.schema,
+        &app.views,
+        view_extras,
+        &params_specs,
+    );
+
+    let mut view_lower_extras: Vec<(crate::ident::ClassId, crate::analyze::ClassInfo)> =
+        model_registry.clone().into_iter().collect();
+    view_lower_extras.extend(route_helper_extras.clone());
+    crate::lower::type_view_library_classes(&mut view_lcs, app, view_lower_extras.clone());
+    let jbuilder_lcs = crate::lower::lower_jbuilder_to_library_classes(
+        &app.views,
+        app,
+        view_lower_extras,
+    );
+
+    let mut controller_extras: Vec<(crate::ident::ClassId, crate::analyze::ClassInfo)> =
+        model_registry.into_iter().collect();
+    controller_extras.extend(library::extras_from_lcs(&view_lcs));
+    controller_extras.extend(route_helper_extras);
+    let assocs = crate::lower::model_associations::compute_association_graph(app);
+    let mut controller_lcs = crate::lower::lower_controllers_with_arel_views_and_assocs(
+        &app.controllers,
+        controller_extras.clone(),
+        Some(&app.schema),
+        &app.views,
+        &assocs,
+    );
+
+    let mut fixture_lcs = crate::lower::lower_fixtures_to_library_classes(app);
+
+    let mut test_lowered: Vec<crate::lower::LoweredTestModule> = if app.test_modules.is_empty() {
+        Vec::new()
+    } else {
+        let mut test_extras = controller_extras;
+        test_extras.extend(library::extras_from_lcs(&controller_lcs));
+        test_extras.extend(library::extras_from_lcs(&fixture_lcs));
+        // Framework runtime RBS — when the App carries
+        // `rbs_signatures` (loaded by `ingest_app` or the
+        // framework_tests gates), translate each `(class, method →
+        // Ty)` row into a ClassInfo extra so the test body-typer
+        // dispatches precisely against framework methods (e.g.
+        // `ActionDispatch::Router.match` returning a typed Record).
+        // Without this, RBS-declared signatures lived only in the
+        // analyzer's class registry and the test lowerer's separate
+        // typing pass couldn't see them.
+        for (class_id, methods) in &app.rbs_signatures {
+            let mut info = crate::analyze::ClassInfo::default();
+            for (m_name, m_ty) in methods {
+                info.instance_methods.insert(m_name.clone(), m_ty.clone());
+            }
+            test_extras.push((class_id.clone(), info));
+        }
+        crate::lower::lower_test_modules_with_inner(
+            &app.test_modules,
+            &app.fixtures,
+            &app.models,
+            test_extras,
+            &crate::lower::routes::helper_id_segments(app),
+            &crate::lower::routes::direct_helper_names(app),
+        )
+    };
+    let mut test_lcs: Vec<crate::dialect::LibraryClass> = test_lowered
+        .iter()
+        .map(|m| m.test_class.clone())
+        .collect();
+    // Inner classes are file-scoped to their owning test class; they
+    // need to be reachable for treeshake (so methods on Validatable
+    // aren't dropped) but get emitted INSIDE each test file rather
+    // than as their own files.
+    let mut test_inner_lcs: Vec<crate::dialect::LibraryClass> = test_lowered
+        .iter()
+        .flat_map(|m| m.inner_classes.iter().cloned())
+        .collect();
+
+    // ── Emit ────────────────────────────────────────────────────────
+
+    // Tree-shake the framework runtime: walk all app-side method
+    // bodies (models, controllers, views, fixtures, tests) and
+    // filter the runtime LibraryClasses to only the methods reached
+    // transitively. `validates_format_of` etc. that the app never
+    // uses get dropped from `validations.ts`. Conservative on
+    // untyped Sends — keeps the method on every class that defines
+    // it, never wrong.
+    // Async coloring (Phase 3): when `with_extern_async_names` is
+    // set by `emit_with_profile`, propagate `is_async` GLOBALLY
+    // across all app class Vecs and route-helper functions. One
+    // unified pass means cross-Vec chains (controller method →
+    // model helper → extern) converge in a single fixed-point
+    // iteration. Empty extern list (the default / sync profile)
+    // makes this a no-op, preserving pre-Phase-3 emit byte-for-byte
+    // (Gate 1). Test classes are propagated alongside model + view
+    // + controller + fixture so a test method calling a colored
+    // helper picks up `async` correctly. `test_inner_lcs` carries
+    // user-defined inner classes (Validatable etc.) — same Vec
+    // shape, same propagation.
+    // Hoist late-built LibraryFunction Vecs so propagation can see
+    // them. `seeds_funcs` in particular calls AR (`Article.create!`
+    // etc.) and must propagate. The other three (routes_dispatch,
+    // importmap, schema) are pure routing/static-data helpers, so
+    // propagation is a no-op for them — but threading them in
+    // keeps the algorithm uniform and Future Rails patterns won't
+    // surprise us.
+    let mut seeds_funcs = crate::lower::lower_seeds_to_library_functions(app);
+    let mut routes_dispatch_funcs = crate::lower::lower_routes_to_dispatch_functions(app);
+    let mut importmap_funcs = crate::lower::lower_importmap_to_library_functions(app);
+    let mut schema_funcs = crate::lower::lower_schema_to_library_functions(&app.schema);
+
+    let extern_async_names = crate::analyze::async_color::active_extern_async_names();
+
+    // Async coloring (Phase 4): parse the runtime once and stage
+    // its classes for the global propagation pass below. The runtime
+    // and app classes propagate together so chains that cross the
+    // boundary in either direction reach a single fixed point —
+    // `Article#update { this.save() }` (app → runtime) and
+    // `Base#save { this.is_valid() }` (within runtime, but
+    // dependent on `validate` which Comment marks async on the app
+    // side) both converge before any emit reads `is_async`. The
+    // alias / extra-roots derivations below reuse this parse.
+    let runtime_units_seed = crate::runtime_loader::typescript_units(|_, c| c)
+        .expect("runtime transpile parse failed");
+    let mut runtime_seed_classes: Vec<crate::dialect::LibraryClass> = runtime_units_seed
+        .iter()
+        .flat_map(|u| u.classes.iter().cloned())
+        .collect();
+    rename_ivars_shadowing_controller_base(&mut controller_lcs, &runtime_seed_classes);
+    let mut expanded_extern_storage: Vec<String> =
+        extern_async_names.iter().map(|s| s.to_string()).collect();
+
+    // Test-runtime async surface. `runtime/typescript/minitest.ts`
+    // is hand-written (not in `typescript_units`), so its async
+    // methods don't reach propagation through the parsed-IR path.
+    // Under any async profile, `dispatch` awaits `process_action`
+    // (controllers are colored async), and the HTTP-style helpers
+    // (`get`/`post`/`put`/`patch`/`head`) await `dispatch`.
+    // `assert_difference` / `assert_no_difference` await both the
+    // count expression and the body block. Listing the names here
+    // gives propagation the shape it needs: test methods that call
+    // `this.get(...)` get marked async, and emit wraps the call.
+    // (`delete` is already in the AR adapter seed list — both the
+    // test-runtime `delete` and `Hash#delete` collide on the name,
+    // and the receiver-aware filter at emit time keeps `Hash#delete`
+    // from being awaited.)
+    if !extern_async_names.is_empty() {
+        for name in &[
+            "get",
+            "post",
+            "put",
+            "patch",
+            "head",
+            "assert_difference",
+            "assert_no_difference",
+        ] {
+            let s = name.to_string();
+            if !expanded_extern_storage.contains(&s) {
+                expanded_extern_storage.push(s);
+            }
+        }
+    }
+
+    let mut route_helper_funcs = route_helper_funcs;
+    if !extern_async_names.is_empty() {
+        // Capture lengths BEFORE `append` drains each source Vec —
+        // we need them to split the merged Vec back into the
+        // original per-category Vecs after propagation. Runtime
+        // seed classes ride along in the same merged Vec so chains
+        // that cross the runtime↔app boundary in BOTH directions
+        // (Base#is_valid → Comment#validate, Article#update →
+        // Base#save) converge in a single fixed-point pass. Without
+        // including runtime classes here, `Base#is_valid` is marked
+        // async only by the per-file pass during runtime emit —
+        // those marks never reach the emit-time
+        // `ASYNC_METHOD_NAMES` thread-local, so `Base#save`'s call
+        // site `this.is_valid()` doesn't wrap with `(await ...)`
+        // and the emitted code awaits a Promise as if it were a
+        // boolean (always truthy).
+        let m_len = model_lcs.len();
+        let v_len = view_lcs.len();
+        let c_len = controller_lcs.len();
+        let fx_len = fixture_lcs.len();
+        let tc_len = test_lcs.len();
+        let tci_len = test_inner_lcs.len();
+        let rt_len = runtime_seed_classes.len();
+        let mut all_classes: Vec<crate::dialect::LibraryClass> = Vec::new();
+        all_classes.append(&mut model_lcs);
+        all_classes.append(&mut view_lcs);
+        all_classes.append(&mut controller_lcs);
+        all_classes.append(&mut fixture_lcs);
+        all_classes.append(&mut test_lcs);
+        all_classes.append(&mut test_inner_lcs);
+        all_classes.append(&mut runtime_seed_classes);
+        // Stitch all functions together for one global pass; split
+        // back like the classes below.
+        let rh_len = route_helper_funcs.len();
+        let sd_len = seeds_funcs.len();
+        let rd_len = routes_dispatch_funcs.len();
+        let im_len = importmap_funcs.len();
+        let sc_len = schema_funcs.len();
+        let _ = (rh_len, sd_len, rd_len, im_len, sc_len);
+        let mut all_funcs: Vec<crate::dialect::LibraryFunction> = Vec::new();
+        all_funcs.append(&mut route_helper_funcs);
+        all_funcs.append(&mut seeds_funcs);
+        all_funcs.append(&mut routes_dispatch_funcs);
+        all_funcs.append(&mut importmap_funcs);
+        all_funcs.append(&mut schema_funcs);
+        let extern_refs: Vec<&str> =
+            expanded_extern_storage.iter().map(|s| s.as_str()).collect();
+        crate::analyze::async_color::propagate_global_with_externs(
+            &mut all_classes,
+            &mut all_funcs,
+            &extern_refs,
+        );
+        // Collect every name the global pass marked async, across
+        // both runtime and app sides. This is the complete set the
+        // emit-time `is_async_method_name` lookup needs to wrap call
+        // sites — both app-marked names (`Article#comments` whose
+        // body calls `Comment.where(...)`) and runtime-marked names
+        // (`Base#save`, `Base#is_valid`, `Base#destroy`).
+        let mut all_async_names: crate::det::HashSet<crate::ident::Symbol> =
+            crate::det::HashSet::default();
+        for class in &all_classes {
+            for method in &class.methods {
+                if method.is_async {
+                    all_async_names.insert(method.name.clone());
+                }
+            }
+        }
+        for func in &all_funcs {
+            if func.is_async {
+                all_async_names.insert(func.name.clone());
+            }
+        }
+        // Fold every marked name (runtime + app) into the runtime-
+        // side extern set, so the runtime emit's per-file
+        // propagation pass arrives at the same fixed point as the
+        // global pass when it re-parses the runtime sources.
+        for sym in &all_async_names {
+            let n = sym.as_str().to_string();
+            if !expanded_extern_storage.contains(&n) {
+                expanded_extern_storage.push(n);
+            }
+        }
+        // Inject every async-known name into the emit-time thread-
+        // local. Two sources: (1) propagation results (`all_async_names`),
+        // and (2) `expanded_extern_storage`, which carries the
+        // adapter seeds AND hand-written runtime methods (the test-
+        // runtime async surface from `minitest.ts` — `get`/`post`/
+        // etc.) that propagation can't see because they're not in
+        // the parsed IR. Without (2), `(await this.get(...))` doesn't
+        // wrap because `get` is in extern but never in the async
+        // name set.
+        let mut emit_async_names = all_async_names;
+        for s in &expanded_extern_storage {
+            emit_async_names.insert(crate::ident::Symbol::from(s.as_str()));
+        }
+        if !emit_async_names.is_empty() {
+            expr::extend_async_methods(emit_async_names);
+        }
+        let mut fiter = all_funcs.into_iter();
+        route_helper_funcs = fiter.by_ref().take(rh_len).collect();
+        seeds_funcs = fiter.by_ref().take(sd_len).collect();
+        routes_dispatch_funcs = fiter.by_ref().take(rd_len).collect();
+        importmap_funcs = fiter.by_ref().take(im_len).collect();
+        schema_funcs = fiter.collect();
+        // Split back in append order. `take(N)` consumes exactly N
+        // elements; the trailing `collect()` picks up the rest.
+        let mut iter = all_classes.into_iter();
+        model_lcs = iter.by_ref().take(m_len).collect();
+        view_lcs = iter.by_ref().take(v_len).collect();
+        controller_lcs = iter.by_ref().take(c_len).collect();
+        fixture_lcs = iter.by_ref().take(fx_len).collect();
+        test_lcs = iter.by_ref().take(tc_len).collect();
+        test_inner_lcs = iter.by_ref().take(tci_len).collect();
+        runtime_seed_classes = iter.collect();
+        let _ = rt_len; // length only used for clarity; consumed via `collect()`.
+
+        // Sync is_async flags from the propagated test_lcs /
+        // test_inner_lcs (clones used for propagation) back to
+        // test_lowered, which the emit pass at the bottom of this
+        // function reads from. Without this writeback, propagation
+        // marks `test_creates_an_article(...)` async but emit uses
+        // the unmarked `test_lowered.test_class` clone — every test
+        // method body containing `await ArticlesFixtures.one()`
+        // tsc-rejects with TS1308 (await outside async function).
+        for (idx, lc) in test_lcs.iter().enumerate() {
+            if let Some(target) = test_lowered.get_mut(idx) {
+                for (mi, m) in lc.methods.iter().enumerate() {
+                    if let Some(t) = target.test_class.methods.get_mut(mi) {
+                        t.is_async = m.is_async;
+                    }
+                }
+            }
+        }
+        let mut tic_iter = test_inner_lcs.iter();
+        for lowered in test_lowered.iter_mut() {
+            for ic_target in lowered.inner_classes.iter_mut() {
+                if let Some(ic_src) = tic_iter.next() {
+                    for (mi, m) in ic_src.methods.iter().enumerate() {
+                        if let Some(t) = ic_target.methods.get_mut(mi) {
+                            t.is_async = m.is_async;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut all_app_classes: Vec<crate::dialect::LibraryClass> =
+        Vec::with_capacity(model_lcs.len() + view_lcs.len() + jbuilder_lcs.len() + controller_lcs.len() + fixture_lcs.len() + test_lcs.len() + test_inner_lcs.len());
+    all_app_classes.extend(model_lcs.iter().cloned());
+    all_app_classes.extend(view_lcs.iter().cloned());
+    // jbuilder views call into the runtime too
+    // (`ViewHelpers.url_for_path` for a `_url`, `JsonBuilder.*`); a
+    // method only they reach was shaken out, and `/articles.json`
+    // answered 500.
+    all_app_classes.extend(jbuilder_lcs.iter().cloned());
+    all_app_classes.extend(controller_lcs.iter().cloned());
+    all_app_classes.extend(fixture_lcs.iter().cloned());
+    all_app_classes.extend(test_lcs.iter().cloned());
+    all_app_classes.extend(test_inner_lcs.iter().cloned());
+    // Each class's `static` constants, for a child constant that shadows
+    // an ancestor's (`expr::ancestor_declares_static`).
+    expr::set_static_constants(all_app_classes.iter().chain(runtime_seed_classes.iter()).chain(app.library_classes.iter()));
+    // Send-site shapes for every class this emit knows: see
+    // `expr::set_class_shapes`.
+    expr::set_class_shapes(
+        all_app_classes
+            .iter()
+            .chain(runtime_seed_classes.iter())
+            .chain(app.library_classes.iter())
+            .map(|c| (c, instance_field_names(c), static_field_names(c))),
+    );
+
+    // Reuse the runtime parse from the async-expansion step above
+    // (`typescript_units` parses + emits in one step; the expansion-
+    // step parse already paid for the classes, so we don't parse a
+    // third time). Alias registration (qualified + last-segment) and
+    // the hand-written-runtime `extra_roots` derivation live in
+    // `for_app_units` — shared with every other shaking target.
+    // App-side standalone functions (seeds, route helpers) carry app
+    // code too: `Article.create!(...)` in seeds.rb needs to keep
+    // `create!` alive on Base.
+    let mut all_app_functions: Vec<crate::dialect::LibraryFunction> = Vec::new();
+    all_app_functions.extend(crate::lower::lower_seeds_to_library_functions(app));
+    all_app_functions.extend(route_helper_funcs.clone());
+    let reach = crate::treeshake::Reachability::for_app_units(
+        &all_app_classes,
+        &runtime_units_seed,
+        &all_app_functions,
+    );
+
+    // Shake the lowerer-synthesized optional model surface (per-column
+    // presence/dirty predicates, `update!`) down to what app code
+    // reaches. Only names in each model's derived shakeable set are
+    // candidates, so user methods and the framework contract are
+    // untouchable. Roots were computed from the UNFILTERED classes
+    // (conservative: a dead predicate's body can keep a runtime method
+    // alive, never the reverse). Row/proxy classes in `model_lcs`
+    // aren't in the map and pass through unchanged.
+    let shakeable_by_model: crate::det::HashMap<
+        crate::ident::ClassId,
+        crate::det::HashSet<crate::ident::Symbol>,
+    > = app
+        .models
+        .iter()
+        .filter_map(|m| {
+            app.schema.tables.get(&m.table.0).map(|t| {
+                (
+                    m.name.clone(),
+                    crate::lower::model_to_library::shakeable_synthesized_names(t, m)
+                        .into_iter()
+                        .collect(),
+                )
+            })
+        })
+        .collect();
+    let mut synth_dropped = 0usize;
+    model_lcs = model_lcs
+        .iter()
+        .map(|lc| match shakeable_by_model.get(&lc.name) {
+            Some(shakeable) => {
+                let filtered =
+                    crate::treeshake::filter_synthesized_model_methods(lc, shakeable, &reach);
+                synth_dropped += lc.methods.len() - filtered.methods.len();
+                filtered
+            }
+            None => lc.clone(),
+        })
+        .collect();
+    if synth_dropped > 0 {
+        eprintln!(
+            "roundhouse: treeshake (typescript): dropped {synth_dropped} unreachable \
+             synthesized model methods"
+        );
+    }
+
+    // Snapshot the EXPANDED extern names for the runtime transform
+    // closure. The closure captures by move, so the owning Vec<String>
+    // is cloned once per call and dereferenced to &[&str] inside.
+    // Using the expanded set (adapter seeds + every method the seed-
+    // pass propagation marked async) lets cross-runtime-file chains
+    // propagate during the actual emit pass — `Validations#valid?`
+    // calling `Base#save` now sees `save` in extern and marks
+    // `valid?` async. Without this, the per-file pass would only see
+    // direct adapter-method calls within a single runtime file.
+    let extern_for_runtime: Vec<String> = expanded_extern_storage.clone();
+    // Per-(class, method) async marks computed during global
+    // propagation (including the inheritance pass that pulls a
+    // parent method async when a subclass override is async). The
+    // runtime emit re-parses each runtime file fresh — without
+    // these marks, the inheritance-driven flips on (e.g.)
+    // `Base#instantiate` would be lost between the global pass
+    // and the per-file emit.
+    let runtime_async_marks: crate::det::HashSet<(crate::ident::ClassId, crate::ident::Symbol)> =
+        runtime_seed_classes
+            .iter()
+            .flat_map(|c| {
+                let cname = c.name.clone();
+                c.methods
+                    .iter()
+                    .filter(|m| m.is_async)
+                    .map(move |m| (cname.clone(), m.name.clone()))
+            })
+            .collect();
+    // Tree-shake observability: per-class (name, total, always_kept,
+    // kept) tallies recorded inside the transform closure, summarized
+    // after the units are built. `always_kept` counts the methods the
+    // filter retains unconditionally (accessors + initialize) so the
+    // summary can report precision over the genuinely eligible set.
+    let shake_stats: std::rc::Rc<std::cell::RefCell<Vec<(String, usize, usize, usize, usize)>>> =
+        Default::default();
+    let shake_stats_in = shake_stats.clone();
+    let runtime_units = crate::runtime_loader::typescript_units(move |_path, classes| {
+        let mut classes: Vec<_> = classes
+            .into_iter()
+            .map(|c| {
+                use crate::dialect::AccessorKind;
+                let total = c.methods.len();
+                let always = c
+                    .methods
+                    .iter()
+                    .filter(|m| {
+                        matches!(
+                            m.kind,
+                            AccessorKind::AttributeReader | AccessorKind::AttributeWriter
+                        ) || m.name.as_str() == "initialize"
+                    })
+                    .count();
+                let filtered = crate::treeshake::filter_runtime_class(&c, &reach);
+                // Of the kept eligible methods, how many were precisely
+                // reachable on this class vs rescued only by the
+                // conservative name-anywhere fallback? The fallback
+                // share bounds how much typed-receiver precision work
+                // could still shrink the output.
+                let fallback_only = filtered
+                    .methods
+                    .iter()
+                    .filter(|m| {
+                        use crate::dialect::AccessorKind;
+                        !matches!(
+                            m.kind,
+                            AccessorKind::AttributeReader | AccessorKind::AttributeWriter
+                        ) && m.name.as_str() != "initialize"
+                            && !reach.contains(&c.name, &m.name)
+                    })
+                    .count();
+                shake_stats_in.borrow_mut().push((
+                    c.name.0.as_str().to_string(),
+                    total,
+                    always,
+                    filtered.methods.len(),
+                    fallback_only,
+                ));
+                filtered
+            })
+            .collect();
+        // Pre-apply the async marks computed during global
+        // propagation. Match by ClassId equality first, falling
+        // back to last-segment match for the runtime/app namespace
+        // mismatch (`Base` vs `ActiveRecord::Base`).
+        if !runtime_async_marks.is_empty() {
+            for class in classes.iter_mut() {
+                let cname_raw = class.name.0.as_str();
+                let cname_last = cname_raw.rsplit("::").next().unwrap_or(cname_raw);
+                for method in class.methods.iter_mut() {
+                    if method.is_async {
+                        continue;
+                    }
+                    let exact = (class.name.clone(), method.name.clone());
+                    if runtime_async_marks.contains(&exact) {
+                        method.is_async = true;
+                        continue;
+                    }
+                    // Last-segment fallback.
+                    let by_last = runtime_async_marks.iter().any(|(cid, mname)| {
+                        let raw = cid.0.as_str();
+                        let last = raw.rsplit("::").next().unwrap_or(raw);
+                        last == cname_last && mname == &method.name
+                    });
+                    if by_last {
+                        method.is_async = true;
+                    }
+                }
+            }
+        }
+        if !extern_for_runtime.is_empty() {
+            let refs: Vec<&str> = extern_for_runtime.iter().map(|s| s.as_str()).collect();
+            crate::analyze::async_color::propagate_with_externs(&mut classes, &refs);
+        }
+        classes
+    })
+    .expect("runtime transpile failed (Ruby source error)");
+    // The runtime's files are written; an app class named `Base` takes
+    // the bare name in the app's (#1228).
+    {
+        let last = |n: &str| n.rsplit("::").next().unwrap_or(n).to_string();
+        let app_classes: crate::det::HashSet<String> = app
+            .library_classes
+            .iter()
+            .map(|c| last(c.name.0.as_str()))
+            .chain(app.models.iter().map(|m| last(m.name.0.as_str())))
+            .chain(app.controllers.iter().map(|c| last(c.name.0.as_str())))
+            .collect();
+        expr::set_runtime_base_aliases(app_classes.contains("Base").then_some(&app_classes));
+    }
+    {
+        // Summarize what the shake kept. `eligible` excludes the
+        // unconditional keeps (accessors + initialize) so the kept%
+        // reflects actual reachability precision, not the floor.
+        let stats = shake_stats.borrow();
+        let total: usize = stats.iter().map(|s| s.1).sum();
+        let always: usize = stats.iter().map(|s| s.2).sum();
+        let kept: usize = stats.iter().map(|s| s.3).sum();
+        let fallback: usize = stats.iter().map(|s| s.4).sum();
+        let eligible = total - always;
+        let kept_eligible = kept - always;
+        if total > 0 {
+            eprintln!(
+                "roundhouse: treeshake (typescript): kept {kept} of {total} runtime methods \
+                 ({always} always-kept accessors/constructors; {kept_eligible} of {eligible} \
+                 eligible = {}%, of which {fallback} only via name-fallback)",
+                if eligible > 0 { kept_eligible * 100 / eligible } else { 100 }
+            );
+        }
+        if std::env::var("ROUNDHOUSE_TREESHAKE_VERBOSE").as_deref() == Ok("1") {
+            for (name, t, a, k, f) in stats.iter() {
+                eprintln!("roundhouse: treeshake:   {name}: kept {k}/{t} ({a} always, {f} name-fallback)");
+            }
+        }
+    }
+    for unit in runtime_units {
+        // Datetime Stage-2: temporal-column readers yield a native `Date`,
+        // which the jbuilder views pass to `JsonBuilder.encode_datetime`.
+        // The transpiled function handles the stored-string path; inject a
+        // `Date` branch (→ Rails' canonical `...Z` millisecond form) so
+        // the native value serializes correctly. TS has no partial-class /
+        // overload-across-files mechanism (unlike the C#/Swift/Crystal
+        // seams), so this augments the transpiled unit in place.
+        let content = if unit.out_path == PathBuf::from("src/json_builder.ts") {
+            patch_json_builder_datetime(unit.content)
+        } else {
+            unit.content
+        };
+        files.push(EmittedFile {
+            path: unit.out_path,
+            content,
+        });
+    }
+
+    if !schema_funcs.is_empty() {
+        files.extend(library::emit_module_file(
+            &schema_funcs,
+            app,
+            PathBuf::from("src/schema.ts"),
+        ));
+    }
+
+    if !route_helper_funcs.is_empty() {
+        files.extend(library::emit_module_file(
+            &route_helper_funcs,
+            app,
+            PathBuf::from("app/route_helpers.ts"),
+        ));
+    }
+
+    if !routes_dispatch_funcs.is_empty() {
+        files.extend(library::emit_module_file(
+            &routes_dispatch_funcs,
+            app,
+            PathBuf::from("app/routes.ts"),
+        ));
+    }
+
+    if !importmap_funcs.is_empty() {
+        files.extend(library::emit_module_file(
+            &importmap_funcs,
+            app,
+            PathBuf::from("app/importmap.ts"),
+        ));
+    }
+
+    let has_seeds = app.seeds.is_some();
+    if !seeds_funcs.is_empty() {
+        files.extend(library::emit_module_file(
+            &seeds_funcs,
+            app,
+            PathBuf::from("db/seeds.ts"),
+        ));
+    }
+
+    // Synthesized siblings (`<Model>Row` from models, `<Resource>Params`
+    // from controllers) carry an `origin` tag. Combine both into one
+    // list so render_imports recognizes them as model-style imports —
+    // they all live in `app/models/` regardless of which lowerer
+    // produced them.
+    let mut synthesized_names: Vec<String> = model_lcs
+        .iter()
+        .chain(controller_lcs.iter())
+        .filter(|lc| lc.origin.is_some())
+        .map(|lc| lc.name.0.as_str().to_string())
+        .collect();
+    synthesized_names.sort();
+    synthesized_names.dedup();
+    let mut nested_by_root: std::collections::BTreeMap<&str, Vec<&crate::dialect::LibraryClass>> =
+        std::collections::BTreeMap::new();
+    for lc in &app.library_classes {
+        if let Some(root) = library::nested_class_root(lc) {
+            nested_by_root.entry(root).or_default().push(lc);
+        }
+    }
+    expr::set_nested_class_names(
+        nested_by_root.values().flatten().map(|lc| lc.name.0.as_str().to_string()),
+    );
+    for lc in &model_lcs {
+        let stem = crate::naming::snake_case(lc.name.0.as_str());
+        let out_path = PathBuf::from(format!("app/models/{stem}.ts"));
+        match nested_by_root.remove(lc.name.0.as_str()) {
+            Some(nested) => files.extend(library::emit_class_file_with_nested(
+                Some(lc),
+                lc.name.0.as_str(),
+                &nested,
+                app,
+                out_path,
+                &synthesized_names,
+            )),
+            None => files.extend(library::emit_class_file_with_synthesized(
+                lc,
+                app,
+                out_path,
+                &synthesized_names,
+            )),
+        }
+    }
+
+    // Views: flatten the per-template LibraryClasses into
+    // LibraryFunctions and emit one function per file. The body-typer
+    // registry above (`view_extras` / `extras_from_lcs(&view_lcs)`)
+    // still uses the class shape so cross-class dispatch
+    // (`Views::Articles.article(x)`) types correctly without a
+    // parallel registry. The class-vs-function choice is purely an
+    // emit-side surface decision.
+    let view_funcs = crate::lower::flatten_lcs_to_functions(&view_lcs);
+    let html_views: Vec<&crate::dialect::View> =
+        app.views.iter().filter(|v| crate::lower::view::lowers_through_view_path(v)).collect();
+    for (view, func) in html_views.iter().zip(view_funcs.iter()) {
+        let out_path = view_output_path(&crate::lower::view::view_output_stem(view));
+        files.extend(library::emit_function_file(func, app, out_path));
+    }
+
+    // Jbuilder (json-format) views — emitted to `<base>_json.ts` so
+    // they sit alongside the html sibling without colliding. The
+    // `JsonBuilder.encode_value` helper transpiles automatically via
+    // the runtime_loader manifest.
+    let jbuilder_funcs = crate::lower::flatten_lcs_to_functions(&jbuilder_lcs);
+    let json_views: Vec<&crate::dialect::View> =
+        app.views.iter().filter(|v| v.jbuilder).collect();
+    for (view, func) in json_views.iter().zip(jbuilder_funcs.iter()) {
+        let out_path = jbuilder_view_output_path(view.name.as_str());
+        files.extend(library::emit_function_file(func, app, out_path));
+    }
+
+    if !view_funcs.is_empty() || !jbuilder_funcs.is_empty() {
+        let mut all_funcs = view_funcs.clone();
+        all_funcs.extend(jbuilder_funcs.iter().cloned());
+        // The aggregator keys import paths off the view name, so each
+        // text view carries its OUTPUT stem — `pwa/manifest_json` for a
+        // json.erb, `show_svg` for an svg one — the file written above.
+        let mut all_views: Vec<crate::dialect::View> = html_views
+            .iter()
+            .map(|v| {
+                let mut clone: crate::dialect::View = (*v).clone();
+                clone.name = crate::ident::Symbol::from(crate::lower::view::view_output_stem(v));
+                clone
+            })
+            .collect();
+        for v in &json_views {
+            let mut clone: crate::dialect::View = (*v).clone();
+            // The aggregator keys output paths off the view name —
+            // append `_json` here so the aggregator references the
+            // `<base>_json.ts` file we just emitted.
+            clone.name = crate::ident::Symbol::from(format!("{}_json", v.name.as_str()));
+            all_views.push(clone);
+        }
+        files.extend(library::emit_views_aggregator(&all_views, &all_funcs));
+    }
+
+    // Synthesized `<Resource>Params` classes ride in `controller_lcs`
+    // (origin tagged); route those to `app/models/` rather than
+    // `app/controllers/`. Use the combined `synthesized_names` so a
+    // controller body's reference to a Row class (or any other
+    // synthesized class) resolves uniformly.
+    for lc in &controller_lcs {
+        let stem = crate::naming::snake_case(lc.name.0.as_str());
+        let out_path = if lc.origin.is_some() {
+            PathBuf::from(format!("app/models/{stem}.ts"))
+        } else {
+            PathBuf::from(format!("app/controllers/{stem}.ts"))
+        };
+        files.extend(library::emit_class_file_with_synthesized(
+            lc,
+            app,
+            out_path,
+            &synthesized_names,
+        ));
+    }
+
+    for lc in &app.library_classes {
+        if library::nested_class_root(lc).is_some() {
+            continue;
+        }
+        let stem = crate::naming::snake_case(lc.name.0.as_str());
+        let out_path = PathBuf::from(format!("app/models/{stem}.ts"));
+        match nested_by_root.remove(lc.name.0.as_str()) {
+            Some(nested) => files.extend(library::emit_class_file_with_nested(
+                Some(lc),
+                lc.name.0.as_str(),
+                &nested,
+                app,
+                out_path,
+                &[],
+            )),
+            None => files.extend(library::emit_class_file(lc, app, out_path)),
+        }
+    }
+    // A root no class carries (`module Billing` around `class Invoice`) gets a file of its own.
+    for (root, nested) in nested_by_root {
+        let out_path = PathBuf::from(format!("app/models/{}.ts", crate::naming::snake_case(root)));
+        files.extend(library::emit_class_file_with_nested(None, root, &nested, app, out_path, &[]));
+    }
+
+    for lc in &fixture_lcs {
+        let stem = fixture_file_stem(lc.name.0.as_str());
+        let out_path = PathBuf::from(format!("test/fixtures/{stem}.ts"));
+        files.extend(library::emit_class_file(lc, app, out_path));
+    }
+
+    if !test_lcs.is_empty() {
+        files.push(EmittedFile {
+            path: PathBuf::from("test/_runtime/minitest.ts"),
+            content: minitest_source_for_active_profile().to_string(),
+        });
+        files.push(emit_test_setup_ts(app, &fixture_lcs));
+        for lowered in &test_lowered {
+            let lc = &lowered.test_class;
+            let stem = test_file_stem(lc.name.0.as_str());
+            let out_path = PathBuf::from(format!("test/{stem}.test.ts"));
+            // Inner classes (declared inline inside the test class
+            // body in Ruby) hoist to file scope as companions; share
+            // the test file's import header so framework dependencies
+            // (`Validations`, `ActiveRecordBase`, etc.) resolve.
+            let mut emitted = library::emit_class_file_full(
+                lc,
+                app,
+                out_path.clone(),
+                &[],
+                &lowered.inner_classes,
+                &lowered.constants,
+            );
+
+            // setup.ts runs schema + adapter + routes + fixtures setup
+            // at module-load time. node:test loads each `.test.ts`
+            // file independently in the same process; the first
+            // file-load triggers setup, subsequent loads no-op.
+            // Imported BEFORE discover_tests so registration sees
+            // the prepared world.
+            append_code(
+                &mut emitted[0],
+                &format!(
+                    "\nimport \"./_runtime/setup.js\";\n\
+                     import {{ discover_tests }} from \"./_runtime/minitest.js\";\n\
+                     discover_tests({});\n",
+                    lc.name.0.as_str(),
+                ),
+            );
+            files.extend(emitted);
+        }
+    }
+
+    if crate::profile::active_http_shim() == crate::profile::HttpShim::SharedWorker {
+        // SharedWorker target: three entry points (main.ts loads
+        // client.ts, worker.ts loads server-worker.ts via
+        // startApplication, dedicated DB Worker bundles
+        // src/db_worker.ts directly), plus index.html shell and
+        // vite.config.ts with named rollup inputs.
+        files.push(emit_worker_main_ts());
+        files.push(emit_worker_app_ts(app, has_seeds));
+        files.push(emit_index_html());
+        files.push(emit_vite_config_ts());
+    } else {
+        files.push(emit_main_ts(app, has_seeds));
+    }
+
+    expr::set_runtime_base_aliases(None);
+    files
+}
+
+/// Append generated code to an emitted `.ts` file, keeping a trailing
+/// `//# sourceMappingURL` comment (if any) as the last line — tools
+/// scan for the comment at the end of the file, and the inserted
+/// lines sit after every mapped position so the map stays valid.
+fn append_code(file: &mut EmittedFile, text: &str) {
+    match file.content.rfind("//# sourceMappingURL=") {
+        Some(pos) => file.content.insert_str(pos, text),
+        None => file.content.push_str(text),
+    }
+}
+
+/// Hand-written `main.ts` shell. Wires together the generated
+/// schema, optional seeds, the routes dispatch table, the imported
+/// controller classes, and the runtime's `startServer`. The server
+/// owns request → controller dispatch (via `Router.match` and the
+/// `controllers` map keyed by controller-symbol).
+fn emit_main_ts(app: &App, has_seeds: bool) -> EmittedFile {
+    let mut s = String::new();
+    s.push_str("// Generated by Roundhouse.\n");
+    s.push_str("import { startServer } from \"./src/server.js\";\n");
+    if !app.schema.tables.is_empty() {
+        s.push_str("import { Schema } from \"./src/schema.js\";\n");
+    }
+    if has_seeds {
+        s.push_str("import { Seeds } from \"./db/seeds.js\";\n");
+    }
+    let flat = crate::lower::flatten_routes(app);
+    let has_routes = !flat.is_empty();
+    // Mirror the routes lowerer's "root iff path == \"/\"" partition.
+    let has_root = flat.iter().any(|r| r.path == "/");
+    if has_routes {
+        s.push_str("import { RouteTable } from \"./app/routes.js\";\n");
+    }
+    // The application layout transpiles to a `(body) => string` function
+    // exported as `application` from `app/views/layouts/application.ts`.
+    // Wiring it into `startServer({ layout })` makes the dispatcher wrap
+    // each response in the real Rails-shaped <head>/<body> instead of
+    // server.ts's fallback shell.
+    let has_layout = app
+        .views
+        .iter()
+        .any(|v| v.name.as_str() == "layouts/application");
+    if has_layout {
+        s.push_str(
+            "import { application as renderLayoutsApplication } \
+             from \"./app/views/layouts/application.js\";\n",
+        );
+    }
+    for c in &app.controllers {
+        let stem = crate::naming::snake_case(c.name.0.as_str());
+        let class_name = c.name.0.as_str();
+        s.push_str(&format!(
+            "import {{ {class_name} }} from \"./app/controllers/{stem}.js\";\n"
+        ));
+    }
+    s.push('\n');
+    s.push_str("await startServer({\n");
+    if app.schema.tables.is_empty() {
+        s.push_str("  schemaStatements: [],\n");
+    } else {
+        s.push_str("  schemaStatements: Schema.statements(),\n");
+    }
+    if has_seeds {
+        s.push_str("  seeds: () => Seeds.run(),\n");
+    }
+    if has_layout {
+        s.push_str("  layout: renderLayoutsApplication,\n");
+    }
+    if has_routes {
+        s.push_str("  routes: RouteTable.table(),\n");
+        if has_root {
+            s.push_str("  rootRoute: RouteTable.root(),\n");
+        }
+        s.push_str("  controllers: {\n");
+        for c in &app.controllers {
+            let class_name = c.name.0.as_str();
+            // `ArticlesController` → `articles` — same convention as
+            // `controller_symbol` in the routes lowerer.
+            let symbol = crate::naming::snake_case(
+                class_name.strip_suffix("Controller").unwrap_or(class_name),
+            );
+            s.push_str(&format!("    {symbol}: {class_name},\n"));
+        }
+        s.push_str("  },\n");
+    } else {
+        s.push_str("  routes: [],\n");
+        s.push_str("  controllers: {},\n");
+    }
+    s.push_str("});\n");
+    EmittedFile {
+        path: PathBuf::from("main.ts"),
+        content: s,
+    }
+}
+
+/// SharedWorker target — main-thread entry. Minimal: import Turbo
+/// for navigation, hand off to `startClient()`. The Turbo intercept
+/// + SharedWorker spawn + meta-tag URL resolution all live inside
+/// `client.ts`.
+fn emit_worker_main_ts() -> EmittedFile {
+    // `./src/styles.css` is the Tailwind entry — Vite (via
+    // `@tailwindcss/vite`) compiles it by scanning the emitted
+    // templates and injects a fingerprinted, base-prefixed
+    // `<link rel="stylesheet">` into index.html. This replaces the
+    // Rails asset-pipeline `stylesheet_link_tag` + importmap model for
+    // the worker target (issue #6): the runtime layout no longer
+    // references `/assets/*` files that don't exist in the bundle.
+    let content = "// Generated by Roundhouse.\n\
+import \"./src/styles.css\";\n\
+import \"@hotwired/turbo\";\n\
+import { startClient } from \"./src/client.js\";\n\
+\n\
+await startClient();\n";
+    EmittedFile {
+        path: PathBuf::from("main.ts"),
+        content: content.to_string(),
+    }
+}
+
+/// SharedWorker target — application-tier entry (the SharedWorker
+/// bundle). Mirrors `emit_main_ts`'s wiring (schema, seeds, routes,
+/// controllers) but calls `startApplication` against
+/// `server-worker.ts`'s onconnect/MessagePort dispatcher.
+fn emit_worker_app_ts(app: &App, has_seeds: bool) -> EmittedFile {
+    let mut s = String::new();
+    s.push_str("// Generated by Roundhouse — SharedWorker entry.\n");
+    s.push_str("import { startApplication } from \"./src/server.js\";\n");
+    if !app.schema.tables.is_empty() {
+        s.push_str("import { Schema } from \"./src/schema.js\";\n");
+    }
+    if has_seeds {
+        s.push_str("import { Seeds } from \"./db/seeds.js\";\n");
+    }
+    let flat = crate::lower::flatten_routes(app);
+    let has_routes = !flat.is_empty();
+    let has_root = flat.iter().any(|r| r.path == "/");
+    if has_routes {
+        s.push_str("import { RouteTable } from \"./app/routes.js\";\n");
+    }
+    let has_layout = app
+        .views
+        .iter()
+        .any(|v| v.name.as_str() == "layouts/application");
+    if has_layout {
+        s.push_str(
+            "import { application as renderLayoutsApplication } \
+             from \"./app/views/layouts/application.js\";\n",
+        );
+    }
+    for c in &app.controllers {
+        let stem = crate::naming::snake_case(c.name.0.as_str());
+        let class_name = c.name.0.as_str();
+        s.push_str(&format!(
+            "import {{ {class_name} }} from \"./app/controllers/{stem}.js\";\n"
+        ));
+    }
+    // Model imports feed the `globalThis.app` debug handle below, not
+    // the dispatcher — controllers already reach models through their
+    // own imports, so ES-module dedup makes these free.
+    let debug_models: Vec<&str> = app
+        .models
+        .iter()
+        .map(|m| m.name.0.as_str())
+        .filter(|n| *n != "ApplicationRecord")
+        .collect();
+    if !debug_models.is_empty() {
+        s.push_str("import { Db } from \"./src/db.js\";\n");
+        for class_name in &debug_models {
+            let stem = crate::naming::snake_case(class_name);
+            s.push_str(&format!(
+                "import {{ {class_name} }} from \"./app/models/{stem}.js\";\n"
+            ));
+        }
+    }
+    s.push('\n');
+    s.push_str("await startApplication({\n");
+    if app.schema.tables.is_empty() {
+        s.push_str("  schemaStatements: [],\n");
+    } else {
+        s.push_str("  schemaStatements: Schema.statements(),\n");
+    }
+    if has_seeds {
+        s.push_str("  seeds: () => Seeds.run(),\n");
+    }
+    if has_layout {
+        s.push_str("  layout: renderLayoutsApplication,\n");
+    }
+    if has_routes {
+        s.push_str("  routes: RouteTable.table(),\n");
+        if has_root {
+            s.push_str("  rootRoute: RouteTable.root(),\n");
+        }
+        s.push_str("  controllers: {\n");
+        for c in &app.controllers {
+            let class_name = c.name.0.as_str();
+            let symbol = crate::naming::snake_case(
+                class_name.strip_suffix("Controller").unwrap_or(class_name),
+            );
+            s.push_str(&format!("    {symbol}: {class_name},\n"));
+        }
+        s.push_str("  },\n");
+    } else {
+        s.push_str("  routes: [],\n");
+        s.push_str("  controllers: {},\n");
+    }
+    s.push_str("});\n");
+    // Console affordance: the app's model classes + Db adapter on the
+    // worker's global scope, reachable from the worker's DevTools
+    // console (chrome://inspect/#workers). The bundle is otherwise
+    // pure ES modules with nothing in scope; assigned after
+    // startApplication so the database is ready by the time anything
+    // can call in. `await app.Article._adapter_all()`, or `.save()` a
+    // new record and watch the Turbo Stream broadcast hit every tab.
+    if !debug_models.is_empty() {
+        s.push('\n');
+        s.push_str(&format!(
+            "(globalThis as any).app = {{ {}, Db }};\n",
+            debug_models.join(", ")
+        ));
+    }
+    EmittedFile {
+        path: PathBuf::from("worker.ts"),
+        content: s,
+    }
+}
+
+/// SharedWorker target — index.html shell. Loads main.ts as a
+/// module entry; placeholder `<meta>` tags get rewritten by the
+/// Vite manifest plugin (in `vite.config.ts`) at build time with
+/// the fingerprinted SharedWorker + dedicated DB Worker URLs.
+fn emit_index_html() -> EmittedFile {
+    let content = "<!DOCTYPE html>
+<html lang=\"en\">
+  <head>
+    <meta charset=\"utf-8\">
+    <title>Roundhouse App</title>
+    <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">
+    <link rel=\"icon\" href=\"data:,\">
+    <!-- Tells Turbo Drive to use morphdom-style head reconciliation
+         on full-page navigations instead of the default replace
+         behavior. Without this, the head difference between this
+         empty shell and the application layout's response forces
+         Turbo into a full page reload — which restarts main.ts and
+         re-fires auto-visit, infinite loop. Same fix juntos uses. -->
+    <meta name=\"turbo-refresh-method\" content=\"morph\">
+    <!-- SPA deep-link restore. A static host (GitHub Pages) 404s on a
+         hard reload of a client-side route; the site 404.html bounces
+         such URLs back to this shell with the original path in `?p=`.
+         Rewrite the address bar to the real path BEFORE the deferred
+         module entry runs, so client.ts routes off the right location.
+         No-op for normal loads (no `?p=`). -->
+    <script>
+      (function () {
+        var p = new URLSearchParams(location.search).get(\"p\");
+        if (p) history.replaceState(null, \"\", location.pathname.replace(/\\/+$/, \"\") + p + location.hash);
+      })();
+    </script>
+    <!-- Worker URLs are rewritten by vite.config.ts's manifest plugin
+         at build time. The Vite dev server resolves them through the
+         manifest virtual module. -->
+    <meta name=\"juntos-worker\" content=\"/worker.ts\">
+    <meta name=\"juntos-db-worker\" content=\"/src/db_worker.ts\">
+  </head>
+  <body>
+    <div id=\"loading\">Loading…</div>
+    <div id=\"app\" style=\"display: none\"></div>
+    <script type=\"module\" src=\"/main.ts\"></script>
+  </body>
+</html>
+";
+    EmittedFile {
+        path: PathBuf::from("index.html"),
+        content: content.to_string(),
+    }
+}
+
+/// SharedWorker target — Vite config. Three named rollup inputs
+/// (main / worker / db_worker) → three fingerprinted bundles. The
+/// manifest plugin reads `.vite/manifest.json` after build and
+/// rewrites the placeholder `<meta name=\"juntos-worker\">` /
+/// `<meta name=\"juntos-db-worker\">` tags in `dist/index.html`
+/// with the fingerprinted asset URLs. The sourcemap plugin feeds the
+/// emitter's sidecar `.ts.map` files (TS → Ruby/ERB) into rollup so
+/// `build.sourcemap` chains all the way back to the `.rb` sources
+/// in devtools.
+fn emit_vite_config_ts() -> EmittedFile {
+    let content = "// Generated by Roundhouse — Vite config for the SharedWorker target.
+import { defineConfig, type Plugin } from \"vite\";
+import tailwindcss from \"@tailwindcss/vite\";
+import { readFileSync, writeFileSync } from \"node:fs\";
+import { resolve } from \"node:path\";
+
+// Deploy base path. Defaults to \"/\" (served from the web root). Set
+// ROUNDHOUSE_BASE (e.g. \"/roundhouse/blog/\", trailing slash required)
+// to mount the app under a subdirectory — needed for project GitHub
+// Pages, which serve under \"/<repo>/...\". Vite rewrites the entry
+// <script> and bundled asset URLs with this base; the meta-injection
+// plugin below applies the same (Vite-normalized) base to the worker
+// <meta> tags, and client.ts strips it back off via import.meta.env.
+const BASE = process.env.ROUNDHOUSE_BASE || \"/\";
+
+/** Rewrite the `<meta name=\"juntos-worker\">` and `juntos-db-worker`
+ *  tags in dist/index.html with the fingerprinted bundle URLs Vite
+ *  produced, base-prefixed. Reads the manifest after closeBundle so
+ *  the asset filenames are final. */
+function manifestMetaInjection(): Plugin {
+  // Vite normalizes `base` to always end in \"/\"; captured from the
+  // resolved config so it matches what Vite applied to other assets.
+  let base = BASE;
+  return {
+    name: \"roundhouse-manifest-meta-injection\",
+    apply: \"build\",
+    configResolved(config) {
+      base = config.base;
+    },
+    closeBundle() {
+      const distDir = resolve(\"dist\");
+      const manifestPath = resolve(distDir, \".vite\", \"manifest.json\");
+      const indexPath = resolve(distDir, \"index.html\");
+      let manifest: Record<string, { file?: string }>;
+      try {
+        manifest = JSON.parse(readFileSync(manifestPath, \"utf8\"));
+      } catch {
+        console.warn(\"[roundhouse] vite manifest not found; skipping meta injection\");
+        return;
+      }
+      let html: string;
+      try {
+        html = readFileSync(indexPath, \"utf8\");
+      } catch {
+        console.warn(\"[roundhouse] dist/index.html not found; skipping meta injection\");
+        return;
+      }
+      const workerAsset = manifest[\"worker.ts\"]?.file;
+      const dbWorkerAsset = manifest[\"src/db_worker.ts\"]?.file;
+      // `base` ends in \"/\"; manifest `file` has no leading slash, so
+      // `${base}${file}` yields e.g. \"/roundhouse/blog/assets/worker-….js\"
+      // (or \"/assets/worker-….js\" at the default root base).
+      if (workerAsset) {
+        html = html.replace(
+          /<meta name=\"juntos-worker\" content=\"[^\"]*\">/,
+          `<meta name=\"juntos-worker\" content=\"${base}${workerAsset}\">`,
+        );
+      }
+      if (dbWorkerAsset) {
+        html = html.replace(
+          /<meta name=\"juntos-db-worker\" content=\"[^\"]*\">/,
+          `<meta name=\"juntos-db-worker\" content=\"${base}${dbWorkerAsset}\">`,
+        );
+      }
+      writeFileSync(indexPath, html);
+    },
+  };
+}
+
+/** Chain the compiler's sidecar `.ts.map` files (generated TS → the
+ *  original Ruby/ERB, with sourcesContent embedded) into the bundle
+ *  maps, so devtools breakpoints land in the `.rb`/`.erb` sources.
+ *  Rollup does not read `sourceMappingURL` comments off disk on its
+ *  own — a load hook has to return the input map alongside the code. */
+function rubySourceMaps(): Plugin {
+  return {
+    name: \"roundhouse-ruby-sourcemaps\",
+    load(id) {
+      let map: string;
+      try {
+        map = readFileSync(id + \".map\", \"utf8\");
+      } catch {
+        return null;
+      }
+      return { code: readFileSync(id, \"utf8\"), map };
+    },
+  };
+}
+
+export default defineConfig({
+  base: BASE,
+  build: {
+    sourcemap: true,
+    manifest: true,
+    rollupOptions: {
+      input: {
+        main: resolve(\"index.html\"),
+        worker: resolve(\"worker.ts\"),
+        db_worker: resolve(\"src/db_worker.ts\"),
+      },
+      output: {
+        entryFileNames: \"assets/[name]-[hash].js\",
+        chunkFileNames: \"assets/[name]-[hash].js\",
+        assetFileNames: \"assets/[name]-[hash][extname]\",
+      },
+    },
+  },
+  plugins: [rubySourceMaps(), tailwindcss(), manifestMetaInjection()],
+});
+";
+    EmittedFile {
+        path: PathBuf::from("vite.config.ts"),
+        content: content.to_string(),
+    }
+}
+
+/// Map a view name (`articles/index`, `articles/_article`,
+/// `layouts/application`) to the output path under `app/views/`.
+fn view_output_path(view_name: &str) -> PathBuf {
+    PathBuf::from(format!("app/views/{view_name}.ts"))
+}
+
+/// Jbuilder counterpart: `articles/_article` → `app/views/articles/
+/// _article_json.ts`. Matches the lowered method name (`article_json`)
+/// and keeps the html sibling's file slot free.
+fn jbuilder_view_output_path(view_name: &str) -> PathBuf {
+    PathBuf::from(format!("app/views/{view_name}_json.ts"))
+}
+
+/// `ArticleTest` → `article` (strip Test suffix, snake_case). Used
+/// for the `test/<stem>.test.ts` output path so the file name reads
+/// naturally without redundant `_test_test`.
+fn test_file_stem(class_name: &str) -> String {
+    let stem = class_name.strip_suffix("Test").unwrap_or(class_name);
+    crate::naming::snake_case(stem)
+}
+
+/// `ArticlesFixtures` → `articles` (strip Fixtures suffix, snake_case).
+fn fixture_file_stem(class_name: &str) -> String {
+    let stem = class_name.strip_suffix("Fixtures").unwrap_or(class_name);
+    crate::naming::snake_case(stem)
+}
+
+/// Emit `test/_runtime/setup.ts` — runs once on first import (each
+/// `.test.ts` file imports it before calling `discover_tests`). Opens
+/// an in-memory SQLite DB, applies the schema, installs the adapter
+/// (via `installDb`'s wire-up), installs routes + controllers for
+/// `this.get/post/...` dispatch, and loads every fixture class's
+/// `_fixtures_load_bang()`. Mirrors the spinel-side `SchemaSetup`
+/// + `FixtureLoader` setup in `runtime/spinel/test/test_helper.rb`.
+fn emit_test_setup_ts(
+    app: &App,
+    fixture_lcs: &[crate::dialect::LibraryClass],
+) -> EmittedFile {
+    // Same selection rule as `juntos_source_for_active_profile` /
+    // `server_source_for_active_profile`: under any async profile
+    // (libsql today, D1/IndexedDB tomorrow) the test runtime can't
+    // import better-sqlite3 — its native module isn't reachable in
+    // the worker/browser/edge variants and even on Node it's the
+    // wrong adapter shape. Switch to the libsql `setupTestDb` path.
+    let async_profile = !crate::analyze::async_color::active_extern_async_names().is_empty();
+
+    let mut s = String::new();
+    s.push_str("// Generated by Roundhouse.\n");
+    if async_profile {
+        s.push_str("import { setupTestDb } from \"../../src/juntos.js\";\n");
+    } else {
+        s.push_str("import Database from \"better-sqlite3\";\n\n");
+        s.push_str("import { installDb } from \"../../src/juntos.js\";\n");
+        // Level-3 primitive surface — adopts the same Database
+        // instance so lowerer-emitted `_adapter_*` methods see
+        // rows written by legacy juntos AR helpers (and vice versa).
+        s.push_str("import { Db } from \"../../src/db.js\";\n");
+    }
+
+    let has_schema = !app.schema.tables.is_empty();
+    if has_schema {
+        s.push_str("import { Schema } from \"../../src/schema.js\";\n");
+    }
+
+    let flat = crate::lower::flatten_routes(app);
+    let has_routes = !flat.is_empty();
+    let has_root = flat.iter().any(|r| r.path == "/");
+    if has_routes {
+        s.push_str("import { installRoutes } from \"./minitest.js\";\n");
+        s.push_str("import { RouteTable } from \"../../app/routes.js\";\n");
+        for c in &app.controllers {
+            let stem = crate::naming::snake_case(c.name.0.as_str());
+            let class_name = c.name.0.as_str();
+            s.push_str(&format!(
+                "import {{ {class_name} }} from \"../../app/controllers/{stem}.js\";\n",
+            ));
+        }
+    }
+
+    for lc in fixture_lcs {
+        let stem = fixture_file_stem(lc.name.0.as_str());
+        let class_name = lc.name.0.as_str();
+        s.push_str(&format!(
+            "import {{ {class_name} }} from \"../fixtures/{stem}.js\";\n",
+        ));
+    }
+
+    s.push('\n');
+    if async_profile {
+        // libsql path: schema + DB install rolled into the async
+        // helper. `setupTestDb` opens an in-memory libsql Client,
+        // runs the DDL one statement at a time (libsql doesn't
+        // support multi-statement execute), and calls `installDb`
+        // for us. Top-level `await` is fine in an ES module.
+        if has_schema {
+            s.push_str("await setupTestDb(Schema.statements().join(\";\"));\n");
+        } else {
+            s.push_str("await setupTestDb(\"\");\n");
+        }
+    } else {
+        s.push_str("const db = new Database(\":memory:\");\n");
+        if has_schema {
+            s.push_str("for (const stmt of Schema.statements()) {\n");
+            s.push_str("  db.exec(stmt);\n");
+            s.push_str("}\n");
+        }
+        // installDb wires the SqliteActiveRecordAdapter onto
+        // ActiveRecord.adapter (juntos.ts) so framework Ruby's
+        // `ActiveRecord.adapter.find/all/...` resolves.
+        s.push_str("installDb(db);\n");
+        // Db.install(db) adopts the same connection for the
+        // Level-3 primitive surface (`Db.prepare`, `Db.step?`,
+        // `Db.column_*`, `Db.escape_int`, …). Both paths see the
+        // same in-memory DB.
+        s.push_str("Db.install(db);\n");
+    }
+
+    if has_routes {
+        s.push_str("installRoutes(\n");
+        s.push_str("  RouteTable.table(),\n");
+        if has_root {
+            s.push_str("  RouteTable.root(),\n");
+        } else {
+            s.push_str("  undefined,\n");
+        }
+        s.push_str("  {\n");
+        for c in &app.controllers {
+            let class_name = c.name.0.as_str();
+            let symbol = crate::naming::snake_case(
+                class_name.strip_suffix("Controller").unwrap_or(class_name),
+            );
+            s.push_str(&format!("    {symbol}: {class_name},\n"));
+        }
+        s.push_str("  },\n");
+        s.push_str(");\n");
+    }
+
+    if !fixture_lcs.is_empty() {
+        s.push('\n');
+        s.push_str("// Load every fixture class's data into the in-memory DB.\n");
+        s.push_str("// Loaded once at module-init; tests share state across\n");
+        s.push_str("// runs in this suite. Per-test isolation (transaction\n");
+        s.push_str("// rollback) is a future improvement.\n");
+        for lc in fixture_lcs {
+            let class_name = lc.name.0.as_str();
+            // Under async profiles `_fixtures_load_bang()` returns
+            // Promise<void> (it `save()`s rows through the libsql
+            // adapter). Top-level await is fine in an ES module —
+            // each test file imports setup.ts at module-init.
+            // Without awaiting, fixture rows aren't in the DB by
+            // the time tests start; `Comment.find(1)` then throws
+            // "Couldn't find Comment with id=1".
+            if async_profile {
+                s.push_str(&format!("await {class_name}._fixtures_load_bang();\n"));
+            } else {
+                s.push_str(&format!("{class_name}._fixtures_load_bang();\n"));
+            }
+        }
+    }
+
+    EmittedFile {
+        path: PathBuf::from("test/_runtime/setup.ts"),
+        content: s,
+    }
+}
+
+
+/// Emit a `LibraryClass` (a single class or mixin module from a
+/// `runtime/ruby/*` file, with method signatures attached) as a
+/// TypeScript class declaration — trailing newline included.
+///
+/// Surface choices:
+///   * `parent: Some(StandardError)` → `extends Error` (TS's
+///     equivalent). Other parents pass through verbatim.
+///   * `parent: None` on a non-module → bare `class Foo`.
+///   * `is_module: true` → bare `class Foo` for now (mixin semantics
+///     are handled at the include site, not the definition site).
+///   * Synthesized attr_reader pattern (zero-param method whose body
+///     is `Ivar { name }` matching the method's own name) → emit as a
+///     class field declaration; the read still works because callers
+///     write `obj.foo` and TS resolves it to the field. Drops the
+///     synthetic getter, which would have collided with the field.
+///   * Synthesized attr_writer pattern (`name=` method that just
+///     assigns the matching ivar) → drops likewise; the field
+///     declaration above already supports `obj.foo = x`.
+///   * `initialize` → `constructor`. Body uses TS's `this.x` for
+///     ivars (already what `expr::emit_body` produces).
+///   * `Class`-receiver methods → `static`.
+///   * `include`s → emitted as a leading `// include: <Name>` comment;
+///     real mixin support is deferred.
+/// String bridge for `emit_library_class` consumers that compose text
+/// (the cross-target `runtime_loader` table). New TS-side callers use
+/// `js_library_class` and place the decl in a `JsModule`.
+pub fn emit_library_class(class: &crate::dialect::LibraryClass) -> Result<String, String> {
+    Ok(printer::render_decl(&js_library_class(class)?))
+}
+
+/// The instance field names `js_library_class` declares for `class`:
+/// its attribute readers and the ivars its instance methods assign.
+/// The class-side counterpart of `instance_field_names`: a class-side
+/// attribute reader, and each `@ivar` a class method assigns, which
+/// `js_library_class` declares as a `static` field (`def self.label;
+/// @label ||= "x"; end` is `static label`, and the method is left out).
+fn static_field_names(class: &crate::dialect::LibraryClass) -> crate::det::HashSet<String> {
+    use crate::dialect::{AccessorKind, MethodReceiver};
+    let mut names = crate::det::HashSet::default();
+    let mut ivars: indexmap::IndexMap<String, Ty> = indexmap::IndexMap::new();
+    for m in &class.methods {
+        if !matches!(m.receiver, MethodReceiver::Class) {
+            continue;
+        }
+        if matches!(m.kind, AccessorKind::AttributeReader) && m.params.is_empty() {
+            names.insert(m.name.as_str().to_string());
+        }
+        collect_ivar_assignments(&m.body, &mut ivars);
+    }
+    names.extend(ivars.into_keys());
+    names
+}
+
+fn instance_field_names(class: &crate::dialect::LibraryClass) -> crate::det::HashSet<String> {
+    use crate::dialect::{AccessorKind, MethodReceiver};
+    let mut names = crate::det::HashSet::default();
+    let mut ivars: indexmap::IndexMap<String, Ty> = indexmap::IndexMap::new();
+    for m in &class.methods {
+        if !matches!(m.receiver, MethodReceiver::Instance) {
+            continue;
+        }
+        if matches!(m.kind, AccessorKind::AttributeReader) && m.params.is_empty() {
+            names.insert(m.name.as_str().to_string());
+        }
+        collect_ivar_assignments(&m.body, &mut ivars);
+    }
+    names.extend(ivars.into_keys());
+    names
+}
+
+pub(super) fn js_library_class(
+    class: &crate::dialect::LibraryClass,
+) -> Result<js_ast::JsDecl, String> {
+    use crate::dialect::{AccessorKind, MethodReceiver};
+    use js_ast::{JsClassMember, JsDecl, TsType};
+
+    // The IR's LibraryClass.name is now the fully-qualified class
+    // path (`ActiveRecord::RecordInvalid`); TS doesn't allow `::` in
+    // identifiers, and each class file is imported by its bare name.
+    // Drop to the last segment for the surface declaration. The
+    // module path survives via the per-target import-resolution
+    // pass — `runtime/typescript/errors.ts` exports `RecordInvalid`.
+    let raw_name = class.name.0.as_str();
+    let class_name = raw_name.rsplit("::").next().unwrap_or(raw_name);
+
+    // Identify attribute readers/writers by the lowerer-recorded
+    // `kind` field rather than pattern-matching the body — the
+    // lowerer knows by construction (`synth_attr_reader`,
+    // `synth_attr_writer`, `attr_*` ingest), so the IR carries the
+    // fact directly. Restricted to instance receivers here because
+    // class-receiver attribute accessors don't have an established
+    // TS rendering pattern yet.
+    let is_attr_reader = |m: &crate::dialect::MethodDef| -> bool {
+        matches!(m.kind, AccessorKind::AttributeReader) && m.params.is_empty()
+    };
+    let is_attr_writer = |m: &crate::dialect::MethodDef| -> bool {
+        matches!(m.kind, AccessorKind::AttributeWriter) && m.params.len() == 1
+    };
+
+    // Collect field declarations (from synthesized attr_readers — the
+    // reader carries the type via its `() -> T` signature; body type
+    // is the next-best source; final fallback is `any`). Class-level
+    // attr_accessors (from `class << self; attr_accessor :x; end`)
+    // become `static x: T;` field declarations; instance-level become
+    // `x: T;`. Either form's setter is suppressed in favor of plain
+    // assignment to the field.
+    // (name, ty, is_static, from_ivar) — `from_ivar` distinguishes
+    // ivar-assignment-derived fields (constructor body assigns
+    // them) from attr_reader fields (typed accessors declared on
+    // this class). When the class has a parent, ivar-derived
+    // fields get a `declare` modifier — TS's signal that the
+    // declaration is type-only and the property is provided by
+    // the parent or by runtime assignment. Without `declare`, a
+    // re-declared parent property trips TS2612.
+    // Datetime storage/reader split (done in the shared lowering): a
+    // temporal column's stored ISO-8601 text is an ordinary `<col>_raw`
+    // String accessor pair (collapsing to a `created_at_raw: string`
+    // stored field below like any other column), and its
+    // `AttributeReader` returns `Ty::Time` with a body parsing that
+    // storage. That reader must not collapse into a stored field — it
+    // emits as an explicit `get <col>(): Date | null` below so the
+    // parsing body survives.
+    let is_temporal_reader = |m: &crate::dialect::MethodDef| -> bool {
+        is_attr_reader(m) && signature_ret_is_time(m.signature.as_ref())
+    };
+
+    let mut fields: Vec<(String, String, bool, bool, crate::span::Span)> = Vec::new();
+    let mut field_names_seen: crate::det::HashSet<String> = crate::det::HashSet::default();
+    // The same names per side, `[instance, static]`: a field subsumes a
+    // method of its name on its own side only (`attr_reader :label` and
+    // `def self.label` are both kept).
+    let mut side_field_names: [crate::det::HashSet<String>; 2] = Default::default();
+    let side = |is_static: bool| usize::from(is_static);
+    for m in &class.methods {
+        if is_attr_reader(m) {
+            // A temporal reader emits as a `Date` getter (below), not a
+            // stored field — reserve the name and skip the stored-field
+            // path.
+            if is_temporal_reader(m) {
+                field_names_seen.insert(m.name.as_str().to_string());
+                side_field_names[side(matches!(m.receiver, MethodReceiver::Class))].insert(m.name.as_str().to_string());
+                continue;
+            }
+            let ty = match m.signature.as_ref() {
+                Some(Ty::Fn { ret, .. }) => ts_ty(ret),
+                _ => m.body.ty.as_ref().map(ts_ty).unwrap_or_else(|| "any".to_string()),
+            };
+            let is_static = matches!(m.receiver, MethodReceiver::Class);
+            field_names_seen.insert(m.name.as_str().to_string());
+            side_field_names[side(is_static)].insert(m.name.as_str().to_string());
+            fields.push((m.name.as_str().to_string(), ty, is_static, false, m.body.span));
+        }
+    }
+
+    // Pre-walk every instance-method body looking for `@ivar = …`
+    // assignments that aren't already declared as attr_readers.
+    // TypeScript strict-mode requires field declarations for
+    // `this.foo` writes; controllers (which assign action-locals like
+    // `@article` for the view to read) and tests (which assign
+    // fixture-helpers at setup time) are the producers. Type comes
+    // from the assignment RHS; falls back to `any` when the analyzer
+    // didn't infer one.
+    let mut ivar_assignments: indexmap::IndexMap<String, Ty> = indexmap::IndexMap::new();
+    let mut static_ivar_assignments: indexmap::IndexMap<String, Ty> = indexmap::IndexMap::new();
+    for m in &class.methods {
+        match m.receiver {
+            MethodReceiver::Instance => {
+                collect_ivar_assignments(&m.body, &mut ivar_assignments);
+            }
+            MethodReceiver::Class => {
+                // `def self.reset_slots!; @slots = {}; end` —
+                // module-level `@slots` is shared across all class
+                // methods and emits as a `static` field.
+                // module_function-promoted methods land here too,
+                // so framework runtime files like `view_helpers.rb`
+                // (which uses `@slots` from inside `module_function`
+                // methods) get a static field declaration on the
+                // emitted class.
+                collect_ivar_assignments(&m.body, &mut static_ivar_assignments);
+            }
+        }
+    }
+    for (name, ty) in ivar_assignments {
+        if side_field_names[0].insert(name.clone()) {
+            field_names_seen.insert(name.clone());
+            fields.push((name, ts_ty(&ty), false, true, crate::span::Span::synthetic()));
+        }
+    }
+    for (name, ty) in static_ivar_assignments {
+        if side_field_names[1].insert(name.clone()) {
+            field_names_seen.insert(name.clone());
+            fields.push((name, ts_ty(&ty), true, true, crate::span::Span::synthetic()));
+        }
+    }
+
+    // Class header. Parent translation:
+    //   - `StandardError` → `Error` (TS builtin)
+    //   - `ActiveRecord::Base` → `ActiveRecordBase` (transpiled, aliased
+    //     from `Base` in src/active_record_base.ts via render_imports).
+    //     The juntos-side `ApplicationRecord` was a parallel
+    //     hand-written re-implementation; this redirect makes the
+    //     transpiled framework Ruby the single source of truth and
+    //     forces juntos's surface down to the per-target primitive
+    //     layer (`project_active_record_layering`).
+    //   - Other qualified names: last segment (Ruby's `Foo::Bar` → TS
+    //     `Bar` after import)
+    // Modules emit as classes for now; include-as-mixin is deferred.
+    let parent = class.parent.as_ref().map(|p| {
+        let raw = p.0.as_str();
+        match raw {
+            "StandardError" | "RuntimeError" | "ArgumentError" | "TypeError" | "NameError" | "NoMethodError"
+            | "NotImplementedError" | "KeyError" | "IndexError" => "Error".to_string(),
+            // Test parents — runtime adapter exports both names.
+            "ActiveSupport::TestCase" | "ActionDispatch::IntegrationTest" => "TestCase".to_string(),
+            "Minitest::Test" => "Test".to_string(),
+            _ if let Some(alias) = expr::runtime_base_alias(raw) => alias,
+            // All other framework parents (`ActiveRecord::Base`,
+            // `ActionController::Base`, mixins) collapse to the last
+            // segment — the imported name in their .ts file.
+            _ => raw.rsplit("::").next().unwrap_or(raw).to_string(),
+        }
+    });
+    // `include Mod` semantics: Ruby's mixin doesn't translate to TS
+    // multiple inheritance. Single-include + no-parent collapses to
+    // `extends <Mod>` so the included module's methods reach
+    // subclasses through TS's inheritance chain. Other shapes
+    // (include with explicit parent, multiple includes) still emit
+    // a comment placeholder — they need the include-as-mixin pass.
+    let synthesized_parent = if parent.is_none() && class.includes.len() == 1 {
+        Some(class.includes[0].0.as_str().rsplit("::").next().unwrap().to_string())
+    } else {
+        None
+    };
+    let effective_parent = parent.as_deref().or(synthesized_parent.as_deref());
+    let mut members: Vec<JsClassMember> = Vec::new();
+
+    if synthesized_parent.is_none() && !class.includes.is_empty() {
+        for inc in &class.includes {
+            members.push(JsClassMember::Comment(format!("include: {}", inc.0.as_str())));
+        }
+    }
+
+    let mut wrote_fields = false;
+    let has_parent = effective_parent.is_some();
+    // Class-body constants (`WEIGHTS = { "small" => 1 }.freeze`) as
+    // `static WEIGHTS = { "small": 1 };`, so a `Klass.WEIGHTS` read
+    // resolves (#1223). Only a literal value TS renders as written is
+    // declared; a constant whose name a static method or field also
+    // takes is left out, as is any other value.
+    for (name, value) in &class.constants {
+        let Some(literal) = declarable_constant_value(value) else {
+            report_undeclared_constant(class, name, value.span, "finds nothing", "its value is not a literal TypeScript renders as written (a constant read, a call, `Struct.new`)");
+            continue;
+        };
+        // Only a static member collides: TypeScript keeps a class's static
+        // and instance sides apart, as Ruby keeps a constant apart from an
+        // instance method of the same name.
+        if fields.iter().any(|f| f.2 && f.0 == name.as_str())
+            || class.methods.iter().any(|m| m.receiver == crate::dialect::MethodReceiver::Class && m.name.as_str() == name.as_str())
+        {
+            report_undeclared_constant(
+                class,
+                name,
+                value.span,
+                "reaches the class's static method or field of that name instead",
+                "a static member for the constant would collide with it",
+            );
+            continue;
+        }
+        let value = literal;
+        // A constant shadowing an ancestor's static of the same name is
+        // typed `any`: TypeScript requires the child's static side to be
+        // assignable to the parent's (TS2417), and Ruby's values may differ.
+        let shadows = expr::ancestor_declares_static(class.parent.as_ref().map(|p| p.0.as_str()), name.as_str());
+        members.push(JsClassMember::Field {
+            is_static: true,
+            declare: false,
+            name: name.as_str().to_string(),
+            ty: shadows.then(|| TsType("any".into())),
+            init: Some(expr::js_expr(value)),
+            span: value.span,
+        });
+        wrote_fields = true;
+    }
+    // Field names declared by the framework Base (active_record_base.ts)
+    // — every model extends ActiveRecordBase transitively, so these
+    // need a `declare` modifier on the subclass to avoid TS2612.
+    // Hardcoded for the small known set rather than threading the
+    // parent's field list through emit_library_class; expand when a
+    // new framework parent surface materializes.
+    const INHERITED_FIELD_NAMES: &[&str] = &["id", "errors", "error_details", "persisted", "destroyed"];
+    // A reader whose whole body memoizes a literal into the ivar of its
+    // own name (`def label; @label ||= "x"; end`) is dropped in favour of
+    // the field below; the field starts at that literal, which is what
+    // every read answers (#1238).
+    let memoized = memoized_literals(class);
+    for (name, ty, is_static, from_ivar, span) in &fields {
+        // ivar-derived fields on a derived class get `declare` —
+        // the constructor body's `this.x = ...` (or a parent
+        // declaration) provides the runtime backing; the field
+        // line is type-only. attr_reader-derived fields get
+        // `declare` only when the name matches a known
+        // framework-inherited field (id/errors/persisted/destroyed)
+        // since attr_readers also declare per-class fields for
+        // schema columns the parent doesn't have (title, body).
+        let inherited = INHERITED_FIELD_NAMES.contains(&name.as_str());
+        let needs_declare = has_parent && (*from_ivar || inherited);
+        // Static fields synthesized from class-method `@ivar = ...`
+        // assignments (module-level state in `module ViewHelpers;
+        // @slots = {}; def self.reset_slots!; @slots = {}; end; end`)
+        // need an initializer — without one, the field is `undefined`
+        // until `reset_slots_bang()` is called, and any earlier read
+        // (`this.slots[slot] = ...` from `content_for_set`) crashes.
+        // The Ruby source initializes module-level @vars at module
+        // load; mirror that with a type-driven default. Skip the
+        // initializer when the field is `declare`d (parent provides
+        // backing).
+        let memo = memoized.get(&(name.clone(), *is_static));
+        let needs_declare = needs_declare && memo.is_none();
+        let init = if let Some(literal) = memo {
+            Some(expr::js_expr(literal))
+        } else if *is_static && !needs_declare {
+            ts_default_for_type(ty)
+        } else {
+            None
+        };
+        members.push(JsClassMember::Field {
+            is_static: *is_static,
+            declare: needs_declare,
+            name: name.clone(),
+            ty: Some(TsType(ty.clone())),
+            init,
+            span: *span,
+        });
+        wrote_fields = true;
+    }
+
+    // Temporal READERS — an explicit computed `get <col>(): Date | null`
+    // rendering the IR body (`parse_db_time(@<col>_raw)` →
+    // `RhDateTime.parse(this.created_at_raw)`). Decoupled from storage:
+    // `article.created_at` is a native `Date`, the stored text stays a
+    // portable `created_at_raw: string` field. (`is_temporal_reader`
+    // gated these out of the stored-field passes above.) Reuse
+    // `js_class_member` for the body/return-type machinery, then flip
+    // the member kind to a getter.
+    for m in &class.methods {
+        if is_temporal_reader(m) {
+            let mut member = class_member(class, m, has_parent)?;
+            if let js_ast::JsClassMember::Method { kind, .. } = &mut member {
+                *kind = js_ast::MethodKind::Get;
+            }
+            members.push(member);
+            wrote_fields = true;
+        }
+    }
+
+    // `?`/`!` method-name suffixes get stripped on the way out
+    // (`save!` → `save`, `valid?` → `valid`); when both forms exist
+    // on the same class the sanitized names collide and TS rejects
+    // the duplicate member. Drop the bang/predicate variant when a
+    // plain-named twin exists — either as another method with the
+    // same sanitized name (`save` vs `save!`) or as a field
+    // declaration (`@persisted` ivar field collides with `persisted?`
+    // sanitized to `persisted`). Predicate bodies that just read the
+    // ivar (`def persisted?; @persisted; end`) are subsumed by the
+    // field; callers reading `record.persisted?` sanitize to
+    // `record.persisted` and get the field directly.
+    // Per side, as `side_field_names`: a static `ready?` keeps its name
+    // beside an instance `is_ready`.
+    let mut sanitized_seen: [crate::det::HashSet<String>; 2] = side_field_names.clone();
+    for m in &class.methods {
+        let raw = m.name.as_str();
+        if !raw.ends_with('?') && !raw.ends_with('!') {
+            sanitized_seen[side(matches!(m.receiver, MethodReceiver::Class))]
+                .insert(crate::emit::typescript::library::sanitize_identifier(raw));
+        }
+    }
+
+    let methods_to_emit: Vec<&crate::dialect::MethodDef> = class
+        .methods
+        .iter()
+        .filter(|m| !is_attr_reader(m) && !is_attr_writer(m))
+        .filter(|m| {
+            // Operator-method names (`[]`, `[]=`, `==`, …) aren't
+            // valid TS method identifiers. TS lacks operator
+            // overloading, so even renaming (`==` → `equals`) leaves
+            // the bodies uncalled by the emitted code: comparison
+            // sites lower to `===`, indexing lowers to `[]`, etc.
+            // Skipping keeps the file syntactically valid; the
+            // bodies remain readable in the source `.rb`.
+            //
+            // `HeaderStore#[]` / `#[]=` are the exception: the store
+            // is a class, not a JS object, and call sites on it go
+            // through `.get` / `.set` (see `is_framework_class_recv`).
+            // Those two methods are renamed in `js_class_member`.
+            (class_name == "HeaderStore" && matches!(m.name.as_str(), "[]" | "[]="))
+                || !matches!(
+                m.name.as_str(),
+                "[]" | "[]=" | "==" | "!=" | "<=>" | "<" | ">" | "<=" | ">="
+                    | "<<" | ">>" | "+" | "-" | "*" | "/" | "%" | "**"
+                    | "&" | "|" | "^" | "~" | "!" | "==="
+            )
+        })
+        .filter(|m| {
+            let raw = m.name.as_str();
+            let stripped =
+                crate::emit::typescript::library::sanitize_identifier(raw);
+            // Drop the method whenever its sanitized name collides
+            // with a field declaration (ivar OR attr_reader). The
+            // common cases: `def errors; @errors ||= []; end`,
+            // `def persisted?; @persisted; end` — bodies that just
+            // accessor-expose an ivar are subsumed by the field.
+            // Non-trivial colliders (rare) lose runtime semantics
+            // here; surface those as a separate Ruby-source change
+            // rather than emitting broken TS. A literal memo is not
+            // one: its field starts at the literal (`memoized_literals`).
+            if side_field_names[side(matches!(m.receiver, MethodReceiver::Class))].contains(&stripped) {
+                return false;
+            }
+            // Predicate/bang vs same-name plain-method twin (`save`
+            // vs `save!`): keep the plain twin.
+            if raw.ends_with('?') || raw.ends_with('!') {
+                !sanitized_seen[side(matches!(m.receiver, MethodReceiver::Class))].contains(&stripped)
+            } else {
+                true
+            }
+        })
+        .collect();
+
+    if wrote_fields && !methods_to_emit.is_empty() {
+        members.push(JsClassMember::Blank);
+    }
+
+    let mut first = true;
+    for m in methods_to_emit {
+        if !first {
+            members.push(JsClassMember::Blank);
+        }
+        first = false;
+        members.push(class_member(class, m, has_parent)?);
+    }
+
+    Ok(JsDecl::Class {
+        export: true,
+        name: class_name.to_string(),
+        extends: effective_parent.map(String::from),
+        members,
+        span: crate::span::Span::synthetic(),
+    })
+}
+
+/// `(ivar, is_static)` → literal for each method of `class` whose body is
+/// `@<its own name> ||= <literal>` (a literal `declarable_constant_value`
+/// takes): the reader `js_library_class` drops for the field of that
+/// name, and the value the field starts at.
+fn memoized_literals(
+    class: &crate::dialect::LibraryClass,
+) -> crate::det::HashMap<(String, bool), &crate::expr::Expr> {
+    use crate::expr::{ExprNode, LValue, OpAssignOp};
+    let mut out = crate::det::HashMap::default();
+    for m in &class.methods {
+        if !m.params.is_empty() {
+            continue;
+        }
+        let body = match &*m.body.node {
+            ExprNode::Seq { exprs } if exprs.len() == 1 => &exprs[0],
+            _ => &m.body,
+        };
+        let ExprNode::OpAssign { target: LValue::Ivar { name }, op: OpAssignOp::OrOr, value } = &*body.node else {
+            continue;
+        };
+        if name.as_str() != m.name.as_str() {
+            continue;
+        }
+        if let Some(literal) = declarable_constant_value(value) {
+            let is_static = matches!(m.receiver, crate::dialect::MethodReceiver::Class);
+            out.insert((name.as_str().to_string(), is_static), literal);
+        }
+    }
+    out
+}
+
+/// A class-body constant the TypeScript emit leaves out, reported as a
+/// gap: a `Klass.NAME` read finds no such member, or (`reaches`) the
+/// static member that took the name. The runtime's own classes (an
+/// `origin`) are not reported.
+fn report_undeclared_constant(
+    class: &crate::dialect::LibraryClass,
+    name: &crate::ident::Symbol,
+    span: crate::span::Span,
+    reaches: &str,
+    why: &str,
+) {
+    if class.origin.is_some() {
+        return;
+    }
+    let owner = class.name.0.as_str();
+    let mut d = crate::diagnostic::Diagnostic::unsupported(
+        span,
+        Some(crate::ident::Symbol::from("typescript")),
+        format!("constant {owner}::{}", name.as_str()),
+        format!(
+            "`{owner}::{name}` is not declared in the typescript emit, so a `{}.{name}` read {reaches}: {why}",
+            owner.rsplit("::").next().unwrap_or(owner),
+            name = name.as_str(),
+        ),
+    );
+    d.severity = crate::diagnostic::Severity::Warning;
+    crate::emit::diagnostics::push(d);
+}
+
+/// A class-body constant's value as TypeScript declares it: `.freeze`
+/// stripped (it has no TS analog), when what is left is a literal TS
+/// renders as written: `nil`, a Boolean, number, String, Symbol or
+/// regexp, or an Array or Hash of those. Anything else (a call, a
+/// constant read, `Struct.new`) is `None`.
+pub(super) fn declarable_constant_value(value: &crate::expr::Expr) -> Option<&crate::expr::Expr> {
+    use crate::expr::ExprNode;
+    let value = match &*value.node {
+        ExprNode::Send { recv: Some(r), method, args, block: None, .. } if method.as_str() == "freeze" && args.is_empty() => r,
+        _ => value,
+    };
+    fn literal(e: &crate::expr::Expr) -> bool {
+        match &*e.node {
+            ExprNode::Lit { .. } => true,
+            ExprNode::Array { elements, .. } => elements.iter().all(literal),
+            ExprNode::Hash { entries, .. } => entries.iter().all(|(k, v)| literal(k) && literal(v)),
+            ExprNode::Send { recv: Some(r), method, args, block: None, .. } if method.as_str() == "freeze" && args.is_empty() => {
+                literal(r)
+            }
+            _ => false,
+        }
+    }
+    literal(value).then_some(value)
+}
+
+/// True when a method's signature return type is `Ty::Time` (or a
+/// `Time | Nil` union) — i.e. a synthesized temporal-column reader
+/// (see `synth_attr_reader`). Gates the datetime storage/reader split:
+/// a `_<col>: string` backing + a `get <col>(): Date | null` getter.
+pub(crate) fn signature_ret_is_time(sig: Option<&Ty>) -> bool {
+    fn is_time(t: &Ty) -> bool {
+        match t {
+            Ty::Time => true,
+            Ty::Union { variants } => variants.iter().any(is_time),
+            _ => false,
+        }
+    }
+    matches!(sig, Some(Ty::Fn { ret, .. }) if is_time(ret))
+}
+
+/// Emit the body of a `constructor` from an `initialize` method's
+/// `Expr`. Floats top-level `super(...)` calls to the front so TS's
+/// strict-derived-class rule (no `this` access before super) holds
+/// even when the source Ruby wrote `@x = arg; super(...)`.
+fn js_constructor_body(
+    body: &crate::expr::Expr,
+    return_ty: &Ty,
+    has_parent: bool,
+) -> Vec<js_ast::JsStmt> {
+    use crate::expr::{Expr, ExprNode};
+    use js_ast::{Js, JsExpr, JsStmt};
+
+    let exprs: Vec<&Expr> = match &*body.node {
+        ExprNode::Seq { exprs } => exprs.iter().collect(),
+        _ => vec![body],
+    };
+
+    let (supers, rest): (Vec<&Expr>, Vec<&Expr>) = exprs
+        .into_iter()
+        .partition(|e| matches!(*e.node, ExprNode::Super { .. }));
+
+    if supers.is_empty() {
+        // Derived classes (TS `class X extends Y`) require an explicit
+        // `super(...)` call before any `this.*` access in the
+        // constructor. Ruby's `def initialize` defaults to an
+        // implicit `super` to the parent's `initialize`; for our
+        // emit we materialize that as a synthetic zero-arg `super()`
+        // so the TS strict-derived-class rule holds. Without this,
+        // a class like `Base extends Validations` whose
+        // `initialize` writes `@id = 0` trips TS17009 + TS2377.
+        let mut out = Vec::new();
+        if has_parent {
+            out.push(JsStmt::expr(Js::call(
+                crate::span::Span::synthetic(),
+                Js::synth(JsExpr::Ident("super".into())),
+                vec![],
+            )));
+        }
+        out.extend(expr::js_body(body, return_ty));
+        return out;
+    }
+
+    let mut reordered_exprs: Vec<Expr> = Vec::new();
+    for s in supers {
+        reordered_exprs.push((*s).clone());
+    }
+    for r in rest {
+        reordered_exprs.push((*r).clone());
+    }
+    let reordered = Expr::new(body.span, ExprNode::Seq { exprs: reordered_exprs });
+    expr::js_body(&reordered, return_ty)
+}
+
+/// Walk an expression tree looking for `ExprNode::Yield`. Used to
+/// detect methods that need a `__block` parameter injected — Ruby's
+/// implicit-block yield translates to `__block(args)` in the emit,
+/// so the method signature must declare the parameter for tsc to
+/// resolve the name.
+/// Field initializer for a static field whose Ruby equivalent would
+/// default to nil (unset @ivar reads as nil). For Hash/Array, emit a
+/// fresh empty literal so reads don't crash on `undefined.<key>` /
+/// `undefined.length`. Untyped / class types return None (no
+/// initializer) — the consumer must guard.
+fn ts_default_for_type(ty: &str) -> Option<js_ast::Js> {
+    use js_ast::{Js, JsExpr};
+    // String matching is the cheap path — `ts_ty` already collapsed
+    // the Ty into its TS form, and the common cases are
+    // string-distinguishable.
+    if ty.starts_with("Record<") || ty == "any" {
+        Some(Js::synth(JsExpr::Object(vec![])))
+    } else if ty.ends_with("[]") || ty.starts_with("Array<") {
+        Some(Js::synth(JsExpr::Array(vec![])))
+    } else if ty == "string" {
+        Some(Js::synth(JsExpr::Str(String::new())))
+    } else if ty == "number" {
+        Some(Js::synth(JsExpr::Num("0".into())))
+    } else if ty == "boolean" {
+        Some(Js::synth(JsExpr::Bool(false)))
+    } else {
+        // Class types, unions, etc. — leave uninitialized so tsc
+        // doesn't infer `null` into a non-nullable position.
+        // Static-field-from-class-method usage reassigns before
+        // reading anyway in the framework patterns we ship today.
+        None
+    }
+}
+
+fn body_contains_yield(body: &crate::expr::Expr) -> bool {
+    use crate::expr::{ExprNode, LValue};
+    match &*body.node {
+        ExprNode::Yield { .. } => true,
+        ExprNode::Seq { exprs } => exprs.iter().any(body_contains_yield),
+        ExprNode::If { cond, then_branch, else_branch } => {
+            body_contains_yield(cond)
+                || body_contains_yield(then_branch)
+                || body_contains_yield(else_branch)
+        }
+        ExprNode::Case { scrutinee, arms } => {
+            body_contains_yield(scrutinee)
+                || arms.iter().any(|a| {
+                    a.guard.as_ref().is_some_and(body_contains_yield)
+                        || body_contains_yield(&a.body)
+                })
+        }
+        ExprNode::Send { recv, args, block, .. } => {
+            recv.as_ref().is_some_and(body_contains_yield)
+                || args.iter().any(body_contains_yield)
+                || block.as_ref().is_some_and(body_contains_yield)
+        }
+        ExprNode::Apply { fun, args, block } => {
+            body_contains_yield(fun)
+                || args.iter().any(body_contains_yield)
+                || block.as_ref().is_some_and(body_contains_yield)
+        }
+        ExprNode::Lambda { body: lb, .. } => body_contains_yield(lb),
+        ExprNode::Assign { target, value } => {
+            (match target {
+                LValue::Attr { recv, .. } | LValue::Index { recv, .. } => {
+                    body_contains_yield(recv)
+                }
+                _ => false,
+            }) || body_contains_yield(value)
+        }
+        ExprNode::Return { value } => body_contains_yield(value),
+        ExprNode::Raise { value } => body_contains_yield(value),
+        ExprNode::Next { value } | ExprNode::Break { value } => {
+            value.as_ref().is_some_and(body_contains_yield)
+        }
+        ExprNode::Splat { value } | ExprNode::KeywordSplat { value } => body_contains_yield(value),
+        ExprNode::Super { args } => args
+            .as_ref()
+            .is_some_and(|v| v.iter().any(body_contains_yield)),
+        ExprNode::BoolOp { left, right, .. } => {
+            body_contains_yield(left) || body_contains_yield(right)
+        }
+        ExprNode::While { cond, body: wb, .. } => {
+            body_contains_yield(cond) || body_contains_yield(wb)
+        }
+        ExprNode::RescueModifier { expr, fallback } => {
+            body_contains_yield(expr) || body_contains_yield(fallback)
+        }
+        ExprNode::BeginRescue {
+            body: inner,
+            rescues,
+            else_branch,
+            ensure,
+            ..
+        } => {
+            body_contains_yield(inner)
+                || rescues.iter().any(|r| body_contains_yield(&r.body))
+                || else_branch.as_ref().is_some_and(body_contains_yield)
+                || ensure.as_ref().is_some_and(body_contains_yield)
+        }
+        ExprNode::Range { begin, end, .. } => {
+            begin.as_ref().is_some_and(body_contains_yield)
+                || end.as_ref().is_some_and(body_contains_yield)
+        }
+        ExprNode::MultiAssign { value, .. } => body_contains_yield(value),
+        ExprNode::StringInterp { parts } => {
+            parts.iter().any(|p| match p {
+                crate::expr::InterpPart::Expr { expr } => body_contains_yield(expr),
+                crate::expr::InterpPart::Text { .. } => false,
+            })
+        }
+        ExprNode::Array { elements, .. } => elements.iter().any(body_contains_yield),
+        ExprNode::Hash { entries, .. } => entries
+            .iter()
+            .any(|(k, v)| body_contains_yield(k) || body_contains_yield(v)),
+        ExprNode::Lit { .. }
+        | ExprNode::Var { .. }
+        | ExprNode::Ivar { .. }
+        | ExprNode::Const { .. }
+        | ExprNode::SelfRef => false,
+        // Catch-all for any new ExprNode variants — be conservative
+        // and assume "no yield" so the function still compiles. New
+        // nodes that wrap sub-expressions should add their own arm.
+        _ => false,
+    }
+}
+
+/// Build one `MethodDef` as a class member (instance method, static,
+/// or constructor). Uses signature when present (typed params + ret);
+/// falls back to body.ty for return and `any` for params when not
+/// (lowered models don't populate signatures yet).
+/// `js_class_member` for a method of `class`, with `self` in its body
+/// naming `class`, on the class side for a class method
+/// (`expr::with_self_class`).
+fn class_member(
+    class: &crate::dialect::LibraryClass,
+    m: &crate::dialect::MethodDef,
+    has_parent: bool,
+) -> Result<js_ast::JsClassMember, String> {
+    let class_side = matches!(m.receiver, crate::dialect::MethodReceiver::Class);
+    expr::with_self_class(class.name.0.as_str().to_string(), class_side, || js_class_member(m, has_parent))
+}
+
+fn js_class_member(
+    m: &crate::dialect::MethodDef,
+    has_parent: bool,
+) -> Result<js_ast::JsClassMember, String> {
+    use crate::dialect::MethodReceiver;
+    use js_ast::{Js, JsClassMember, JsExpr, JsParam, MethodKind, TsType};
+
+    // Pull (param-types, kinds, return-type) from signature when
+    // available. Kinds drive optional-param decoration: Ruby kwargs
+    // with defaults (`def foo(x, status: 200)`) and explicit-optional
+    // positionals (`def foo(x = nil)`) emit as TS `name?: T` so
+    // call sites that omit them type-check. Without this, every
+    // kwarg-default call (`render(html)` where Ruby has
+    // `render(html, status: 200)`) trips TS2554.
+    //
+    // `is_keyword` per param drives the destructured-object emit at
+    // the end: kwargs from Ruby (`def x(a:, b: 0)`) become a single
+    // trailing `{a, b}: {a: T, b?: U}` destructured object so call
+    // sites that pass a Hash literal (`x({a: 1})`) match.
+    let (sig_param_tys, sig_param_optional, sig_param_is_keyword, ret_ty): (
+        Vec<Ty>,
+        Vec<bool>,
+        Vec<bool>,
+        Ty,
+    ) = match m.signature.as_ref() {
+        Some(Ty::Fn { params: sig_params, ret, .. }) => {
+            let non_block: Vec<&crate::ty::Param> = sig_params
+                .iter()
+                .filter(|p| !matches!(p.kind, crate::ty::ParamKind::Block))
+                .collect();
+            if non_block.len() != m.params.len() {
+                return Err(format!(
+                    "method `{}`: signature/param arity mismatch ({} vs {})",
+                    m.name,
+                    non_block.len(),
+                    m.params.len(),
+                ));
+            }
+            let tys = non_block.iter().map(|p| (*p.ty).clone()).collect();
+            let optionals = non_block
+                .iter()
+                .map(|p| {
+                    matches!(
+                        p.kind,
+                        crate::ty::ParamKind::Optional
+                            | crate::ty::ParamKind::Keyword { required: false }
+                            | crate::ty::ParamKind::KeywordRest
+                    )
+                })
+                .collect();
+            let is_keyword = non_block
+                .iter()
+                .map(|p| {
+                    matches!(
+                        p.kind,
+                        crate::ty::ParamKind::Keyword { .. } | crate::ty::ParamKind::KeywordRest
+                    )
+                })
+                .collect();
+            (tys, optionals, is_keyword, (**ret).clone())
+        }
+        _ => (
+            m.params.iter().map(|_| Ty::Untyped).collect(),
+            m.params.iter().map(|_| false).collect(),
+            m.params.iter().map(|_| false).collect(),
+            m.body.ty.clone().unwrap_or(Ty::Nil),
+        ),
+    };
+
+    // Build the param list — positional params first (one slot each),
+    // then a single destructured object holding any kwargs. Without
+    // this, Ruby `fill_timestamps(creating: true)` call sites emit
+    // `fill_timestamps({creating: true})` (Hash literal) but the def
+    // signature is `fill_timestamps(creating: boolean)` (positional)
+    // → TS2345 "argument of type {creating: boolean} not assignable
+    // to parameter of type boolean".
+    let mut param_slots: Vec<JsParam> = Vec::new();
+    // (name, ts_ty, optional, default_expr_str)
+    let mut kwarg_pieces: Vec<(String, String, bool, Option<String>)> = Vec::new();
+    for (i, name) in m.params.iter().enumerate() {
+        let ty = &sig_param_tys[i];
+        let optional = sig_param_optional[i];
+        let is_kw = sig_param_is_keyword[i];
+        if is_kw {
+            // Carry through the default Expr (rendered as TS) when
+            // the Ruby source supplied one — `def redirect_to(...
+            // status: :found)` defaults `status` to "found", so a
+            // call without `status:` resolves to 302 (Found) not 200.
+            // Without this, the destructuring pattern uses the
+            // generic `null` fallback and breaks every Rails
+            // optional-kwarg-with-non-nil-default API.
+            let default_s = name.default.as_ref().map(|d| expr::emit_expr(d));
+            kwarg_pieces.push((name.as_str().to_string(), ts_ty(ty), optional, default_s));
+        } else {
+            // Default-value path: when the param is `Optional` AND
+            // carries a default Expr, prefer `name: T = <default>`
+            // over `name?: T`. The latter binds the param to
+            // `undefined` when the caller omits it; the former
+            // gives back the actual default the Ruby source wrote.
+            // Matters for `def initialize(attrs = {})`: with `?:`
+            // the body's `attrs["id"]` crashes on a no-args call
+            // (`new Article()` from `from_row`), with `= {}` the
+            // empty hash is what's read from. Both signatures
+            // type-check at call sites since `?` and `=` give the
+            // caller the same option to omit the argument.
+            let has_default = optional && name.default.is_some();
+            param_slots.push(JsParam {
+                name: escape_reserved(name.as_str()),
+                optional: optional && !has_default,
+                ty: Some(TsType(ts_ty(ty))),
+                default: if has_default {
+                    Some(expr::js_expr(name.default.as_ref().unwrap()))
+                } else {
+                    None
+                },
+            });
+        }
+    }
+    let body_uses_yield = body_contains_yield(&m.body);
+    if !kwarg_pieces.is_empty() {
+        // Each kwarg name appears in two slots: the destructuring
+        // pattern (must be a valid binding) and the type annotation
+        // (the original Ruby symbol, callers spell it that way).
+        // When the Ruby name shadows a TS reserved word (`with`,
+        // `class`, `default`), rename in the pattern via `:`-rename
+        // and use the escaped local in the body. The body emit
+        // already escapes via `escape_reserved` when reading the
+        // local, so the pattern's `original: escaped` keeps the
+        // type annotation untouched while the binding is JS-legal.
+        // Optional kwargs default to `null` in the destructuring
+        // pattern so omitted args produce `null` (matching Ruby's
+        // `nil` default) rather than `undefined`. Without this,
+        // `x.nil?` (which the emit lowers to `x === null`) returns
+        // false for omitted kwargs — a Ruby `if !x.nil? && cond`
+        // would pull in untaken branches with undefined values.
+        let names: Vec<String> = kwarg_pieces
+            .iter()
+            .map(|(n, _, opt, default_s)| {
+                let escaped = escape_reserved(n);
+                let pat = if escaped == *n {
+                    n.clone()
+                } else {
+                    format!("{n}: {escaped}")
+                };
+                match (opt, default_s) {
+                    (true, Some(d)) => format!("{pat} = {d}"),
+                    (true, None) => format!("{pat} = null"),
+                    _ => pat,
+                }
+            })
+            .collect();
+        let typed: Vec<String> = kwarg_pieces
+            .iter()
+            .map(|(n, t, opt, _)| {
+                let marker = if *opt { "?" } else { "" };
+                format!("{n}{marker}: {t}")
+            })
+            .collect();
+        // If every kwarg is optional, the kwarg object itself is
+        // optional — call sites omitting kwargs entirely
+        // (`fill_timestamps()`) still type-check. TS forbids `?` on
+        // a destructuring binding pattern in an implementation
+        // signature, so spell the optional via `= {}` default.
+        let default = if kwarg_pieces.iter().all(|(_, _, opt, _)| *opt) {
+            Some(Js::synth(JsExpr::Object(vec![])))
+        } else {
+            None
+        };
+        // The destructuring pattern and its object type ride the
+        // JsParam name/ty slots as pre-rendered text — they're
+        // binding syntax, not expressions, so the printer treats
+        // them opaquely.
+        param_slots.push(JsParam {
+            name: format!("{{ {} }}", names.join(", ")),
+            optional: false,
+            ty: Some(TsType(format!("{{ {} }}", typed.join(", ")))),
+            default,
+        });
+    }
+    // Inject a `__block: (...args: any[]) => any` parameter when the
+    // method body uses `yield`. The yield-emit code in expr.rs
+    // produces `__block(args)`; without a corresponding parameter
+    // declaration, tsc errors with "Cannot find name '__block'".
+    // Block-aware call sites (`emit_send_with_block`) pass the block
+    // as the trailing positional arg, so the wire-up works once
+    // both ends agree on the param name. Goes LAST in the param
+    // list — Ruby blocks always trail positional + keyword args.
+    if body_uses_yield {
+        param_slots.push(JsParam {
+            name: "__block".into(),
+            optional: false,
+            ty: Some(TsType("(...args: any[]) => any".into())),
+            default: None,
+        });
+    }
+
+    let raw_name = m.name.as_str();
+    // `HeaderStore#[]` / `#[]=` are emitted as `get` / `set`. The
+    // names aren't legal TS methods, and the call sites on that class
+    // already dispatch to those two names.
+    let mname = match raw_name {
+        "[]" => "get".to_string(),
+        "[]=" => "set".to_string(),
+        _ => crate::emit::typescript::library::sanitize_identifier(raw_name),
+    };
+    let is_constructor =
+        raw_name == "initialize" && matches!(m.receiver, MethodReceiver::Instance);
+
+    let rewritten = if is_constructor {
+        crate::emit::typescript::library::rewrite_for_constructor(&m.body)
+    } else {
+        crate::emit::typescript::library::rewrite_for_class_method(&m.body, raw_name)
+    };
+
+    // Set enclosing-method parameter names so the await-wrap site
+    // can suppress wrapping bare Sends whose name shadows a param
+    // (e.g. view function `_form(article)` referencing `article`).
+    let param_set: crate::det::HashSet<crate::ident::Symbol> =
+        m.params.iter().map(|p| p.name.clone()).collect();
+    let body = expr::with_method_params(param_set, || {
+        if is_constructor {
+            // TS constructors implicitly return the constructed instance;
+            // an explicit `return <expr>` on the last statement of a Ruby
+            // `def initialize` would replace `this` with the expression's
+            // value (e.g. `return this.errors = []` → constructor returns
+            // an array, breaking `instanceof` and method dispatch). Emit
+            // body as void so the trailing-statement-becomes-return
+            // transform is suppressed.
+            js_constructor_body(&rewritten, &Ty::Nil, has_parent)
+        } else if m.is_async {
+            // Yield emit consults `in_async_method()` to decide
+            // between `(await __block(...))` and `__block(...)`.
+            // Methods marked async (yield-with-capture, propagation
+            // via async sends, etc.) get the await; sync methods
+            // that yield without capturing get plain __block.
+            expr::with_async_method_context(|| expr::js_body(&rewritten, &ret_ty))
+        } else {
+            expr::js_body(&rewritten, &ret_ty)
+        }
+    });
+
+    // Async coloring (Phase 3): prepend `async` for methods the
+    // propagation pass colored. Skip attribute slots — TS getters
+    // and setters can't be `async`. The propagation pass also
+    // produces a `SyncSlotViolation` for these cases so the
+    // build can fail loudly instead of silently dropping the
+    // marker. Constructors never get `async`.
+    let emit_async = !is_constructor
+        && m.is_async
+        && !matches!(
+            m.kind,
+            crate::dialect::AccessorKind::AttributeReader
+                | crate::dialect::AccessorKind::AttributeWriter
+        );
+    let ret = if is_constructor {
+        None
+    } else if emit_async {
+        Some(TsType(ts_async_return_ty(&ret_ty)))
+    } else {
+        Some(TsType(ts_return_ty(&ret_ty)))
+    };
+    Ok(JsClassMember::Method {
+        is_static: !is_constructor && matches!(m.receiver, MethodReceiver::Class),
+        is_async: emit_async,
+        kind: if is_constructor { MethodKind::Constructor } else { MethodKind::Normal },
+        name: if is_constructor { "constructor".into() } else { mname },
+        params: param_slots,
+        ret,
+        body,
+        span: m.body.span,
+    })
+}
+
+/// Emit a `LibraryFunction` as a top-level `export function` (no
+/// surrounding class). Body emission shares the param-typing /
+/// return-typing / body-typing machinery with `emit_class_member`,
+/// but the rewrite pass differs: free functions don't have `this`,
+/// so bare Sends and Ivar references aren't injected with SelfRef.
+pub fn emit_library_function(
+    func: &crate::dialect::LibraryFunction,
+) -> Result<String, String> {
+    Ok(printer::render_decl(&js_library_function(func)?))
+}
+
+pub(super) fn js_library_function(
+    func: &crate::dialect::LibraryFunction,
+) -> Result<js_ast::JsDecl, String> {
+    use js_ast::{JsDecl, JsParam, TsType};
+
+    let (sig_param_tys, sig_param_optional, ret_ty): (Vec<Ty>, Vec<bool>, Ty) =
+        match func.signature.as_ref() {
+            Some(Ty::Fn { params: sig_params, ret, .. }) => {
+                let non_block: Vec<&crate::ty::Param> = sig_params
+                    .iter()
+                    .filter(|p| !matches!(p.kind, crate::ty::ParamKind::Block))
+                    .collect();
+                if non_block.len() != func.params.len() {
+                    return Err(format!(
+                        "function `{}`: signature/param arity mismatch ({} vs {})",
+                        func.name,
+                        non_block.len(),
+                        func.params.len(),
+                    ));
+                }
+                let tys = non_block.iter().map(|p| (*p.ty).clone()).collect();
+                let optionals = non_block
+                    .iter()
+                    .map(|p| {
+                        matches!(
+                            p.kind,
+                            crate::ty::ParamKind::Optional
+                                | crate::ty::ParamKind::Keyword { required: false }
+                                | crate::ty::ParamKind::KeywordRest
+                        )
+                    })
+                    .collect();
+                (tys, optionals, (**ret).clone())
+            }
+            _ => (
+                func.params.iter().map(|_| Ty::Untyped).collect(),
+                func.params.iter().map(|_| false).collect(),
+                func.body.ty.clone().unwrap_or(Ty::Nil),
+            ),
+        };
+
+    // Defaults ride through, the same way `js_class_member` carries
+    // them: `name: T = <default>` when the param declares one, plain
+    // `name?: T` otherwise. Dropping the default binds an omitted arg
+    // to `undefined` instead of the value the source wrote — a route
+    // helper defaulting `format` to `""` rendered `/articles/1.` +
+    // `String(undefined)` = "/articles/1.undefined" on every call that
+    // omitted it. `?` and `= <default>` give the CALLER the same
+    // option to omit; only the callee sees the difference.
+    let param_list: Vec<JsParam> = func
+        .params
+        .iter()
+        .zip(sig_param_tys.iter())
+        .zip(sig_param_optional.iter())
+        .map(|((p, ty), optional)| {
+            let has_default = *optional && p.default.is_some();
+            JsParam {
+                name: escape_reserved(p.name.as_str()),
+                optional: *optional && !has_default,
+                ty: Some(TsType(ts_ty(ty))),
+                default: has_default
+                    .then(|| expr::js_expr(p.default.as_ref().unwrap())),
+            }
+        })
+        .collect();
+
+    let raw_name = func.name.as_str();
+    let mname = escape_for_function_name(raw_name);
+
+    // Free-function rewrite: no SelfRef injection, no super rewrite —
+    // bare Sends emit as plain function calls (resolved against
+    // imports), and `super` doesn't apply since there's no inheritance.
+    let rewritten = crate::emit::typescript::library::rewrite_for_free_function(&func.body);
+    let param_set: crate::det::HashSet<crate::ident::Symbol> =
+        func.params.iter().map(|p| p.name.clone()).collect();
+    let body = expr::with_method_params(param_set, || expr::js_body(&rewritten, &ret_ty));
+
+    // Async coloring (Phase 3): same gating as `js_class_member`,
+    // minus the attribute-slot exemption (free functions can't be
+    // attribute readers/writers).
+    let ret_s = if func.is_async {
+        ts_async_return_ty(&ret_ty)
+    } else {
+        ts_return_ty(&ret_ty)
+    };
+    Ok(JsDecl::Function {
+        export: true,
+        is_async: func.is_async,
+        name: mname,
+        params: param_list,
+        ret: Some(TsType(ret_s)),
+        body,
+        span: func.body.span,
+    })
+}
+
+/// Emit a list of typed `MethodDef`s — produced by
+/// `parse_methods_with_rbs` from a whole `.rb` + `.rbs` pair — as a
+/// single TypeScript module file (trailing newline included).
+pub fn emit_module(methods: &[crate::dialect::MethodDef]) -> Result<String, String> {
+    use crate::dialect::MethodReceiver;
+
+    if methods.is_empty() {
+        return Ok(String::new());
+    }
+    if !methods.iter().all(|m| matches!(m.receiver, MethodReceiver::Class)) {
+        return Err(format!(
+            "emit_module: only all-class-method modules supported so far; \
+             saw mixed/instance methods (first instance: `{}`)",
+            methods
+                .iter()
+                .find(|m| matches!(m.receiver, MethodReceiver::Instance))
+                .map(|m| m.name.as_str())
+                .unwrap_or("<none>"),
+        ));
+    }
+
+    let mut out = String::new();
+    for (i, m) in methods.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(&emit_method(m));
+    }
+    Ok(out)
+}
+
+/// Map a Ruby identifier to a safe TS parameter name. Each name in
+/// Identifier escape applied to LibraryFunction names. Strips Ruby's
+/// `?`/`!` suffixes via `sanitize_identifier`, then maps reserved
+/// JS words (`new`, `default`, etc.) to a `name_` suffix form so the
+/// emitted `export function <x>` parses.
+pub(super) fn escape_for_function_name(raw: &str) -> String {
+    escape_reserved(&crate::emit::typescript::library::sanitize_identifier(raw))
+}
+
+/// Walk an Expr collecting every `@ivar = value` assignment, keyed
+/// by the ivar name. Later assignments overwrite earlier ones (keeps
+/// the most-narrowed type when the body assigns the same ivar
+/// multiple places). Used by `emit_library_class` to synthesize
+/// `name: type;` field declarations for ivars that aren't otherwise
+/// declared via attr_reader.
+fn collect_ivar_assignments(
+    e: &crate::expr::Expr,
+    out: &mut indexmap::IndexMap<String, Ty>,
+) {
+    use crate::expr::{ExprNode, InterpPart, LValue};
+    match &*e.node {
+        ExprNode::Assign { target: LValue::Ivar { name }, value }
+        | ExprNode::OpAssign { target: LValue::Ivar { name }, value, .. } => {
+            // Type from the RHS, falling back to `any` (Ty::Untyped)
+            // when the analyzer didn't infer one.
+            let ty = value.ty.clone().unwrap_or(Ty::Untyped);
+            out.insert(name.as_str().to_string(), ty);
+            collect_ivar_assignments(value, out);
+        }
+        ExprNode::Assign { target, value }
+        | ExprNode::OpAssign { target, value, .. } => {
+            if let LValue::Attr { recv, .. } | LValue::Index { recv, .. } = target {
+                collect_ivar_assignments(recv, out);
+            }
+            collect_ivar_assignments(value, out);
+        }
+        ExprNode::Send { recv, args, block, .. } => {
+            if let Some(r) = recv {
+                collect_ivar_assignments(r, out);
+            }
+            for a in args {
+                collect_ivar_assignments(a, out);
+            }
+            if let Some(b) = block {
+                collect_ivar_assignments(b, out);
+            }
+        }
+        ExprNode::Apply { fun, args, block } => {
+            collect_ivar_assignments(fun, out);
+            for a in args {
+                collect_ivar_assignments(a, out);
+            }
+            if let Some(b) = block {
+                collect_ivar_assignments(b, out);
+            }
+        }
+        ExprNode::Hash { entries, .. } => {
+            for (k, v) in entries {
+                collect_ivar_assignments(k, out);
+                collect_ivar_assignments(v, out);
+            }
+        }
+        ExprNode::Array { elements, .. } => {
+            for el in elements {
+                collect_ivar_assignments(el, out);
+            }
+        }
+        ExprNode::StringInterp { parts } => {
+            for p in parts {
+                if let InterpPart::Expr { expr } = p {
+                    collect_ivar_assignments(expr, out);
+                }
+            }
+        }
+        ExprNode::BoolOp { left, right, .. } => {
+            collect_ivar_assignments(left, out);
+            collect_ivar_assignments(right, out);
+        }
+        ExprNode::Let { value, body, .. } => {
+            collect_ivar_assignments(value, out);
+            collect_ivar_assignments(body, out);
+        }
+        ExprNode::Lambda { body, .. } => collect_ivar_assignments(body, out),
+        ExprNode::MethodRef { recv, .. } => {
+            if let Some(r) = recv {
+                collect_ivar_assignments(r, out);
+            }
+        }
+        ExprNode::If { cond, then_branch, else_branch } => {
+            collect_ivar_assignments(cond, out);
+            collect_ivar_assignments(then_branch, out);
+            collect_ivar_assignments(else_branch, out);
+        }
+        ExprNode::Case { scrutinee, arms } => {
+            collect_ivar_assignments(scrutinee, out);
+            for arm in arms {
+                collect_ivar_assignments(&arm.body, out);
+            }
+        }
+        ExprNode::CaseMatch { scrutinee, arms, else_body } => {
+            collect_ivar_assignments(scrutinee, out);
+            for arm in arms {
+                collect_ivar_assignments(&arm.body, out);
+            }
+            if let Some(e) = else_body {
+                collect_ivar_assignments(e, out);
+            }
+        }
+        ExprNode::MatchPredicate { value, .. } | ExprNode::MatchRequired { value, .. } => {
+            collect_ivar_assignments(value, out);
+        }
+        ExprNode::Seq { exprs } => {
+            for sub in exprs {
+                collect_ivar_assignments(sub, out);
+            }
+        }
+        ExprNode::Yield { args } => {
+            for a in args {
+                collect_ivar_assignments(a, out);
+            }
+        }
+        ExprNode::Raise { value } => collect_ivar_assignments(value, out),
+        ExprNode::RescueModifier { expr, fallback } => {
+            collect_ivar_assignments(expr, out);
+            collect_ivar_assignments(fallback, out);
+        }
+        ExprNode::Return { value } => collect_ivar_assignments(value, out),
+        ExprNode::BeginRescue { body, rescues, else_branch, ensure, .. } => {
+            collect_ivar_assignments(body, out);
+            for r in rescues {
+                collect_ivar_assignments(&r.body, out);
+            }
+            if let Some(eb) = else_branch {
+                collect_ivar_assignments(eb, out);
+            }
+            if let Some(ensure_b) = ensure {
+                collect_ivar_assignments(ensure_b, out);
+            }
+        }
+        ExprNode::Next { value } | ExprNode::Break { value } => {
+            if let Some(v) = value {
+                collect_ivar_assignments(v, out);
+            }
+        }
+        ExprNode::Splat { value } | ExprNode::KeywordSplat { value } => {
+            collect_ivar_assignments(value, out)
+        }
+        ExprNode::MultiAssign { value, .. } => collect_ivar_assignments(value, out),
+        ExprNode::While { cond, body, .. } => {
+            collect_ivar_assignments(cond, out);
+            collect_ivar_assignments(body, out);
+        }
+        ExprNode::Range { begin, end, .. } => {
+            if let Some(b) = begin {
+                collect_ivar_assignments(b, out);
+            }
+            if let Some(e2) = end {
+                collect_ivar_assignments(e2, out);
+            }
+        }
+        ExprNode::Super { args } => {
+            if let Some(args) = args {
+                for a in args {
+                    collect_ivar_assignments(a, out);
+                }
+            }
+        }
+        ExprNode::Cast { value, .. } => collect_ivar_assignments(value, out),
+        ExprNode::ForwardKeywordsWithPairs { entries } => {
+            for (key, value) in entries {
+                collect_ivar_assignments(key, out);
+                collect_ivar_assignments(value, out);
+            }
+        }
+        ExprNode::Lit { .. }
+        | ExprNode::Var { .. }
+        | ExprNode::Ivar { .. }
+        | ExprNode::Const { .. }
+        | ExprNode::Retry
+        | ExprNode::Redo
+        | ExprNode::ForwardArgs
+        | ExprNode::ForwardKeywords
+        | ExprNode::Defined { .. }
+        | ExprNode::SelfRef => {}
+    }
+}
+
+/// the list below is reserved in TS but commonly used as a Rails-side
+/// method/keyword arg.
+fn escape_reserved(name: &str) -> String {
+    matches!(
+        name,
+        "default"
+            | "with"
+            | "function"
+            | "class"
+            | "for"
+            | "let"
+            | "const"
+            | "var"
+            | "return"
+            | "switch"
+            | "case"
+            | "if"
+            | "else"
+            | "while"
+            | "do"
+            | "yield"
+            | "delete"
+            | "new"
+            | "this"
+            | "super"
+            | "true"
+            | "false"
+            | "null"
+            | "void"
+            | "typeof"
+            | "instanceof"
+    )
+    .then(|| format!("{name}_"))
+    .unwrap_or_else(|| name.to_string())
+}
+
+/// Emit a typed `MethodDef` as a standalone exported TypeScript
+/// function (trailing newline included). Used by the
+/// runtime-extraction pipeline.
+pub fn emit_method(m: &crate::dialect::MethodDef) -> String {
+    let sig = m
+        .signature
+        .as_ref()
+        .expect("emit_method requires a signature");
+    let Ty::Fn { params: sig_params, ret, .. } = sig else {
+        panic!("signature is not Ty::Fn");
+    };
+    assert_eq!(
+        sig_params.len(),
+        m.params.len(),
+        "method `{}`: signature/param arity mismatch",
+        m.name
+    );
+
+    let param_list: Vec<js_ast::JsParam> = m
+        .params
+        .iter()
+        .zip(sig_params.iter())
+        .map(|(name, p)| js_ast::JsParam {
+            name: name.as_str().to_string(),
+            optional: false,
+            ty: Some(js_ast::TsType(ts_ty(&p.ty))),
+            default: None,
+        })
+        .collect();
+
+    let param_set: crate::det::HashSet<crate::ident::Symbol> =
+        m.params.iter().map(|p| p.name.clone()).collect();
+    let body = expr::with_method_params(param_set, || expr::js_body(&m.body, ret));
+
+    // Async coloring (Phase 3): same gating as `js_class_member`,
+    // skipping attribute slots. Module-level methods can't be
+    // constructors so no special-case here.
+    let emit_async = m.is_async
+        && !matches!(
+            m.kind,
+            crate::dialect::AccessorKind::AttributeReader
+                | crate::dialect::AccessorKind::AttributeWriter
+        );
+    let ret_s = if emit_async {
+        ts_async_return_ty(ret)
+    } else {
+        ts_return_ty(ret)
+    };
+    printer::render_decl(&js_ast::JsDecl::Function {
+        export: true,
+        is_async: emit_async,
+        name: m.name.as_str().to_string(),
+        params: param_list,
+        ret: Some(js_ast::TsType(ret_s)),
+        body,
+        span: m.body.span,
+    })
+}
+
+/// An app controller's ivar that shares a name with a member of the
+/// runtime `ActionController::Base` takes another name (#1614). Ruby keeps
+/// `@status` apart from the runtime's own `@status` and its `status`
+/// reader: Rails keeps its state in `@_`-prefixed ivars, and an ivar never
+/// shares a namespace with a method. A TypeScript class property does, so
+/// the app's `status` overrode the runtime's field, which `tsc` refused
+/// (TS2416), and even where the types agree the two would be one value.
+///
+/// The names come from the runtime's own `Base`: its methods, by their Ruby
+/// name and the name the class emit gives them (`performed?` is
+/// `is_performed()`), and the ivars its bodies use, so a runtime change
+/// can't leave one out. One rename map
+/// covers every app controller, so an ivar ApplicationController sets and a
+/// subclass reads keeps one name. The new name (`app_<name>`, numbered if
+/// taken) is checked against the runtime's members and every controller's
+/// own methods and ivars. Views get the values as arguments, under their
+/// own parameter names, so nothing outside the controllers changes. The
+/// lowering's own framework ivars (`@params`, `@flash`, `@session`) refer
+/// to the runtime's state on purpose and keep their names.
+fn rename_ivars_shadowing_controller_base(
+    controllers: &mut [crate::dialect::LibraryClass],
+    runtime: &[crate::dialect::LibraryClass],
+) {
+    use crate::expr::{Expr, ExprNode, LValue};
+    use crate::ident::Symbol;
+    fn ivars_in(e: &Expr, out: &mut crate::det::HashSet<Symbol>) {
+        let lvalue = |lv: &LValue, out: &mut crate::det::HashSet<Symbol>| {
+            if let LValue::Ivar { name } = lv {
+                out.insert(name.clone());
+            }
+        };
+        match &*e.node {
+            ExprNode::Ivar { name } => {
+                out.insert(name.clone());
+            }
+            ExprNode::Assign { target, .. } | ExprNode::OpAssign { target, .. } => lvalue(target, out),
+            ExprNode::MultiAssign { targets, .. } => targets.iter().for_each(|t| lvalue(t, out)),
+            _ => {}
+        }
+        e.node.for_each_child(&mut |c| ivars_in(c, out));
+    }
+    fn rename(e: &mut Expr, map: &crate::det::HashMap<Symbol, Symbol>) {
+        let lvalue = |lv: &mut LValue| {
+            if let LValue::Ivar { name } = lv
+                && let Some(to) = map.get(name)
+            {
+                *name = to.clone();
+            }
+        };
+        match &mut *e.node {
+            ExprNode::Ivar { name } => {
+                if let Some(to) = map.get(name) {
+                    *name = to.clone();
+                }
+            }
+            ExprNode::Assign { target, .. } | ExprNode::OpAssign { target, .. } => lvalue(target),
+            ExprNode::MultiAssign { targets, .. } => targets.iter_mut().for_each(lvalue),
+            _ => {}
+        }
+        e.node.for_each_child_mut(&mut |c| rename(c, map));
+    }
+
+    const BASE: &str = "ActionController::Base";
+    let mut taken: crate::det::HashSet<Symbol> = crate::det::HashSet::default();
+    // A method is taken under the name the class emit writes for it too:
+    // `performed?` is `is_performed()` in TypeScript, `save!` is
+    // `save_bang()`, `name=` is `set_name()`.
+    let method_names = |name: &Symbol| [name.clone(), Symbol::from(library::sanitize_identifier(name.as_str()))];
+    for class in runtime.iter().filter(|c| c.name.0.as_str() == BASE) {
+        for m in &class.methods {
+            taken.extend(method_names(&m.name));
+            ivars_in(&m.body, &mut taken);
+        }
+    }
+    if taken.is_empty() {
+        return;
+    }
+    // A controller is a class whose parents lead to the runtime base.
+    let parents: crate::det::HashMap<String, Option<String>> = controllers
+        .iter()
+        .map(|c| (c.name.0.as_str().to_string(), c.parent.as_ref().map(|p| p.0.as_str().to_string())))
+        .collect();
+    let is_controller = |name: &str| {
+        let mut at = Some(name.to_string());
+        let mut seen = crate::det::HashSet::default();
+        while let Some(n) = at {
+            if n == BASE {
+                return true;
+            }
+            if !seen.insert(n.clone()) {
+                return false;
+            }
+            at = parents.get(&n).cloned().flatten();
+        }
+        false
+    };
+    let controller_idx: Vec<usize> =
+        (0..controllers.len()).filter(|&i| is_controller(controllers[i].name.0.as_str())).collect();
+    let mut app_ivars: crate::det::HashSet<Symbol> = crate::det::HashSet::default();
+    for &i in &controller_idx {
+        for m in &controllers[i].methods {
+            taken.extend(method_names(&m.name));
+            ivars_in(&m.body, &mut app_ivars);
+        }
+    }
+    // The lowering's own `@params` / `@flash` / `@session` ARE the
+    // runtime's: they stay.
+    let framework = crate::lower::controller_to_library::FRAMEWORK_IVARS;
+    let mut shadowing: Vec<Symbol> = app_ivars
+        .iter()
+        .filter(|n| taken.contains(*n) && !framework.contains(&n.as_str()))
+        .cloned()
+        .collect();
+    shadowing.sort();
+    if shadowing.is_empty() {
+        return;
+    }
+    taken.extend(app_ivars.iter().cloned());
+    let mut map: crate::det::HashMap<Symbol, Symbol> = crate::det::HashMap::default();
+    for name in shadowing {
+        let mut n = 1;
+        let to = loop {
+            let candidate = if n == 1 {
+                Symbol::from(format!("app_{}", name.as_str()))
+            } else {
+                Symbol::from(format!("app_{}_{n}", name.as_str()))
+            };
+            if !taken.contains(&candidate) {
+                break candidate;
+            }
+            n += 1;
+        };
+        taken.insert(to.clone());
+        map.insert(name, to);
+    }
+    for &i in &controller_idx {
+        for m in &mut controllers[i].methods {
+            rename(&mut m.body, &map);
+        }
+    }
+}

@@ -1,0 +1,14 @@
+2
+syscall
+true
+false
+true
+true
+true
+"Errno::ENOENT"
+"SystemCallError"
+44
+44
+true
+typed ok
+raised Errno::ENOENT

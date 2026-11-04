@@ -1,0 +1,7 @@
+:wait_readable
+"hello"
+:wait_readable
+"user-class 10"
+3
+3
+ok

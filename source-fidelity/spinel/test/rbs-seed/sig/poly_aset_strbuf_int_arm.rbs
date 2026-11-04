@@ -1,0 +1,3 @@
+class SeedCounter
+  def []=: (Symbol name, Integer value) -> Integer?
+end

@@ -1,0 +1,10 @@
+3
+"hello\n"
+["test/no_such_argf_input.txt"]
+"test/argf_input.txt"
+"world\n"
+"fin\n"
+"No such file or directory @ rb_sysopen - test/no_such_argf_input.txt"
+[]
+["hello\n", "world\n", "fin\n"]
+nil

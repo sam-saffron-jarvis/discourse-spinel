@@ -1,0 +1,26 @@
+in-struct
+when-struct
+expr-struct
+stmt-struct
+stmt-data
+other
+pair-struct
+named-struct
+in-data
+when-data
+other
+fixed-data
+other
+either
+either
+true
+true
+false
+fields 1 2
+point
+object
+SD--
+S--
+-D-
+other
+other

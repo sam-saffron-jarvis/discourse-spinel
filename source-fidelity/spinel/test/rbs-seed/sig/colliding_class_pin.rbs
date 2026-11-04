@@ -1,0 +1,17 @@
+module Red
+  class Base
+    @rtag: String?
+    def rtag: () -> String?
+
+    class Inner
+      @itag: String?
+      def itag: () -> String?
+    end
+  end
+end
+
+module Blue
+  class Base
+    def btag: () -> (Integer | String)
+  end
+end

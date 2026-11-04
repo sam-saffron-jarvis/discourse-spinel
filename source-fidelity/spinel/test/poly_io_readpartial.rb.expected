@@ -1,0 +1,5 @@
+"abcd"
+["ef", "ef", true]
+eof
+wrong number of arguments (given 0, expected 1..2)
+wrong number of arguments (given 3, expected 1..2)

@@ -1,0 +1,6 @@
+class EmptyRowTables
+  @a: Array[Array[Float]]
+  @b: Array[Array[Integer]]
+  @c: Array[Array[Integer]]
+  @d: Array[Array[Float]]
+end

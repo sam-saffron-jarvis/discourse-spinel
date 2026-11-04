@@ -1,0 +1,32 @@
+"widget"
+"widget-digits-[2]"
+"widget-gcd"
+"widget-lcm"
+"widget-ceildiv"
+"widget-pow-[1]"
+"widget-allbits"
+"widget-anybits"
+"widget-nobits"
+8
+[3, 2, 1]
+[11, 7]
+2
+12
+4
+1024
+24
+true
+false
+true
+71
+[4, 2, 4, 3, 0, 3, 1, 1, 4, 7, 1, 7, 0, 2, 6, 1, 9, 5, 0, 8, 1, 1]
+"diff-arity-gcd"
+2
+"diff-arity-digits"
+[3, 2, 1]
+"undefined method 'frobnicate' for an instance of Integer"
+:nomethod
+:nomethod
+:nomethod
+:nomethod
+:nomethod

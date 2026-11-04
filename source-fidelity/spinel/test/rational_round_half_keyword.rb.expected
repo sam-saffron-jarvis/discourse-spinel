@@ -1,0 +1,43 @@
+2
+2
+2
+2
+20
+20
+20
+(1/5)
+(1/10)
+2
+(5/2)
+0
+(1/5)
+20
+2
+2
+20
+(1/5)
+foo: unknown keyword: :foo
+one: invalid rounding mode: 1
+bogus: invalid rounding mode: bogus
+zero: invalid rounding mode: bogus
+ceil: not an integer
+floor: not an integer
+truncate: not an integer
+ceil2: wrong number of arguments (given 2, expected 0..1)
+2
+2
+2
+2
+20
+20
+(1/5)
+2
+20
+pfoo: unknown keyword: :foo
+pfloor: not an integer
+pfloor2: wrong number of arguments (given 2, expected 0..1)
+probe pos
+probe kw
+order: invalid rounding mode: bogus
+probe ckw
+corder: not an integer

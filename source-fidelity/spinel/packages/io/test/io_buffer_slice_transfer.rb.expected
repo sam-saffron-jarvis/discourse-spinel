@@ -1,0 +1,24 @@
+== slice ==
+size: => 8
+str: => "EFGHIJKL"
+view: => "z"
+write back: => "!"
+nested: => "GH"
+flags: => "#<IO::Buffer 0xX+8 SLICE>"
+no args: => 16
+one arg: => 6
+oob: ArgumentError: Specified offset+length is bigger than the buffer size!
+neg: ArgumentError: Offset can't be negative!
+empty end: => 0
+slice resize detach: => ["#<IO::Buffer 0xX+2 INTERNAL>", "AB", "ABCD"]
+== transfer/free/dup ==
+moved: => "QRSTUVWX"
+old: => [true, true, 0, "", "#<IO::Buffer 0xX+0 NULL INTERNAL>"]
+free: => ["#<IO::Buffer 0xX+0 NULL>", true, 0]
+free again: => "#<IO::Buffer 0xX+0 NULL>"
+freed get: ArgumentError: Type extends beyond end of buffer! (offset=0 > size=0)
+freed get_string: => ""
+dup: => [false, "#<IO::Buffer 0xX+4 INTERNAL>"]
+dup indep: => ["NNNN", "MMMM"]
+dup null: => "#<IO::Buffer 0xX+0 NULL>"
+clone: => false

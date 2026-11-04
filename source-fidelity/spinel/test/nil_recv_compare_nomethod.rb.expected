@@ -1,0 +1,13 @@
+>: undefined method '>' for nil
+>=: undefined method '>=' for nil
+<: undefined method '<' for nil
+<=: undefined method '<=' for nil
+between?: undefined method 'between?' for nil
+clamp: undefined method 'clamp' for nil
+clamp range: undefined method 'clamp' for nil
+nil
+nil
+right-hand nil: comparison of Integer with nil failed
+true
+true
+2

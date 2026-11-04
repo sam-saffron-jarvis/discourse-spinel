@@ -1,0 +1,57 @@
+floor: RangeError
+ceil: RangeError
+round: RangeError
+truncate: RangeError
+to_i: RangeError
+to_int: RangeError
+floor direct: RangeError
+ceil direct: RangeError
+round direct: RangeError
+truncate direct: RangeError
+to_i direct: RangeError
+Integer(): RangeError
+floor(-1): RangeError
+round(runtime -1): RangeError
+div: RangeError
+divmod: RangeError
+poly floor: RangeError
+poly ceil: RangeError
+poly round: RangeError
+poly truncate: RangeError
+poly round(-1): RangeError
+negative floor: RangeError
+inf floor: FloatDomainError: Infinity
+-inf ceil: FloatDomainError: -Infinity
+nan round: FloatDomainError: NaN
+poly inf floor: FloatDomainError: Infinity
+3
+4
+4
+-3
+3
+3
+-4
+-3
+-3
+3
+1234.56
+1200
+1300
+1200
+1200
+3
+[3, 1.5]
+3
+4
+4
+-3
+1200
+"s"
+boxed bignum to_i: RangeError
+kw: float out of Integer range (Bignum promotion pending)
+kwdyn: float out of Integer range (Bignum promotion pending)
+kwstr: float out of Integer range (Bignum promotion pending)
+100000000000000000000
+100000000000000000000
+100000000000000000000
+100000000000000000000

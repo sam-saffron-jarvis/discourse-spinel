@@ -1,0 +1,14 @@
+defaults: => [false, true, false]
+strict: => false
+set: => false
+read back: => false
+truthy: => ["yes", true]
+bogus get: ArgumentError: unknown category: bogus
+bogus set: ArgumentError: unknown category: bogus
+warn ret: => nil
+kernel warn: => nil
+dep off: => nil
+dep on: => false
+exp off: => nil
+perf: => nil
+warn bogus cat: ArgumentError: unknown category: bogus

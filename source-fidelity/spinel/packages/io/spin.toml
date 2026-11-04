@@ -1,0 +1,9 @@
+[package]
+name = "io"
+boot = "io/buffer"   # CRuby has IO::Buffer before a program runs (tools/gen_package_facts.rb)
+
+# Pre-installed spin package: ships with the compiler, versioned with it.
+# A pure native binding: no carried C -- IO::Buffer's implementation lives
+# in the runtime (lib/sp_iobuffer.c), and io/buffer.rb binds it. The
+# compiler splices `require "io/buffer"` into any program that references
+# `IO::Buffer`, mirroring CRuby, where the class needs no require.

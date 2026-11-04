@@ -1,0 +1,1382 @@
+//! `LibraryClass` → Kotlin file.
+//!
+//! Renders a lowered class to idiomatic Kotlin:
+//!   - `attr_reader`/`attr_writer` accessor methods collapse into Kotlin
+//!     `var` properties (the property *is* the accessor); the synthetic
+//!     getter/setter `MethodDef`s are dropped.
+//!   - Instance `Method`s → `fun`; class methods (`def self.x`) →
+//!     `companion object` members.
+//!   - Ruby's implicit return becomes an explicit `return` on the final
+//!     statement of value-returning methods (Kotlin block bodies don't
+//!     implicitly return).
+//!   - Kotlin requires every parameter typed, so params take their
+//!     signature type, falling back to `Any?`.
+
+use std::collections::BTreeMap;
+use crate::det::HashSet;
+use std::path::PathBuf;
+
+use crate::dialect::{AccessorKind, LibraryClass, MethodDef, MethodReceiver};
+use crate::emit::EmittedFile;
+use crate::expr::{Expr, ExprNode, LValue};
+use crate::ty::Ty;
+
+use super::expr::{
+    begin_method, emit_expr, hoisted_decls, register_method_param_tys, register_method_params,
+    set_current_class, set_instance_prop_types, set_instance_props, set_param_names,
+    set_return_label, set_returns_unit,
+};
+use super::naming::{camel, type_name};
+use super::ty::kotlin_ty;
+
+/// Emit a `LibraryClass` as a standalone Kotlin file under
+/// `src/main/kotlin/app/models/<Name>.kt`.
+pub fn emit_class_file(lc: &LibraryClass) -> EmittedFile {
+    let name = lc.name.0.as_str();
+    let last = name.rsplit("::").next().unwrap_or(name);
+    EmittedFile {
+        path: PathBuf::from(format!("src/main/kotlin/app/models/{last}.kt")),
+        content: format!("package roundhouse\n\n{}", emit_library_class(lc)),
+    }
+}
+
+/// `Result`-returning wrapper for the `runtime_loader::TargetEmit` slot.
+pub fn emit_library_class_result(lc: &LibraryClass) -> Result<String, String> {
+    Ok(emit_library_class(lc))
+}
+
+/// Emit a module of free functions (sharing one `module_path`, e.g.
+/// `RouteHelpers`' `article_path(id)` or `Importmap`'s `pins`/`entry`) as a
+/// Kotlin `object <Name>` under `src/main/kotlin/<Name>.kt`. Returns `None`
+/// when there are no functions. They're class-method-shaped (no instance
+/// state), so they reuse the `object` (module) emit path.
+pub fn emit_function_module(funcs: &[crate::dialect::LibraryFunction]) -> Option<EmittedFile> {
+    let first = funcs.first()?;
+    let name = first
+        .module_path
+        .last()
+        .map(|s| s.as_str().to_string())
+        .unwrap_or_default();
+    let enclosing = first.module_path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
+    let methods: Vec<MethodDef> = funcs
+        .iter()
+        .map(|f| MethodDef {
+            visibility: crate::dialect::MethodVisibility::Public,
+            unsupported_formals: f.unsupported_formals,
+            has_anonymous_block: f.has_anonymous_block,
+            name_span: crate::span::Span::synthetic(),
+            name: f.name.clone(),
+            receiver: MethodReceiver::Class,
+            params: f.params.clone(),
+            block_param: None,
+            body: f.body.clone(),
+            signature: f.signature.clone(),
+            effects: f.effects.clone(),
+            enclosing_class: Some(crate::ident::Symbol::from(enclosing.clone())),
+            kind: AccessorKind::Method,
+            is_async: f.is_async,
+            mutates_self: false,
+        })
+        .collect();
+    let content = emit_module(&methods).ok()?;
+    Some(EmittedFile {
+        path: PathBuf::from(format!("src/main/kotlin/{name}.kt")),
+        content: format!("package roundhouse\n\n{content}"),
+    })
+}
+
+/// Render a Ruby `module X` (parsed as a set of class methods) as a
+/// Kotlin `object X { ... }`. Used for `Mode::Module` runtime entries
+/// (e.g. `inflector.rb`). The module name comes from the methods'
+/// `enclosing_class`.
+pub fn emit_module(methods: &[MethodDef]) -> Result<String, String> {
+    set_instance_prop_types(crate::det::HashMap::default());
+    set_current_class("");
+    let name = methods
+        .first()
+        .and_then(|m| m.enclosing_class.as_ref())
+        .map(|s| type_name(s.as_str()))
+        .unwrap_or_default();
+    register_params_for(&name, methods);
+    let mut out = format!("object {name} {{\n");
+    // Module-level `@ivar` state (e.g. ViewHelpers' `@slots = {}`) → private
+    // object properties; reads of them in method bodies resolve as property
+    // names (set via `INSTANCE_PROPS`).
+    let ivars = emit_object_body_ivars(methods, &BTreeMap::new());
+    out.push_str(&ivars);
+    if !ivars.is_empty() {
+        out.push('\n');
+    }
+    for m in methods {
+        out.push_str(&indent_method(&emit_method(m, "")));
+        out.push('\n');
+    }
+    out.push_str("}\n");
+    Ok(out)
+}
+
+/// Emit declarations for module-level `@ivar`s referenced in `methods`,
+/// skipping any already covered by `accessor_props`. Object (singleton)
+/// mutable state is process-global, so it's emitted as a `ThreadLocal` (a
+/// concurrent server would otherwise bleed it across requests — e.g.
+/// ViewHelpers' `@slots` content_for store); reads/writes route through
+/// `.get()`/`.set()` via `OBJECT_TL_FIELDS`. Also registers the ivar names as
+/// `INSTANCE_PROPS` so body references resolve as fields, not method calls.
+/// Returns the declaration block (each line indented), empty when none.
+fn emit_object_body_ivars(
+    methods: &[MethodDef],
+    accessor_props: &BTreeMap<String, Ty>,
+) -> String {
+    let mut body_ivars: BTreeMap<String, ()> = BTreeMap::new();
+    for m in methods {
+        collect_ivars(&m.body, &mut body_ivars);
+    }
+    set_instance_props(body_ivars.keys().cloned().collect());
+    let tl_fields: HashSet<String> =
+        body_ivars.keys().filter(|n| !accessor_props.contains_key(*n)).cloned().collect();
+    super::expr::set_object_tl_fields(tl_fields);
+    let inferred = infer_body_ivar_types(methods);
+    let mut out = String::new();
+    for n in body_ivars.keys() {
+        if accessor_props.contains_key(n) {
+            continue;
+        }
+        let (ty, default) = match inferred.get(n) {
+            Some(ty) => (kotlin_ty(ty), default_for(ty)),
+            None => ("Any?".to_string(), "null".to_string()),
+        };
+        out.push_str(&format!(
+            "    private val {n}: ThreadLocal<{ty}> = ThreadLocal.withInitial {{ {default} }}\n"
+        ));
+    }
+    out
+}
+
+pub fn emit_library_class(lc: &LibraryClass) -> String {
+    let name = lc.name.0.as_str();
+    let class_name = type_name(name);
+    register_params_for(&class_name, &lc.methods);
+
+    // A Ruby `module` (only module-functions, no instance state) → a
+    // Kotlin `object`. Class-level `attr_accessor` (from `class << self`)
+    // collapses to an object `var` property; everything else is a `fun`.
+    if lc.is_module {
+        set_instance_prop_types(crate::det::HashMap::default());
+        set_current_class("");
+        let accessor_props = class_accessor_props(&lc.methods);
+        let mut out = format!("object {class_name} {{\n");
+        for (n, ty) in &accessor_props {
+            out.push_str(&format!("    {}\n", object_property_decl(n, ty)));
+        }
+        // Module-level `@ivar`s (e.g. ViewHelpers' `@slots = {}`) become
+        // private object properties; this also registers them as
+        // `INSTANCE_PROPS` so body references read as properties.
+        let ivars = emit_object_body_ivars(&lc.methods, &accessor_props);
+        out.push_str(&ivars);
+        if !accessor_props.is_empty() || !ivars.is_empty() {
+            out.push('\n');
+        }
+        for m in &lc.methods {
+            // Skip the synthetic getter/setter funs — the `var` is the
+            // accessor.
+            if m.kind == AccessorKind::Method {
+                out.push_str(&indent_method(&emit_method(m, "")));
+                out.push('\n');
+            }
+        }
+        out.push_str("}\n");
+        return out;
+    }
+
+    // Instance classes have no thread-local singleton state — their `@ivar`s
+    // are per-object (Flash/Session are instantiated per request). Clear any
+    // registry left from a preceding object emit.
+    super::expr::set_object_tl_fields(HashSet::default());
+
+    // Temporal (Date/DateTime/Time) columns arrive from the shared
+    // lowering already split: storage is an ordinary `<col>_raw` String
+    // accessor pair (which collapses to a `var <col>Raw: String` property
+    // like any other column), and the public `<col>` reader is a computed
+    // body parsing that storage. A plain `var` property would couple the
+    // member type to the reader's `Time` and drop the parsing body —
+    // Kotlin has one member per name — so Time-returning readers are
+    // pulled out of the accessor→`var` collapse and emitted as explicit
+    // computed getters below.
+    let mut temporal_names: HashSet<String> = HashSet::default();
+    let mut temporal_readers: Vec<(String, Ty, Expr)> = Vec::new();
+    for m in &lc.methods {
+        if m.kind == AccessorKind::AttributeReader && signature_ret_is_time(m.signature.as_ref()) {
+            let name = camel(m.name.as_str());
+            if temporal_names.insert(name.clone()) {
+                let ret = match m.signature.as_ref() {
+                    Some(Ty::Fn { ret, .. }) => (**ret).clone(),
+                    _ => Ty::Time,
+                };
+                temporal_readers.push((name, ret, m.body.clone()));
+            }
+        }
+    }
+
+    // 1. Accessor-derived properties (name → type), and the set of method
+    //    names to drop (the synthesized getters/setters). Time-returning
+    //    readers are skipped — emitted as computed getters below.
+    let mut prop_types: BTreeMap<String, Ty> = BTreeMap::new();
+    for m in &lc.methods {
+        match m.kind {
+            AccessorKind::AttributeReader => {
+                if temporal_names.contains(&camel(m.name.as_str())) {
+                    continue;
+                }
+                if let Some(Ty::Fn { ret, .. }) = m.signature.as_ref() {
+                    prop_types
+                        .entry(camel(m.name.as_str()))
+                        .or_insert_with(|| (**ret).clone());
+                }
+            }
+            AccessorKind::AttributeWriter => {
+                if let Some(Ty::Fn { params, .. }) = m.signature.as_ref() {
+                    if let Some(p) = params.first() {
+                        // writer name is `foo=`; strip the `=`.
+                        let base = m.name.as_str().trim_end_matches('=');
+                        prop_types.entry(camel(base)).or_insert_with(|| (*p.ty).clone());
+                    }
+                }
+            }
+            AccessorKind::Method => {}
+        }
+    }
+
+    // 2. Body-only ivars (e.g. `@comments_cache`) that have no accessor —
+    //    declared as `Any?` since we have no signature for them.
+    let mut body_ivars: BTreeMap<String, ()> = BTreeMap::new();
+    for m in &lc.methods {
+        collect_ivars(&m.body, &mut body_ivars);
+    }
+
+    let mut out = String::new();
+
+    // Ruby `initialize` → Kotlin primary constructor + `init` block. The
+    // constructor params shadow the same-named properties inside `init`,
+    // where ivar writes are `this.`-qualified.
+    let init = lc
+        .methods
+        .iter()
+        .find(|m| m.receiver == MethodReceiver::Instance && m.name.as_str() == "initialize");
+
+    // Parent class. Ruby's StandardError/RuntimeError → Kotlin
+    // RuntimeException. A `super(args)` inside `initialize` becomes the
+    // supertype constructor call in the header.
+    let parent_name = lc.parent.as_ref().map(|p| {
+        // Not a second table: a raise and a superclass name the same Ruby class, so they map alike
+        super::expr::kotlin_exception_class(&type_name(p.0.as_str()))
+    });
+    let super_args = init.and_then(|m| find_super_args(&m.body));
+    // Not the implicit no-arg constructor: `raise X, "message"` builds an exception subclass with its message
+    let message_ctor = init.is_none() && parent_name.as_deref().is_some_and(|p| p.ends_with("Exception"));
+    let super_args = if message_ctor { Some(vec!["message".to_string()]) } else { super_args };
+    let parent_clause = match (&parent_name, &super_args) {
+        (Some(pn), Some(args)) => format!(" : {pn}({})", args.join(", ")),
+        (Some(pn), None) => format!(" : {pn}()"),
+        (None, _) => String::new(),
+    };
+    // Every emitted class is `open` — Kotlin classes are final by default,
+    // and the model chain (Article → ApplicationRecord → Base) needs each
+    // link extendable. The instance members a subclass inherits get an
+    // explicit `override`; the rest are `open` so a further subclass could
+    // override them (harmless on leaf classes). `inherited` is the union of
+    // member names visible from the parent upward.
+    let inherited: HashSet<String> = lc
+        .parent
+        .as_ref()
+        .map(|p| type_name(p.0.as_str()))
+        .map(|p| super::expr::ancestor_members(&p))
+        .unwrap_or_default();
+    // Properties already declared by an ancestor (e.g. a controller's
+    // `params`/`flash`/`status` from `ActionController::Base`). The subclass
+    // must NOT redeclare them (that would be an override with a possibly
+    // different type) — it inherits the slot.
+    let inherited_props: HashSet<String> = lc
+        .parent
+        .as_ref()
+        .map(|p| type_name(p.0.as_str()))
+        .map(|p| super::expr::ancestor_props(&p))
+        .unwrap_or_default();
+    let member_modifier = |name: &str| -> &'static str {
+        if inherited.contains(name) {
+            "override "
+        } else {
+            "open "
+        }
+    };
+
+    let header = match init {
+        Some(m) => {
+            format!("open class {class_name}({}){parent_clause}", method_params(m).join(", "))
+        }
+        None if message_ctor => format!("open class {class_name}(message: String? = null){parent_clause}"),
+        None => format!("open class {class_name}{parent_clause}"),
+    };
+    out.push_str(&header);
+    out.push_str(" {\n");
+
+    // Properties. Constructor-param-backed properties are assigned in the
+    // `init` block, so they need no initializer (and a non-null type like
+    // `Base` can't be defaulted to null anyway).
+    let ctor_param_names: crate::det::HashSet<String> = init
+        .map(|m| m.params.iter().map(|p| camel(p.name.as_str())).collect())
+        .unwrap_or_default();
+    for (n, ty) in &prop_types {
+        if inherited_props.contains(n) && !ctor_param_names.contains(n) {
+            continue; // inherited slot — don't redeclare
+        }
+        if ctor_param_names.contains(n) {
+            // Constructor-param-backed: assigned in the `init` block, no
+            // declaration initializer. Kotlin forbids `open` on a
+            // backing-field property without an initializer, so these stay
+            // final. The inherited case takes `override` — which is open,
+            // so it needs the initializer after all ("Property must be
+            // initialized, be final, or be abstract"); the `init` block
+            // then assigns the real value over the type's default. A test
+            // double's `attr_accessor :id` over the base's key contract is
+            // the case in hand (roundhouse#90).
+            if inherited.contains(n) {
+                out.push_str(&format!("    override var {n}: {} = {}\n", kotlin_ty(ty), default_for(ty)));
+            } else {
+                out.push_str(&format!("    var {n}: {}\n", kotlin_ty(ty)));
+            }
+        } else {
+            out.push_str(&format!("    {}\n", render_member(member_modifier(n), n, ty)));
+        }
+    }
+    let inferred_ivar_types = infer_body_ivar_types(&lc.methods);
+    for n in body_ivars.keys() {
+        if !prop_types.contains_key(n) && !inherited_props.contains(n) {
+            let m = member_modifier(n);
+            match inferred_ivar_types.get(n) {
+                Some(ty) => out.push_str(&format!("    {}\n", render_member(m, n, ty))),
+                None => out.push_str(&format!("    {m}var {n}: Any? = null\n")),
+            }
+        }
+    }
+    // Temporal columns: the native-`Time` computed getter (`<name>`,
+    // parsing the `<name>Raw` storage property that the raw accessor
+    // pair already collapsed to above). The getter renders the IR body —
+    // `parse_db_time(@<col>_raw)` → `RhDateTime.parse(<name>Raw)`.
+    // Deterministic order.
+    let mut temporal_sorted = temporal_readers.clone();
+    temporal_sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    for (n, ret, body) in &temporal_sorted {
+        out.push_str(&format!(
+            "    {}val {n}: {} get() = {}\n",
+            member_modifier(n),
+            kotlin_ty(ret),
+            emit_expr(body),
+        ));
+    }
+    if !prop_types.is_empty() || !body_ivars.is_empty() || !temporal_readers.is_empty() {
+        out.push('\n');
+    }
+
+    // The class's property names (accessor-backed + body ivars + the
+    // temporal computed getters), so a `self.x` zero-arg send in a body
+    // emits as a property read; everything else gets `()`. Active for the
+    // rest of this function's method emit.
+    let instance_props: HashSet<String> = prop_types
+        .keys()
+        .chain(body_ivars.keys())
+        .chain(temporal_names.iter())
+        .chain(inherited_props.iter())
+        .cloned()
+        .collect();
+    set_instance_props(instance_props);
+    // Column scalar types, so a `self.<col> = row[k]`/`attrs[k]` write
+    // coerces the untyped value to the property's type — plus inferred
+    // body-ivar types (e.g. `@data: Hash[...]`) so a `data.keys`/`.length`
+    // call dispatches as a Map even though `data` is a body ivar.
+    let mut prop_ty_map: crate::det::HashMap<String, Ty> =
+        prop_types.iter().map(|(n, t)| (n.clone(), t.clone())).collect();
+    for (n, t) in &inferred_ivar_types {
+        prop_ty_map.entry(n.clone()).or_insert_with(|| t.clone());
+    }
+    set_instance_prop_types(prop_ty_map);
+    // Implicit-self `new(...)` in a companion factory → this class's ctor.
+    set_current_class(&class_name);
+
+    // init block (initialize body). Kotlin `init` can't `return`, so when
+    // the body has a guard `return`, wrap it in `run { }` and emit
+    // `return@run`.
+    if let Some(m) = init {
+        begin_method(&m.body);
+        set_param_names(m.params.iter().map(|p| camel(p.name.as_str())).collect());
+        set_returns_unit(true);
+        let has_return = body_has_return(&m.body);
+        if has_return {
+            set_return_label(Some("run"));
+        }
+        let body = emit_body(&m.body, false);
+        set_return_label(None);
+        let inner = if has_return {
+            format!("run {{\n{}\n}}", indent4(&body))
+        } else {
+            body
+        };
+        out.push_str(&format!("    init {{\n{}\n    }}\n\n", indent4(&indent4(&inner))));
+    }
+
+    // Instance methods (skip accessors and the initialize we just used).
+    for m in &lc.methods {
+        if m.receiver == MethodReceiver::Instance
+            && m.kind == AccessorKind::Method
+            && m.name.as_str() != "initialize"
+        {
+            out.push_str(&indent_method(&emit_method(m, member_modifier(&member_name(m)))));
+            out.push('\n');
+        }
+    }
+
+    // Polymorphic `schema_columns`. The base `fill_timestamps` calls
+    // `self.class.schema_columns`, which kotlin emits as a bare
+    // `schemaColumns()`. As a COMPANION method that resolves statically to
+    // the enclosing class's companion — i.e. always the base stub, never the
+    // runtime subclass (Kotlin companions aren't virtual) — so create 500s
+    // with `schema_columns must be overridden`. Synthesize a virtual INSTANCE
+    // `schemaColumns()` that shadows the companion in instance context: the
+    // root base's is the `open` stub; each model's `override` delegates to its
+    // own companion (the real column list). `self.class.schema_columns` →
+    // `schemaColumns()` then dispatches through the instance vtable to the
+    // record's actual class. Only classes that define a companion
+    // `schema_columns` get one (so abstract ApplicationRecord, with none, is
+    // skipped and inherits the base's open stub).
+    // `schema_time_columns` (the temporal subset, read by the JSON
+    // serializer) has the same companion-isn't-virtual problem, so it
+    // gets the same instance shadow. Its base is an empty list rather
+    // than a raise — a model with no temporal column has none.
+    for (snake, camel, base_body) in [
+        (
+            "schema_columns",
+            "schemaColumns",
+            "throw NotImplementedError(\"ActiveRecord::Base.schema_columns must be overridden\")"
+                .to_string(),
+        ),
+        (
+            "schema_time_columns",
+            "schemaTimeColumns",
+            "return mutableListOf()".to_string(),
+        ),
+    ] {
+        if !lc
+            .methods
+            .iter()
+            .any(|m| m.receiver == MethodReceiver::Class && m.name.as_str() == snake)
+        {
+            continue;
+        }
+        let (modifier, body) = if lc.parent.is_none() {
+            ("open", base_body)
+        } else {
+            ("override", format!("return {class_name}.{camel}()"))
+        };
+        out.push_str(&format!(
+            "    {modifier} fun {camel}(): MutableList<String> {{ {body} }}\n\n"
+        ));
+    }
+
+    // Class methods → companion object.
+    let class_methods: Vec<&MethodDef> = lc
+        .methods
+        .iter()
+        .filter(|m| m.receiver == MethodReceiver::Class)
+        .collect();
+    // Ruby's class-name reflection (`self.name`, emitted as a `name()`
+    // call) has no Kotlin analog; synthesize a companion `name()` returning
+    // this class's (Ruby-qualified) name. Skip if the class defines its own
+    // `name`. Per-model subclasses get their own when emitted.
+    let needs_name = references_class_name(&lc.methods)
+        && !lc.methods.iter().any(|m| m.name.as_str() == "name");
+    // Kotlin companions aren't inherited, so a model's `Article.find` /
+    // `Article.exists` (the public AR finders Base defines) don't resolve
+    // through the `: Base()` extends. Synthesize per-model copies that
+    // delegate to the model's own `_adapter_*` companion methods (Db-direct
+    // Level-3). Gated on the model marker `_adapterAll`; each emitted only
+    // when not already defined (so Base, which defines them itself, and
+    // ApplicationRecord, which has no `_adapter_*`, synthesize nothing).
+    let present: HashSet<String> = class_methods.iter().map(|m| member_name(m)).collect();
+    let synth_finders = synth_inherited_finders(&class_name, &present);
+    if !class_methods.is_empty() || needs_name || !synth_finders.is_empty() {
+        out.push_str("    companion object {\n");
+        if needs_name {
+            out.push_str(&format!(
+                "        fun name(): String {{\n            return {:?}\n        }}\n",
+                lc.name.0.as_str()
+            ));
+        }
+        for m in class_methods {
+            out.push_str(&indent_method(&indent_method(&emit_method(m, ""))));
+            out.push('\n');
+        }
+        out.push_str(&synth_finders);
+        out.push_str("    }\n");
+    }
+
+    out.push_str("}\n");
+    out
+}
+
+/// Render a lowered test class (`InflectorTest`, …) as a JUnit-5 test file
+/// body. Mirrors the instance-class path of `emit_library_class` but drops
+/// the AR machinery (no companion finders, no `open`/inheritance modifiers):
+/// a test class is a leaf. Each `test_*` instance method gets an `@Test`
+/// annotation so JUnit's platform discovers it; setup/helper methods emit
+/// plain. Assertion bodies were already rewritten to inline `throw` by the
+/// `inline_assertions` lowerer, so a failing assertion surfaces as a JUnit
+/// failure with no per-target assertion shim needed.
+///
+/// `constants` (class-body `TABLE = [...]`) hoist to file scope above the
+/// class — same lift as the Crystal/Ruby test emit. Body-only ivars (`@article`
+/// set in `setup`) become `var` properties so cross-method reads resolve.
+pub fn emit_test_class(
+    lc: &LibraryClass,
+    inner_classes: &[LibraryClass],
+    constants: &[(crate::ident::Symbol, Expr)],
+) -> String {
+    let class_name = type_name(lc.name.0.as_str());
+    register_params_for(&class_name, &lc.methods);
+    // The inline stand-ins get the same pre-scan the runtime and model
+    // classes get. Without their parent edge in the registry, a test-body
+    // send through one of them (`@controller.redirect_to(notice: …)`,
+    // where `@controller` is a `TestController < ActionController::Base`)
+    // can't walk up to the framework base's parameter list, and the
+    // kwargs hash stays a map literal the callee won't accept.
+    register_class_hierarchy(inner_classes);
+    super::expr::set_object_tl_fields(HashSet::default());
+
+    let mut out = String::new();
+
+    // File-scope constants (hoisted above the class).
+    for (name, value) in constants {
+        out.push_str(&format!("val {} = {}\n", name.as_str(), emit_expr(value)));
+    }
+    if !constants.is_empty() {
+        out.push('\n');
+    }
+
+    // Inner helper classes declared inline in the test file (a non-test
+    // model/controller paired with the `*Test` class — e.g.
+    // `Article < ActiveRecord::Base` in view_helpers_test, `TestController <
+    // ActionController::Base` in base_test). Ingest lifts them onto the
+    // module's `inner_classes`; hoist them to file scope above the test
+    // class so the test body's references resolve. Same companion-hoist the
+    // TypeScript/Crystal gates do. `emit_library_class` sets its own emit
+    // context, which the test-class setup below then overrides.
+    for inner in inner_classes {
+        out.push_str(&emit_library_class(inner));
+        out.push('\n');
+    }
+
+    // Body-only ivars (e.g. `@article` assigned in `setup`) → `var`
+    // properties so reads in other test methods resolve.
+    let mut body_ivars: BTreeMap<String, ()> = BTreeMap::new();
+    for m in &lc.methods {
+        collect_ivars(&m.body, &mut body_ivars);
+    }
+    let inferred_ivar_types = infer_body_ivar_types(&lc.methods);
+
+    // Every test class extends the hand-written RoundhouseTestCase
+    // (RhTestSupport.kt, emitted whenever the App carries tests): JUnit
+    // runs its @BeforeEach (schema reset + fixtures) before the
+    // subclass's, and the controller-test surface (get/post/
+    // assertResponse/assertSelect) resolves by inheritance.
+    out.push_str(&format!("class {class_name} : RoundhouseTestCase() {{\n"));
+    for n in body_ivars.keys() {
+        match inferred_ivar_types.get(n) {
+            Some(ty) => out.push_str(&format!("    {}\n", render_member("", n, ty))),
+            None => out.push_str(&format!("    var {n}: Any? = null\n")),
+        }
+    }
+    if !body_ivars.is_empty() {
+        out.push('\n');
+    }
+
+    // Property registry so `self.@article` reads emit as a property name.
+    let instance_props: HashSet<String> = body_ivars.keys().cloned().collect();
+    set_instance_props(instance_props);
+    let prop_ty_map: crate::det::HashMap<String, Ty> = inferred_ivar_types
+        .iter()
+        .map(|(n, t)| (n.clone(), t.clone()))
+        .collect();
+    set_instance_prop_types(prop_ty_map);
+    set_current_class(&class_name);
+
+    for m in &lc.methods {
+        if m.receiver != MethodReceiver::Instance || m.kind != AccessorKind::Method {
+            continue;
+        }
+        if m.name.as_str() == "initialize" {
+            continue;
+        }
+        // JUnit discovery: annotate the `test_*` methods, and `setup` as
+        // @BeforeEach (runs after the inherited RoundhouseTestCase
+        // @BeforeEach — JUnit orders superclass lifecycle methods first).
+        // Other helpers stay plain (called by the test body).
+        let rendered = if m.name.as_str().starts_with("test_") {
+            format!("@org.junit.jupiter.api.Test\n{}", emit_method(m, ""))
+        } else if m.name.as_str() == "setup" {
+            format!("@org.junit.jupiter.api.BeforeEach\n{}", emit_method(m, ""))
+        } else {
+            emit_method(m, "")
+        };
+        out.push_str(&indent_method(&rendered));
+        out.push('\n');
+    }
+    out.push_str("}\n");
+    out
+}
+
+/// Per-model copies of the public AR class methods Base defines, delegating
+/// to the model's own `_adapter_*` companion members (Kotlin companions
+/// aren't inherited). Emitted (indented for a companion body) only for a
+/// Base-subclass model — detected by the `_adapterAll` marker — and only
+/// for finders the class doesn't already define. `where`/`find_by` are
+/// intentionally omitted (they route through the dropped adapter and
+/// real-blog never calls them on a model). The bodies mirror
+/// `active_record/base.rb`, specialized to `T` and using `size - 1` for
+/// `last` (no negative index).
+fn synth_inherited_finders(t: &str, present: &HashSet<String>) -> String {
+    if !present.contains("_adapterAll") {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut emit = |name: &str, body: String| {
+        if !present.contains(name) {
+            out.push_str(&indent_method(&indent_method(&body)));
+            out.push('\n');
+        }
+    };
+    emit("all", format!("fun all(): MutableList<{t}> {{\n    return _adapterAll()\n}}\n"));
+    emit(
+        "find",
+        format!(
+            "fun find(id: Long): {t} {{\n    val result = _adapterFindById(id)\n    if (result == null) {{\n        throw RecordNotFound(\"Couldn't find {t} with id=${{id}}\")\n    }}\n    return result\n}}\n"
+        ),
+    );
+    emit("count", "fun count(): Long {\n    return _adapterCount()\n}\n".to_string());
+    emit(
+        "existsPred",
+        "fun existsPred(id: Long): Boolean {\n    return _adapterExistsByIdPred(id)\n}\n".to_string(),
+    );
+    emit(
+        "last",
+        format!(
+            "fun last(): {t}? {{\n    return _adapterLast()\n}}\n"
+        ),
+    );
+    emit(
+        "destroyAll",
+        format!(
+            "fun destroyAll(): MutableList<{t}> {{\n    val records = all()\n    records.forEach {{ it.destroy() }}\n    return records\n}}\n"
+        ),
+    );
+    emit(
+        "create",
+        format!(
+            "fun create(attrs: MutableMap<String, Any?> = mutableMapOf<String, Any?>()): {t} {{\n    val instance = {t}(attrs)\n    instance.save()\n    return instance\n}}\n"
+        ),
+    );
+    emit(
+        "createBang",
+        format!(
+            "fun createBang(attrs: MutableMap<String, Any?> = mutableMapOf<String, Any?>()): {t} {{\n    val instance = {t}(attrs)\n    if (!instance.save()) {{\n        throw RecordInvalid(instance)\n    }}\n    return instance\n}}\n"
+        ),
+    );
+    out
+}
+
+/// Register every method's parameter names under `receiver.method` for the
+/// kwargs-vs-map call-site decision (see `expr::METHOD_PARAMS`).
+fn register_params_for(receiver: &str, methods: &[MethodDef]) {
+    for m in methods {
+        register_method_params(
+            receiver,
+            m.name.as_str(),
+            m.params.iter().map(|p| camel(p.name.as_str())).collect(),
+        );
+        register_method_param_tys(receiver, m.name.as_str(), positional_signature_tys(m));
+    }
+}
+
+/// Positional parameter types from the RBS signature, in call order.
+/// Keyword, rest, and block params are not positional arguments.
+fn positional_signature_tys(m: &MethodDef) -> Vec<Ty> {
+    use crate::ty::ParamKind;
+    let Some(Ty::Fn { params, .. }) = m.signature.as_ref() else {
+        return Vec::new();
+    };
+    params
+        .iter()
+        .filter(|p| matches!(p.kind, ParamKind::Required | ParamKind::Optional))
+        .map(|p| (*p.ty).clone())
+        .collect()
+}
+
+fn indent_method(s: &str) -> String {
+    s.lines()
+        .map(|l| if l.is_empty() { String::new() } else { format!("    {l}") })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The Kotlin member name a method emits under (`[]`→`get`, `[]=`→`set`,
+/// else camelCased) — the key used for override resolution.
+fn member_name(m: &MethodDef) -> String {
+    match m.name.as_str() {
+        "[]" => "get".to_string(),
+        "[]=" => "set".to_string(),
+        _ => camel(m.name.as_str()),
+    }
+}
+
+/// The camelCased instance-member names a class defines (accessor props +
+/// body ivars + instance methods, excluding `initialize`). Used both to
+/// register the class for override resolution and — via the ancestor union
+/// — to decide which members of a subclass need `override`.
+fn instance_member_names(lc: &LibraryClass) -> HashSet<String> {
+    let mut out = HashSet::default();
+    for m in &lc.methods {
+        if m.receiver != MethodReceiver::Instance {
+            continue;
+        }
+        match m.kind {
+            AccessorKind::AttributeReader | AccessorKind::AttributeWriter => {
+                out.insert(camel(m.name.as_str().trim_end_matches('=')));
+            }
+            AccessorKind::Method if m.name.as_str() != "initialize" => {
+                out.insert(member_name(m));
+            }
+            AccessorKind::Method => {}
+        }
+    }
+    let mut body_ivars: BTreeMap<String, ()> = BTreeMap::new();
+    for m in &lc.methods {
+        collect_ivars(&m.body, &mut body_ivars);
+    }
+    out.extend(body_ivars.into_keys());
+    out
+}
+
+/// Pre-scan hook: register each class's parent + instance members so that,
+/// when a subclass renders, members it inherits get an `override` modifier
+/// (Kotlin requires it explicitly). Skips modules (`object`s never
+/// participate in inheritance). Called for the runtime classes (via the
+/// `kotlin_units` transform) and the model classes (before they render).
+pub fn register_class_hierarchy(classes: &[LibraryClass]) {
+    for lc in classes {
+        if lc.is_module {
+            continue;
+        }
+        let name = type_name(lc.name.0.as_str());
+        let parent = lc.parent.as_ref().map(|p| type_name(p.0.as_str()));
+        super::expr::register_class_hierarchy(&name, parent.as_deref(), instance_member_names(lc));
+        super::expr::register_instance_methods(&name, instance_method_names(lc));
+    }
+}
+
+/// The camelCased names of a class's zero-arg instance *methods* (kind
+/// `Method`, excluding `initialize` and any that take parameters) — the set
+/// a typed-receiver send consults to keep its `()` (vs reading a property).
+/// Distinct from `instance_member_names`, which also includes accessor
+/// properties (used for `override` resolution).
+fn instance_method_names(lc: &LibraryClass) -> HashSet<String> {
+    lc.methods
+        .iter()
+        .filter(|m| {
+            m.receiver == MethodReceiver::Instance
+                && m.kind == AccessorKind::Method
+                && m.name.as_str() != "initialize"
+                && m.params.is_empty()
+        })
+        .map(member_name)
+        .collect()
+}
+
+fn emit_method(m: &MethodDef, modifier: &str) -> String {
+    // Ruby `[]` / `[]=` → Kotlin indexing operators. `set` is always
+    // Unit-returning (the source RBS union return is dropped).
+    let (decl_kw, name, force_unit) = match m.name.as_str() {
+        "[]" => ("operator fun", "get".to_string(), false),
+        "[]=" => ("operator fun", "set".to_string(), true),
+        _ => ("fun", camel(m.name.as_str()), false),
+    };
+
+    let mut params = method_params(m);
+    // The Kotlin AR base declares the indexer over String keys
+    // (`operator fun get(_name: String)` / `set(_name: String, …)`). A
+    // subclass `[]`/`[]=` whose key param infers `Any?` (common when the
+    // source `def [](field)` carries no signature) would emit a different
+    // parameter type and thus override nothing. Pin the key param to String
+    // so the override resolves against the base. Scoped to `override`
+    // members only — a class that *defines* its own indexer (e.g. Flash,
+    // keyed over `Any?` and called as such by its own `fetch`/`key`) keeps
+    // its inferred key type.
+    if matches!(m.name.as_str(), "[]" | "[]=") && modifier.contains("override") {
+        if let Some(first) = params.first_mut() {
+            let pn = first.split(':').next().unwrap_or("").trim().to_string();
+            *first = format!("{pn}: String");
+        }
+    }
+    // A method that `yield`s takes a `block` parameter in Kotlin (there's
+    // no implicit block); `yield` calls it. Type from the signature's
+    // block slot.
+    if body_has_yield(&m.body) {
+        let bt = match m.signature.as_ref() {
+            Some(Ty::Fn { block: Some(b), .. }) => kotlin_ty(b),
+            _ => "(Any?) -> Unit".to_string(),
+        };
+        params.push(format!("block: {bt}"));
+    }
+
+    // Return type.
+    // Not Unit for a method without a signature: an app method's answer is its body's type
+    let ret_ty = match m.signature.as_ref() {
+        Some(Ty::Fn { ret, .. }) => Some((**ret).clone()),
+        _ if m.name.as_str() == "initialize" => None,
+        _ => m.body.ty.clone().filter(|t| !t.is_open()),
+    };
+    let returns_value = !force_unit && matches!(&ret_ty, Some(t) if !matches!(t, Ty::Nil));
+    let ret_clause = if force_unit {
+        String::new()
+    } else {
+        match &ret_ty {
+            Some(t) if !matches!(t, Ty::Nil) => format!(": {}", kotlin_ty(t)),
+            _ => String::new(),
+        }
+    };
+
+    begin_method(&m.body);
+    set_param_names(m.params.iter().map(|p| camel(p.name.as_str())).collect());
+    // A `Unit` method's guard `return nil` emits a bare `return`.
+    set_returns_unit(!returns_value);
+    // A value-returning method with an empty body (Ruby `def x; end` →
+    // implicit `nil`) can't emit a bare `return` in Kotlin — a non-Unit
+    // function must yield a value. These are the load-bearing-empty AR
+    // overrides (`_adapter_insert`, `_adapter_reload`, …); subclasses
+    // override, so the base body never runs. Synthesize the type's default
+    // (`0` for `Long`, `null` for nullable returns) to keep it a no-op.
+    let body = if returns_value && is_empty_body(&m.body) {
+        let ret = ret_ty.clone().unwrap_or(Ty::Untyped);
+        format!("return {}", default_for(&ret))
+    } else {
+        emit_body(&m.body, returns_value)
+    };
+    // Prepend any hoisted `var` declarations (locals first assigned in a
+    // nested scope but used at an outer level) computed by `begin_method`.
+    let hoist = hoisted_decls();
+    let body = if hoist.is_empty() {
+        body
+    } else {
+        format!("{}\n{}", hoist.join("\n"), body)
+    };
+
+    format!(
+        "{modifier}{decl_kw} {name}({}){ret_clause} {{\n{}\n}}\n",
+        params.join(", "),
+        indent4(&body)
+    )
+}
+
+/// Render a method's params, always typed (Kotlin requirement); falls
+/// back to `Any?` where the signature is missing.
+fn method_params(m: &MethodDef) -> Vec<String> {
+    let sig_params = match m.signature.as_ref() {
+        Some(Ty::Fn { params, .. }) => Some(params),
+        _ => None,
+    };
+    m.params
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let pn = camel(p.name.as_str());
+            let ty = sig_params
+                .and_then(|sp| sp.get(i))
+                .map(|sp| kotlin_ty(&sp.ty))
+                .unwrap_or_else(|| "Any?".to_string());
+            match &p.default {
+                Some(d) => format!("{pn}: {ty} = {}", emit_expr(d)),
+                None => format!("{pn}: {ty}"),
+            }
+        })
+        .collect()
+}
+
+fn indent4(s: &str) -> String {
+    s.lines()
+        .map(|l| if l.is_empty() { String::new() } else { format!("    {l}") })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Emit a method body, adding an explicit `return` to the final statement
+/// when the method returns a value (Ruby implicit return → Kotlin).
+fn emit_body(body: &Expr, returns_value: bool) -> String {
+    if !returns_value {
+        return emit_expr(body);
+    }
+    match &*body.node {
+        ExprNode::Seq { exprs } if !exprs.is_empty() => {
+            let mut lines: Vec<String> = exprs[..exprs.len() - 1].iter().map(emit_expr).collect();
+            lines.push(wrap_return(&exprs[exprs.len() - 1]));
+            lines.join("\n")
+        }
+        _ => wrap_return(body),
+    }
+}
+
+/// Prefix `return` unless the expression is already terminal or is a
+/// statement that has no value (assignment, loop).
+fn wrap_return(e: &Expr) -> String {
+    // A nested `Seq` (e.g. the `else` block of a guard-return method) has
+    // its *last* statement as its value — recurse so `return` lands there,
+    // not on the whole block. Without this, a multi-statement tail emits
+    // `return <stmt1>\n<stmt2>…` (the `return val stmt = …` bug).
+    if let ExprNode::Seq { exprs } = &*e.node {
+        if !exprs.is_empty() {
+            return emit_body(e, true);
+        }
+    }
+    // An empty `{}` / `[]` literal in return position: emit the
+    // type-argument-free constructor so the method's declared return type
+    // drives inference (`attributes()` → `MutableMap<String, Any?>`),
+    // rather than the literal's own `<Any?, Any?>` guess.
+    match &*e.node {
+        ExprNode::Hash { entries, .. } if entries.is_empty() => {
+            return "return mutableMapOf()".to_string();
+        }
+        ExprNode::Array { elements, .. } if elements.is_empty() => {
+            return "return mutableListOf()".to_string();
+        }
+        // A non-empty hash in return position drops its explicit type args so
+        // the declared return type drives inference (a permitted-params
+        // `to_h` returns `MutableMap<String, String>`); invariance is a
+        // non-issue for a return value.
+        ExprNode::Hash { .. } => {
+            return format!("return {}", super::expr::emit_return_value(e));
+        }
+        _ => {}
+    }
+    // Not the assignment alone: Ruby's assignment answers the value, and a value method must return it
+    if let ExprNode::Assign { target: target @ (crate::expr::LValue::Var { .. } | crate::expr::LValue::Ivar { .. }), .. } = &*e.node {
+        let read = match target {
+            crate::expr::LValue::Var { id, name } => ExprNode::Var { id: *id, name: name.clone() },
+            crate::expr::LValue::Ivar { name } => ExprNode::Ivar { name: name.clone() },
+            _ => unreachable!(),
+        };
+        return format!("{}\nreturn {}", emit_expr(e), emit_expr(&Expr::new(e.span, read)));
+    }
+    let s = emit_expr(e);
+    // A `raise Class, msg` send emits as a `throw` (type `Nothing`); like a
+    // `Raise` node it needs no `return` prefix.
+    let is_raise_send = matches!(
+        &*e.node,
+        ExprNode::Send { recv: None, method, .. } if method.as_str() == "raise"
+    );
+    let no_return = is_raise_send
+        || matches!(
+            &*e.node,
+            ExprNode::Return { .. }
+                | ExprNode::Raise { .. }
+                | ExprNode::While { .. }
+                | ExprNode::Assign { .. }
+                | ExprNode::Super { .. }
+                | ExprNode::Next { .. }
+                | ExprNode::Break { .. }
+        );
+    if no_return {
+        s
+    } else {
+        format!("return {s}")
+    }
+}
+
+fn body_has_yield(e: &Expr) -> bool {
+    matches!(&*e.node, ExprNode::Yield { .. }) || expr_children(e).iter().any(|c| body_has_yield(c))
+}
+
+/// Find a `super(args)` call (delegated to the parent constructor in the
+/// class header). Returns the emitted arg strings, or `None` if there's
+/// no `super` (or it's `super()` with no args returns `Some(vec![])`).
+fn find_super_args(e: &Expr) -> Option<Vec<String>> {
+    if let ExprNode::Super { args } = &*e.node {
+        return Some(
+            args.as_ref()
+                .map(|a| a.iter().map(emit_expr).collect())
+                .unwrap_or_default(),
+        );
+    }
+    for c in expr_children(e) {
+        if let Some(r) = find_super_args(c) {
+            return Some(r);
+        }
+    }
+    None
+}
+
+fn body_has_return(e: &Expr) -> bool {
+    matches!(&*e.node, ExprNode::Return { .. })
+        || expr_children(e).iter().any(|c| body_has_return(c))
+}
+
+fn collect_ivars(e: &Expr, out: &mut BTreeMap<String, ()>) {
+    match &*e.node {
+        ExprNode::Ivar { name } => {
+            out.insert(camel(name.as_str()), ());
+        }
+        ExprNode::Assign { target: LValue::Ivar { name }, value } => {
+            out.insert(camel(name.as_str()), ());
+            collect_ivars(value, out);
+        }
+        _ => {}
+    }
+    for child in expr_children(e) {
+        collect_ivars(child, out);
+    }
+}
+
+fn expr_children(e: &Expr) -> Vec<&Expr> {
+    let mut v = Vec::new();
+    match &*e.node {
+        ExprNode::Seq { exprs } => v.extend(exprs.iter()),
+        ExprNode::If { cond, then_branch, else_branch } => {
+            v.push(cond);
+            v.push(then_branch);
+            v.push(else_branch);
+        }
+        ExprNode::While { cond, body, .. } => {
+            v.push(cond);
+            v.push(body);
+        }
+        ExprNode::Assign { value, .. } => v.push(value),
+        ExprNode::Case { scrutinee, arms } => {
+            v.push(scrutinee);
+            for a in arms {
+                v.push(&a.body);
+            }
+        }
+        ExprNode::Send { recv, args, block, .. } => {
+            if let Some(r) = recv {
+                v.push(r);
+            }
+            v.extend(args.iter());
+            if let Some(b) = block {
+                v.push(b);
+            }
+        }
+        ExprNode::BoolOp { left, right, .. } => {
+            v.push(left);
+            v.push(right);
+        }
+        ExprNode::Return { value } | ExprNode::Raise { value } => v.push(value),
+        ExprNode::Lambda { body, .. } => v.push(body),
+        ExprNode::Hash { entries, .. } => {
+            for (k, val) in entries {
+                v.push(k);
+                v.push(val);
+            }
+        }
+        ExprNode::Array { elements, .. } => v.extend(elements.iter()),
+        ExprNode::StringInterp { parts } => {
+            for p in parts {
+                if let crate::expr::InterpPart::Expr { expr } = p {
+                    v.push(expr);
+                }
+            }
+        }
+        ExprNode::BeginRescue { body, rescues, else_branch, ensure, .. } => {
+            v.push(body);
+            v.extend(rescues.iter().map(|r| &r.body));
+            v.extend(else_branch.iter());
+            v.extend(ensure.iter());
+        }
+        _ => {}
+    }
+    v
+}
+
+/// Pre-scan hook (runs before rendering, via the `kotlin_units` transform):
+/// register every module/object-level accessor property so a
+/// `Const`-receiver read of it (`ActiveRecord.adapter`) drops its parens.
+/// Order-independent — the registry is populated for all classes in an
+/// entry before any of them render.
+pub fn register_object_accessors(classes: &[LibraryClass]) {
+    for lc in classes {
+        if !lc.is_module {
+            continue;
+        }
+        let object = lc.name.0.as_str().rsplit("::").next().unwrap_or(lc.name.0.as_str());
+        for prop in class_accessor_props(&lc.methods).keys() {
+            super::expr::register_object_accessor(object, prop);
+        }
+    }
+}
+
+/// Collect class-level (`receiver == Class`) accessor properties — the
+/// `class << self; attr_accessor :x` pairs — as camelCased name → type
+/// (from the reader's RBS return / the writer's param). Instance accessors
+/// are handled separately (they collapse to instance `var`s).
+fn class_accessor_props(methods: &[MethodDef]) -> BTreeMap<String, Ty> {
+    let mut props: BTreeMap<String, Ty> = BTreeMap::new();
+    for m in methods {
+        if m.receiver != MethodReceiver::Class {
+            continue;
+        }
+        match m.kind {
+            AccessorKind::AttributeReader => {
+                if let Some(Ty::Fn { ret, .. }) = m.signature.as_ref() {
+                    props.entry(camel(m.name.as_str())).or_insert_with(|| (**ret).clone());
+                }
+            }
+            AccessorKind::AttributeWriter => {
+                if let Some(Ty::Fn { params, .. }) = m.signature.as_ref() {
+                    if let Some(p) = params.first() {
+                        let base = m.name.as_str().trim_end_matches('=');
+                        props.entry(camel(base)).or_insert_with(|| (*p.ty).clone());
+                    }
+                }
+            }
+            AccessorKind::Method => {}
+        }
+    }
+    props
+}
+
+/// Declaration for an object-level accessor property. A non-null reference
+/// type (the global adapter slot) is `lateinit var` — set once at boot, so
+/// a nullable default would force `!!` at every read; primitives/nullables
+/// fall back to a defaulted `var`.
+fn object_property_decl(name: &str, ty: &Ty) -> String {
+    let kt = kotlin_ty(ty);
+    if can_lateinit(ty) {
+        format!("lateinit var {name}: {kt}")
+    } else {
+        format!("var {name}: {kt} = {}", default_for(ty))
+    }
+}
+
+/// `lateinit` is legal only for non-null, non-primitive types.
+fn can_lateinit(ty: &Ty) -> bool {
+    match ty {
+        Ty::Int | Ty::Float | Ty::Bool | Ty::Nil | Ty::Untyped | Ty::Var { .. } => false,
+        Ty::Union { variants } if variants.iter().any(|v| matches!(v, Ty::Nil)) => false,
+        _ => true,
+    }
+}
+
+/// True when any method references Ruby's class-name reflection — a bare
+/// (implicit-self) `name` send with no args, as in `"#{name}.table_name
+/// must be overridden"`.
+fn references_class_name(methods: &[MethodDef]) -> bool {
+    methods.iter().any(|m| sends_class_name(&m.body))
+}
+
+fn sends_class_name(e: &Expr) -> bool {
+    let hit = matches!(
+        &*e.node,
+        ExprNode::Send { recv, method, args, .. }
+            if method.as_str() == "name"
+                && args.is_empty()
+                && matches!(recv.as_ref().map(|r| &*r.node), None | Some(ExprNode::SelfRef))
+    );
+    hit || expr_children(e).iter().any(|c| sends_class_name(c))
+}
+
+/// True when a method body is empty (`def x; end` → an empty `Seq`).
+fn is_empty_body(e: &Expr) -> bool {
+    matches!(&*e.node, ExprNode::Seq { exprs } if exprs.is_empty())
+}
+
+/// Infer types for body-only ivars (those without an `attr_*` accessor) so
+/// they don't all collapse to `Any?`. Two signals, strongest first:
+///   1. A pure reader method whose body *is* the ivar (`def errors;
+///      @errors; end`) donates its declared return type — this is how
+///      `@persisted`/`@destroyed` get `bool` from `base.rbs` without
+///      needing an ivar declaration of their own. (`@errors` now carries
+///      an explicit `@errors: Array[String]` there as well: a consumer
+///      that reads only signatures, as spinel does, otherwise seeds it
+///      from the bare `[]` in `initialize` and lands on an int array.)
+///   2. Otherwise, the literal an ivar is assigned (`@persisted = false`).
+/// Same shape works for flash/session's `@data` once they're wired.
+fn infer_body_ivar_types(methods: &[MethodDef]) -> BTreeMap<String, Ty> {
+    let mut out: BTreeMap<String, Ty> = BTreeMap::new();
+
+    // Signal 1: reader methods returning exactly an ivar.
+    for m in methods {
+        if let (Some(ivar), Some(Ty::Fn { ret, .. })) =
+            (body_returns_ivar(&m.body), m.signature.as_ref())
+        {
+            if !matches!(&**ret, Ty::Nil) {
+                out.entry(ivar).or_insert_with(|| (**ret).clone());
+            }
+        }
+    }
+
+    // Signal 1.25: `initialize` assigns the ivar an object (`@cache_control
+    // = CacheControlStore.new`) and nothing assigns it a nilable value. A
+    // READ carries `T | nil` (unset before `initialize`), which signal 1.5
+    // would take first, but the slot is never nil once constructed.
+    let mut nilable_assigned: HashSet<String> = HashSet::default();
+    for m in methods {
+        collect_nilable_ivar_assigns(&m.body, &mut nilable_assigned);
+    }
+    for m in methods.iter().filter(|m| m.name.as_str() == "initialize") {
+        let stmts: Vec<&Expr> = match &*m.body.node {
+            ExprNode::Seq { exprs } => exprs.iter().collect(),
+            _ => vec![&m.body],
+        };
+        for st in stmts {
+            if let ExprNode::Assign { target: LValue::Ivar { name }, value } = &*st.node {
+                let n = camel(name.as_str());
+                if let Some(ty @ Ty::Class { .. }) = value.ty.as_ref() {
+                    if !nilable_assigned.contains(&n) {
+                        out.entry(n).or_insert_with(|| ty.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    // Signal 1.5: a concrete `Ty` carried on an ivar read/assign node (the
+    // typer often knows it — e.g. `@comments_cache` reads as
+    // `Array[Comment]` from the has_many association) — for ivars not
+    // already fixed by a reader.
+    for m in methods {
+        collect_ivar_node_types(&m.body, &mut out);
+    }
+
+    // Signal 2: literal assignments, only for ivars not already inferred.
+    for m in methods {
+        collect_ivar_literal_types(&m.body, &mut out);
+    }
+
+    out
+}
+
+/// Record the `Ty` the typer attached to an ivar read (`@x`) or to the
+/// value of `@x = …`, when it's concrete (not `Untyped`/`Var`). Never
+/// overwrites a stronger signal already present.
+fn collect_ivar_node_types(e: &Expr, out: &mut BTreeMap<String, Ty>) {
+    let useful = |ty: &Ty| !matches!(ty, Ty::Untyped | Ty::Var { .. } | Ty::Nil);
+    match &*e.node {
+        ExprNode::Ivar { name } => {
+            if let Some(ty) = e.ty.as_ref().filter(|t| useful(t)) {
+                out.entry(camel(name.as_str())).or_insert_with(|| ty.clone());
+            }
+        }
+        ExprNode::Assign { target: LValue::Ivar { name }, value } => {
+            if let Some(ty) = value.ty.as_ref().filter(|t| useful(t)) {
+                out.entry(camel(name.as_str())).or_insert_with(|| ty.clone());
+            }
+        }
+        _ => {}
+    }
+    for child in expr_children(e) {
+        collect_ivar_node_types(child, out);
+    }
+}
+
+/// Ivars some assignment gives a nil or nil-able value.
+fn collect_nilable_ivar_assigns(e: &Expr, out: &mut HashSet<String>) {
+    if let ExprNode::Assign { target: LValue::Ivar { name }, value } = &*e.node {
+        let nilable = match value.ty.as_ref() {
+            Some(Ty::Nil) => true,
+            Some(Ty::Union { variants }) => variants.iter().any(|v| matches!(v, Ty::Nil)),
+            None | Some(Ty::Untyped | Ty::Var { .. }) => true,
+            _ => false,
+        };
+        if nilable {
+            out.insert(camel(name.as_str()));
+        }
+    }
+    for child in expr_children(e) {
+        collect_nilable_ivar_assigns(child, out);
+    }
+}
+
+/// If a method body is (or ends in) a bare ivar read, return that ivar's
+/// camel-cased name. Covers `@x`, `return @x`, and a `Seq` ending in `@x`.
+fn body_returns_ivar(e: &Expr) -> Option<String> {
+    match &*e.node {
+        ExprNode::Ivar { name } => Some(camel(name.as_str())),
+        ExprNode::Return { value } => body_returns_ivar(value),
+        ExprNode::Seq { exprs } => exprs.last().and_then(body_returns_ivar),
+        _ => None,
+    }
+}
+
+/// Record `@ivar = <literal>` types as a fallback, never overwriting a
+/// type already established by a reader (signal 1 is stronger).
+fn collect_ivar_literal_types(e: &Expr, out: &mut BTreeMap<String, Ty>) {
+    if let ExprNode::Assign { target: LValue::Ivar { name }, value } = &*e.node {
+        if let Some(ty) = literal_ty(value) {
+            out.entry(camel(name.as_str())).or_insert(ty);
+        }
+    }
+    for child in expr_children(e) {
+        collect_ivar_literal_types(child, out);
+    }
+}
+
+/// The `Ty` of a literal expression, when it's unambiguous from the node.
+fn literal_ty(e: &Expr) -> Option<Ty> {
+    use crate::expr::Literal;
+    match &*e.node {
+        ExprNode::Lit { value: Literal::Bool { .. } } => Some(Ty::Bool),
+        ExprNode::Lit { value: Literal::Int { .. } } => Some(Ty::Int),
+        ExprNode::Lit { value: Literal::Float { .. } } => Some(Ty::Float),
+        ExprNode::Lit { value: Literal::Str { .. } } => Some(Ty::Str),
+        _ => None,
+    }
+}
+
+/// Render a mutable property declaration. A non-null reference type whose
+/// default would be `null` (a lazily-assigned slot like a controller's
+/// `@flash`/`@session`, set before the action runs) becomes `lateinit var`
+/// with no initializer; everything else takes its default initializer.
+fn render_member(modifier: &str, name: &str, ty: &Ty) -> String {
+    let kt = kotlin_ty(ty);
+    let def = default_for(ty);
+    if def == "null" && can_lateinit(ty) {
+        format!("{modifier}lateinit var {name}: {kt}")
+    } else {
+        format!("{modifier}var {name}: {kt} = {def}")
+    }
+}
+
+/// True when a method's return type is `Time` (or a `Time | Nil` union) —
+/// i.e. a synthesized temporal-column reader (`synth_attr_reader`). Its
+/// storage stays a `String` backing while the reader parses to a native
+/// `OffsetDateTime`; mirrors crystal's `signature_ret_is_time`.
+fn signature_ret_is_time(sig: Option<&Ty>) -> bool {
+    fn is_time(t: &Ty) -> bool {
+        match t {
+            Ty::Time => true,
+            Ty::Union { variants } => variants.iter().any(is_time),
+            _ => false,
+        }
+    }
+    matches!(sig, Some(Ty::Fn { ret, .. }) if is_time(ret))
+}
+
+/// Default initializer for a property type (Kotlin requires properties
+/// be initialized).
+fn default_for(ty: &Ty) -> String {
+    match ty {
+        Ty::Int => "0".to_string(),
+        Ty::Float => "0.0".to_string(),
+        Ty::Bool => "false".to_string(),
+        Ty::Str | Ty::Sym => "\"\"".to_string(),
+        Ty::Array { .. } => "mutableListOf()".to_string(),
+        Ty::Hash { .. } => "mutableMapOf()".to_string(),
+        Ty::Union { variants } if variants.iter().any(|v| matches!(v, Ty::Nil)) => {
+            "null".to_string()
+        }
+        _ => "null".to_string(),
+    }
+}

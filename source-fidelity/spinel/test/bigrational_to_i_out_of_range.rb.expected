@@ -1,0 +1,7 @@
+to_i: bignum too big to convert into 'long'
+to_i: bignum too big to convert into 'long'
+to_i: bignum too big to convert into 'long'
+to_int: bignum too big to convert into 'long'
+numerator: bignum too big to convert into 'long'
+Integer: bignum too big to convert into 'long'
+boxed to_i: bignum too big to convert into 'long'

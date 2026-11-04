@@ -1,0 +1,20 @@
+cr: ArgumentError: header field value cannot include CR/LF
+lf: ArgumentError: header field value cannot include CR/LF
+crlf: ArgumentError: header field value cannot include CR/LF
+trailing lf: ArgumentError: header field value cannot include CR/LF
+array element: ArgumentError: header field value cannot include CR/LF
+array element cr: ArgumentError: header field value cannot include CR/LF
+after refusals key? false false
+plain: accepted
+spaces kept: accepted
+array: accepted
+integer: accepted
+stored "hello" " padded " "one, two" "7"
+initheader lf: ArgumentError: header X-Note has field value "hello\nX-Injected: yes", this cannot include CR/LF
+initheader cr: ArgumentError: header X-Note has field value "a\rb", this cannot include CR/LF
+initheader crlf: ArgumentError: header Content-Type has field value "text/plain\r\nX-Injected: yes", this cannot include CR/LF
+initheader second key: accepted
+initheader array element: refused
+initheader stripped "hello" "padded"
+initheader plain "text/plain"
+append to stored "vv"

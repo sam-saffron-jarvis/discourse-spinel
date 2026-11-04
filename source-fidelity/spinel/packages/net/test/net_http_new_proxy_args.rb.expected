@@ -1,0 +1,5 @@
+["example.com", 443]
+443
+nil
+5
+net/http: proxies are not supported (Net::HTTP.new given proxy proxy.internal)

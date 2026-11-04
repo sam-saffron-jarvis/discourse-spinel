@@ -1,0 +1,5 @@
+join nil
+status "sleep"
+plain "ordinary"
+missing Errno::ENOENT
+end

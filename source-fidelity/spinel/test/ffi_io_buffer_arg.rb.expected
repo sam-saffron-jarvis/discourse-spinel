@@ -1,0 +1,34 @@
+759
+240006
+[4278190080, 4278190081, 4278190082, 4278190083]
+17112760326
+286331153
+286331153
+4278190082
+"\x01\x02\x03\xFA\xFB\xFC"
+"\x00\x00\a\a\a\a\x00\x00"
+"\x00\x00\a\t\t\a\x00\x00"
+16
+64
+128
+131
+true
+6
+294
+IO::Buffer::AccessError: Buffer is not writable!
+IO::Buffer::AccessError: Buffer is not writable!
+1
+1
+1
+0
+IO::Buffer::InvalidatedError: Buffer has been invalidated!
+IO::Buffer::InvalidatedError: Buffer is invalid!
+572662306
+5
+1
+1
+[-3, 0, 2, 5, 9]
+"42-ok"
+3
+72340172838076673
+[50, 50, 50, 50]

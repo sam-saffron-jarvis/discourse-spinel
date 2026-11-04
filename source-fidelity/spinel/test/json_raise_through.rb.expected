@@ -1,0 +1,20 @@
+ArgumentError: boom
+ArgumentError: boom
+ArgumentError: boom
+ArgumentError: boom
+ArgumentError: boom
+["x",1,"y"]
+ArgumentError: sometimes
+[
+  "x",
+  1,
+  "y"
+]
+JSON::NestingError: nesting of 100 is too deep. Did you try to serialize objects with circular references?
+no raise after the throw
+RuntimeError: after
+the proc returned out of the walk
+RuntimeError: after
+no raise
+documents wrong: 0
+["ArgumentError: boom"]

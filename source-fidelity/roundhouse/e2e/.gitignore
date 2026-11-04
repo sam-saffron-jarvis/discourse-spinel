@@ -1,0 +1,8 @@
+# Node / Playwright
+/node_modules/
+# scripts/e2e tailwind asset build (transient input, normally rm'd post-build)
+/.tailwind-input.css
+/test-results/
+/playwright-report/
+/blob-report/
+/playwright/.cache/

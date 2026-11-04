@@ -1,0 +1,23 @@
+Integer: 1
+String: "a"
+Float: 2.5
+Symbol: :s
+Numeric: 1, 2.5
+Comparable: 1, "a", 2.5, :s
+NilClass: nil
+Animal: Dog, Cat
+Dog: Dog
+Cat: Cat
+Walks: Cat
+Object: 1, "a", 2.5, :s, nil, Dog, Cat, [1], {a: 1}
+Array: [1]
+Hash: {a: 1}
+Integer
+String
+Animal
+nil
+true
+false
+true
+false
+true

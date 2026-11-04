@@ -1,0 +1,8 @@
+attr alias true
+attr ivar ["seed", 7]
+getter alias true
+getter ivar ["seed", 7]
+empty ivar ["s"]
+errors ["blank"]
+mixed ivar ["seed", 1, :sym]
+ints [1, 2, 3] 6

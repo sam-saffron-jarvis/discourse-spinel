@@ -1,0 +1,273 @@
+//! C# toolchain integration test — compile the full real-blog emit.
+//!
+//! Generates the emitted C# (ASP.NET Core) project for a fixture into a
+//! scratch dir and runs `dotnet build` against it — the compile/typecheck
+//! gate, the C# analog of `go vet` / `crystal build --no-codegen` / `tsc
+//! --noEmit`. Catches emit regressions (the model layer, the transpiled
+//! framework runtime, and the hand-written primitives all compile together).
+//!
+//! Marked `#[ignore]` so the default `cargo test` run stays fast; run with:
+//!
+//!     cargo test --test csharp_toolchain -- --ignored --nocapture
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+#[path = "support/emit_and_run.rs"]
+#[allow(dead_code)]
+mod emit_and_run;
+#[path = "support/i18n_locales_app.rs"]
+#[allow(dead_code)]
+mod i18n_locales_app;
+#[path = "support/record_slice_app.rs"]
+#[allow(dead_code)]
+mod record_slice_app;
+
+use roundhouse::emit::csharp;
+use roundhouse::ingest::ingest_app;
+
+fn scratch_dir(fixture: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("roundhouse-csharp-check-{fixture}"))
+}
+
+fn generate_project(fixture_path: &Path, out: &Path) {
+    if out.exists() {
+        std::fs::remove_dir_all(out).expect("clean scratch");
+    }
+    std::fs::create_dir_all(out).expect("create scratch");
+
+    let mut app = ingest_app(fixture_path).expect("ingest");
+    roundhouse::session::analyze_and_lower(&mut app);
+    let files = csharp::emit(&app);
+
+    for file in &files {
+        let path = out.join(&file.path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("mkdir");
+        }
+        std::fs::write(&path, &file.content).expect("write emitted file");
+    }
+}
+
+fn assert_dotnet_build_passes(fixture: &str, scratch: &Path) {
+    // `dotnet build` does an implicit restore, so this is a single
+    // self-contained compile of the whole emitted project.
+    let output = Command::new("dotnet")
+        .arg("build")
+        .arg("--nologo")
+        .current_dir(scratch)
+        .output()
+        .expect("run dotnet build");
+
+    assert!(
+        output.status.success(),
+        "dotnet build failed on emitted {fixture} project at {}:\n\
+         \n=== stdout ===\n{}\n\
+         \n=== stderr ===\n{}",
+        scratch.display(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
+#[ignore]
+fn real_blog_dotnet_build_passes() {
+    let fixture = roundhouse::fixtures::real_blog();
+    let scratch = scratch_dir("real-blog");
+    generate_project(fixture, &scratch);
+    assert_dotnet_build_passes("real-blog", &scratch);
+}
+
+/// The execution half of the toolchain gate: emit real-blog and run the
+/// transpiled suite under `dotnet test` — ArticleTest 4, CommentTest 5,
+/// ArticlesControllerTest 9, CommentsControllerTest 3 = 21, executed
+/// against a per-test SQLite database. Sibling of
+/// `real_blog_kotlin_tests_pass` / `real_blog_swift_tests_pass`.
+///
+/// The **executed-count floor** is the point: `dotnet test` exits 0 when it
+/// discovers nothing, which is exactly how the csharp gate reported success
+/// while running zero assertions before this suite existed (#34 §0). Parsing
+/// the summary and asserting `>= 35` (the 21 app tests plus 14 formatted-count
+/// cases) makes silent test-discovery regressions fail.
+#[test]
+#[ignore]
+fn real_blog_csharp_tests_pass() {
+    let fixture = roundhouse::fixtures::real_blog();
+    let scratch = scratch_dir("real-blog-tests");
+    generate_project(fixture, &scratch);
+    // Execute the shared formatted-count seam, including the prefix and
+    // nonempty-suffix boundaries that a zero-removal shortcut can get wrong.
+    std::fs::write(
+        scratch.join("tests/FormattedPluralizeTest.cs"),
+        r#"
+using Xunit;
+namespace Roundhouse;
+public class FormattedPluralizeTest
+{
+    [Theory]
+    [InlineData("1", "1 word")]
+    [InlineData("1.0", "1.0 word")]
+    [InlineData("1.00", "1.00 word")]
+    [InlineData("01", "01 words")]
+    [InlineData("1.", "1. words")]
+    [InlineData("10.", "10. words")]
+    [InlineData("10.0", "10.0 words")]
+    [InlineData("1.01", "1.01 words")]
+    [InlineData("1.0002", "1.0002 words")]
+    [InlineData("1,001", "1,001 words")]
+    [InlineData("", " words")]
+    [InlineData("2\n1.0\n", "2\n1.0\n word")]
+    [InlineData("1\r\n", "1\r\n words")]
+    [InlineData("1.٠", "1.٠ words")]
+    public void FormattedCountLabels(string count, string expected)
+    {
+        Assert.Equal(expected, Inflector.PluralizeFormatted(count, "word"));
+    }
+}
+"#,
+    )
+    .expect("write formatted-count test");
+
+    let output = Command::new("dotnet")
+        .arg("test")
+        .arg("tests")
+        .arg("--nologo")
+        .current_dir(&scratch)
+        .output()
+        .expect("run dotnet test");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    assert!(
+        output.status.success(),
+        "dotnet test failed on emitted real-blog project at {}:\n\
+         \n=== stdout ===\n{stdout}\n\
+         \n=== stderr ===\n{stderr}",
+        scratch.display(),
+    );
+
+    let passed = parse_passed_count(&stdout).unwrap_or_else(|| {
+        panic!(
+            "no `Passed: N` summary in dotnet test output — the runner reported \
+             nothing, which is the zero-discovery trap this gate exists to catch \
+             (#34 §0):\n{stdout}"
+        )
+    });
+    assert!(
+        passed >= 35,
+        "expected at least 21 executed tests (ArticleTest 4 + CommentTest 5 + \
+         ArticlesControllerTest 9 + CommentsControllerTest 3) plus 14 formatted-count \
+         cases, got {passed}:\n{stdout}"
+    );
+    eprintln!("csharp real-blog suite: {passed} tests passed");
+}
+
+/// `Passed!  - Failed:     0, Passed:    21, …` → 21.
+fn parse_passed_count(stdout: &str) -> Option<usize> {
+    for line in stdout.lines() {
+        let Some(idx) = line.find("Passed:") else {
+            continue;
+        };
+        let rest = line[idx + "Passed:".len()..].trim_start();
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if let Ok(n) = digits.parse::<usize>() {
+            return Some(n);
+        }
+    }
+    None
+}
+
+#[test]
+fn parses_the_dotnet_test_summary() {
+    let line = "Passed!  - Failed:     0, Passed:    21, Skipped:     0, Total:    21";
+    assert_eq!(parse_passed_count(line), Some(21));
+    // The `Passed!` banner alone (no counts) must NOT read as a count.
+    assert_eq!(parse_passed_count("Build succeeded."), None);
+}
+
+#[test]
+#[ignore]
+fn real_blog_i18n_locales_run() {
+    // The answers `emit_and_run::i18n_locales` checks on CRuby, but for a String
+    // locale named in an error: C# has no Symbol apart from String, so `"de"` shows as `:de`.
+    let (emitted, errors) = i18n_locales_app::probe_app()
+        .edit("app/models/article.rb", i18n_locales_app::IN_LOCALE, "")
+        .emit(roundhouse::project::BuildTarget::CSharp);
+    assert!(errors.is_empty(), "{errors:?}");
+    std::fs::write(emitted.join("tests/I18nProbeTest.cs"), r#"using System;
+using System.Collections.Generic;
+using Xunit;
+
+namespace Roundhouse;
+
+public class I18nProbeTest
+{
+    private static void Expect(string what, object? got, object? want)
+    {
+        var g = System.Text.Json.JsonSerializer.Serialize(got);
+        var w = System.Text.Json.JsonSerializer.Serialize(want);
+        Assert.True(g == w, what + ": " + g);
+    }
+
+    [Fact]
+    public void LocalesAnswerAsRails()
+    {
+        Expect("lookups", Article.Lookups(), new List<object?> { "Hello", "Hi <x>", "1 item", "2 items", "Translation missing: en.probe.nope", "Cześć", "fallback 3", "en" });
+        Expect("polish", Article.Polish(), new List<object?> { "1 rzecz", "5 rzeczy", "English only", "Cześć", "Translation missing: pl.probe.nope", "Cześć", "Hi Ola", "pl" });
+        Expect("restored", I18n.Locale(), "en");
+        Expect("named", new List<object?> { Article.Named("pl"), Article.Named("en"), Article.Named(null) }, new List<object?> { "Cześć", "Hello", "Hello" });
+        Expect("dynamic", new List<object?> { Article.ProbeKey("greet"), Article.OnlyKey("xx") }, new List<object?> { "Hello", "Translation missing: en.probe.only_xx" });
+        var e = Assert.Throws<InvalidLocale>(() => Article.Named("de"));
+        Expect("named de", e.Message, ":de is not a valid locale");
+    }
+}
+"#).expect("write probe test");
+    let output = Command::new("dotnet")
+        .args(["test", "tests", "--nologo", "--filter", "I18nProbeTest"])
+        .current_dir(&emitted)
+        .output()
+        .expect("run dotnet test");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[ignore]
+fn real_blog_record_slice_runs() {
+    // The answers `emit_and_run::record_slice` checks on CRuby.
+    let (emitted, errors) = record_slice_app::probe_app().emit(roundhouse::project::BuildTarget::CSharp);
+    assert!(errors.is_empty(), "{errors:?}");
+    std::fs::write(emitted.join("tests/RecordSliceProbeTest.cs"), r#"using System.Collections.Generic;
+using Xunit;
+
+namespace Roundhouse;
+
+public class RecordSliceProbeTest
+{
+    [Fact]
+    public void SliceAnswersAsRails()
+    {
+        var got = System.Text.Json.JsonSerializer.Serialize(Article.Sliced());
+        var want = System.Text.Json.JsonSerializer.Serialize(new List<object?> { "2", "Sliced", "7", "1", "Other", "3", "Bound", "5", "4", "A comment body." });
+        Assert.True(got == want, "sliced: " + got);
+    }
+}
+"#).expect("write probe test");
+    let output = Command::new("dotnet")
+        .args(["test", "tests", "--nologo", "--filter", "RecordSliceProbeTest"])
+        .current_dir(&emitted)
+        .output()
+        .expect("run dotnet test");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

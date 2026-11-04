@@ -1,0 +1,49 @@
+2
+3
+2
+20
+2.35
+2
+20
+2
+20
+2.68
+2.35
+2
+2
+20
+2.5
+3
+3
+2
+foo: unknown keyword: :foo
+foobar: unknown keywords: :foo, :bar
+str: unknown keyword: "a"
+splat: unknown keyword: :x
+intfoo: unknown keyword: :foo
+one: invalid rounding mode: 1
+intone: invalid rounding mode: 1
+1
+1
+1
+int0: invalid rounding mode: bogus
+floor: no implicit conversion of Hash into Integer
+intceil: no implicit conversion of Hash into Integer
+trunc2: wrong number of arguments (given 2, expected 0..1)
+intfloor2: wrong number of arguments (given 2, expected 0..1)
+probe pos
+probe kw
+order: invalid rounding mode: bogus
+probe ignored
+1
+probe f_kw
+fceil: no implicit conversion of Hash into Integer
+probe f_pos
+probe f_kw2
+fceil2: wrong number of arguments (given 2, expected 0..1)
+probe i_kw
+iceil: no implicit conversion of Hash into Integer
+probe i_pos
+probe i_kw2
+iceil2: wrong number of arguments (given 2, expected 0..1)
+many: unknown keywords: :k1, :

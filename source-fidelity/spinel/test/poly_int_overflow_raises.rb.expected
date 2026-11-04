@@ -1,0 +1,15 @@
+mul2: integer overflow in *
+mul4: integer overflow in *
+mulself: integer overflow in *
+add: integer overflow in +
+sub: integer overflow in -
+typed mul2: integer overflow in *
+typed add: integer overflow in +
+4611686018427387904
+4611686018427387904
+4611686018427387903
+2305843009213693952
+12
+7
+-1
+42

@@ -1,0 +1,15 @@
+# Array[Array[Integer]] and Array[Array[Float]] are the two nested element
+# types spinel has an unboxed table for (sp_PtrArray of sp_IntArray* /
+# sp_FloatArray*). Every other nesting has no table form and stays poly_array.
+#
+# On an IVAR these two are a REQUEST the narrowing pass answers, not a pin --
+# pinning would stop the pass that produces the table, so the accurate
+# signature would have made the program slower. See docs/rbs-extract.md.
+class Nested
+  def ii: (Array[Array[Integer]]) -> Array[Array[Integer]]
+  def ff: (Array[Array[Float]]) -> Array[Array[Float]]
+  def ss: (Array[Array[String]]) -> Array[Array[String]]
+  def yy: (Array[Array[Symbol]]) -> Array[Array[Symbol]]
+  def oo: (Array[Array[Foo]]) -> Array[Array[Foo]]
+  def iii: (Array[Array[Array[Integer]]]) -> Array[Array[Array[Integer]]]
+end

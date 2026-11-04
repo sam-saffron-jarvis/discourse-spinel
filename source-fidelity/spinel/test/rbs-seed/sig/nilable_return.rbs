@@ -1,0 +1,6 @@
+class Helper
+  def self.guard_if: (bool) -> String?
+  def self.explicit_nil: (bool) -> String?
+  def self.case_nil: (Integer) -> String?
+  def self.count: (bool) -> Integer?
+end

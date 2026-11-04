@@ -1,0 +1,62 @@
+(13/2)
+1000000000000000000000000000006
+[TypeError, "no implicit conversion of Integer into String"]
+[NoMethodError, "undefined method '+' for nil"]
+[NoMethodError, "undefined method '+' for false"]
+(6+1.0i)
+[TypeError, "no implicit conversion of Integer into Array"]
+6.5
+7
+3.5
+1.0e+30
+[TypeError, "no implicit conversion of Float into String"]
+[NoMethodError, "undefined method '+' for nil"]
+1.0
+6.5
+7.5
+1000000000000000000000000000006
+[ArgumentError, "invalid value for Float(): \"x\""]
+[TypeError, "can't convert nil into Float"]
+[TypeError, "can't convert false into Float"]
+[TypeError, "can't convert Array into Float"]
+(1/2)
+6.5
+[TypeError, "String can't be coerced into Float"]
+[TypeError, "String can't be coerced into Integer"]
+[NoMethodError, "undefined method '+' for nil"]
+[NoMethodError, "undefined method '+' for false"]
+nil
+[TypeError, "Array can't be coerced into Integer"]
+[:a, 1, :b, 2]
+[TypeError, "String can't be coerced into Rational"]
+[TypeError, "String can't be coerced into Integer"]
+[TypeError, "Array can't be coerced into Integer"]
+[TypeError, "String can't be coerced into Rational"]
+[TypeError, "String can't be coerced into Integer"]
+Infinity
+Infinity
+NaN
+NaN
+Infinity
+Infinity
+(0.6000000000000001+1i)
+16
+(7/2)
+4.0
+$6
+T(6)
+(7/2)
+1
+(7/2)
+1
+0.6
+0.6
+0.6
+1.6
+1.6
+1.6
+0.6
+0.6
+0.6
+0.6
+Infinity

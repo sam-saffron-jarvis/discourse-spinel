@@ -1,0 +1,6 @@
+3
+12
+127
+(3, 6)
+(4, 5)
+undefined method 'nosuchmethod' for an instance of Integer

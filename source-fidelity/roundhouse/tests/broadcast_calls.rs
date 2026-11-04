@@ -1,0 +1,309 @@
+//! Rails-API broadcast calls written as ORDINARY METHODS —
+//! campfire's `Message::Broadcasts` concern, which no callback walk
+//! reaches.
+//!
+//! Semantics measured against turbo-rails 2.0.23 + Rails 8.1:
+//! `target: [room, :messages]` runs through `dom_id(*target)`, whose
+//! PREFIX COMES FIRST (`messages_room_1`); `broadcast_remove_to`
+//! defaults its target to `dom_id(self)` while the insert actions
+//! default to `model_name.plural`; and with no `partial:` the payload
+//! is the record's own partial.
+//!
+//! The stream name is the half that cannot be checked in isolation: it
+//! has to match what `turbo_stream_from` emits in the VIEW, or the
+//! message is published where nobody is listening. Both sides call
+//! `lower::broadcasts::stream_name`, and the last test here pins them
+//! together.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+use roundhouse::emit::ruby;
+use roundhouse::ingest::ingest_app_from_tree;
+
+fn tree(files: &[(&str, &str)]) -> HashMap<PathBuf, Vec<u8>> {
+    files
+        .iter()
+        .map(|(p, c)| (PathBuf::from(p), c.as_bytes().to_vec()))
+        .collect()
+}
+
+fn lowered() -> Vec<roundhouse::emit::EmittedFile> {
+    // `emit_library` is what writes a concern MODULE — the home
+    // campfire's broadcasts actually live in.
+    ruby::emit_library(&lowered_app())
+}
+
+fn lowered_app() -> roundhouse::App {
+    let mut app = ingest_app_from_tree(tree(&[
+        (
+            "db/schema.rb",
+            r#"ActiveRecord::Schema.define do
+  create_table "rooms", force: :cascade do |t|
+    t.string "name", null: false
+  end
+  create_table "messages", force: :cascade do |t|
+    t.integer "room_id", null: false
+    t.string "body", null: false
+  end
+end
+"#,
+        ),
+        ("app/models/room.rb", "class Room < ApplicationRecord\n  has_many :messages\nend\n"),
+        (
+            "app/models/message.rb",
+            r#"class Message < ApplicationRecord
+  include Message::Broadcasts
+
+  belongs_to :room
+end
+"#,
+        ),
+        (
+            "app/models/message/broadcasts.rb",
+            r#"module Message::Broadcasts
+  def broadcast_create
+    broadcast_append_to room, :messages, target: [ room, :messages ]
+  end
+
+  def broadcast_remove
+    broadcast_remove_to room, :messages
+  end
+end
+"#,
+        ),
+    ]))
+    .expect("ingest");
+    roundhouse::session::analyze_and_lower(&mut app);
+    app
+}
+
+fn sti_room_app() -> roundhouse::App {
+    let mut app = ingest_app_from_tree(tree(&[
+        (
+            "db/schema.rb",
+            r#"ActiveRecord::Schema.define do
+  create_table "rooms", force: :cascade do |t|
+    t.string "type"
+    t.string "name", null: false
+  end
+end
+"#,
+        ),
+        (
+            "app/models/room.rb",
+            "class Room < ApplicationRecord\nend\n",
+        ),
+        (
+            "app/models/rooms/open.rb",
+            "class Rooms::Open < Room\nend\n",
+        ),
+    ]))
+    .expect("ingest STI room app");
+    roundhouse::session::analyze_and_lower(&mut app);
+    app
+}
+
+fn find(files: &[roundhouse::emit::EmittedFile], name: &str) -> String {
+    files
+        .iter()
+        .find(|f| f.path.ends_with(name))
+        .unwrap_or_else(|| panic!("no {name} in {:?}", files.iter().map(|f| &f.path).collect::<Vec<_>>()))
+        .content
+        .clone()
+}
+
+#[test]
+fn append_lowers_to_a_broadcasts_call_with_the_records_own_partial() {
+    let src = find(&lowered(), "broadcasts.rb");
+    assert!(
+        src.contains(
+            "Broadcasts.append(stream: \"#{bc_owner.to_gid_param}:messages\", \
+             target: \"messages_#{bc_owner.dom_prefix}_#{bc_owner.dom_record_key}\", \
+             html: ActionView::ViewHelpers.broadcast_render(ActionView::ViewHelpers.begin_broadcast_render, Views::Messages.message(self)))"
+        ),
+        "{src}",
+    );
+}
+
+/// Rails mints an STI row's GlobalID with the row's own class. Rows
+/// hydrate base-classed here, so the base's `to_gid_param` reads the
+/// `type` column (as `dom_prefix` does): `Room.find` and `becomes!`
+/// then mint the same stream name.
+#[test]
+fn sti_global_ids_name_the_row_class_from_the_type_column() {
+    let mut app = sti_room_app();
+    assert!(
+        roundhouse::analyze::diagnose(&app).is_empty(),
+        "the synthesized GlobalID method must remain fully typed"
+    );
+    app.global_id_locate_models.insert(roundhouse::ident::Symbol::from("Room"));
+    app.global_id_locate_signed_models.insert(roundhouse::ident::Symbol::from("Room"));
+    let files = ruby::emit_library(&app)
+        .into_iter()
+        .chain(ruby::emit_lowered_models(&app))
+        .collect::<Vec<_>>();
+    let src = find(&files, "room.rb");
+    let mint = src
+        .split("def to_gid_param")
+        .nth(1)
+        .and_then(|rest| rest.split("\n  end").next())
+        .unwrap_or_else(|| panic!("no to_gid_param in room.rb:\n{src}"));
+    assert!(mint.contains("case @type"), "dispatch on the type column:\n{mint}");
+    assert!(mint.contains("when \"Rooms::Open\""), "{mint}");
+    assert!(mint.contains("\"Room\""), "unknown types keep the base name:\n{mint}");
+    assert!(!mint.contains("self.class"), "hydration is base-classed:\n{mint}");
+
+    let files = roundhouse::project::spinel_base_files(&app, roundhouse::fixtures::real_blog())
+        .expect("Spinel base files");
+    let locator = files
+        .iter()
+        .find(|(path, _)| path.ends_with("global_id_locator.rb"))
+        .map(|(_, content)| content.clone())
+        .expect("global_id_locator.rb");
+    for entry in ["def self.locate_room(", "def self.locate_signed_room("] {
+        let body = locator
+            .split(entry)
+            .nth(1)
+            .and_then(|rest| rest.split("\n    end").next())
+            .unwrap_or_else(|| panic!("no {entry} in:\n{locator}"));
+        assert!(
+            body.contains("return nil unless parts[1] == \"Room\" || parts[1] == \"Rooms::Open\""),
+            "the closed set of names, nothing constantized from the wire:\n{body}"
+        );
+        assert!(
+            body.contains("return nil unless record.to_gid_param == GlobalID.param(parts[1], record.id)"),
+            "a subclass name must match the row it finds:\n{body}"
+        );
+    }
+}
+
+/// A model with no STI subclasses keeps the literal name and the plain
+/// finder.
+#[test]
+fn plain_models_keep_the_literal_global_id_name() {
+    let app = lowered_app();
+    let files = ruby::emit_library(&app)
+        .into_iter()
+        .chain(ruby::emit_lowered_models(&app))
+        .collect::<Vec<_>>();
+    let src = find(&files, "room.rb");
+    assert!(src.contains("GlobalID.param(\"Room\", self.id)"), "{src}");
+}
+
+/// The association is read ONCE. The stream name and the DOM target both
+/// want the owner's id, and on most targets reading an association is a
+/// query.
+#[test]
+fn the_record_streamable_binds_to_one_local_and_is_nil_guarded() {
+    let src = find(&lowered(), "broadcasts.rb");
+    assert!(src.contains("bc_owner = room"), "{src}");
+    assert!(src.contains("return if bc_owner.nil?"), "{src}");
+    assert_eq!(src.matches("bc_owner = room").count(), 2, "once per method:\n{src}");
+}
+
+/// `broadcast_remove_to` defaults its target to the record itself, not
+/// to the plural the insert actions use — measured, and the asymmetry is
+/// easy to get wrong.
+#[test]
+fn remove_defaults_its_target_to_the_record_and_carries_no_html() {
+    let src = find(&lowered(), "broadcasts.rb");
+    assert!(
+        src.contains(
+            "Broadcasts.remove(stream: \"#{bc_owner.to_gid_param}:messages\", target: \"#{dom_prefix}_#{dom_record_key}\")"
+        ),
+        "{src}",
+    );
+}
+
+/// The `/cable` endpoint, the `Broadcasts.set_transport` registration in
+/// config.ru and the `websocket-driver` gem all ride ONE predicate, and
+/// it used to ask whether a model DECLARED broadcasts. This app declares
+/// none — the calls are ordinary methods on a concern — so the tree
+/// shipped `Broadcasts.append` with nothing to deliver it: the POST wrote
+/// its row and no second tab ever heard about it.
+#[test]
+fn a_broadcast_written_as_a_plain_method_still_needs_the_cable_endpoint() {
+    let app = lowered_app();
+    assert!(
+        app.models
+            .iter()
+            .all(|m| roundhouse::lower::lower_broadcasts(m).is_empty()),
+        "no model here DECLARES a broadcast — that is exactly the case that regressed",
+    );
+    assert!(roundhouse::lower::app_broadcasts_live(&app));
+}
+
+/// The other direction, and the reason the predicate can't just be
+/// `true`: an app that never broadcasts still ships cable-free (no
+/// endpoint, no gem — issue #67).
+#[test]
+fn an_app_that_never_broadcasts_stays_cable_free() {
+    let mut app = ingest_app_from_tree(tree(&[
+        (
+            "db/schema.rb",
+            r#"ActiveRecord::Schema.define do
+  create_table "rooms", force: :cascade do |t|
+    t.string "name", null: false
+  end
+end
+"#,
+        ),
+        ("app/models/room.rb", "class Room < ApplicationRecord\nend\n"),
+    ]))
+    .expect("ingest");
+    roundhouse::session::analyze_and_lower(&mut app);
+    assert!(!roundhouse::lower::app_broadcasts_live(&app));
+}
+
+/// The two ends of the wire. A publish-side name that does not match the
+/// subscribe side is invisible — the page renders, the broadcast runs,
+/// and nothing arrives — so this pins them to the same spelling.
+#[test]
+fn the_stream_name_matches_what_a_view_subscribes_to() {
+    use roundhouse::expr::{Expr, ExprNode, InterpPart, Literal};
+    use roundhouse::lower::broadcasts::{stream_name, Streamable};
+
+    let record = Expr::new(roundhouse::span::Span::synthetic(), ExprNode::SelfRef);
+    let name = stream_name(&[
+        Streamable::Record { record },
+        Streamable::Literal("messages".into()),
+    ]);
+    let ExprNode::StringInterp { parts } = &*name.node else {
+        panic!("expected an interpolation, got {name:?}");
+    };
+    // A record contributes its own GlobalID parameter, preserving its
+    // runtime class identity for STI, and the literal follows after the
+    // `:` join. Two parts, not three: a
+    // record in first position has no leading text before it.
+    //
+    // turbo-rails 2.0.16 spells this `s.try(:to_gid_param) || s.to_param`,
+    // and it matters beyond convention: campfire's own
+    // `RoomMessagesChannel.subscribable_room` reads the name back with
+    // `GlobalID::Locator.locate`, which a `room_1` cannot satisfy.
+    assert_eq!(parts.len(), 2, "{parts:?}");
+    let [InterpPart::Expr { expr }, InterpPart::Text { value }] = parts.as_slice() else {
+        panic!("expected <gid expr>:messages, got {parts:?}");
+    };
+    assert_eq!(value, ":messages");
+    let ExprNode::Send { recv, method, args, .. } = &*expr.node else {
+        panic!("expected the gid mint, got {expr:?}");
+    };
+    assert_eq!(method.as_str(), "to_gid_param");
+    assert!(
+        matches!(recv.as_ref().map(|r| &*r.node), Some(ExprNode::SelfRef)),
+        "{recv:?}",
+    );
+    assert!(
+        args.is_empty(),
+        "the record supplies its GlobalID: {args:?}"
+    );
+
+    // An all-literal name stays a plain String — the blog's
+    // `turbo_stream_from "articles"` has always emitted the literal.
+    let plain = stream_name(&[Streamable::Literal("articles".into())]);
+    assert!(
+        matches!(&*plain.node, ExprNode::Lit { value: Literal::Str { value } } if value == "articles"),
+        "{plain:?}",
+    );
+}

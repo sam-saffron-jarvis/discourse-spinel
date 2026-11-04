@@ -1,0 +1,31 @@
+[false, true, false, false, true, false]
+true
+false
+[false, false, false, false, false, false]
+[false, true, true, false]
+[false, true, true, false, true]
+[false, true, true, false, true, nil, nil, false]
+8
+IndexError: index -20 too small for array; minimum: -8
+FrozenError
+[true, false, true]
+[false, true, true, false, false]
+2
+1
+true
+true
+false
+false
+[true, true, false, true, true]
+2
+true
+6
+5
+"[false, false, true, false, false]"
+"false,false,true,false,false"
+1
+ArgumentError
+[false, false, true, false, false, 3]
+["x", false, true, false, false, 3]
+[2, 3, 5, 7, 11, 13, 17, 19, 23, 29]
+["s0", "s1", "s2"]

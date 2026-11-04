@@ -1,0 +1,6 @@
+[package]
+name = "json"
+sources = ["sp_json.c"]   # carried C is declared, not discovered (#4362)
+
+# Pre-installed spin package: ships with the compiler, versioned with it.
+# A typed native binding to lib/sp_json.c (see json.rb).

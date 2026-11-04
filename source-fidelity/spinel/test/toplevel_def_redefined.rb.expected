@@ -1,0 +1,14 @@
+[:second]
+:two
+[:second, 1, 2]
+[:second, 1, 3]
+"4!"
+:two
+:c_two
+[:second, 9, 2]
+1
+1
+2
+2
+:q1
+:q2

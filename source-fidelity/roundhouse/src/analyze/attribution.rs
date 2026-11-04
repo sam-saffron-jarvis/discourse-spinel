@@ -1,0 +1,926 @@
+//! Gap attribution: reclassify diagnostics whose root cause is a
+//! roundhouse ingest gap, not a defect in the user's code.
+//!
+//! Survey-mode ingest (`ingest::survey`) recovers from unsupported
+//! constructs by recording a gap and substituting a `nil` placeholder.
+//! That keeps the app queryable, but the analysis downstream of the
+//! placeholder is built on sand: the enclosing class's ivars don't
+//! resolve, its methods vanish from dispatch, and every consumer of
+//! that class inherits the confusion. On a 75K-LOC app (Mastodon) the
+//! result is ~1400 `error`-severity diagnostics of which ~90% are
+//! shadows of ~150 recorded gaps — each one an accusation ("@account
+//! has no known type") pointed at code that is fine.
+//!
+//! This pass runs after [`super::diagnose`] wherever survey gaps are
+//! in hand (roundhouse-check --continue, the LSP, the MCP server) and
+//! downgrades the shadowed diagnostics to [`Severity::Info`] with the
+//! root cause appended, leaving genuine findings at their original
+//! severity. Four attribution rules, cheapest first:
+//!
+//! 1. **Same file** — the diagnostic sits in a file that recorded a
+//!    gap. Whatever the analyzer failed to resolve there, the skipped
+//!    construct is the prime suspect.
+//! 2. **Receiver class** — a `SendDispatchFailed` whose receiver class
+//!    is defined in a gap file (registered, or declared there and dropped
+//!    by survey mode): the method likely exists but its definition (or the
+//!    DSL declaring it) didn't ingest.
+//! 3. **View feeders** — a diagnostic in a view any of whose feeding
+//!    controllers (per [`App::view_feeders`], ancestors included) is
+//!    tainted: the ivar channel that seeds the view runs through the
+//!    gap. A Rails-convention path fallback covers views whose feeder
+//!    didn't ingest at all (a wholly-skipped controller file never
+//!    registers, so no feeder edge exists to consult).
+//! 4. **Gap-declared constant** — an unsupported constant whose class or
+//!    module a gap file declares: survey mode may drop such a class whole,
+//!    and every reference to it then reports the constant. The reads of an
+//!    ivar a controller assigns from that constant follow, in the
+//!    controller and the views it feeds, as for an unknown gem.
+//!
+//! Deliberately over-broad in the safe direction: a genuine app error
+//! inside a gap-touched blast radius renders as a coverage note until
+//! the gap is fixed — cheap compared to the trust cost of a false
+//! accusation. Only unresolved-shaped kinds (`IvarUnresolved`,
+//! `SendDispatchFailed`, `IncompatibleBinop`, `UnresolvedType`,
+//! `UndefinedFilterTarget`) are eligible, plus rule 4's constant;
+//! `Parse` (a real syntax error), any other `Unsupported` (already a tool
+//! statement), and `GradualUntyped` (author-signed) never move.
+
+use crate::det::{HashMap, HashSet};
+
+use crate::app::App;
+use crate::diagnostic::{Diagnostic, DiagnosticKind, Severity};
+use crate::expr::Expr;
+use crate::ident::ClassId;
+use crate::ingest::{survey, IngestError};
+use crate::span::FileId;
+use crate::ty::Ty;
+
+mod gem_ancestry;
+mod generated_methods;
+use gem_ancestry::{GemAncestry, GemClaim};
+
+/// Add post-inference admission failures to the survey ledger. Alba's source
+/// declarations can ingest successfully while their inferred property types
+/// are outside its executable subset. Unlike placeholder-shadow attribution,
+/// these failures remain errors: coverage classification is not support.
+/// Call after ingest-gap attribution so analysis entries do not taint files.
+pub fn attribute_analysis_gaps(diags: &mut [Diagnostic], app: &App, gaps: &mut Vec<IngestError>) {
+    let census = app.gem_lock.as_ref().map(crate::gems::GemCensus::of);
+    // Synthesized Alba admission failures have an exact provider, not a
+    // namespace-prefix guess (alba-inertia alone is not evidence for alba).
+    let provider = census.as_ref()
+        .and_then(|c| c.unknown().find(|g| g.name == "alba" && g.version.is_some()));
+    for d in diags {
+        let DiagnosticKind::Unsupported { construct, .. } = &d.kind else { continue };
+        match construct.as_str() {
+            "alba_serialization" => {
+                if let Some(gem) = provider {
+                    let attribution = format!(
+                        " — roundhouse coverage of the `{}` gem; executable serialization remains unsupported",
+                        gem.name
+                    );
+                    if !d.message.ends_with(&attribution) {
+                        d.message.push_str(&attribution);
+                    }
+                }
+            }
+            // An `alias new old` roundhouse couldn't resolve after
+            // synthesis. Before this construct existed, an unresolved
+            // model alias was a hard INGEST error, and survey mode
+            // always made that non-fatal (the whole model, not just
+            // the alias line, was dropped — see `ModelBodyItem::Alias`'s
+            // doc). Resolving at lowering time keeps the rest of the
+            // model, but owes survey mode the same non-fatal treatment
+            // for the one line that didn't resolve: demote to Info,
+            // unlike `alba_serialization` above (deliberately still
+            // fatal — see this function's doc).
+            "alias_target_unresolved" => {
+                d.severity = Severity::Info;
+            }
+            _ => continue,
+        }
+        let Some(source) = d.span.file.0.checked_sub(1)
+            .and_then(|i| app.sources.get(i as usize)) else { continue };
+        let (line, column) = source.line_col(d.span.start);
+        // Put ownership before the diagnostic's parentheses: survey buckets
+        // truncate their suffix, so appended attribution alone is invisible.
+        let owner = provider.map(|gem| format!("the `{}` gem: ", gem.name)).unwrap_or_default();
+        let message = format!("analysis: {line}:{column}: {owner}{}", d.message);
+        if !gaps.iter().any(|gap| matches!(gap,
+            IngestError::Unsupported { file, message: prior }
+                if file == &source.path && prior == &message))
+        {
+            gaps.push(IngestError::Unsupported { file: source.path.clone(), message });
+        }
+    }
+}
+
+/// Downgrade diagnostics attributable to `gaps` (see module docs).
+/// No-op when `gaps` is empty — strict-mode callers can pass through
+/// unconditionally.
+pub fn attribute_ingest_gaps(diags: &mut [Diagnostic], app: &App, gaps: &[IngestError]) {
+    if gaps.is_empty() || diags.is_empty() {
+        return;
+    }
+    let ctx = AttributionCtx::build(app, gaps);
+    // Sites of constants whose declaring file recorded a gap, for the ivar pass below.
+    let mut constant_sites: Vec<(FileId, u32, String)> = Vec::new();
+    for d in diags.iter_mut() {
+        if let Some(cause) = ctx.constant_cause(d) {
+            constant_sites.push((d.span.file, d.span.start, cause.clone()));
+            mark_gap(d, cause, None);
+            continue;
+        }
+        if !eligible(&d.kind) {
+            continue;
+        }
+        if let Some(cause) = ctx.cause_for(d) {
+            mark_gap(d, cause, None);
+        }
+    }
+    attribute_gap_ivars(diags, app, &constant_sites);
+}
+
+fn mark_gap(d: &mut Diagnostic, cause: &str, via_ivar: Option<&str>) {
+    d.severity = Severity::Info;
+    match via_ivar {
+        Some(ivar) => d.message.push_str(&format!(
+            " — likely roundhouse coverage, not an app error (@{ivar} is assigned from a class whose source did not ingest: ingest gap in {cause})"
+        )),
+        None => d.message.push_str(&format!(
+            " — likely roundhouse coverage, not an app error (ingest gap in {cause})"
+        )),
+    }
+}
+
+/// An ivar assigned from a gap-declared constant, in a controller's actions
+/// and filters, is unresolved for the same reason: its reads in that
+/// controller and the views it feeds are the gap's shadow, as for a gem.
+fn attribute_gap_ivars(diags: &mut [Diagnostic], app: &App, sites: &[(FileId, u32, String)]) {
+    if sites.is_empty() {
+        return;
+    }
+    let mut ivar_cause: HashMap<(ClassId, crate::ident::Symbol), String> = HashMap::default();
+    for c in &app.controllers {
+        for a in c.actions() {
+            collect_gem_ivars(&a.body, sites, |name, cause| {
+                ivar_cause.entry((c.name.clone(), name)).or_insert_with(|| cause.to_string());
+            });
+        }
+    }
+    if ivar_cause.is_empty() {
+        return;
+    }
+    let mut view_by_file: HashMap<FileId, &crate::ident::Symbol> = HashMap::default();
+    for v in &app.views {
+        if let Some(f) = first_real_file(&[&v.body]) {
+            view_by_file.entry(f).or_insert(&v.name);
+        }
+    }
+    let mut controller_file: HashMap<FileId, &ClassId> = HashMap::default();
+    for c in &app.controllers {
+        let bodies: Vec<&Expr> = c.actions().map(|a| &a.body).collect();
+        if let Some(f) = first_real_file(&bodies) {
+            controller_file.entry(f).or_insert(&c.name);
+        }
+    }
+    for d in diags.iter_mut() {
+        let DiagnosticKind::IvarUnresolved { name } = &d.kind else { continue };
+        if d.severity == Severity::Info {
+            continue;
+        }
+        let feeders: Vec<&ClassId> = match view_by_file.get(&d.span.file) {
+            Some(view) => app.view_feeders.get(*view).into_iter().flatten().collect(),
+            None => controller_file.get(&d.span.file).into_iter().copied().collect(),
+        };
+        if let Some(cause) = feeders.iter().find_map(|c| ivar_cause.get(&((*c).clone(), name.clone()))) {
+            let ivar = name.as_str().to_string();
+            let cause = cause.clone();
+            mark_gap(d, &cause, Some(&ivar));
+        }
+    }
+}
+
+/// Kinds that mean "the analyzer could not resolve this" — the shapes a
+/// nil-placeholder substitution produces downstream. `Parse`,
+/// `Unsupported`, and `GradualUntyped` describe their own root cause and
+/// are never reattributed.
+fn eligible(kind: &DiagnosticKind) -> bool {
+    matches!(
+        kind,
+        DiagnosticKind::IvarUnresolved { .. }
+            | DiagnosticKind::SendDispatchFailed { .. }
+            | DiagnosticKind::IncompatibleBinop { .. }
+            | DiagnosticKind::UnresolvedType { .. }
+            | DiagnosticKind::UndefinedFilterTarget { .. }
+    )
+}
+
+/// Everything precomputed once per attribution run.
+struct AttributionCtx<'a> {
+    app: &'a App,
+    /// Gap file path → rendered cause (`path (bucketed message)`), app-root
+    /// relative for readability. First gap per file wins — one cause line
+    /// is enough to point the user at the file.
+    gap_by_path: HashMap<&'a str, String>,
+    /// `FileId`s of sources whose path recorded a gap.
+    tainted_files: HashMap<FileId, &'a str>,
+    /// Class → the gap path tainting it (own file, or for controllers an
+    /// ancestor's file — `ApplicationController` gaps taint every child's
+    /// ivar environment through the inherited filter chain).
+    tainted_classes: HashMap<ClassId, &'a str>,
+    /// View name for each template file, so a diagnostic's `FileId` finds
+    /// its view (and through it, its feeders).
+    view_by_file: HashMap<FileId, &'a crate::ident::Symbol>,
+    /// Whether any controller at all is tainted — the layout rule
+    /// (layouts are fed by every controller).
+    any_controller_tainted: Option<&'a str>,
+    /// Namespace (fully qualified) → gap path, for every `class` / `module`
+    /// a gap file declares. Survey mode may drop such a class wholesale, and
+    /// each reference to it then reports an unsupported constant.
+    gap_namespaces: HashMap<String, &'a str>,
+    /// `gap_namespaces` less aliases, for a dispatch receiver: a gap file's
+    /// `Alias = Bar` does not make a `class Alias` reopened elsewhere a gap.
+    gap_receivers: HashMap<String, &'a str>,
+    /// Rubydex's answers, to name the declaration a constant reference means.
+    resolver: Option<std::sync::Arc<super::body::ConstResolver>>,
+}
+
+impl<'a> AttributionCtx<'a> {
+    fn build(app: &'a App, gaps: &'a [IngestError]) -> Self {
+        let mut gap_by_path: HashMap<&str, String> = HashMap::default();
+        for gap in gaps {
+            let (IngestError::Unsupported { file, .. } | IngestError::Parse { file, .. }) = gap
+            else {
+                continue;
+            };
+            gap_by_path.entry(file).or_insert_with(|| {
+                let rel = file.strip_prefix(&app.root).map(|r| r.trim_start_matches('/'));
+                format!("{}: {}", rel.unwrap_or(file), survey::bucket_key(gap))
+            });
+        }
+
+        let mut tainted_files: HashMap<FileId, &str> = HashMap::default();
+        for (i, src) in app.sources.iter().enumerate() {
+            if let Some((path, _)) = gap_by_path.get_key_value(src.path.as_str()) {
+                tainted_files.insert(FileId(i as u32 + 1), path);
+            }
+        }
+
+        // Class taint by defining file. A class's file is where its first
+        // real-span body lands — models/controllers/library classes all
+        // ingest single-file in Rails convention.
+        let mut class_file: HashMap<ClassId, FileId> = HashMap::default();
+        for c in &app.controllers {
+            let bodies: Vec<&Expr> = c.actions().map(|a| &a.body).collect();
+            if let Some(f) = first_real_file(&bodies) {
+                class_file.insert(c.name.clone(), f);
+            }
+        }
+        for m in &app.models {
+            let bodies: Vec<&Expr> = m
+                .methods()
+                .map(|me| &me.body)
+                .chain(m.scopes().map(|s| &s.body))
+                .collect();
+            if let Some(f) = first_real_file(&bodies) {
+                class_file.insert(m.name.clone(), f);
+            }
+        }
+        for lc in &app.library_classes {
+            let bodies: Vec<&Expr> = lc.methods.iter().map(|me| &me.body).collect();
+            if let Some(f) = first_real_file(&bodies) {
+                class_file.insert(lc.name.clone(), f);
+            }
+        }
+
+        let own_taint = |id: &ClassId| -> Option<&str> {
+            class_file.get(id).and_then(|f| tainted_files.get(f)).copied()
+        };
+        let mut tainted_classes: HashMap<ClassId, &str> = HashMap::default();
+        for id in class_file.keys() {
+            if let Some(p) = own_taint(id) {
+                tainted_classes.insert(id.clone(), p);
+            }
+        }
+        // Controllers inherit taint down the parent chain (a gap in
+        // ApplicationController's before_action targets poisons every
+        // subclass's seeded ivars).
+        let parent: HashMap<&ClassId, &ClassId> = app
+            .controllers
+            .iter()
+            .filter_map(|c| c.parent.as_ref().map(|p| (&c.name, p)))
+            .collect();
+        for c in &app.controllers {
+            if tainted_classes.contains_key(&c.name) {
+                continue;
+            }
+            let mut walk = Some(&c.name);
+            let mut seen: HashSet<&ClassId> = HashSet::default();
+            while let Some(id) = walk {
+                if !seen.insert(id) {
+                    break;
+                }
+                if let Some(p) = tainted_classes.get(id).copied().or_else(|| own_taint(id)) {
+                    tainted_classes.insert(c.name.clone(), p);
+                    break;
+                }
+                walk = parent.get(id).copied();
+            }
+        }
+
+        let mut view_by_file: HashMap<FileId, &crate::ident::Symbol> = HashMap::default();
+        for v in &app.views {
+            if let Some(f) = first_real_file(&[&v.body]) {
+                view_by_file.entry(f).or_insert(&v.name);
+            }
+        }
+
+        let any_controller_tainted = app
+            .controllers
+            .iter()
+            .find_map(|c| tainted_classes.get(&c.name))
+            .copied();
+
+        let mut gap_namespaces: HashMap<String, &str> = HashMap::default();
+        let mut gap_receivers: HashMap<String, &str> = HashMap::default();
+        let resolver = (!tainted_files.is_empty()).then(|| app.const_resolver.for_sources(&app.sources));
+        if let Some(resolver) = &resolver {
+            // A namespace several gap files reopen (`module Discourse` in
+            // `config/application.rb` and `lib/discourse.rb`) names one
+            // cause, the same on every run: the file Rails would autoload
+            // it from, else the first path.
+            let rank = |name: &str, path: &str| {
+                let conventional = format!("/{}.rb", crate::naming::underscore(name.trim_start_matches("::")));
+                (!path.ends_with(&conventional), path.to_string())
+            };
+            let mut files: Vec<(&FileId, &&str)> = tainted_files.iter().collect();
+            files.sort_by_key(|(_, path)| **path);
+            for (file, path) in files {
+                for name in resolver.namespaces_declared_in(*file) {
+                    let slot = gap_namespaces.entry(name.to_string()).or_insert(path);
+                    if rank(name, path) < rank(name, slot) {
+                        *slot = path;
+                    }
+                }
+                for name in resolver.receivers_declared_in(*file) {
+                    let slot = gap_receivers.entry(name.to_string()).or_insert(path);
+                    if rank(name, path) < rank(name, slot) {
+                        *slot = path;
+                    }
+                }
+            }
+        }
+
+        AttributionCtx {
+            app,
+            gap_by_path,
+            tainted_files,
+            tainted_classes,
+            view_by_file,
+            any_controller_tainted,
+            gap_namespaces,
+            gap_receivers,
+            resolver,
+        }
+    }
+
+    /// The rendered cause for an unsupported constant a gap file declares.
+    /// The name is the declaration Rubydex resolved the reference to (a
+    /// relative `Slack` inside `module Util` is `Util::Slack`), never the
+    /// path as written: `::Article` is not `Admin::Article`, and an
+    /// unresolved `LIMIT` is not a gap file's top-level `LIMIT`.
+    fn constant_cause(&self, d: &Diagnostic) -> Option<&String> {
+        let DiagnosticKind::Unsupported { construct, detail, .. } = &d.kind else {
+            return None;
+        };
+        if construct.as_str() != "constant" || d.severity == Severity::Info {
+            return None;
+        }
+        let segments: Vec<crate::ident::Symbol> =
+            detail.trim_start_matches("::").split("::").map(crate::ident::Symbol::from).collect();
+        let resolved = self.resolver.as_ref()?.declaration_name(d.span, &segments)?;
+        let path = self.gap_namespaces.get(resolved.trim_start_matches("::"))?;
+        self.gap_by_path.get(*path)
+    }
+
+    /// The rendered cause when `d` is attributable to a gap, else `None`.
+    fn cause_for(&self, d: &Diagnostic) -> Option<&String> {
+        // Rule 1: the diagnostic's own file recorded a gap.
+        if let Some(path) = self.tainted_files.get(&d.span.file) {
+            return self.gap_by_path.get(path);
+        }
+        // Rule 2: dispatch failed on a receiver whose class is tainted.
+        if let DiagnosticKind::SendDispatchFailed { recv_ty, .. } = &d.kind {
+            if let Some(path) = self.recv_taint(recv_ty) {
+                return self.gap_by_path.get(path);
+            }
+        }
+        // Rule 3: the diagnostic sits in a view fed by a tainted
+        // controller (layouts: fed by all).
+        let view = self.view_by_file.get(&d.span.file)?;
+        if view.as_str().starts_with("layouts/") {
+            return self.any_controller_tainted.and_then(|p| self.gap_by_path.get(p));
+        }
+        if let Some(feeders) = self.app.view_feeders.get(view) {
+            if let Some(path) = feeders.iter().find_map(|f| self.tainted_classes.get(f)) {
+                return self.gap_by_path.get(*path);
+            }
+        }
+        // Fallback for views with no (surviving) feeder: Rails
+        // convention maps the view directory to its controller path —
+        // covers controllers whose file skipped ingest wholesale and so
+        // never registered a feeder edge. `application_controller.rb`
+        // participates as the conventional root of every chain.
+        for cand in conventional_controller_paths(view.as_str()) {
+            if let Some(cause) = self
+                .gap_by_path
+                .iter()
+                .find_map(|(p, c)| p.ends_with(&cand).then_some(c))
+            {
+                return Some(cause);
+            }
+        }
+        None
+    }
+
+    /// Taint for a dispatch receiver: the root class of `ty` (unions:
+    /// any arm) defined in a gap file, including a class survey mode
+    /// dropped and so never registered.
+    fn recv_taint(&self, ty: &Ty) -> Option<&&str> {
+        match ty {
+            Ty::Class { id, .. } => self
+                .tainted_classes
+                .get(id)
+                .or_else(|| self.gap_receivers.get(id.0.as_str().trim_start_matches("::"))),
+            Ty::Union { variants } => variants.iter().find_map(|v| self.recv_taint(v)),
+            _ => None,
+        }
+    }
+}
+
+// ── Unknown-gem attribution ──────────────────────────────────────────
+//
+// The second root cause a real app's error list hides: a gem the
+// analyzer does not model. `@microposts = @user.microposts.paginate(…)`
+// fails dispatch on `paginate`, the ivar never types, and every view
+// that reads it reports `ivar_unresolved` — 23 errors for one gem. The
+// census ([`crate::gems`]) says which gems are unknown; this pass
+// labels the diagnostics that land on their surface and the ivars
+// that flow from those sites, so the list reads "will_paginate is not
+// modeled" instead of "your views are broken".
+
+/// Downgrade diagnostics attributable to an unknown gem in the app's
+/// `Gemfile.lock` (see the section comment). No-op when the app carries
+/// no lockfile or the census has no unknown gem.
+///
+/// Recorded ancestry is evidence of missing coverage, NOT method ownership:
+/// even a typo on a gem-dependent receiver can be a note. Types and emitted
+/// methods remain unchanged; ambiguous ancestry does not claim a diagnostic.
+/// An unsupported constant that an initializer assigns (`::DB =
+/// MiniSqlMultisiteConnection.instance`, `ForemStatsClient = …`). Rails
+/// runs every initializer at boot, so the app's reads of it are sound,
+/// but a top-level assignment there has no home in the ingested tree yet:
+/// the reads are the tool's gap, not the app's errors. Matched by the
+/// declaration Rubydex resolves the reference to, so a namesake in
+/// another namespace stays an error, and so does one only a conditional
+/// assignment defines.
+pub fn attribute_initializer_constants(diags: &mut [Diagnostic], app: &App) {
+    if !diags.iter().any(|d| d.severity != Severity::Info && is_unsupported_constant(d)) {
+        return;
+    }
+    let root = app.root.trim_end_matches('/');
+    let mut assigned: HashMap<String, Vec<String>> = HashMap::default();
+    for f in &app.sources {
+        let rel = f.path.strip_prefix(root).unwrap_or(&f.path).trim_start_matches('/');
+        if !rel.starts_with("config/initializers/") {
+            continue;
+        }
+        for name in unconditional_constant_writes(&f.text) {
+            let paths = assigned.entry(name).or_default();
+            if !paths.iter().any(|p| p == rel) {
+                paths.push(rel.to_string());
+            }
+        }
+    }
+    if assigned.is_empty() {
+        return;
+    }
+    let resolver = app.const_resolver.for_sources(&app.sources);
+    for d in diags.iter_mut() {
+        if d.severity == Severity::Info || !is_unsupported_constant(d) {
+            continue;
+        }
+        let DiagnosticKind::Unsupported { detail, .. } = &d.kind else { continue };
+        let segments: Vec<crate::ident::Symbol> =
+            detail.trim_start_matches("::").split("::").map(crate::ident::Symbol::from).collect();
+        let Some(resolved) = resolver.declaration_name(d.span, &segments) else { continue };
+        let Some(paths) = assigned.get(resolved.trim_start_matches("::")) else { continue };
+        d.severity = Severity::Info;
+        d.message.push_str(&format!(
+            " — likely roundhouse coverage, not an app error (assigned in {}: a constant an initializer assigns is not ingested yet)",
+            paths.join(", ")
+        ));
+    }
+}
+
+/// The constants (fully qualified) a file assigns where the assignment
+/// always runs: at the top level, or in a class or module body. One inside
+/// an `if`, a block or a method may never run, and the read stays an error.
+fn unconditional_constant_writes(text: &str) -> Vec<String> {
+    fn id(id: &ruby_prism::ConstantId<'_>) -> String {
+        String::from_utf8_lossy(id.as_slice()).into_owned()
+    }
+    /// `A::B` as written, or None for a path that is not plain constants.
+    fn path(node: &ruby_prism::Node<'_>) -> Option<(bool, String)> {
+        if let Some(read) = node.as_constant_read_node() {
+            return Some((false, id(&read.name())));
+        }
+        let p = node.as_constant_path_node()?;
+        let last = id(&p.name()?);
+        match p.parent() {
+            None => Some((true, last)),
+            Some(parent) => path(&parent).map(|(rooted, head)| (rooted, format!("{head}::{last}"))),
+        }
+    }
+    fn qualify(namespace: &str, rooted: bool, name: &str) -> String {
+        if rooted || namespace.is_empty() { name.to_string() } else { format!("{namespace}::{name}") }
+    }
+    fn walk(stmts: Option<ruby_prism::StatementsNode<'_>>, namespace: &str, out: &mut Vec<String>) {
+        let Some(stmts) = stmts else { return };
+        for stmt in stmts.body().iter() {
+            if let Some(w) = stmt.as_constant_write_node() {
+                out.push(qualify(namespace, false, &id(&w.name())));
+            } else if let Some(w) = stmt.as_constant_path_write_node() {
+                if let Some((rooted, name)) = path(&w.target().as_node()) {
+                    out.push(qualify(namespace, rooted, &name));
+                }
+            } else if let Some(c) = stmt.as_class_node() {
+                if let Some((rooted, name)) = path(&c.constant_path()) {
+                    let inner = qualify(namespace, rooted, &name);
+                    walk(c.body().and_then(|b| b.as_statements_node()), &inner, out);
+                }
+            } else if let Some(m) = stmt.as_module_node() {
+                if let Some((rooted, name)) = path(&m.constant_path()) {
+                    let inner = qualify(namespace, rooted, &name);
+                    walk(m.body().and_then(|b| b.as_statements_node()), &inner, out);
+                }
+            }
+        }
+    }
+    let parsed = ruby_prism::parse(text.as_bytes());
+    let mut out = Vec::new();
+    if let Some(program) = parsed.node().as_program_node() {
+        walk(Some(program.statements()), "", &mut out);
+    }
+    out
+}
+
+fn is_unsupported_constant(d: &Diagnostic) -> bool {
+    matches!(&d.kind, DiagnosticKind::Unsupported { construct, .. } if construct.as_str() == "constant")
+}
+
+pub fn attribute_unknown_gems(diags: &mut [Diagnostic], app: &App) {
+    let Some(lock) = &app.gem_lock else { return };
+    let census = crate::gems::GemCensus::of(lock);
+    if census.unknown().next().is_none() || diags.is_empty() {
+        return;
+    }
+    let ancestry = diags.iter().any(|d| d.severity != Severity::Info
+        && matches!(d.kind, DiagnosticKind::SendDispatchFailed { .. }))
+        .then(|| GemAncestry::new(app));
+
+    // Pass 1: a declared generated surface is the most specific
+    // evidence, ahead of ancestry and fixed DSL/helper names.
+    let gem_for = |d: &Diagnostic| -> Option<(&str, Option<String>)> {
+        match &d.kind {
+            DiagnosticKind::SendDispatchFailed { method, recv_ty } => {
+                if let Some((dsl, owner)) = ancestry.as_ref()?.generating_dsl(recv_ty, method.as_str(), lock) {
+                    if let Some(gem) = crate::gems::gem_providing_dsl(lock, dsl) {
+                        return Some((gem, Some(format!("matches the declared `{dsl}` surface in {}; runtime method availability is unverified", owner.0))));
+                    }
+                }
+                match ancestry.as_ref()?.receiver_gem(recv_ty, &census, &|gem, path| app.gem_boundary.declares_path(gem, path)) {
+                    GemClaim::Known { gem, constant } => Some((gem, Some(format!(
+                        "receiver ancestry reaches `{constant}`; method ownership is unverified"
+                    )))),
+                    GemClaim::Uncertain => None,
+                    GemClaim::Absent => crate::gems::gem_claiming_method(lock, method.as_str())
+                        .map(|gem| (gem, None)),
+                }
+            }
+            DiagnosticKind::UnresolvedType { name: Some(n), .. }
+            | DiagnosticKind::UndefinedFilterTarget { target: n, .. } => {
+                crate::gems::gem_claiming_method(lock, n.as_str()).map(|gem| (gem, None))
+            }
+            DiagnosticKind::Unsupported { construct, detail, .. }
+                if construct.as_str() == "constant" =>
+            {
+                crate::gems::gem_owning_constant_with(&census, detail, &|gem, path| {
+                    app.gem_boundary.declares_path(gem, path)
+                })
+                .map(|gem| (gem, None))
+            }
+            _ => None,
+        }
+    };
+    let mut sites: Vec<(FileId, u32, String)> = Vec::new();
+    for d in diags.iter_mut() {
+        // Already a coverage note (an ingest gap claimed it first).
+        let unknown_constant = matches!(
+            &d.kind,
+            DiagnosticKind::Unsupported { construct, .. } if construct.as_str() == "constant"
+        );
+        if unknown_constant {
+            // Attribution cannot certify a constant whose emitted body
+            // is a refusal stub. Keep severity/kind/span and add context only.
+            if let Some((gem, _)) = gem_for(d) {
+                let context = format!(" — unmodeled gem `{gem}`; emitted constant availability is unverified");
+                if !d.message.ends_with(&context) { d.message.push_str(&context); }
+            }
+            continue;
+        }
+        // Kept an error: the call site is the gem's own refusal, and only what it feeds becomes a note
+        if let DiagnosticKind::Unsupported { construct, .. } = &d.kind
+            && crate::gems::claims_surface(construct.as_str())
+        {
+            sites.push((d.span.file, d.span.start, construct.as_str().to_string()));
+            continue;
+        }
+        if !eligible(&d.kind) || d.severity == Severity::Info {
+            continue;
+        }
+        // Catalogued gem classes (e.g. Pay::Charge for `is_a?`) own their
+        // surface: missing methods must stay errors. Downgrading them to
+        // unknown-gem notes would quiet `check` while the empty façade
+        // still NoMethodErrors on emit (invariant 6).
+        if matches!(
+            &d.kind,
+            DiagnosticKind::SendDispatchFailed { recv_ty, .. }
+                if catalogued_class_receiver(recv_ty)
+        ) {
+            continue;
+        }
+        if let Some((gem, evidence)) = gem_for(d) {
+            sites.push((d.span.file, d.span.start, gem.to_string()));
+            mark(d, gem, None);
+            if let Some(evidence) = evidence {
+                d.message.push_str(&format!(" ({evidence})"));
+            }
+        }
+    }
+    if sites.is_empty() {
+        return;
+    }
+
+    // Pass 2: ivars assigned from an attributed site, per controller
+    // (its own actions and filters), then the reads of those ivars in
+    // the controller's views and its own file.
+    let mut ivar_gem: HashMap<(ClassId, crate::ident::Symbol), String> = HashMap::default();
+    for c in &app.controllers {
+        for a in c.actions() {
+            collect_gem_ivars(&a.body, &sites, |name, gem| {
+                ivar_gem.entry((c.name.clone(), name)).or_insert_with(|| gem.to_string());
+            });
+        }
+    }
+    if ivar_gem.is_empty() {
+        return;
+    }
+    let mut view_by_file: HashMap<FileId, &crate::ident::Symbol> = HashMap::default();
+    for v in &app.views {
+        if let Some(f) = first_real_file(&[&v.body]) {
+            view_by_file.entry(f).or_insert(&v.name);
+        }
+    }
+    let mut controller_file: HashMap<FileId, &ClassId> = HashMap::default();
+    for c in &app.controllers {
+        let bodies: Vec<&Expr> = c.actions().map(|a| &a.body).collect();
+        if let Some(f) = first_real_file(&bodies) {
+            controller_file.entry(f).or_insert(&c.name);
+        }
+    }
+    for d in diags.iter_mut() {
+        let DiagnosticKind::IvarUnresolved { name } = &d.kind else { continue };
+        if d.severity == Severity::Info {
+            continue;
+        }
+        let feeders: Vec<&ClassId> = match view_by_file.get(&d.span.file) {
+            Some(view) => app.view_feeders.get(*view).into_iter().flatten().collect(),
+            None => controller_file.get(&d.span.file).into_iter().copied().collect(),
+        };
+        if let Some(gem) = feeders.iter().find_map(|c| ivar_gem.get(&((*c).clone(), name.clone()))) {
+            let ivar = name.as_str().to_string();
+            mark(d, gem, Some(&ivar));
+        }
+    }
+}
+
+fn mark(d: &mut Diagnostic, gem: &str, via_ivar: Option<&str>) {
+    d.severity = Severity::Info;
+    match via_ivar {
+        Some(ivar) => d.message.push_str(&format!(
+            " — likely roundhouse coverage, not an app error (@{ivar} is assigned from the `{gem}` gem, which roundhouse does not model)"
+        )),
+        None => d.message.push_str(&format!(
+            " — likely roundhouse coverage, not an app error (the `{gem}` gem is in the Gemfile and roundhouse does not model it)"
+        )),
+    }
+}
+
+/// Receiver class id appears in [`crate::catalog::GEM_CATALOG`]. Roundhouse
+/// already owns that surface — missing methods are intentional refusals,
+/// not unknown-gem notes (invariant 6).
+fn catalogued_class_receiver(ty: &crate::ty::Ty) -> bool {
+    match ty {
+        crate::ty::Ty::Class { id, .. } => crate::catalog::GEM_CATALOG
+            .iter()
+            .any(|g| g.name == id.0.as_str()),
+        _ => false,
+    }
+}
+
+/// Every `@ivar = value` in `body` whose `value` subtree contains one
+/// of `sites` (an attributed diagnostic's file + offset) → `f(ivar, gem)`.
+fn collect_gem_ivars(
+    body: &Expr,
+    sites: &[(FileId, u32, String)],
+    mut f: impl FnMut(crate::ident::Symbol, &str),
+) {
+    fn contains(e: &Expr, file: FileId, offset: u32) -> bool {
+        if !e.span.is_synthetic() && e.span.file == file && e.span.start <= offset && offset < e.span.end.max(e.span.start + 1) {
+            return true;
+        }
+        let mut hit = false;
+        e.node.for_each_child(&mut |c| {
+            if !hit {
+                hit = contains(c, file, offset);
+            }
+        });
+        hit
+    }
+    fn walk(e: &Expr, sites: &[(FileId, u32, String)], f: &mut impl FnMut(crate::ident::Symbol, &str)) {
+        if let crate::expr::ExprNode::Assign { target: crate::expr::LValue::Ivar { name }, value } = &*e.node {
+            if let Some((_, _, gem)) = sites.iter().find(|(file, off, _)| contains(value, *file, *off)) {
+                f(name.clone(), gem);
+            }
+        }
+        e.node.for_each_child(&mut |c| walk(c, sites, f));
+    }
+    walk(body, sites, &mut f);
+}
+
+/// The first non-synthetic file any of these bodies' subtrees touches.
+fn first_real_file(bodies: &[&Expr]) -> Option<FileId> {
+    fn find(e: &Expr) -> Option<FileId> {
+        if !e.span.is_synthetic() {
+            return Some(e.span.file);
+        }
+        let mut found = None;
+        e.node.for_each_child(&mut |c| {
+            if found.is_none() {
+                found = find(c);
+            }
+        });
+        found
+    }
+    bodies.iter().find_map(|b| find(b))
+}
+
+/// Candidate controller path suffixes for a view name, most specific
+/// first: `admin/reports/show` → `app/controllers/admin/reports_controller.rb`,
+/// `app/controllers/admin_controller.rb`, then the conventional root
+/// `app/controllers/application_controller.rb`.
+fn conventional_controller_paths(view: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let dirs: Vec<&str> = view.split('/').collect();
+    if dirs.len() >= 2 {
+        for i in (1..dirs.len()).rev() {
+            out.push(format!("app/controllers/{}_controller.rb", dirs[..i].join("/")));
+        }
+    }
+    out.push("app/controllers/application_controller.rb".to_string());
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ident::Symbol;
+    use crate::span::Span;
+
+    fn diag(kind: DiagnosticKind, severity: Severity, file: FileId) -> Diagnostic {
+        Diagnostic {
+            span: Span { file, start: 0, end: 1 },
+            severity,
+            message: "test".to_string(),
+            kind,
+        }
+    }
+
+    #[test]
+    fn no_gaps_is_a_noop() {
+        let app = App::new();
+        let mut diags = vec![diag(
+            DiagnosticKind::IvarUnresolved { name: Symbol::from("x") },
+            Severity::Error,
+            FileId(1),
+        )];
+        attribute_ingest_gaps(&mut diags, &app, &[]);
+        assert_eq!(diags[0].severity, Severity::Error);
+    }
+
+    #[test]
+    fn same_file_gap_downgrades_to_info_with_cause() {
+        let mut app = App::new();
+        app.root = "fixtures/demo".to_string();
+        app.sources.push(crate::span::SourceFile {
+            path: "fixtures/demo/app/models/thing.rb".to_string(),
+            text: "class Thing; end".to_string(),
+        });
+        let gaps = vec![IngestError::Unsupported {
+            file: "fixtures/demo/app/models/thing.rb".to_string(),
+            message: "unsupported expression node: SingletonClassNode (…)".to_string(),
+        }];
+        let mut diags = vec![
+            diag(
+                DiagnosticKind::IvarUnresolved { name: Symbol::from("x") },
+                Severity::Error,
+                FileId(1),
+            ),
+            // Parse diagnostics never move, even in a tainted file.
+            diag(
+                DiagnosticKind::Parse { message: "boom".to_string() },
+                Severity::Error,
+                FileId(1),
+            ),
+        ];
+        attribute_ingest_gaps(&mut diags, &app, &gaps);
+        assert_eq!(diags[0].severity, Severity::Info);
+        assert!(
+            diags[0].message.contains("app/models/thing.rb"),
+            "cause names the gap file: {}",
+            diags[0].message
+        );
+        assert!(diags[0].message.contains("SingletonClassNode"));
+        assert_eq!(diags[1].severity, Severity::Error);
+    }
+
+    #[test]
+    fn untainted_file_keeps_severity() {
+        let mut app = App::new();
+        app.sources.push(crate::span::SourceFile {
+            path: "app/models/clean.rb".to_string(),
+            text: String::new(),
+        });
+        let gaps = vec![IngestError::Unsupported {
+            file: "app/models/other.rb".to_string(),
+            message: "gap".to_string(),
+        }];
+        let mut diags = vec![diag(
+            DiagnosticKind::IvarUnresolved { name: Symbol::from("x") },
+            Severity::Error,
+            FileId(1),
+        )];
+        attribute_ingest_gaps(&mut diags, &app, &gaps);
+        assert_eq!(diags[0].severity, Severity::Error);
+    }
+
+    #[test]
+    fn unknown_gem_constant_keeps_its_error_and_idempotent_context() {
+        let mut app = App::new();
+        app.gem_lock = Some(crate::gems::Lockfile::parse(
+            "GEM\n  remote: https://rubygems.org/\n  specs:\n    acme-core (1.0.0)\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  acme-core\n",
+        ));
+        let mut diags = vec![
+            Diagnostic::unsupported(Span::synthetic(), None, "constant", "AcmeCore::Client"),
+            Diagnostic::unsupported(Span::synthetic(), None, "other construct", "AcmeCore::Client"),
+        ];
+        attribute_unknown_gems(&mut diags, &app);
+        assert_eq!(diags[0].severity, Severity::Error);
+        assert!(diags[0].message.contains("acme-core"));
+        assert_eq!(diags[1].severity, Severity::Error);
+        let once = diags.clone();
+        attribute_unknown_gems(&mut diags, &app);
+        assert_eq!(diags, once);
+    }
+
+    #[test]
+    fn conventional_paths_walk_up_the_view_dirs() {
+        assert_eq!(
+            conventional_controller_paths("admin/reports/show"),
+            vec![
+                "app/controllers/admin/reports_controller.rb".to_string(),
+                "app/controllers/admin_controller.rb".to_string(),
+                "app/controllers/application_controller.rb".to_string(),
+            ]
+        );
+        assert_eq!(
+            conventional_controller_paths("layouts/application"),
+            vec![
+                "app/controllers/layouts_controller.rb".to_string(),
+                "app/controllers/application_controller.rb".to_string(),
+            ]
+        );
+    }
+}

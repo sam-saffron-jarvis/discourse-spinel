@@ -1,0 +1,47 @@
+"unset"
+false
+true
+"unset"
+[:idle, false, 1, false, ":idle", "idle|"]
+[nil, true, 0, true, "nil", "|"]
+[:run, false, 1, false, ":run", "run|"]
+?
+Y
+N
+false
+[nil, true]
+true
+[nil, true]
+:b
+[nil, true]
+[nil, true]
+[true, false]
+[nil, true]
+[:a, false]
+[nil, true]
+[nil, true]
+false
+"unset"
+true
+"unset"
+[false, false]
+[nil, true]
+[nil, nil, true, true]
+[true, :s, false, false]
+true
+nil
+[:idle, false]
+[nil, true]
+[nil, true]
+[true, nil]
+[false, Integer]
+[true, nil]
+[false, (1/3)]
+[5, false, false]
+true
+false
+nil
+true
+false
+nil
+true

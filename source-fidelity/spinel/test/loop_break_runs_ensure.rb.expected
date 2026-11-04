@@ -1,0 +1,13 @@
+[2, "later", "later"]
+[5, [:e1]]
+[30, [[:in, 1], [:out, 1], [:in, 2], [:out, 2], [:in, 3], [:out, 3]]]
+[[:w, 1], [:after, 1], [:w, 2], [:after, 2], :outer]
+[[:ens, 1], :resc, [:ens, 2], [:ens, 3], [:ens, 4]]
+[[:inner, 1], [:inner, 2], :loop_done, :outer_once]
+[1, 2]
+:from_ensure
+[:e8]
+[300, [1, 2, 3]]
+[:after, [:e]]
+[:plain, nil, [:stop]]
+7

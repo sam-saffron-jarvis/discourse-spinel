@@ -1,0 +1,15 @@
+# Type-level shapes with no spinel tag. A parameter of such a type takes
+# an empty field (the analyzer leaves that one alone) and a return of
+# such a type reads "-", so the other parameters keep their seeds; once
+# any one of these dropped the whole method. `f` shows a tuple return
+# beside two seeded parameters. Note: `untyped` is NOT here -- it maps to
+# poly.
+class DroppedTypes
+  def c: (_Each) -> void
+  def d: (Integer & String) -> void
+  def e: (:sym) -> void
+  def f: (Integer, String) -> [Integer, String]
+  def g: (top) -> void
+  def h: (^(Integer) -> void) -> void
+  def kept: (Integer) -> Integer
+end

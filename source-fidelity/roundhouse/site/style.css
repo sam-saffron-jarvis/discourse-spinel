@@ -1,0 +1,622 @@
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+:root {
+  --bg: #1a1b26;
+  --bg-light: #24283b;
+  --bg-lighter: #292e42;
+  --border: #3b4261;
+  --text: #c0caf5;
+  --text-dim: #737aa2;
+  --accent-ruby: #f7768e;
+  --accent-crystal: #bb9af7;
+  --accent-elixir: #a855f7;
+  --accent-go: #73daca;
+  --accent-kotlin: #ff79c6;
+  --accent-python: #7aa2f7;
+  --accent-rust: #ff9e64;
+  --accent-swift: #f0805e;
+  --accent-typescript: #e0af68;
+  --accent: var(--accent-ruby);
+  --tree-hover: #292e42;
+  --tree-active: #3b4261;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+/* --------- Landing page --------- */
+
+body.landing {
+  justify-content: center;
+  align-items: center;
+  padding: 2rem;
+}
+
+.landing-main {
+  max-width: 46rem;
+  text-align: center;
+}
+
+/* Keep prose readable even though the hub is wide enough for a 3-up card row. */
+.landing-main .blurb,
+.landing-main .overview,
+.landing-main .reading {
+  max-width: 40rem;
+  margin-left: auto;
+  margin-right: auto;
+}
+
+.logo {
+  width: 128px;
+  height: 128px;
+  margin-bottom: 1.25rem;
+}
+
+.landing-main h1 {
+  font-size: 2rem;
+  font-weight: 600;
+  color: var(--accent);
+  margin-bottom: 0.35rem;
+}
+
+.landing-main .tagline {
+  color: var(--text-dim);
+  font-size: 0.95rem;
+  margin-bottom: 2rem;
+}
+
+.landing-main .blurb {
+  color: var(--text);
+  font-size: 0.95rem;
+  line-height: 1.55;
+  margin-bottom: 2rem;
+}
+
+.landing-nav {
+  display: flex;
+  justify-content: center;
+  gap: 0.75rem;
+  margin-bottom: 2rem;
+  flex-wrap: wrap;
+}
+
+.landing-nav a {
+  display: inline-block;
+  padding: 0.55rem 1rem;
+  border: 1px solid var(--border);
+  border-radius: 0.35rem;
+  color: var(--text);
+  text-decoration: none;
+  font-size: 0.9rem;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.landing-nav a:hover {
+  background: var(--bg-light);
+  border-color: var(--accent);
+}
+
+.overview {
+  text-align: left;
+  color: var(--text);
+  font-size: 0.9rem;
+  line-height: 1.55;
+  margin-bottom: 2rem;
+}
+
+.overview p {
+  margin-bottom: 0.9rem;
+}
+
+.overview code {
+  font-size: 0.85em;
+}
+
+.reading {
+  list-style: none;
+  padding: 0;
+  color: var(--text-dim);
+  font-size: 0.85rem;
+}
+
+.reading li {
+  margin-bottom: 0.35rem;
+}
+
+.reading a {
+  color: var(--accent);
+}
+
+.footnote {
+  color: var(--text-dim);
+  font-size: 0.8rem;
+}
+
+.footnote a {
+  color: var(--text-dim);
+}
+
+.footnote a:hover {
+  color: var(--text);
+}
+
+/* --------- Browse page --------- */
+
+header {
+  padding: 1.25rem 1.5rem 0.75rem;
+  border-bottom: 1px solid var(--border);
+}
+
+header h1 {
+  font-size: 1.25rem;
+  font-weight: 600;
+  color: var(--accent);
+}
+
+header h1 a {
+  color: inherit;
+  text-decoration: none;
+}
+
+.tagline {
+  font-size: 0.8rem;
+  color: var(--text-dim);
+  margin-top: 0.15rem;
+}
+
+/* Language tabs */
+.tabs {
+  display: flex;
+  gap: 0;
+  border-bottom: 1px solid var(--border);
+  padding: 0 1.5rem;
+  flex-wrap: wrap;
+}
+
+.tab {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  padding: 0.6rem 1.25rem;
+  font-size: 0.85rem;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  transition: color 0.15s, border-color 0.15s;
+}
+
+.tab:hover {
+  color: var(--text);
+}
+
+.tab.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+
+.tab[data-lang="blog"].active { color: var(--accent-ruby); border-bottom-color: var(--accent-ruby); }
+.tab[data-lang="ruby"].active { color: var(--accent-ruby); border-bottom-color: var(--accent-ruby); }
+.tab[data-lang="crystal"].active { color: var(--accent-crystal); border-bottom-color: var(--accent-crystal); }
+.tab[data-lang="elixir"].active { color: var(--accent-elixir); border-bottom-color: var(--accent-elixir); }
+.tab[data-lang="go"].active { color: var(--accent-go); border-bottom-color: var(--accent-go); }
+.tab[data-lang="kotlin"].active { color: var(--accent-kotlin); border-bottom-color: var(--accent-kotlin); }
+.tab[data-lang="python"].active { color: var(--accent-python); border-bottom-color: var(--accent-python); }
+.tab[data-lang="rust"].active { color: var(--accent-rust); border-bottom-color: var(--accent-rust); }
+.tab[data-lang="swift"].active { color: var(--accent-swift); border-bottom-color: var(--accent-swift); }
+.tab[data-lang="typescript"].active { color: var(--accent-typescript); border-bottom-color: var(--accent-typescript); }
+
+/* Main layout */
+main {
+  flex: 1;
+  overflow: hidden;
+}
+
+.panels {
+  display: flex;
+  height: calc(100vh - 8rem);
+}
+
+/* File tree */
+.file-tree {
+  width: 260px;
+  min-width: 200px;
+  border-right: 1px solid var(--border);
+  overflow-y: auto;
+  padding: 0.5rem 0;
+}
+
+.tree-item {
+  display: flex;
+  align-items: center;
+  padding: 0.2rem 0.75rem;
+  cursor: pointer;
+  font-size: 0.8rem;
+  color: var(--text-dim);
+  white-space: nowrap;
+  user-select: none;
+}
+
+.tree-item:hover {
+  background: var(--tree-hover);
+  color: var(--text);
+}
+
+.tree-item.active {
+  background: var(--tree-active);
+  color: var(--text);
+}
+
+.tree-item.dir {
+  color: var(--text);
+  font-weight: 500;
+}
+
+.tree-icon {
+  width: 1rem;
+  margin-right: 0.35rem;
+  text-align: center;
+  font-size: 0.7rem;
+  flex-shrink: 0;
+}
+
+.tree-item.dir .tree-icon::before { content: "\25B6"; }
+.tree-item.dir.open .tree-icon::before { content: "\25BC"; }
+.tree-item.file .tree-icon::before { content: ""; }
+
+.tree-children {
+  display: none;
+}
+
+.tree-children.open {
+  display: block;
+}
+
+/* Code panel */
+.code-panel {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.code-header {
+  padding: 0.5rem 1rem;
+  font-size: 0.8rem;
+  color: var(--text-dim);
+  background: var(--bg-light);
+  border-bottom: 1px solid var(--border);
+  font-family: "SF Mono", "Fira Code", "Cascadia Code", monospace;
+}
+
+.code-content {
+  flex: 1;
+  overflow: auto;
+  padding: 1rem;
+  background: var(--bg);
+  font-family: "SF Mono", "Fira Code", "Cascadia Code", monospace;
+  font-size: 0.8rem;
+  line-height: 1.5;
+  tab-size: 2;
+  white-space: pre;
+  color: var(--text);
+}
+
+.code-content.hljs {
+  background: var(--bg);
+}
+
+footer {
+  padding: 0.5rem 1.5rem;
+  border-top: 1px solid var(--border);
+  font-size: 0.75rem;
+}
+
+footer a {
+  color: var(--text-dim);
+  text-decoration: none;
+  margin-right: 1rem;
+}
+
+footer a:hover {
+  color: var(--text);
+}
+
+.loading {
+  padding: 2rem;
+  text-align: center;
+  color: var(--text-dim);
+}
+
+/* --------- Doc / prose page (demo) --------- */
+
+.doc-main {
+  max-width: 52rem;
+  margin: 0 auto;
+  padding: 2.5rem 1.5rem 4rem;
+  line-height: 1.6;
+}
+
+.doc-main h2 {
+  font-size: 1.3rem;
+  font-weight: 600;
+  color: var(--accent);
+  margin: 2.5rem 0 0.85rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid var(--border);
+}
+
+.doc-main h2:first-of-type {
+  border-top: none;
+  padding-top: 0;
+}
+
+.doc-main h3 {
+  font-size: 1.02rem;
+  font-weight: 600;
+  color: var(--text);
+  margin: 1.6rem 0 0.5rem;
+}
+
+.doc-main .lead {
+  font-size: 1.05rem;
+  color: var(--text);
+  margin-bottom: 1.5rem;
+}
+
+.doc-main p {
+  color: var(--text);
+  margin-bottom: 1rem;
+}
+
+.doc-main ul {
+  margin: 0 0 1rem 1.25rem;
+  color: var(--text);
+}
+
+.doc-main li {
+  margin-bottom: 0.4rem;
+}
+
+.doc-main a {
+  color: var(--accent-python);
+  text-decoration: none;
+}
+
+.doc-main a:hover {
+  text-decoration: underline;
+}
+
+.doc-main code {
+  font-family: "SF Mono", "Fira Code", "Cascadia Code", monospace;
+  font-size: 0.85em;
+  background: var(--bg-lighter);
+  padding: 0.1rem 0.35rem;
+  border-radius: 0.25rem;
+  color: var(--accent-go);
+}
+
+.doc-main pre {
+  background: var(--bg-light);
+  border: 1px solid var(--border);
+  border-radius: 0.4rem;
+  padding: 0.9rem 1.1rem;
+  overflow-x: auto;
+  margin: 0 0 1.25rem;
+  font-size: 0.82rem;
+  line-height: 1.55;
+}
+
+.doc-main pre code {
+  background: none;
+  padding: 0;
+  color: var(--text);
+  font-size: inherit;
+}
+
+.doc-main .note {
+  font-size: 0.85rem;
+  color: var(--text-dim);
+}
+
+.doc-main table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0 0 1.5rem;
+  font-size: 0.88rem;
+}
+
+.doc-main th, .doc-main td {
+  text-align: left;
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+
+.doc-main th {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.doc-main .pill {
+  display: inline-block;
+  font-size: 0.75rem;
+  padding: 0.15rem 0.55rem;
+  border: 1px solid var(--border);
+  border-radius: 1rem;
+  color: var(--text-dim);
+  margin: 0 0.35rem 0.35rem 0;
+}
+
+.doc-main .run-live {
+  background: var(--bg-light);
+  border: 1px solid var(--accent-typescript);
+  border-radius: 0.5rem;
+  padding: 1rem 1.25rem;
+  margin: 1.5rem 0;
+}
+.doc-main .run-live a {
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--accent-typescript);
+}
+.doc-main .run-live small {
+  color: var(--text-dim);
+  display: inline-block;
+  margin-top: 0.5rem;
+}
+
+/* --------- App picker cards (landing hub) --------- */
+
+.app-cards {
+  display: grid;
+  /* 16rem is the width that makes four cards land 2×2 in the content column
+     rather than 3-then-1; narrower viewports still collapse to one. */
+  grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
+  gap: 1.5rem;
+  text-align: left;
+  margin: 2.5rem 0;
+}
+
+.app-card {
+  display: block;
+  padding: 1.2rem 1.3rem 1.3rem;
+  /* Tint the card with its app's colour so each section reads clearly on the
+     dark page; the plain fill is the fallback where color-mix is unsupported. */
+  background: var(--bg-light);
+  background: color-mix(in srgb, var(--card-accent, var(--accent)) 14%, var(--bg-light));
+  border: 1px solid var(--border);
+  border: 1px solid color-mix(in srgb, var(--card-accent, var(--accent)) 45%, var(--border));
+  border-top: 3px solid var(--card-accent, var(--accent));
+  border-radius: 0.5rem;
+  text-decoration: none;
+  color: var(--text);
+  transition: background 0.15s, transform 0.15s, border-color 0.15s, box-shadow 0.15s;
+}
+
+.app-card:hover {
+  background: color-mix(in srgb, var(--card-accent, var(--accent)) 24%, var(--bg-light));
+  border-color: var(--card-accent, var(--accent));
+  transform: translateY(-3px);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+}
+.app-card.blog     { --card-accent: var(--accent-ruby); }
+.app-card.lobsters { --card-accent: var(--accent-rust); }
+.app-card.campfire { --card-accent: var(--accent-go); }
+.app-card.mastodon { --card-accent: var(--accent-crystal); }
+
+.app-card h2 {
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--card-accent, var(--accent));
+  margin-bottom: 0.25rem;
+}
+
+.app-card .role {
+  font-size: 0.68rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--card-accent, var(--accent));
+  margin-bottom: 0.6rem;
+}
+
+.app-card p {
+  font-size: 0.82rem;
+  color: var(--text);
+  line-height: 1.45;
+  margin: 0;
+}
+
+.app-card .go {
+  display: inline-block;
+  margin-top: 0.7rem;
+  font-size: 0.8rem;
+  color: var(--card-accent, var(--accent));
+}
+
+/* --------- Per-app case-study pages (site/apps/) --------- */
+
+body.app-blog     { --card-accent: var(--accent-ruby); }
+body.app-lobsters { --card-accent: var(--accent-rust); }
+body.app-campfire { --card-accent: var(--accent-go); }
+body.app-mastodon { --card-accent: var(--accent-crystal); }
+
+body.doc header h1 a,
+body.doc .doc-main h2 { color: var(--card-accent, var(--accent)); }
+
+.status-line {
+  font-size: 0.85rem;
+  color: var(--text-dim);
+  border-left: 3px solid var(--card-accent, var(--accent));
+  padding: 0.2rem 0 0.2rem 0.85rem;
+  margin: 0 0 1.4rem;
+}
+
+.cta-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  margin: 1.4rem 0 1.9rem;
+}
+
+.cta-row a {
+  display: inline-block;
+  padding: 0.5rem 0.95rem;
+  border: 1px solid var(--border);
+  border-radius: 0.35rem;
+  color: var(--text);
+  text-decoration: none;
+  font-size: 0.85rem;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.cta-row a:hover { background: var(--bg-light); border-color: var(--card-accent, var(--accent)); }
+
+.cta-row a.primary {
+  border-color: var(--card-accent, var(--accent));
+  color: var(--card-accent, var(--accent));
+  font-weight: 600;
+}
+
+/* --------- User guide (docs/guide/*.md, rendered by `roundhouse --site`) --------- */
+
+body.guide .tagline a {
+  color: var(--text-dim);
+  text-decoration: none;
+}
+body.guide .tagline a:hover { text-decoration: underline; }
+
+.doc-main ol {
+  margin: 0 0 1.25rem 1.5rem;
+  line-height: 1.6;
+}
+.doc-main ol li { margin-bottom: 0.4rem; }
+
+.doc-main h4 {
+  font-size: 0.95rem;
+  color: var(--text);
+  margin: 1.25rem 0 0.5rem;
+}
+
+.doc-main hr {
+  border: 0;
+  border-top: 1px solid var(--border);
+  margin: 2rem 0;
+}
+
+/* A flex child's minimum width is its content's: a long unbreakable
+   line in a <pre> would push the whole column past the viewport on a
+   narrow window. Let the column shrink; the <pre> scrolls on its own. */
+.doc-main { min-width: 0; width: 100%; }
+
+/* Wide tables (the coverage page) scroll rather than overflow the column. */
+.doc-main table { display: block; overflow-x: auto; }

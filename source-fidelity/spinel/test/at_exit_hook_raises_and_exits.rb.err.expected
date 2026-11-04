@@ -1,0 +1,5 @@
+hook 4 (registered last, runs first)
+hook 3 exiting
+hook 2 blew up (RuntimeError)
+hook 1 (registered first, runs last)
+boom (ArgumentError)

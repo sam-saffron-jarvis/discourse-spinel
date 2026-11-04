@@ -1,0 +1,117 @@
+--- still answering
+closed? => true
+close => nil
+inspect => "#<File:/tmp/sp_io_closed_stream.txt (closed)>"
+path => "/tmp/sp_io_closed_stream.txt"
+to_path => "/tmp/sp_io_closed_stream.txt"
+--- readers
+eof?: IOError: closed stream
+read: IOError: closed stream
+read(1): IOError: closed stream
+readpartial: IOError: closed stream
+sysread: IOError: closed stream
+pread: IOError: closed stream
+gets: IOError: closed stream
+gets(sep): IOError: closed stream
+readline: IOError: closed stream
+readlines: IOError: closed stream
+each_line: IOError: closed stream
+getc: IOError: closed stream
+readchar: IOError: closed stream
+getbyte: IOError: closed stream
+readbyte: IOError: closed stream
+ungetc: IOError: closed stream
+ungetbyte: IOError: closed stream
+each_byte: IOError: closed stream
+each_char: IOError: closed stream
+each_codepoint: IOError: closed stream
+--- writers
+write: IOError: closed stream
+puts: IOError: closed stream
+print: IOError: closed stream
+<<: IOError: closed stream
+putc: IOError: closed stream
+syswrite: IOError: closed stream
+pwrite: IOError: closed stream
+flush: IOError: closed stream
+fsync: IOError: closed stream
+fdatasync: IOError: closed stream
+--- position
+pos: IOError: closed stream
+tell: IOError: closed stream
+pos=: IOError: closed stream
+seek: IOError: closed stream
+sysseek: IOError: closed stream
+rewind: IOError: closed stream
+lineno: IOError: closed stream
+lineno=: IOError: closed stream
+--- flags and descriptor
+sync: IOError: closed stream
+sync=: IOError: closed stream
+autoclose?: IOError: closed stream
+autoclose=: IOError: closed stream
+close_on_exec?: IOError: closed stream
+close_on_exec=: IOError: closed stream
+binmode: IOError: closed stream
+binmode?: IOError: closed stream
+tty?: IOError: closed stream
+isatty: IOError: closed stream
+fileno: IOError: closed stream
+to_i: IOError: closed stream
+stat: IOError: closed stream
+flock: IOError: closed stream
+advise: IOError: closed stream
+fcntl: IOError: closed stream
+wait_readable: IOError: closed stream
+wait_writable: IOError: closed stream
+wait: IOError: closed stream
+winsize: IOError: closed stream
+--- a pipe end read back out of its pair
+pipe sync: IOError: closed stream
+pipe sync=: IOError: closed stream
+pipe gets: IOError: closed stream
+pipe write: IOError: closed stream
+pipe closed? => [true, true]
+--- an open handle keeps its answers
+open lineno => 0
+open gets => "abc\n"
+open lineno after gets => 1
+open lineno= => 7
+open sync => false
+open sync= => true
+open autoclose? => true
+open autoclose= => true
+open getbyte => 100
+open eof? at end => true
+open getc at end => nil
+open getbyte at end => nil
+open readbyte at end: EOFError: end of file reached
+--- a temporary receiver keeps its handle for the whole loop
+each_line on a temporary receiver saw 200 lines
+each_byte on a temporary receiver saw 1692 bytes
+each_char on a temporary receiver saw 1692 chars
+each_codepoint on a temporary receiver saw 1692 codepoints
+Dir#each on a temporary receiver saw 22 entries
+Dir#each_child on a temporary receiver saw 20 children
+--- sync and sync= evaluate their receiver once
+sync evaluated its receiver 1 time(s)
+sync= evaluated its receiver 1 time(s)
+--- a closed socket
+socket addr: IOError: closed stream
+socket peeraddr: IOError: closed stream
+server addr: IOError: closed stream
+--- Dir
+dir close => nil
+dir path => "/tmp/sp_io_closed_stream_dir"
+dir inspect => "#<Dir:/tmp/sp_io_closed_stream_dir>"
+dir read: IOError: closed directory
+dir rewind: IOError: closed directory
+dir tell: IOError: closed directory
+dir pos: IOError: closed directory
+dir seek: IOError: closed directory
+dir pos=: IOError: closed directory
+dir fileno: IOError: closed directory
+dir each: IOError: closed directory
+dir each_child: IOError: closed directory
+dir children: IOError: closed directory
+dir entries: IOError: closed directory

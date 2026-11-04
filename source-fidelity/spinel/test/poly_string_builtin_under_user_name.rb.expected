@@ -1,0 +1,27 @@
+120
+7
+"xyz  "
+"  xyz"
+:"  xyz  "
+true
+true
+"  qyz  "
+"  qyz  "
+"  qyz  "
+"--  xyz  --"
+"  xyz  --"
+"--  xyz  "
+"xyz"
+["x"]
+#<MatchData "y">
+true
+32
+"  xyz  "
+true
+true
+["  x", "y", "z  "]
+["  x", "y", "z  "]
+:sock
+:sock
+:sock
+:sock

@@ -1,0 +1,14 @@
+false
+true
+true
+false
+false
+true
+true
+unlock: Attempt to unlock a mutex which is not locked
+relock: deadlock; recursive locking
+monitor depth ok
+16000
+false
+"woken"
+false

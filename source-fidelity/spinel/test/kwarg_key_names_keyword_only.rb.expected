@@ -1,0 +1,17 @@
+"wrong number of arguments (given 0, expected 1)"
+"unknown keyword: :x"
+"wrong number of arguments (given 0, expected 1; required keyword: k)"
+[5, 1]
+[1, 3]
+"wrong number of arguments (given 2, expected 1; required keyword: k)"
+"wrong number of arguments (given 0, expected 1; required keyword: k)"
+"wrong number of arguments (given 2, expected 1; required keyword: k)"
+"wrong number of arguments (given 0, expected 1; required keywords: a, b)"
+"wrong number of arguments (given 2, expected 1; required keywords: a, b)"
+"wrong number of arguments (given 2, expected 1)"
+"missing keyword: :k"
+"wrong number of arguments (given 0, expected 1; required keyword: k)"
+"missing keyword: :k"
+"wrong number of arguments (given 0, expected 1; required keyword: k)"
+"wrong number of arguments (given 0, expected 1)"
+"unknown keyword: :z"

@@ -1,0 +1,270 @@
+# Typing contract for the raw-SQL connection facade. Rows are
+# Hash[String, untyped] by design — raw SQL's row shape (aliased
+# aggregates, computed columns) is genuinely dynamic; see connection.rb.
+module ActiveRecord
+  module TimestampSwitches
+    def self.store: (String name, bool value) -> bool
+    def self.lookup: (String name) -> bool?
+  end
+
+  class Rollback < StandardError
+  end
+
+  module TransactionHooks
+    def self.began: () -> nil
+    def self.committed: () -> nil
+    def self.rolled_back: () -> nil
+  end
+
+  class IntegerKeyCast
+    @valid: bool
+    @value: Integer
+    def valid: () -> bool
+    def value: () -> Integer
+    def initialize: (bool valid, Integer value) -> void
+    def self.input_text: (Integer | Float | String | nil id) -> String
+    def self.parse: (Integer | Float | String | nil id) -> ::ActiveRecord::IntegerKeyCast
+    def self.number_start: (String text) -> Integer
+    def self.digit_value: (String char) -> Integer
+    def self.exceeds_limit: (String digits, String limit) -> bool
+  end
+
+  class Result
+    @rows: Array[Hash[String, untyped]]
+    @affected_rows: Integer
+
+    def initialize: (Array[Hash[String, untyped]] rows, ?Integer affected_rows) -> void
+    def affected_rows: () -> Integer
+    def columns: () -> Array[String]
+    def rows: () -> Array[Array[untyped]]
+    def to_a: () -> Array[Hash[String, untyped]]
+    def first: () -> Hash[String, untyped]?
+    def each: () { (Hash[String, untyped]) -> void } -> Array[Hash[String, untyped]]
+    def map: [U] () { (Hash[String, untyped]) -> U } -> Array[U]
+  end
+
+  class RawConnection
+    def self._rollback_savepoint: (String name) -> nil
+    def transaction: (?Symbol mode) { () -> untyped } -> untyped
+  end
+
+  class Connection
+    self.@shared: Connection?
+    def self.shared: () -> Connection
+    def adapter_name: () -> String
+    def quote: (String | Symbol | Integer | Float | bool | nil value) -> String
+    def quote_string: (String str) -> String
+    def execute: (String sql) -> Result
+    def select_rows: (String sql) -> Array[Array[untyped]]
+    def select_value: (String sql) -> untyped
+    def data_source_exists?: (String | Symbol name) -> bool
+    def column_exists?: (String | Symbol table, String | Symbol column) -> bool
+    def raw_connection: () -> RawConnection
+    def exec_query: (String sql) -> Result
+    def select_all: (String sql) -> Result
+    def exec_update: (String sql, ?String? name, ?Array[String | Integer | Float | bool | nil] binds) -> Integer
+    def exec_delete: (String sql, ?String? name, ?Array[String | Integer | Float | bool | nil] binds) -> Integer
+    def exec_insert: (String sql, ?String? name, ?Array[String | Integer | Float | bool | nil] binds) -> Result
+  end
+
+  class Transaction
+    def after_commit: (^() -> nil work) -> nil
+  end
+
+  class EnlistedRecord
+    @record: Base
+    @kind: Integer
+    def record: () -> Base
+    def kind: () -> Integer
+    def initialize: (Base record, Integer kind) -> void
+  end
+
+  class Relation
+    def lock: (?(bool | String)? locking) -> Relation
+    def create_or_find_by: (Hash[Symbol, untyped] conditions) -> Base
+    def create_or_find_by!: (Hash[Symbol, untyped] conditions) -> Base
+  end
+
+  class Base
+    def self.lock: (?(bool | String)? locking) -> Relation
+    def readonly?: () -> bool
+    def readonly!: () -> Base
+    def _raise_readonly_record_error: () -> nil
+    def assign_attributes: (Hash[String | Symbol, untyped] attributes) -> nil
+    def _assign_mass_attribute: (String name, untyped value) -> nil
+    def _unknown_mass_attribute: (String name) -> nil
+    def read_attribute: (Symbol name) -> untyped
+    def write_attribute: (Symbol name, untyped value) -> untyped
+    def slice: (*(Symbol | String | Array[Symbol | String]) names) -> Hash[String, untyped]
+    def saved_changes?: () -> bool
+    def attribute_in_database: (Symbol | String name) -> untyped
+    def self.schema_column_types: () -> Hash[Symbol, Symbol]
+    def self.type_for_attribute: (String name) -> ActiveRecord::Type::Value
+    def self.default_scoped: () -> Relation
+    # cache_key / cache_version / cache_key_with_version — see
+    # connection.rb for why these live in this ruby-family/Spinel-only
+    # reopen rather than base.rb.
+    def cache_key: () -> String
+    def cache_version: () -> String?
+    def cache_key_with_version: () -> String
+    # Request values stay intact until the schema-selected scalar adapter.
+    def self.find: (Integer | Float | String | nil id) -> Base
+    def self.find_by!: (Hash[String | Symbol, untyped] conditions) -> Base
+    def self._find_primary_key_input: (Integer | Float | String | nil id) -> Base?
+    def self._cast_primary_key: (Integer | Float | String | nil id) -> (Integer | String | nil)
+    def self.connection: () -> Connection
+    def self.sanitize_sql: (Array[untyped] statement) -> String
+    def self.sanitize_sql_array: (Array[untyped] statement) -> String
+    def self.sanitize_sql_for_order: (String condition) -> String
+    def self.current_transaction: () -> ActiveRecord::Transaction
+    def self._after_commit: (^() -> nil work) -> nil
+    def self._run_after_commits_from: (Integer from) -> nil
+    def self._drop_after_commits_from: (Integer from) -> nil
+    def self.uncached: () { () -> untyped } -> untyped
+    def self.clear_query_caches_for_current_thread: () -> nil
+    def self.transaction: (?isolation: untyped, ?requires_new: untyped, ?joinable: bool) { () -> untyped } -> untyped
+    def with_lock: (?(bool | String)? lock, ?isolation: untyped, ?requires_new: untyped, ?joinable: bool) { () -> untyped } -> untyped
+    def self.delete_all: () -> Integer
+    def self.update_counters: (Integer | String id, Hash[Symbol, untyped] counters) -> Integer
+    def self.upsert: (Hash[Symbol | String, untyped] attrs, ?unique_by: (String | Symbol | Array[Symbol | String]), ?on_duplicate: String?, ?update_only: (String | Symbol | Array[Symbol | String])?, ?returning: untyped, ?record_timestamps: bool?) -> ActiveRecord::Result
+    def self._conflict_predicate: (String columns) -> String
+    def self._unique_index_columns: (String name) -> String
+    def self._conflict_target: (String | Symbol | Array[Symbol | String] unique_by) -> Array[String]
+    def self._string_keyed_rows: (Array[Hash[Symbol | String, untyped]] rows) -> Array[Hash[String, untyped]]
+    def self._database_now_sql: () -> String
+    def self._same_value_sql: (String left, String right) -> String
+    def self._bulk_stamps: (Array[String] given, bool? record_timestamps) -> Array[Symbol]
+    def self.upsert_all: (Array[Hash[Symbol | String, untyped]] rows, ?unique_by: (String | Symbol | Array[Symbol | String]), ?on_duplicate: String?, ?update_only: (String | Symbol | Array[Symbol | String])?, ?returning: untyped, ?record_timestamps: bool?) -> ActiveRecord::Result
+    def self.insert_all: (Array[Hash[Symbol | String, untyped]] rows, ?unique_by: (String | Symbol | Array[Symbol | String])?, ?returning: untyped, ?record_timestamps: bool?) -> ActiveRecord::Result
+    def self.insert_all!: (Array[Hash[Symbol | String, untyped]] rows, ?returning: untyped, ?record_timestamps: bool?) -> ActiveRecord::Result
+    def self.insert: (Hash[Symbol | String, untyped] attrs, ?unique_by: (String | Symbol | Array[Symbol | String])?, ?returning: untyped, ?record_timestamps: bool?) -> ActiveRecord::Result
+    def self.insert!: (Hash[Symbol | String, untyped] attrs, ?returning: untyped, ?record_timestamps: bool?) -> ActiveRecord::Result
+    def self._returned_rows: (String sql) -> Array[Hash[String, untyped]]
+    def self._insert_rows: (Array[Hash[Symbol | String, untyped]] rows, bool skip_duplicates, (String | Symbol | Array[Symbol | String])? unique_by, untyped returning, bool? record_timestamps) -> ActiveRecord::Result
+    def self.composite_primary_key?: () -> bool
+    def self.record_timestamps=: (bool value) -> bool
+    def self.record_timestamps: () -> bool
+    def stamps_timestamps?: () -> bool
+    def update_column: (String | Symbol name, untyped value) -> bool
+    def update_attribute: (String | Symbol name, untyped value) -> bool
+    def _run_save_callbacks: () ?{ () -> untyped } -> untyped
+    def _run_create_callbacks: () ?{ () -> untyped } -> untyped
+    def _run_update_callbacks: () ?{ () -> untyped } -> untyped
+    def _run_destroy_callbacks: () ?{ () -> untyped } -> untyped
+    def _run_validation_callbacks: () ?{ () -> untyped } -> untyped
+    def update_columns: (Hash[Symbol | String, untyped] attributes) -> bool
+    def delete: () -> Base
+    def _as_json_only: (Array[Symbol] only) -> Hash[String, untyped]
+    # Nil and uncastable request keys reject before the scalar adapter.
+    # Not `?id`: the def takes `*ids`, and spinel types a positional field by the def's own slot.
+    def self.exists?: (*(Integer | Float | String | Hash[String | Symbol, untyped] | nil) ids) -> bool
+    def self._exists_primary_key_input: (Integer | Float | String | nil id) -> bool
+    # Ruby-family overrides of base.rb's Array / COUNT fallbacks.
+    def self.where: (?(Hash[String | Symbol, untyped] | String | nil) condition, *untyped args) -> Relation
+    def self.find_by: (Hash[String | Symbol, untyped] | String | nil conditions) -> Base?
+    def self.find_sole_by: (Hash[String | Symbol, untyped] conditions) -> Base
+    def self.find_or_initialize_by: (Hash[Symbol, untyped] conditions) -> Base
+    def self.find_or_create_by: (Hash[Symbol, untyped] conditions) -> Base
+    def self.find_or_create_by!: (Hash[Symbol, untyped] conditions) -> Base
+    def self.create_or_find_by: (Hash[Symbol, untyped] conditions) -> Base
+    def self.create_or_find_by!: (Hash[Symbol, untyped] conditions) -> Base
+    def self.sole: () -> Base
+    def self.delete_by: (Hash[Symbol, untyped] | String conditions) -> Integer
+    def self.destroy_by: (Hash[Symbol, untyped] | String conditions) -> Array[Base]
+    def self.distinct: (?(bool | Symbol | String) value) -> Relation
+    def self.eager_load: (*(Symbol | Hash[Symbol, Symbol | EagerFilter]) names) -> Relation
+    def self.excluding: (*untyped records) -> Relation
+    def self.find_each: () { (Base) -> void } -> Relation
+    def self.find_in_batches: () { (Array[Base]) -> void } -> Relation
+    def self.first_or_initialize: () -> Base
+    def self.first!: () -> Base
+    def self.from: (String source) -> Relation
+    def self.group: (*(String | Symbol) parts) -> Relation
+    def self.having: (String condition, *untyped args) -> Relation
+    def self.ids: () -> Array[Integer]
+    def self.includes: (*(Symbol | Hash[Symbol, Symbol | EagerFilter]) names) -> Relation
+    def self.joins: (*(String | Symbol) specs) -> Relation
+    def self.left_joins: (*(String | Symbol) specs) -> Relation
+    def self.left_outer_joins: (*(String | Symbol) specs) -> Relation
+    def self.limit: (Integer | Float | String | nil n) -> Relation
+    def self.many?: () -> bool
+    def self.maximum: (String | Symbol expr) -> untyped
+    def self.merge: (Relation other) -> Relation
+    def self.minimum: (String | Symbol expr) -> untyped
+    def self.offset: (Integer | String | nil n) -> Relation
+    def self.one?: () -> bool
+    def self.or: (Relation other) -> Relation
+    def self.order: (*(String | Symbol | Hash[Symbol, Symbol | Hash[Symbol, Symbol]]) parts) -> Relation
+    def self.pick: (String | Symbol col) -> untyped
+    def self.pluck: (String | Symbol col) -> Array[untyped]
+    def self.preload: (*(Symbol | Hash[Symbol, Symbol | EagerFilter]) names) -> Relation
+    def self.references: (*Symbol names) -> Relation
+    def self.reorder: (*(String | Symbol | Hash[Symbol, Symbol | Hash[Symbol, Symbol]]) parts) -> Relation
+    def self.select: (*(String | Symbol) specs) -> Relation
+    def self.sum: (String | Symbol expr) -> Float
+    def self.touch_all: (?Symbol? name) -> Integer
+    def self.unscope: (?where: Symbol | String | Array[Symbol | String]?) -> Relation
+    def self.update_all: (Hash[Symbol, untyped] | String updates) -> Integer
+    def self.with_recursive: (Hash[Symbol, Array[Relation]] ctes) -> Relation
+    def self.without: (*untyped records) -> Relation
+    def self.all: () -> Relation
+    def self.unscoped: () ?{ () -> untyped } -> untyped
+    def self._default_scope_where: () -> Hash[Symbol, untyped]
+    def self._find_in_scope: (Integer | Float | String | nil id) -> Base?
+    def self.count: () -> Integer
+    def self.last: () -> Base?
+    def self.destroy_all: () -> Array[Base]
+    def self.none: () -> Relation
+    def self.page: (?(Integer | String | nil) num) -> Relation
+    def self.in_batches: (?of: Integer, ?order: Symbol?) ?{ (Relation) -> void } -> Relation
+    def self.paginate: (?(Integer | String | nil) num, ?page: (Integer | String | nil), ?per_page: (Integer | String | nil)) -> Relation
+    def self.any?: () -> bool
+    def self.none?: () -> bool
+    def _note_hydrated: () -> void
+    def _note_unloaded: (Hash[String, untyped] row) -> nil
+    def has_attribute?: (Symbol name) -> bool
+    def attribute_previously_was: (String name) -> untyped
+    def self.first: () -> Base?
+    def self.take: () -> Base?
+    def self._hydrate_all: (String sql) -> Array[Base]
+    def self._adapter_all: () -> Array[Base]
+    def self._adapter_find_by_id: (Integer id) -> Base?
+    def self.decode_plucked: (String | Symbol column, untyped value) -> untyped
+    def save: () -> bool
+    def valid?: () -> bool
+    def save!: () -> Base
+    def destroy: () -> (Base | false)
+    def destroy!: () -> Base
+    def save_after_validation: () -> bool
+    def _halted_by_abort: () { () -> untyped } -> bool
+    def touch: () -> bool
+    def touch_written: () -> bool
+    def _note_touched: () -> nil
+    @__touch_owner: Base?
+    def _adopt_touch_owner: (Base owner) -> nil
+    def _touch_owner: () -> nil
+    def touch_later: () -> bool
+    def self._flush_deferred_touches: () -> nil
+    def self._flush_deferred_touches_from: (Integer from) -> nil
+    def _save_committed: (bool was_new) -> void
+    def _destroy_committed: () -> void
+    def _enlist_or_run: (Integer kind) -> nil
+    def _enlist_write: (Integer kind) -> nil
+    def _forget_rollback_state: () -> nil
+    def _run_commit_callbacks: (Integer kind) -> nil
+    def self._txn_parent_joinable?: (Integer depth) -> bool
+    def self._txn_note_joinable: (Integer depth, bool joinable) -> nil
+    def self._commit_enlisted: () -> nil
+    def self._take_enlisted: (Integer from) -> Array[ActiveRecord::EnlistedRecord]?
+    def self._commit_enlisted_from: (Integer from) -> nil
+    def self._rollback_enlisted: (Integer from) -> nil
+    def _restore_after_rollback: (Integer kind) -> nil
+    # Ruby-family overrides of base.rb's dirty-tracking stubs.
+    def __track_saved_changes: (bool was_new) -> void
+    def saved_changes: () -> Hash[String, untyped]
+    def changes_to_save: () -> Hash[String, untyped]
+    def attribute_was: (String name) -> untyped
+    def clear_attribute_change: (String name) -> nil
+    def restore_attribute!: (String name) -> nil
+  end
+end

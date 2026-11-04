@@ -1,0 +1,390 @@
+//! ActionView view-context surface: the `FormBuilder`, the mime-responds
+//! `Collector`, the `ActionView::Base` flat-helper accumulator (links, tags,
+//! flash accessors, jbuilder `json`, route helpers, paginate, simple_form,
+//! and the app/helpers fold), and the `ActionDispatch::Flash::FlashHash`
+//! class. Extracted verbatim from `Analyzer::with_adapter`.
+
+use std::collections::BTreeSet;
+use crate::det::HashMap;
+
+use crate::analyze::ClassInfo;
+use crate::expr::{ExprNode, Literal};
+use crate::App;
+use crate::ident::{ClassId, Symbol};
+use crate::ty::Ty;
+
+// The index also contains singleton defs and promoted module functions.
+// Only a retained instance body overrides the catalog's instance return;
+// the other spellings keep their existing concern-fold behavior.
+pub(in crate::analyze) fn has_instance_helper(app: &App, name: &Symbol, owner: &ClassId) -> bool {
+    app.library_classes.iter().any(|class| &class.name == owner && class.methods.iter().any(|method| {
+        &method.name == name && method.receiver == crate::dialect::MethodReceiver::Instance
+    })) || app.controllers.iter().any(|controller| {
+        &controller.name == owner && controller.actions().any(|action| &action.name == name)
+    })
+}
+
+pub(in crate::analyze) fn register(
+    classes: &mut HashMap<ClassId, ClassInfo>,
+    app: &App,
+    route_helper_names: &[String],
+) {
+    // ActionView form builder — `form_with do |form| form.text_field
+    // ... end`. `form_with` yields a FormBuilder whose field helpers
+    // render to strings (`ActiveSupport::SafeBuffer`, modeled as Str).
+    // Registered so both the block param AND the per-field calls type:
+    // once `form` is a FormBuilder, an unregistered `form.x` would be a
+    // dispatch *error*, so the field surface is covered here.
+    let form_builder_id = ClassId(Symbol::from("ActionView::Helpers::FormBuilder"));
+    let form_builder_ty = Ty::Class { id: form_builder_id.clone(), args: vec![].into() };
+    let mut form_builder = ClassInfo::default();
+    for m in [
+        "label", "submit", "button", "text_field", "text_area", "textarea",
+        "hidden_field", "password_field", "email_field", "number_field",
+        "url_field", "tel_field", "telephone_field", "phone_field",
+        "search_field", "color_field", "range_field", "date_field",
+        "time_field", "datetime_field", "datetime_local_field", "month_field",
+        "week_field", "file_field", "check_box", "radio_button", "select",
+        "collection_select", "grouped_collection_select", "time_zone_select",
+        "collection_check_boxes", "collection_radio_buttons", "date_select",
+        "time_select", "datetime_select", "rich_text_area", "weekday_select",
+        // Rails 7.1 renamed the Action Text builder method (the guide
+        // uses the new spelling) and `check_box`; both spellings live.
+        "rich_textarea", "checkbox",
+        "id", "to_s",
+    ] {
+        form_builder.instance_methods.insert(Symbol::from(m), Ty::Str);
+    }
+    // `form.object` is the form's model (unknown model → gradual);
+    // nested `fields_for`/`fields` yield another builder.
+    form_builder.instance_methods.insert(Symbol::from("object"), Ty::Untyped);
+    for m in ["fields_for", "fields"] {
+        form_builder
+            .instance_methods
+            .insert(Symbol::from(m), super::block_fn(&form_builder_ty, Ty::Str));
+    }
+    classes.insert(form_builder_id, form_builder);
+
+    // `respond_to do |format| format.html { } format.json { } end` —
+    // the block yields a mime Collector whose format methods return
+    // nil. (`respond_to` itself is registered on ApplicationController.)
+    let mut collector = ClassInfo::default();
+    for m in collector_format_names() {
+        collector.instance_methods.insert(Symbol::from(m.as_str()), Ty::Nil);
+    }
+    classes.insert(
+        ClassId(Symbol::from("ActionController::MimeResponds::Collector")),
+        collector,
+    );
+
+    // View context — the `self` a view body types against. `form_with`
+    // lives here (flat view helpers — `link_to`/`render`/… — will join
+    // it); the view loops set this as `self_ty` so implicit-self helper
+    // calls dispatch against it.
+    // Route URL helper names from the ingested route table — one
+    // `<as_name>_path` / `<as_name>_url` per named route (same flattening
+    // the route emitters use). Registered on the view context,
+    // ApplicationController, and library classes below. See
+    // `registry::routes`.
+
+    let mut action_view = ClassInfo::default();
+    action_view
+        .instance_methods
+        .insert(Symbol::from("form_with"), super::block_fn(&form_builder_ty, Ty::Str));
+    // Flat view helpers — links, tags, asset/meta tags, text and number
+    // formatting, dom ids, render, turbo helpers. All render to strings
+    // (`ActiveSupport::SafeBuffer`, modeled as Str), so the implicit-self
+    // call types and any `.html_safe`/`.gsub`/etc. chained on the result
+    // resolves through `str_method`. (Route helpers `*_path`/`*_url`,
+    // flash `notice`/`alert`, and jbuilder `json` are registered
+    // elsewhere.)
+    for helper in [
+        // links / urls
+        "link_to", "button_to", "link_to_if", "link_to_unless",
+        "link_to_unless_current", "mail_to", "url_for",
+        // tags / assets / meta
+        "content_tag", "image_tag", "image_url", "image_path",
+        "video_tag", "audio_tag", "asset_path", "asset_url",
+        "favicon_link_tag", "stylesheet_link_tag", "stylesheet_path",
+        "javascript_include_tag", "javascript_path",
+        "javascript_importmap_tags", "javascript_tag",
+        "stylesheet_pack_tag", "javascript_pack_tag", "csrf_meta_tags",
+        "csrf_meta_tag", "csp_meta_tag", "auto_discovery_link_tag",
+        "preload_link_tag", "action_cable_meta_tag",
+        "content_security_policy_nonce",
+        // text / number formatting
+        "pluralize", "truncate", "simple_format", "highlight", "excerpt",
+        "word_wrap", "sanitize", "sanitize_css", "strip_tags",
+        "strip_links", "raw", "h", "html_escape", "concat", "safe_join",
+        // A `.builder` template's text / attribute escapes (`crate::builder`).
+        "builder_text", "builder_attr",
+        "cycle", "current_cycle", "number_to_currency", "number_to_human",
+        "number_to_human_size", "number_to_percentage", "number_to_phone",
+        "number_with_delimiter", "number_with_precision",
+        // dates
+        "time_ago_in_words", "distance_of_time_in_words",
+        "distance_of_time_in_words_to_now",
+        // i18n — the view-side translate/localize helpers (delegate
+        // to I18n; lazy-lookup `t(".key")` included). Str like the
+        // rest of the SafeBuffer-rendering surface.
+        "t", "translate", "l", "localize",
+        // Our own HAML lowering's dynamic-attribute helper
+        // (`%div{opengraph_tags}` → `render_attrs(…)`, see
+        // src/haml.rs) — renders an attribute string.
+        "render_attrs",
+        // Our own HAML lowering's shortcut-class merge helper
+        // (`.g{ class: k }` → `render_attrs({ class: haml_class("g", k)
+        // })`, see src/haml.rs) — renders the merged class string.
+        "haml_class",
+        // dom / rendering / capture
+        "dom_id", "dom_class", "render", "render_to_string", "capture",
+        "content_for", "provide", "escape_javascript", "j",
+        // fragment caching: `cache @product do … end` renders the block
+        // (or the cached fragment) — a String either way.
+        "cache", "cache_if", "cache_unless", "uncached",
+        // turbo / hotwire
+        "turbo_frame_tag", "turbo_stream_from", "turbo_refreshes_with",
+        "turbo_include_tags", "turbo_page_requires_reload",
+        // The rest of Turbo::DriveHelper, beside the two members that
+        // were already here. All four deposit into `:head` and render
+        // nothing; `src/lower/view_to_library/turbo_drive.rs` expands
+        // them away before emit, so what they are typed as never
+        // reaches a target — they are listed to be RESOLVED.
+        "turbo_exempts_page_from_preview", "turbo_exempts_page_from_cache",
+        // form option builders + FormTagHelper (all render to SafeBuffer
+        // strings, like the tag helpers above).
+        "options_for_select", "options_from_collection_for_select",
+        "option_groups_from_collection_for_select", "grouped_options_for_select",
+        "time_zone_options_for_select", "collection_select",
+        "form_tag", "label_tag", "text_field_tag", "password_field_tag",
+        "hidden_field_tag", "text_area_tag", "check_box_tag",
+        "radio_button_tag", "select_tag", "submit_tag", "button_tag",
+        "field_set_tag", "file_field_tag", "email_field_tag",
+        "number_field_tag", "search_field_tag", "telephone_field_tag",
+        "url_field_tag", "date_field_tag", "color_field_tag",
+        "fields_for", "token_list", "class_names",
+        // controller/request context exposed to views (and controllers,
+        // registered there too) — both return the current name as Str.
+        "action_name", "controller_name", "controller_path",
+    ] {
+        action_view
+            .instance_methods
+            .entry(Symbol::from(helper))
+            .or_insert(Ty::Str);
+    }
+    // `tag` is the dynamic TagBuilder — `tag.div`/`tag.details` build an
+    // element from the *method name*, so no fixed method table fits.
+    // Typed as the builder class, whose dispatch rule (send.rs, beside
+    // the StringInquirer one) answers every method as the String it
+    // renders; `tag("br")`, the call form, is the same String.
+    action_view.instance_methods.insert(
+        Symbol::from("tag"),
+        Ty::Class { id: ClassId(Symbol::from("ActionView::Helpers::TagHelper::TagBuilder")), args: vec![].into() },
+    );
+    // Flash convenience accessors — Rails 7 scaffolds emit bare
+    // `notice`/`alert` in views; both read `flash[:notice]`/`[:alert]`.
+    // Typed Str (not Str|Nil): consistent with the other Str-returning
+    // helpers, and a nilable here trips Crystal's strict nil-concat
+    // narrowing in `<%= notice %>`. `.present?` still resolves on Str.
+    for m in ["notice", "alert"] {
+        action_view.instance_methods.insert(Symbol::from(m), Ty::Str);
+    }
+    // `flash` — the FlashHash. Bare `flash` was unmodeled, so
+    // `flash[:error]` / `flash.now[:error]` / `flash.each` / `flash.keep`
+    // (pervasive in controllers and views) all bottomed out at Var. Type
+    // it as a FlashHash whose surface is registered below; both the view
+    // (instance) and controller (class-side) contexts get it.
+    let flash_ty = Ty::Class {
+        id: ClassId(Symbol::from("ActionDispatch::Flash::FlashHash")),
+        args: vec![].into(),
+    };
+    action_view
+        .instance_methods
+        .insert(Symbol::from("flash"), flash_ty.clone());
+    // jbuilder's `json` builder (in `*.json.jbuilder` views): every
+    // `json.<field>` is a key write by METHOD NAME, so no fixed table
+    // fits. Typed as the builder class, whose dispatch rule (send.rs,
+    // beside TagBuilder's) mirrors Jbuilder's own semantics — a field
+    // write answers its value, a block form the object it built, the
+    // builder mutations (`extract!`, `partial!`, …) nil.
+    action_view.instance_methods.insert(
+        Symbol::from("json"),
+        Ty::Class { id: ClassId(Symbol::from("Jbuilder")), args: vec![].into() },
+    );
+    // Route URL helpers (view side).
+    for name in route_helper_names {
+        action_view
+            .instance_methods
+            .entry(Symbol::from(name.as_str()))
+            .or_insert(Ty::Str);
+    }
+    // View-side paginator helper renders to a SafeBuffer string,
+    // like the tag helpers above.
+    action_view
+        .instance_methods
+        .entry(Symbol::from("paginate"))
+        .or_insert(Ty::Str);
+    // will_paginate's view helper — same shape (the Rails tutorial's
+    // `<%= will_paginate %>`), plus its `page_entries_info` caption.
+    for m in ["will_paginate", "page_entries_info"] {
+        action_view
+            .instance_methods
+            .entry(Symbol::from(m))
+            .or_insert(Ty::Str);
+    }
+    // `local_assigns` — the locals a render passed, as a Hash. Its
+    // values are whatever the site passed, so the read is gradual.
+    action_view.instance_methods.insert(
+        Symbol::from("local_assigns"),
+        Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(Ty::Untyped) },
+    );
+    // `params` is exposed to templates too (same strong-params
+    // surface the controller context declares).
+    action_view.instance_methods.insert(
+        Symbol::from("params"),
+        Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(Ty::Str) },
+    );
+    // SimpleForm's form builder — same shape as `form_with` but the
+    // yielded builder (`f.input`, `f.association`, …) is a SimpleForm
+    // class we don't model structurally, so the block param is the
+    // gradual escape: `f.input :name` flows through instead of
+    // bottoming out unresolved.
+    for m in ["simple_form_for", "simple_fields_for"] {
+        action_view
+            .instance_methods
+            .entry(Symbol::from(m))
+            .or_insert_with(|| super::block_fn(&Ty::Untyped, Ty::Str));
+    }
+    // Rails mixes app helpers into every view (`helpers :all` default).
+    // Keep their includes for context, but the helper index selects each
+    // method's owner. Until harvest_returns_to_registry projects that
+    // owner's return, calls are gradual, not the framework's answer or
+    // another module's signature selected by the generic concern fold.
+    for (name, owner) in &app.helper_method_index {
+        if has_instance_helper(app, name, owner) {
+            action_view.instance_methods.insert(name.clone(), Ty::Untyped);
+        }
+    }
+    let helper_modules: BTreeSet<ClassId> =
+        app.helper_method_index.values().cloned().collect();
+    action_view.includes.extend(helper_modules);
+    classes.insert(ClassId(Symbol::from("ActionView::Base")), action_view);
+
+    // `ActionView::ViewHelpers` itself, called by its constant — the
+    // spelling generated templates use (a `.builder` feed's escapes,
+    // `crate::builder`). Its surface is the runtime module's own
+    // signatures, read rather than restated, so the analyzer knows
+    // exactly what every lane ships.
+    {
+        const RBS: &str = include_str!("../../../runtime/ruby/action_view/view_helpers.rbs");
+        if let Ok(parsed) = crate::rbs::parse_app_signatures(RBS) {
+            let id = ClassId(Symbol::from("ActionView::ViewHelpers"));
+            if let Some(methods) = parsed.get(&id) {
+                let cls = classes.entry(id).or_default();
+                for (m, ty) in methods {
+                    cls.class_methods.entry(m.clone()).or_insert_with(|| ty.clone());
+                }
+            }
+        }
+    }
+
+    // The FlashHash returned by `flash`. Values are messages (Str); `now`
+    // is the same hash scoped to this request (so `flash.now[:x]` types);
+    // `notice`/`alert`/`error`/`success` are the convenience readers Rails
+    // generates; `keep`/`discard`/`each` return the hash for chaining;
+    // predicates and `[]` round out the surface. Lookups not listed fall
+    // through to "no known method" — extend as the corpus demands.
+    {
+        let mut flash = ClassInfo::default();
+        let flash_self = Ty::Class {
+            id: ClassId(Symbol::from("ActionDispatch::Flash::FlashHash")),
+            args: vec![].into(),
+        };
+        for (m, ty) in [
+            ("[]", Ty::Str),
+            ("[]=", Ty::Nil),
+            ("store", Ty::Nil),
+            ("now", flash_self.clone()),
+            ("notice", Ty::Str),
+            ("alert", Ty::Str),
+            ("error", Ty::Str),
+            ("success", Ty::Str),
+            ("notice=", Ty::Str),
+            ("alert=", Ty::Str),
+            ("delete", Ty::Str),
+            ("keep", flash_self.clone()),
+            ("discard", flash_self.clone()),
+            ("each", flash_self.clone()),
+            ("each_pair", flash_self.clone()),
+            ("clear", flash_self.clone()),
+            ("update", flash_self.clone()),
+            ("merge!", flash_self.clone()),
+            ("key?", Ty::Bool),
+            ("has_key?", Ty::Bool),
+            ("include?", Ty::Bool),
+            ("any?", Ty::Bool),
+            ("empty?", Ty::Bool),
+            ("present?", Ty::Bool),
+            ("blank?", Ty::Bool),
+            ("keys", Ty::Array { elem: std::sync::Arc::new(Ty::Sym) }),
+            ("values", Ty::Array { elem: std::sync::Arc::new(Ty::Str) }),
+            ("to_h", Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(Ty::Str) }),
+            ("to_hash", Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(Ty::Str) }),
+        ] {
+            flash.instance_methods.insert(Symbol::from(m), ty);
+        }
+        classes.insert(
+            ClassId(Symbol::from("ActionDispatch::Flash::FlashHash")),
+            flash,
+        );
+    }
+}
+
+/// The format names `respond_to`'s Collector answers.
+///
+/// Rails' Collector has no such methods: it responds to a format
+/// through `method_missing`, driven by the MIME registry, so the set is
+/// whatever has been registered. The analyzer still enumerates it —
+/// enumerating is what makes an unregistered format a REPORTED gap
+/// instead of a silent pass, which is the property the ledger is for.
+///
+/// But the enumeration is DERIVED, not hand-kept. `runtime/ruby/mime.rb`
+/// already carries actionpack's registry, ported from its own
+/// `mime_types.rb` rather than retyped; reading its `SYMBOLS` table here
+/// means the analyzer's idea of "a format Rails answers" cannot drift
+/// from the runtime's. A second hand-kept list is exactly how
+/// `format.turbo_stream` came to read as a dispatch failure in an app
+/// whose views and broadcasts handled Turbo Streams fine (issue #74).
+fn collector_format_names() -> Vec<String> {
+    // `turbo_stream` is registered by turbo-rails, not actionpack, so it
+    // is not in the ported table — and it is the format a Rails 8 app
+    // reaches for most after html. `any`/`all`/`none` are the
+    // Collector's OWN methods, not MIME types at all.
+    let mut names: Vec<String> =
+        ["turbo_stream", "any", "all", "none"].iter().map(|s| s.to_string()).collect();
+    let consts = crate::runtime_src::parse_module_constant_exprs(include_str!(
+        "../../../runtime/ruby/mime.rb"
+    ))
+    .expect("runtime/ruby/mime.rb should parse");
+    let (_, table) = consts
+        .into_iter()
+        .find(|(n, _)| n.as_str() == "SYMBOLS")
+        .expect("runtime/ruby/mime.rb should define SYMBOLS");
+    let ExprNode::Hash { entries, .. } = &*table.node else {
+        panic!("mime.rb's SYMBOLS should be a Hash literal");
+    };
+    // Loud rather than graceful on all three steps above: the file is
+    // compiled in, so the only way any of them fails is that the shipped
+    // runtime changed shape. Degrading to a partial set would strip
+    // `html` and `json` off the Collector and turn every `respond_to` in
+    // every app into a dispatch failure — a far quieter, far worse
+    // outcome than a build the tests catch.
+    for (_, v) in entries {
+        if let ExprNode::Lit { value: Literal::Sym { value: sym } } = &*v.node {
+            names.push(sym.as_str().to_string());
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}

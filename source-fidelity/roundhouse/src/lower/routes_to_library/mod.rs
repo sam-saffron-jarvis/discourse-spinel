@@ -1,0 +1,2396 @@
+//! Lower the flattened route table into a `RouteHelpers` LibraryClass
+//! with one class method per named route. Bodies are typed
+//! `StringInterp` expressions that build the path from the typed
+//! `:param` segments — `article_path(id: Integer) -> String` produces
+//! `"/articles/#{id}"`. The runtime previously hand-shipped this
+//! shape; producing it from `app.routes` keeps it in sync with
+//! `config/routes.rb` and removes the per-app stub.
+//!
+//! Self-describing IR: each path-param is typed (`Int` for `id`-shape
+//! params, `Str` otherwise) and each method's signature is recorded
+//! up front. The TS emitter renders these as `static` methods returning
+//! `string`; downstream targets get the same shape.
+//!
+//! Module-shaped (no inheritance, no instance state) so it emits the
+//! same way under every target's class-vs-module distinction.
+
+pub mod direct;
+
+use crate::App;
+use crate::dialect::{HttpMethod, LibraryFunction, Param};
+use crate::effect::EffectSet;
+use crate::expr::{ArrayStyle, Expr, ExprNode, InterpPart, Literal};
+use crate::ident::{ClassId, Symbol, VarId};
+use crate::lower::routes::{flatten_routes, flatten_routes_for_helpers, FlatRoute};
+use crate::lower::typing::{fn_sig, lit_str, lit_sym, with_ty};
+use crate::span::Span;
+use crate::ty::Ty;
+
+/// Build the `Routes` dispatch module — `RouteTable.table -> Array<Route>`
+/// (one `Route` instance per concrete `(verb, pattern, controller,
+/// action)`) and `RouteTable.root -> Route` (the shorthand `root "c#a"`
+/// route, when present). Empty when `app.routes` has no entries.
+///
+/// Each entry is `ActionDispatch::Router::Route.new(...)` — a typed
+/// class with `verb`/`pattern`/`controller`/`action` accessors —
+/// rather than a `Hash[Symbol, untyped]`. Strict-typed targets (Rust,
+/// Crystal) get a real per-field type at every access; permissive
+/// targets (TS, Ruby) keep working without runtime change.
+///
+/// Separate from `RouteHelpers` (URL-helper functions like
+/// `article_path(id)`) because the two artifacts serve different
+/// consumers: helpers are called from view + controller bodies,
+/// dispatch is read at startup by the HTTP router.
+pub fn lower_routes_to_dispatch_functions(app: &App) -> Vec<LibraryFunction> {
+    let flat = flatten_routes(app);
+    let mounts = super::rack_mounts::mounts(app);
+    if flat.is_empty() && mounts.is_empty() {
+        return Vec::new();
+    }
+    let module_path = vec![Symbol::from("RouteTable")];
+    // The first route on path "/" (the `root`, when the app has one)
+    // goes to `RouteTable.root`, every other route to `RouteTable.table`.
+    // Callers combine them at use site (`[RouteTable.root] +
+    // RouteTable.table`). Only the first: Rails matches on verb AND
+    // path, so a `match "/", via: %i[post delete]` beside a `root` (or
+    // the second verb of that `match`) is a route of its own, and it
+    // stays in the table in declaration order.
+    let root_index = flat.iter().position(|r| r.path == "/");
+    let root_routes: Vec<&FlatRoute> = root_index.map(|i| &flat[i]).into_iter().collect();
+    let table_routes: Vec<&FlatRoute> =
+        flat.iter().enumerate().filter(|(i, _)| Some(*i) != root_index).map(|(_, r)| r).collect();
+
+    let route_class_id = ClassId(Symbol::from("ActionDispatch::Router::Route"));
+    let route_ty = Ty::Class {
+        id: route_class_id.clone(),
+        args: vec![].into(),
+    };
+
+    let mut out: Vec<LibraryFunction> = Vec::new();
+
+    let table_body = with_ty(
+        Expr::new(
+            Span::synthetic(),
+            ExprNode::Array {
+                elements: table_routes
+                    .iter()
+                    .map(|r| build_route_new(r, &route_class_id, &route_ty))
+                    .collect(),
+                style: ArrayStyle::Brackets,
+            },
+        ),
+        Ty::Array { elem: std::sync::Arc::new(route_ty.clone()) },
+    );
+    out.push(LibraryFunction {
+        module_path: module_path.clone(),
+        name: Symbol::from("table"),
+        params: Vec::new(),
+        unsupported_formals: None,
+        has_anonymous_block: false,
+        body: table_body,
+        signature: Some(fn_sig(
+            vec![],
+            Ty::Array { elem: std::sync::Arc::new(route_ty.clone()) },
+        )),
+        effects: EffectSet::default(),
+        is_async: false,
+    });
+
+    if let Some(r) = root_routes.first() {
+        let root_body = build_route_new(r, &route_class_id, &route_ty);
+        // Where the root was declared among the table's routes: route
+        // generation (the test helper's `assert_generates`) breaks a
+        // tie by declaration order, so `root "articles#index"` declared
+        // first generates "/" for articles#index, as in Rails.
+        let position = root_index.unwrap_or(table_routes.len()) as i64;
+        out.push(LibraryFunction {
+            module_path: module_path.clone(),
+            name: Symbol::from("root_position"),
+            params: Vec::new(),
+            unsupported_formals: None,
+            has_anonymous_block: false,
+            body: with_ty(Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Int { value: position } }), Ty::Int),
+            signature: Some(fn_sig(vec![], Ty::Int)),
+            effects: EffectSet::default(),
+            is_async: false,
+        });
+        out.push(LibraryFunction {
+            module_path: module_path.clone(),
+            name: Symbol::from("root"),
+            params: Vec::new(),
+            unsupported_formals: None,
+            has_anonymous_block: false,
+            body: root_body,
+            signature: Some(fn_sig(vec![], route_ty.clone())),
+            effects: EffectSet::default(),
+            is_async: false,
+        });
+    }
+
+    if !mounts.is_empty() {
+        for (index, mount) in mounts.iter().enumerate() {
+            out.push(rack_route_array(
+                &format!("rack_routes_before_{index}"), mount.preceding.iter(),
+                &route_class_id, &route_ty,
+            ));
+        }
+        out.push(rack_route_array(
+            "rack_head_routes", flat.iter().filter(|route| route.method == HttpMethod::Head),
+            &route_class_id, &route_ty,
+        ));
+    }
+    out
+}
+
+/// Reuse the controller route constructor, including all its requirements.
+fn rack_route_array<'a>(
+    name: &str, routes: impl Iterator<Item = &'a FlatRoute>,
+    class: &ClassId, route_ty: &Ty,
+) -> LibraryFunction {
+    let ty = Ty::Array { elem: std::sync::Arc::new(route_ty.clone()) };
+    LibraryFunction {
+        module_path: vec![Symbol::from("RouteTable")], name: Symbol::from(name),
+        params: Vec::new(), unsupported_formals: None, has_anonymous_block: false,
+        body: with_ty(Expr::new(Span::synthetic(), ExprNode::Array {
+            elements: routes.map(|route| build_route_new(route, class, route_ty)).collect(),
+            style: ArrayStyle::Brackets,
+        }), ty.clone()),
+        signature: Some(fn_sig(vec![], ty)), effects: EffectSet::default(), is_async: false,
+    }
+}
+
+/// Build `ActionDispatch::Router::Route.new("GET", "/x", :articles,
+/// :index)`. Per-field types are baked into the Route class definition
+/// in `runtime/ruby/action_dispatch/router.rb` (and its RBS sidecar),
+/// so strict-typed targets resolve each accessor against its declared
+/// type rather than an untyped value channel. Positional (not kwarg)
+/// args — per-target emitters convert kwarg-style def to positional
+/// pub fn but don't unpack kwarg-style call sites; matches the
+/// positional `initialize` signature.
+fn build_route_new(r: &FlatRoute, class_id: &ClassId, route_ty: &Ty) -> Expr {
+    let verb_str = match r.method {
+        HttpMethod::Get => "GET",
+        HttpMethod::Post => "POST",
+        HttpMethod::Put => "PUT",
+        HttpMethod::Patch => "PATCH",
+        HttpMethod::Delete => "DELETE",
+        HttpMethod::Head => "HEAD",
+        HttpMethod::Options => "OPTIONS",
+        HttpMethod::Any => "ANY",
+    };
+    let controller_sym = controller_symbol(r.controller.0.as_str());
+    let mut args = vec![
+        lit_str(verb_str.to_string()),
+        lit_str(crate::lower::segment_pattern::dispatch_path(&r.path, &r.seg_patterns)),
+        lit_sym(Symbol::from(controller_sym)),
+        lit_sym(r.action.clone()),
+    ];
+    // Route-forced format rides as the optional 5th positional
+    // (`Route.new(..., :rss)`); format-free routes stay 4-arg so
+    // existing route tables emit byte-identical.
+    if let Some(fmt) = &r.format {
+        args.push(lit_sym(fmt.clone()));
+    }
+    // Digit-constrained params ride as the optional 6th positional, a
+    // single space-joined string (`Route.new(..., nil, "id")`) — the
+    // router rejects candidate segments that aren't all digits (Roda
+    // `Integer` matcher, Rails digit-class `constraints:`). A scalar
+    // `String` (not `Array[String]`) keeps the optional tail one type
+    // across strict/AOT targets; constraint-free routes keep their
+    // 4-/5-arg shape.
+    let seg_constraints = crate::lower::segment_pattern::encode_route_constraints(&r.seg_patterns);
+    if !r.int_params.is_empty() || !seg_constraints.is_empty() {
+        if r.format.is_none() {
+            let mut nil = Expr::new(
+                Span::synthetic(),
+                ExprNode::Lit { value: Literal::Nil },
+            );
+            nil.ty = Some(Ty::Nil);
+            args.push(nil);
+        }
+        args.push(lit_str(r.int_params.join(" ")));
+    }
+    // Segment-pattern requirements (anything beyond the digit class —
+    // `constraints(slug: %r{[^@/.]+})`, compiled by `segment_pattern`
+    // into a portable, backtrack-free encoding) ride the optional 7th
+    // positional as ONE combined string, the same reason `int_params`
+    // stays a scalar rather than an array: a `nil`-or-`[]` optional
+    // tail collapses to `Any?`/a bare variadic on several strict
+    // targets. Routes with no such requirement keep their existing
+    // 4-/5-/6-arg shape, so unconstrained apps emit byte-identical.
+    if !seg_constraints.is_empty() {
+        args.push(lit_str(seg_constraints));
+    }
+    let class_path: Vec<Symbol> = class_id
+        .0
+        .as_str()
+        .split("::")
+        .map(Symbol::from)
+        .collect();
+    let recv = Expr::new(
+        Span::synthetic(),
+        ExprNode::Const { path: class_path },
+    );
+    with_ty(
+        Expr::new(
+            Span::synthetic(),
+            ExprNode::Send {
+                recv: Some(recv),
+                method: Symbol::from("new"),
+                args,
+                block: None,
+                parenthesized: true,
+            },
+        ),
+        route_ty.clone(),
+    )
+}
+
+/// `ArticlesController` → `articles` (the controller-symbol form
+/// the spinel router uses). Mirrors the existing per-target convention.
+/// Namespaced controllers flatten with a double underscore
+/// (`Mod::ActivitiesController` → `mod__activities`) — a plain-ident
+/// symbol every target's symbol literal can carry (`:mod::activities`
+/// parses as scope resolution, not a symbol, under Ruby).
+// Not a single underscore: lobsters' `Mod::MailsController` and top-level `ModMailsController` both flattened to `mod_mails`, and /mod/mails/* dispatched to the wrong one.
+pub(crate) fn controller_symbol(class_name: &str) -> String {
+    let base = class_name.strip_suffix("Controller").unwrap_or(class_name);
+    crate::naming::underscore(base).replace('/', "__")
+}
+
+/// Build the `RouteHelpers` module from `app.routes` as a list of
+/// `LibraryFunction`s, one per named route. Empty when the app has
+/// no routes.
+pub fn lower_routes_to_library_functions(app: &App) -> Vec<LibraryFunction> {
+    let flat = flatten_routes_for_helpers(app);
+    if flat.is_empty() {
+        return Vec::new();
+    }
+    let module_path = vec![Symbol::from("RouteHelpers")];
+    // Dedupe: multiple HTTP verbs on the same path collapse to a
+    // single helper (`articles` for both index/create — same URL).
+    // First-occurrence wins; the as_name + path are identical so the
+    // function body is the same.
+    let mut seen: crate::det::HashSet<String> = crate::det::HashSet::default();
+    let mut funcs: Vec<LibraryFunction> = Vec::new();
+    // Helper name -> (every segment name it can take, how many
+    // positionals the GENERATED helper requires). The query survey
+    // needs both: to tell an option naming a SEGMENT from a query
+    // param, and to ignore a call that doesn't fill the segments.
+    //
+    // Segments UNION across same-named routes and `required` is
+    // first-wins, because `flatten_routes` expands a Rails optional
+    // group into several routes that share one helper — lobsters'
+    // `get "/mod/notes(/:period)"` yields one route with `period` and
+    // one without, and the generated helper is the FIRST (`seen` below).
+    // Taking the last one's segments instead made `period` look like a
+    // query param and emitted `mod_notes_path(period = nil, period:
+    // nil)` — a duplicate parameter name.
+    let mut helper_shape: crate::det::HashMap<String, (Vec<String>, usize)> =
+        Default::default();
+    for r in flat.iter().filter(|r| r.named) {
+        // Both spellings: `_url` is the same helper with the host in
+        // front (the view/controller lowering rewrites it to `"http://…"
+        // + <name>_path(…)`), and campfire calls `new_session_url(
+        // email_address: …)`. That rewrite happens after this survey, so
+        // a `_url`-only key would be missed — register the alias and
+        // record its demand against the `_path` helper that is generated.
+        for suffix in ["_path", "_url"] {
+            let entry = helper_shape
+                .entry(format!("{}{suffix}", r.as_name))
+                .or_insert_with(|| (Vec::new(), r.required_params.min(r.path_params.len())));
+            for p in &r.path_params {
+                if !entry.0.iter().any(|s| s == p.as_str()) {
+                    entry.0.push(p.to_string());
+                }
+            }
+        }
+    }
+    // Format variants are registered in the survey BEFORE it runs, and
+    // that ordering is load-bearing: `route_format_suffix` has already
+    // renamed `x_path(bot_key: k, format: :json)` to
+    // `x_json_path(bot_key: k)`, so a survey keyed on the BASE name no
+    // longer sees that call at all. A helper whose only call site
+    // carried a format then lost its query keys and the variant was
+    // generated without them (`unknown keyword: :bot_key`). Registering
+    // the variant under its own name collects them against the variant,
+    // where they belong.
+    let declared: crate::det::HashSet<String> =
+        flat.iter().filter(|r| r.named).map(|r| format!("{}_path", r.as_name)).collect();
+    let variants = format_variant_demand(app, &declared);
+    for (name, (as_name, _)) in &variants {
+        let base = helper_shape.get(&format!("{as_name}_path")).cloned();
+        if let Some(shape) = base {
+            let stem = name.strip_suffix("_path").unwrap_or(name);
+            for suffix in ["_path", "_url"] {
+                helper_shape.entry(format!("{stem}{suffix}")).or_insert_with(|| shape.clone());
+            }
+        }
+    }
+    let query_keys = query_param_demand(app, &helper_shape);
+    let string_segments = string_segment_demand(app, &helper_shape);
+    for route in &flat {
+        // Unnamed dynamic routes (`get "/comments/page/:page"`, no `as:`)
+        // get no helper in Rails — their action-name fallback would
+        // shadow a real static route's helper under first-wins dedupe
+        // (`comments_path` for `/replies/comments/page/:page` hiding
+        // `/comments`).
+        if !route.named {
+            continue;
+        }
+        let helper = format!("{}_path", route.as_name);
+        if !seen.insert(helper.clone()) {
+            continue;
+        }
+        funcs.push(build_helper_function(
+            &module_path,
+            &helper,
+            route,
+            app,
+            query_keys.get(&helper).map(|v| v.as_slice()).unwrap_or(&[]),
+            string_segments.get(&helper),
+            None,
+        ));
+    }
+    // Format variants — one function per (route, format) a call site
+    // actually asked for. See `format_variant_demand`.
+    for (name, (as_name, ext)) in &variants {
+        let Some(route) = flat.iter().find(|r| r.named && &r.as_name == as_name) else {
+            continue;
+        };
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        funcs.push(build_helper_function(
+            &module_path,
+            name,
+            route,
+            app,
+            query_keys.get(name).map(|v| v.as_slice()).unwrap_or(&[]),
+            string_segments.get(name),
+            Some(ext),
+        ));
+    }
+    // Hash-form `url_for` resolvers ride along here rather than at each
+    // target's call site: every emitter that wants route helpers wants
+    // these too, and a per-target wiring is nine places to forget one.
+    funcs.extend(lower_url_option_helpers(app));
+    funcs.extend(lower_dynamic_url_helper(app, &module_path, &flat));
+    // `direct :name do … end` helpers — not routes, so they never reach
+    // `flat`; they ride here because they live in the same module and
+    // their `route_for` bodies need the flattened table to resolve.
+    // A `route_for` argument meets its target's signature the way any
+    // other call site does, so the generated helpers' parameter types go
+    // with it.
+    let helper_params: crate::det::HashMap<String, Vec<Ty>> = funcs
+        .iter()
+        .filter_map(|f| match &f.signature {
+            Some(Ty::Fn { params, .. }) => Some((f.name.as_str().to_string(), params.iter().map(|p| (*p.ty).clone()).collect())),
+            _ => None,
+        })
+        .collect();
+    funcs.extend(direct::lower_direct_helpers(&module_path, app, &flat, &helper_params));
+    // The `**hash` half of the query string. `query_keys` above covers
+    // every key a call site NAMES; a call site that splats a runtime
+    // Hash names none, and there is nothing static to read them off —
+    // campfire's bot pagination is
+    // `room_bot_messages_url(@room, params[:bot_key], **next_page)`
+    // where `next_page` is `{after: id}` on one branch and
+    // `{before: id}` on the other. So the keys are rendered at run
+    // time instead, by the one function below, and the call site is
+    // split into `<helper>(segments…) + RouteHelpers.query_suffix(h)`
+    // (`controller_to_library::rewrites::rewrite_route_helpers`).
+    //
+    // DEMAND-GATED, like the format variants above: an app with no such
+    // call site emits no such function, which matters because its
+    // parameter is a `Hash[Symbol, untyped]` — the one shape
+    // `feedback_types_are_performance` says to keep out of a tree that
+    // does not need it.
+    if app_splats_into_a_route_helper(app) || app_merges_into_url_options(app) {
+        funcs.push(build_query_suffix_helper(&module_path));
+    }
+    // These bodies carry APP source (a `direct` block's expressions —
+    // campfire's `v: Current.account&.updated_at&.to_fs(:number)`), but
+    // they are synthesized HERE, after the post-analyze hook has already
+    // walked every body it owns. So the Time grounding has to be applied
+    // to them on the way out; otherwise the one place `to_fs` is emitted
+    // by us, rather than written by the app, is the one place it never
+    // gets lowered.
+    for f in &mut funcs {
+        crate::lower::time_current::rewrite_time_current(&mut f.body, &app.time_formats);
+    }
+    funcs
+}
+
+/// `a && b`, for the resolver's arm conditions.
+fn and(a: Expr, b: Expr) -> Expr {
+    Expr::new(
+        Span::synthetic(),
+        ExprNode::BoolOp {
+            op: crate::expr::BoolOpKind::And,
+            surface: crate::expr::BoolOpSurface::Symbol,
+            left: a,
+            right: b,
+        },
+    )
+}
+
+/// The generated resolver for a hash-form `url_for`. `extras` are the
+/// option keys beside `controller:`/`action:`, sorted — one function per
+/// distinct set, so each keeps TYPED params instead of taking a
+/// `Hash[Symbol, untyped]` bag. Shared with the view lowerer, which
+/// emits the call.
+pub fn url_options_helper_name(extras: &[String]) -> String {
+    if extras.is_empty() {
+        "path_for_controller_action".to_string()
+    } else {
+        format!("path_for_controller_action_{}", extras.join("_"))
+    }
+}
+
+/// Resolvers for the hash-form `url_for` — `link_to text, {controller:
+/// controller_name, action: action_name, page: @page + 1}`, which is how
+/// every lobsters index paginates.
+///
+/// Rails resolves that against the route set at render time. A compile-
+/// time resolution is impossible here for the reason the shape exists at
+/// all: `controller_name`/`action_name` are runtime reads, and the view
+/// holding them (`home/index`) is rendered by eight different actions.
+/// So generate the LOOKUP instead — a function per extra-key set,
+/// carrying the table of every route whose dynamic segments are exactly
+/// those extras, keyed on `"controller#action"`.
+///
+/// Left unresolved, the options hash reached the tag renderer and each
+/// key became an HTML attribute: `<a href-controller="home"
+/// href-action="newest" href-page="2">`, i.e. no href at all — a dead
+/// "Page 2 >>" link on /, /newest, /recent, /comments, /replies and
+/// /moderations.
+pub fn lower_url_option_helpers(app: &App) -> Vec<LibraryFunction> {
+    let mut extra_sets: Vec<Vec<String>> = Vec::new();
+    for view in &app.views {
+        collect_url_option_key_sets(&view.body, &mut extra_sets);
+    }
+    extra_sets.sort();
+    extra_sets.dedup();
+    if extra_sets.is_empty() {
+        return Vec::new();
+    }
+    let flat = flatten_routes_for_helpers(app);
+    let module_path = vec![Symbol::from("RouteHelpers")];
+    extra_sets
+        .iter()
+        .map(|extras| build_url_options_function(&module_path, extras, &flat))
+        .collect()
+}
+
+/// `RouteHelpers.path_for_params(controller, action, params, recall)`: a
+/// URL built from a Hash only known at run time (lobsters' moderation log
+/// pages through `link_to "Page 2", @moderation_params.merge(page: 2)`),
+/// as Rails' route generation answers it. The request's controller and
+/// action stand for the ones the Hash leaves out.
+///
+/// Rails' Journey: a candidate is a GET route of that controller#action
+/// whose every segment the Hash or the request's path parameters supply;
+/// the one whose segments the Hash names most wins, the first written on
+/// a tie; the rest of the Hash is the query string, less the parts of
+/// the route as written (an optional segment it could not place is
+/// dropped, not moved to the query). Generated only for an app whose
+/// views build such a URL.
+fn lower_dynamic_url_helper(app: &App, module_path: &[Symbol], flat: &[FlatRoute]) -> Option<LibraryFunction> {
+    if !app.views.iter().any(|v| crate::lower::view_to_library::view_uses_dynamic_url_hash(&v.body)) {
+        return None;
+    }
+    // Every controller's, not only the linking views' own: a shared partial renders under any controller, and the Hash can name one.
+    let controllers: std::collections::BTreeSet<String> = flat
+        .iter()
+        .filter(|r| r.method == HttpMethod::Get)
+        .map(|r| controller_symbol(r.controller.0.as_str()))
+        .collect();
+    let mut arms = String::new();
+    for controller in &controllers {
+        let mut actions: Vec<&Symbol> = Vec::new();
+        for r in flat.iter().filter(|r| r.method == HttpMethod::Get && controller_symbol(r.controller.0.as_str()) == *controller) {
+            if !actions.contains(&&r.action) {
+                actions.push(&r.action);
+            }
+        }
+        for action in actions {
+            let _ = std::fmt::Write::write_fmt(&mut arms, format_args!("  if key == \"{controller}#{action}\"\n"));
+            for r in flat.iter().filter(|r| r.method == HttpMethod::Get && controller_symbol(r.controller.0.as_str()) == *controller && &r.action == action) {
+                // This variant's own segments (an expanded optional group carries its siblings' names too).
+                let names: Vec<String> = r
+                    .path
+                    .split('/')
+                    .filter_map(|seg| seg.strip_prefix(':').or_else(|| seg.strip_prefix('*')))
+                    .map(str::to_string)
+                    .collect();
+                let present: Vec<String> = names.iter().map(|p| format!("(given.key?(\"{p}\") || recall.key?(\"{p}\"))")).collect();
+                let cond = if present.is_empty() { "true".to_string() } else { present.join(" && ") };
+                let score: Vec<String> = names.iter().map(|p| format!("(given.key?(\"{p}\") ? 1 : 0)")).collect();
+                let score = if score.is_empty() { "0".to_string() } else { score.join(" + ") };
+                let path = r
+                    .path
+                    .split('/')
+                    .map(|seg| match seg.strip_prefix(':').or_else(|| seg.strip_prefix('*')) {
+                        Some(p) => format!("#{{given.key?(\"{p}\") ? given.fetch(\"{p}\", \"\").to_s : recall.fetch(\"{p}\", \"\")}}"),
+                        None => seg.to_string(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("/");
+                let written: Vec<String> = r
+                    .source_path
+                    .split(|c: char| c == '/' || c == '(' || c == ')' || c == '.')
+                    .filter_map(|seg| seg.strip_prefix(':').or_else(|| seg.strip_prefix('*')))
+                    .map(|p| format!("\"{p}\""))
+                    .collect();
+                let _ = std::fmt::Write::write_fmt(
+                    &mut arms,
+                    format_args!(
+                        "    if {cond}\n      score = {score}\n      if score > best\n        best = score\n        path = \"{path}\"\n        parts = [{}]\n      end\n    end\n",
+                        written.join(", ")
+                    ),
+                );
+            }
+            arms.push_str("  end\n");
+        }
+    }
+    let source = format!(
+        "def self.path_for_params(controller, action, params, recall)\n\
+         \x20 given = {{}}\n\
+         \x20 params.each {{ |k, v| given[k.to_s] = v }}\n\
+         \x20 c = given.key?(\"controller\") ? given.fetch(\"controller\", \"\").to_s : controller\n\
+         \x20 a = given.key?(\"action\") ? given.fetch(\"action\", \"\").to_s : action\n\
+         \x20 key = c.gsub(\"::\", \"_\").gsub(\"/\", \"_\") + \"#\" + a\n\
+         \x20 best = -1\n\
+         \x20 path = \"\"\n\
+         \x20 parts = []\n\
+         {arms}\
+         \x20 raise \"no route matches \" + key if best < 0\n\
+         \x20 rest = {{}}\n\
+         \x20 given.each {{ |k, v| rest[k] = v unless k == \"controller\" || k == \"action\" || parts.include?(k) }}\n\
+         \x20 query = ActiveSupport.to_query(rest)\n\
+         \x20 query.empty? ? path : path + \"?\" + query\n\
+         end\n"
+    );
+    let method = crate::runtime_src::parse_methods(&source).ok()?.into_iter().next()?;
+    let params_ty = Ty::Hash { key: std::sync::Arc::new(Ty::Untyped), value: std::sync::Arc::new(Ty::Untyped) };
+    let recall_ty = Ty::Hash { key: std::sync::Arc::new(Ty::Str), value: std::sync::Arc::new(Ty::Str) };
+    Some(LibraryFunction {
+        module_path: module_path.to_vec(),
+        name: Symbol::from("path_for_params"),
+        unsupported_formals: None,
+        has_anonymous_block: false,
+        params: method.params.clone(),
+        body: method.body,
+        signature: Some(fn_sig(
+            vec![
+                (Symbol::from("controller"), Ty::Str),
+                (Symbol::from("action"), Ty::Str),
+                (Symbol::from("params"), params_ty),
+                (Symbol::from("recall"), recall_ty),
+            ],
+            Ty::Str,
+        )),
+        effects: EffectSet::default(),
+        is_async: false,
+    })
+}
+
+/// Every url-options hash in a view: a Hash literal in the URL argument
+/// of `link_to`, `link_to_if` or `button_to`, whose keys are all Symbols
+/// and include both `controller` and `action`. Yields the remaining
+/// keys, sorted.
+///
+/// The view lowerer resolves a url-options hash only in that URL
+/// argument (`emit_url_options_hash`), so this looks only there. A Hash
+/// in another place renders as it is: a Stimulus `data:` hash
+/// (`data: { controller: "menu", action: "menu#open" }`) has the same
+/// keys, and it is `data-*` attributes, not a URL.
+pub(crate) fn collect_url_option_key_sets(e: &Expr, out: &mut Vec<Vec<String>>) {
+    if let ExprNode::Send { recv: None, method, args, block, .. } = &*e.node {
+        // The block form puts the URL first; the positional form puts
+        // the label first, as `classify_view_helper` reads it.
+        let url = if block.is_some() && matches!(method.as_str(), "link_to" | "button_to") {
+            args.first()
+        } else {
+            match crate::lower::view::classify_view_helper(method.as_str(), args) {
+                Some(crate::lower::view::ViewHelperKind::LinkTo { url, .. })
+                | Some(crate::lower::view::ViewHelperKind::LinkToIf { url, .. })
+                | Some(crate::lower::view::ViewHelperKind::ButtonTo { target: url, .. }) => {
+                    Some(url)
+                }
+                _ => None,
+            }
+        };
+        if let Some(url) = url {
+            collect_url_options_in_url(url, out);
+        }
+    }
+    e.node.for_each_child(&mut |c| collect_url_option_key_sets(c, out));
+}
+
+/// The URL shapes `emit_url_arg` resolves to a url-options hash: the
+/// Hash itself, a `.merge` on it, and each branch of a conditional.
+fn collect_url_options_in_url(url: &Expr, out: &mut Vec<Vec<String>>) {
+    match &*url.node {
+        ExprNode::If { then_branch, else_branch, .. } => {
+            collect_url_options_in_url(then_branch, out);
+            collect_url_options_in_url(else_branch, out);
+        }
+        ExprNode::Send { recv: Some(base), method, args, block: None, .. }
+            if method.as_str() == "merge" && args.len() == 1 =>
+        {
+            collect_url_options_in_url(base, out);
+        }
+        ExprNode::Hash { entries, .. } => {
+            let keys: Option<Vec<String>> = entries
+                .iter()
+                .map(|(k, _)| match &*k.node {
+                    ExprNode::Lit { value: Literal::Sym { value } } => {
+                        Some(value.as_str().to_string())
+                    }
+                    _ => None,
+                })
+                .collect();
+            if let Some(keys) = keys {
+                if keys.iter().any(|k| k == "controller") && keys.iter().any(|k| k == "action") {
+                    let mut extras: Vec<String> = keys
+                        .into_iter()
+                        .filter(|k| k != "controller" && k != "action")
+                        .collect();
+                    extras.sort();
+                    out.push(extras);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// One resolver: `path_for_controller_action_page(controller, action,
+/// page)`. Body is an if-chain over `"#{controller}##{action}"` — an
+/// if-chain rather than a `case` so every target's expression emitter
+/// renders it without pattern-match support. The fall-through raises,
+/// which is what Rails does for an unroutable `url_for`
+/// (`ActionController::UrlGenerationError`); returning some invented
+/// path would ship a wrong link instead of reporting the gap.
+fn build_url_options_function(
+    module_path: &[Symbol],
+    extras: &[String],
+    flat: &[FlatRoute],
+) -> LibraryFunction {
+    let no_slugs = crate::det::HashSet::default();
+    let key_expr = Expr::new(
+        Span::synthetic(),
+        ExprNode::StringInterp {
+            parts: vec![
+                InterpPart::Expr { expr: var_ref("controller") },
+                InterpPart::Text { value: "#".to_string() },
+                InterpPart::Expr { expr: var_ref("action") },
+            ],
+        },
+    );
+    // Candidates, per `"controller#action"`, in the order Rails' own
+    // generation answers them (checked against actionpack 8.1 for
+    // lobsters' `get "/top(/:length(/page/:page))"`):
+    //
+    //   1. EXACT — a GET whose dynamic segments are exactly the extras.
+    //      `/newest/page/:page` for `{…, page:}`.
+    //   2. RECALL — one with more segments, when the request's own path
+    //      parameters supply each one the hash leaves out, most segments
+    //      first. Rails fills them from the current request: on
+    //      `/top/1y`, `{controller:, action:, page: 2}` is
+    //      `/top/1y/page/2`.
+    //   3. DROP — the most specific one whose segments are a subset of
+    //      the extras, when every extra it leaves out is a segment of
+    //      that action's routes: an optional segment Rails cannot place
+    //      is dropped, not moved to the query. On `/top?length=1y` there
+    //      is no `:length` to recall and Rails answers `/top`.
+    //
+    // `/newest/:user/page/:page` is never a candidate for another
+    // action's link: every arm is keyed on the controller#action.
+    let mut groups: Vec<(String, Vec<&FlatRoute>)> = Vec::new();
+    for route in flat {
+        if route.method != HttpMethod::Get {
+            continue;
+        }
+        let key = format!(
+            "{}#{}",
+            controller_symbol(route.controller.0.as_str()),
+            route.action.as_str()
+        );
+        match groups.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, rs)) => rs.push(route),
+            None => groups.push((key, vec![route])),
+        }
+    }
+    let sorted = |r: &FlatRoute| {
+        let mut p = r.path_params.clone();
+        p.sort();
+        p
+    };
+    let recall_ref = || var_ref("recall");
+    let mut arms: Vec<(String, Option<Expr>, Expr)> = Vec::new();
+    for (key, routes) in &groups {
+        if let Some(r) = routes.iter().find(|r| sorted(r) == extras) {
+            arms.push((key.clone(), None, build_path_expr(&r.path, &r.path_params, &no_slugs)));
+            continue;
+        }
+        let mut supers: Vec<&&FlatRoute> = routes
+            .iter()
+            .filter(|r| {
+                let p = sorted(r);
+                p.len() > extras.len() && extras.iter().all(|x| p.contains(x))
+            })
+            .collect();
+        supers.sort_by_key(|r| std::cmp::Reverse(r.path_params.len()));
+        let mut seen_paths: crate::det::HashSet<&str> = crate::det::HashSet::default();
+        for r in supers {
+            if !seen_paths.insert(r.path.as_str()) {
+                continue;
+            }
+            let missing: Vec<&String> =
+                r.path_params.iter().filter(|p| !extras.contains(p)).collect();
+            let mut cond: Option<Expr> = None;
+            let mut binds: Vec<Expr> = Vec::new();
+            for m in &missing {
+                let has = Expr::new(
+                    Span::synthetic(),
+                    ExprNode::Send {
+                        recv: Some(recall_ref()),
+                        method: Symbol::from("key?"),
+                        args: vec![lit_str(m.to_string())],
+                        block: None,
+                        parenthesized: true,
+                    },
+                );
+                cond = Some(match cond {
+                    None => has,
+                    Some(c) => and(c, has),
+                });
+                binds.push(Expr::new(
+                    Span::synthetic(),
+                    ExprNode::Assign {
+                        target: crate::expr::LValue::Var {
+                            id: VarId(0),
+                            name: Symbol::from(m.as_str()),
+                        },
+                        value: Expr::new(
+                            Span::synthetic(),
+                            ExprNode::Send {
+                                recv: Some(recall_ref()),
+                                method: Symbol::from("fetch"),
+                                args: vec![lit_str(m.to_string()), lit_str(String::new())],
+                                block: None,
+                                parenthesized: true,
+                            },
+                        ),
+                    },
+                ));
+            }
+            binds.push(build_path_expr(&r.path, &r.path_params, &no_slugs));
+            arms.push((
+                key.clone(),
+                cond,
+                Expr::new(Span::synthetic(), ExprNode::Seq { exprs: binds }),
+            ));
+        }
+        let family: crate::det::HashSet<&String> =
+            routes.iter().flat_map(|r| r.path_params.iter()).collect();
+        let drop = routes
+            .iter()
+            .filter(|r| {
+                let p = sorted(r);
+                p.len() < extras.len()
+                    && p.iter().all(|x| extras.contains(x))
+                    && extras.iter().all(|x| p.contains(x) || family.contains(x))
+            })
+            .max_by_key(|r| r.path_params.len());
+        if let Some(r) = drop {
+            arms.push((key.clone(), None, build_path_expr(&r.path, &r.path_params, &no_slugs)));
+        }
+    }
+    // Innermost else. `raise` reads as a Send on every target that
+    // emits this module.
+    let unroutable = Expr::new(
+        Span::synthetic(),
+        ExprNode::Send {
+            recv: None,
+            method: Symbol::from("raise"),
+            args: vec![Expr::new(
+                Span::synthetic(),
+                ExprNode::StringInterp {
+                    parts: vec![
+                        InterpPart::Text { value: "no route matches ".to_string() },
+                        InterpPart::Expr { expr: key_expr.clone() },
+                    ],
+                },
+            )],
+            block: None,
+            parenthesized: false,
+        },
+    );
+    // Fold the arms into a nested if/else, last arm outermost-last.
+    let mut body = unroutable;
+    for (key, extra_cond, path) in arms.into_iter().rev() {
+        let is_key = Expr::new(
+            Span::synthetic(),
+            ExprNode::Send {
+                recv: Some(key_expr.clone()),
+                method: Symbol::from("=="),
+                args: vec![lit_str(key)],
+                block: None,
+                parenthesized: false,
+            },
+        );
+        body = Expr::new(
+            Span::synthetic(),
+            ExprNode::If {
+                cond: match extra_cond {
+                    None => is_key,
+                    Some(c) => and(is_key, c),
+                },
+                then_branch: path,
+                else_branch: body,
+            },
+        );
+    }
+    let names: Vec<String> = std::iter::once("controller".to_string())
+        .chain(std::iter::once("action".to_string()))
+        .chain(extras.iter().cloned())
+        .collect();
+    // The request's path parameters, last: what the RECALL arms read.
+    let recall_ty = Ty::Hash { key: std::sync::Arc::new(Ty::Str), value: std::sync::Arc::new(Ty::Str) };
+    LibraryFunction {
+        module_path: module_path.to_vec(),
+        name: Symbol::from(url_options_helper_name(extras)),
+        unsupported_formals: None,
+        has_anonymous_block: false,
+        params: names
+            .iter()
+            .map(|n| Param::positional(Symbol::from(n.clone())))
+            .chain(std::iter::once(Param::positional(Symbol::from("recall"))))
+            .collect(),
+        body,
+        signature: Some(fn_sig(
+            names
+                .iter()
+                .map(|n| (Symbol::from(n.clone()), Ty::Str))
+                .chain(std::iter::once((Symbol::from("recall"), recall_ty)))
+                .collect(),
+            Ty::Str,
+        )),
+        effects: EffectSet::default(),
+        is_async: false,
+    }
+}
+
+/// Does the route's resource model override `to_param`? Rails feeds a
+/// path helper's `:id` segment from `record.to_param`, so an override
+/// (lobsters' Story#to_param → short_id) makes the helper's id param
+/// String-shaped, not Integer. Controller → model by singularizing
+/// the controller symbol (`StoriesController` → `story`); an
+/// `as:`-named route can point at a foreign controller (lobsters'
+/// `/domains/:id => home#for_domain, as: "domain"`), so the helper's
+/// own name is the fallback resource lookup (`domain_path` → Domain).
+fn model_overrides_to_param(controller: &str, helper_name: &str, app: &App) -> bool {
+    let base = controller.strip_suffix("Controller").unwrap_or(controller);
+    let from_controller = crate::naming::singularize(&crate::naming::underscore(base).replace('/', "_"));
+    if named_model_overrides_to_param(&from_controller, app) {
+        return true;
+    }
+    let base = helper_name.strip_suffix("_path").unwrap_or(helper_name);
+    let word = base.rsplit('_').next().unwrap_or(base);
+    named_model_overrides_to_param(&crate::naming::singularize(word), app)
+}
+
+/// Whether the resource's model fills its `:id` segment with a
+/// String: it overrides `to_param`, or its primary key is not an
+/// integer (`create_table id: :uuid`), where Rails' default
+/// `to_param` — `id.to_s` — is a uuid the helper must take as a
+/// String (roundhouse#90).
+fn named_model_overrides_to_param(resource: &str, app: &App) -> bool {
+    let model_name = crate::naming::camelize(resource);
+    app.models.iter().any(|m| {
+        m.name.0.as_str() == model_name
+            && (m.body.iter().any(|item| matches!(
+                item,
+                crate::dialect::ModelBodyItem::Method { method, .. }
+                    if method.name.as_str() == "to_param"
+            )) || model_key_is_string(m, app))
+    })
+}
+
+fn model_key_is_string(model: &crate::dialect::Model, app: &App) -> bool {
+    use crate::schema::ColumnType;
+    app.schema
+        .tables
+        .get(&model.table.0)
+        .and_then(|t| t.columns.iter().find(|c| c.primary_key))
+        .is_some_and(|c| !matches!(c.col_type, ColumnType::Integer | ColumnType::BigInt))
+}
+
+fn build_helper_function(
+    module_path: &[Symbol],
+    helper_name: &str,
+    route: &FlatRoute,
+    app: &App,
+    query_keys: &[QueryKey],
+    // Segments a call site fills with a String — see
+    // `string_segment_demand`. Overrides the name-based `id`-is-Integer
+    // default for exactly those.
+    string_segments: Option<&crate::det::HashSet<String>>,
+    // `Some("json")` builds the MONOMORPHIZED variant a call site's
+    // `format: :json` asks for — see `format_variant_demand`. The
+    // extension is a literal here, so it costs the base helper nothing.
+    ext: Option<&str>,
+) -> LibraryFunction {
+    let slug_id = model_overrides_to_param(route.controller.0.as_str(), helper_name, app);
+    // Slugness is PER PARAM: a nested parent's segment names its model
+    // directly (`story_id` in `/stories/:story_id/suggestions` → Story,
+    // whose to_param is a short_id slug) — the owning route's
+    // controller/helper say nothing about the parent. `<x>_id` params
+    // consult model `<x>`; bare `id` (and unmatched stems) keep the
+    // route-level heuristic. Typing a slug segment Int made every
+    // strict-target call site passing `story.short_id` a C type error.
+    let param_is_slug = |p: &str| -> bool {
+        // A call site that fills the segment with a String settles it,
+        // ahead of every name-based rule below.
+        if string_segments.map(|s| s.contains(p)).unwrap_or(false) {
+            return true;
+        }
+        if let Some(stem) = p.strip_suffix("_id") {
+            if !stem.is_empty() && named_model_overrides_to_param(stem, app) {
+                return true;
+            }
+        }
+        slug_id
+    };
+    let slug_params: crate::det::HashSet<String> = route
+        .path_params
+        .iter()
+        .filter(|p| param_is_slug(p.as_str()))
+        .cloned()
+        .collect();
+    // A trailing `(.:format)` is Rails' OPTIONAL format suffix, not a
+    // path segment: the helper takes `format = nil` last and appends
+    // `.<format>` only when given (`domain_path(d)` → "/domains/d",
+    // `comments_path(:rss)` → "/comments.rss"). Without this the
+    // literal parens land in the URL and `format` is demanded of every
+    // caller.
+    let has_format = route.path.ends_with("(.:format)");
+    let path = route.path.strip_suffix("(.:format)").unwrap_or(&route.path);
+    let seg_params: Vec<String> = route
+        .path_params
+        .iter()
+        .filter(|p| !(has_format && p.as_str() == "format"))
+        .cloned()
+        .collect();
+
+    // Leading required-param count (clamped: a dropped `format` seg may
+    // have been counted required upstream). Params beyond it come from
+    // trailing Rails optional groups and take `nil` defaults.
+    let required = route.required_params.min(seg_params.len());
+    let nil_default = || {
+        Expr::new(Span::synthetic(), ExprNode::Lit { value: crate::expr::Literal::Nil })
+    };
+    // `scope defaults: { user_id: "me" }` — the segment has a value
+    // Rails supplies, so the helper takes it OPTIONALLY. campfire's
+    // `resource :profile` lives under exactly that scope and every call
+    // site writes a bare `user_profile_url`.
+    //
+    // Only honored when the defaulted params form a SUFFIX of the
+    // signature. NOT because Ruby forbids the other shape — it does
+    // not, `def f(a = "me", b)` is legal and binds `f(x)` to
+    // `a="me", b=x`, which is exactly Rails' rule. The restriction is
+    // for the STRICT targets: Rust has no default arguments, so the
+    // emitter fills them at the CALL SITE by padding MISSING TRAILING
+    // args (`expr::mod::current_class_method_param_tys`). A leading
+    // default would be appended at the end instead of filled in place,
+    // silently swapping the segments in the URL.
+    //
+    // What it costs, in campfire: push_subscriptions is routed under
+    // `scope defaults: { user_id: "me" }`, so Rails accepts
+    // `user_push_subscription_path(record)` — one arg for a two-segment
+    // member route. Here that param stays required and the call raises
+    // `wrong number of arguments (given 1, expected 2)`. The collection
+    // helper is fine (its only defaulted param IS the suffix). Lifting
+    // this means teaching the call-site padders to fill by position
+    // from the left, not appending.
+    let default_for = |p: &String| -> Option<&String> {
+        route.param_defaults.iter().find(|(n, _)| n == p).map(|(_, v)| v)
+    };
+    let defaults_are_a_suffix = seg_params
+        .iter()
+        .position(|p| default_for(p).is_some())
+        .is_none_or(|first| seg_params[first..].iter().all(|p| default_for(p).is_some()));
+    let seg_default = |p: &String| -> Option<Expr> {
+        if !defaults_are_a_suffix {
+            return None;
+        }
+        default_for(p).map(|v| {
+            Expr::new(
+                Span::synthetic(),
+                ExprNode::Lit { value: crate::expr::Literal::Str { value: v.clone() } },
+            )
+        })
+    };
+    // A defaulted segment that is NOT part of the suffix becomes a
+    // KEYWORD, and leaves the positional list entirely.
+    //
+    // campfire routes push_subscriptions under `scope defaults: {
+    // user_id: "me" }`, so Rails accepts
+    // `user_push_subscription_path(record)` — one argument for a
+    // two-segment member route. Keeping `user_id` positional-with-a-
+    // default is what Ruby would do and what the strict targets cannot:
+    // Rust has no default arguments, so the emitter fills them at the
+    // CALL SITE by padding MISSING TRAILING args, and a LEADING default
+    // would be appended at the end instead of filled in place, silently
+    // swapping the segments in the URL. Every call site in the corpus
+    // passes only the non-defaulted segments, so the keyword form binds
+    // all of them and the padder never sees the ambiguity.
+    //
+    // WHAT IT COSTS, and the direction is the point: Rails also accepts
+    // `user_push_subscription_path(user, record)`, filling the segments
+    // left to right. Against a keyword that is an ARITY ERROR — loud,
+    // at the call site, naming the helper — rather than a URL with its
+    // segments swapped. A wrong URL that returns 200 for the wrong
+    // record is the failure this shape must not have.
+    let keyworded = |p: &String| -> bool { !defaults_are_a_suffix && default_for(p).is_some() };
+    let keyword_default = |p: &String| -> Expr {
+        Expr::new(
+            Span::synthetic(),
+            ExprNode::Lit {
+                value: crate::expr::Literal::Str {
+                    value: default_for(p).cloned().unwrap_or_default(),
+                },
+            },
+        )
+    };
+    let mut params: Vec<Param> = seg_params
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| !keyworded(p))
+        .map(|(i, p)| {
+            let sym = Symbol::from(p.clone());
+            if let Some(d) = seg_default(p) {
+                Param::with_default(sym, d)
+            } else if i < required {
+                Param::positional(sym)
+            } else {
+                Param::with_default(sym, nil_default())
+            }
+        })
+        .collect();
+    let mut sig_params: Vec<(Symbol, Ty)> = seg_params
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| !keyworded(p))
+        .map(|(i, p)| {
+            // Not `param_ty` for a defaulted segment: its default is the route table's text, so the type follows that `Str`, as the keyword half below does.
+            if seg_default(p).is_some() {
+                return (Symbol::from(p.clone()), Ty::Str);
+            }
+            let base = param_ty(p, slug_params.contains(p.as_str()));
+            let ty = if i < required {
+                base
+            } else {
+                Ty::Union { variants: vec![base, Ty::Nil].into() }
+            };
+            (Symbol::from(p.clone()), ty)
+        })
+        .collect();
+    // The keyword half, in segment order, appended after the
+    // positionals — `def f(id, user_id: "me")`.
+    let mut segment_keyword_sig: Vec<crate::ty::Param> = Vec::new();
+    for p in seg_params.iter().filter(|p| keyworded(p)) {
+        let sym = Symbol::from(p.clone());
+        params.push(Param::keyword(sym.clone(), Some(keyword_default(p))));
+        segment_keyword_sig.push(crate::ty::Param {
+            name: sym,
+            // `Str`, NOT `param_ty` — the type has to follow the DEFAULT
+            // this same loop just emitted, and `keyword_default` always
+            // builds a `Literal::Str` because a route table stores its
+            // defaults as text (`defaults: { user_id: "me" }`).
+            //
+            // `param_ty` answers a different question — it types a
+            // SEGMENT, and anything ending `_id` is an Int unless a
+            // call site proved otherwise. For a keyworded segment those
+            // two answers were computed independently and disagreed:
+            // `user_push_subscription_test_notifications_path(id,
+            // user_id: "me")` declared `user_id` an `sp_int` and
+            // defaulted it to a `char *`, so every call that let the
+            // default apply failed the C build with an int-conversion.
+            // One description, and the default is the one that is
+            // always present.
+            ty: crate::ty::Ty::Str.into(),
+            kind: crate::ty::ParamKind::Keyword { required: false },
+        });
+    }
+    let mut body = if required < seg_params.len() {
+        build_optional_path_expr(path, &seg_params, required, &slug_params)
+    } else {
+        build_path_expr(path, &seg_params, &slug_params)
+    };
+    // Rails' `(.:format)`: a route path spelled the `rails routes` way
+    // ends in `(.:format)`, which gives the helper a trailing optional
+    // positional — `comments_path(:rss)` → "/comments.rss".
+    //
+    // The KEYWORD spelling (`x_path(format: :json)`) is NOT a parameter:
+    // `lower::route_format_suffix` turns it into a string concatenation
+    // at the CALL SITE before this pass runs. Growing a parameter for it
+    // was the obvious move and the wrong one — Rust and Go have no
+    // default arguments, so widening a helper's signature broke every
+    // call site that omitted the format, in every app, to serve the few
+    // that pass one.
+    if has_format {
+        let format_sym = Symbol::from("format");
+        params.push(Param::with_default(
+            format_sym.clone(),
+            Expr::new(Span::synthetic(), ExprNode::Lit { value: crate::expr::Literal::Nil }),
+        ));
+        sig_params.push((
+            format_sym.clone(),
+            Ty::Union { variants: vec![Ty::Str, Ty::Nil].into() },
+        ));
+        // <path> + (format.to_s == "" ? "" : ".#{format}")
+        //
+        // Not bare `format`: the param is `String | Nil`, and a target
+        // whose `if` wants a real Bool rejects Ruby truthiness on it.
+        // Not `format.nil?` either — Go renders an omitted optional as
+        // the zero value, so `nil?` folds to `false` there and every
+        // caller who omitted the format gets a trailing dot in the URL.
+        // `to_s == ""` reads "absent" correctly whether the target
+        // spells absence as nil, None, or "".
+        //
+        // Every node carries `Ty::Str`: a conditional whose type is left
+        // for the emitter to infer renders as the target's top type (Go
+        // answered `interface{}` and then refused to `+` it onto a
+        // string), and the IR knows the answer perfectly well.
+        let dot_format = with_ty(
+            Expr::new(
+                Span::synthetic(),
+                ExprNode::StringInterp {
+                    parts: vec![
+                        InterpPart::Text { value: ".".to_string() },
+                        InterpPart::Expr { expr: var_ref("format") },
+                    ],
+                },
+            ),
+            Ty::Str,
+        );
+        let format_to_s = with_ty(
+            Expr::new(
+                Span::synthetic(),
+                ExprNode::Send {
+                    recv: Some(var_ref("format")),
+                    method: Symbol::from("to_s"),
+                    args: vec![],
+                    block: None,
+                    parenthesized: false,
+                },
+            ),
+            Ty::Str,
+        );
+        let is_absent = with_ty(
+            Expr::new(
+                Span::synthetic(),
+                ExprNode::Send {
+                    recv: Some(format_to_s),
+                    method: Symbol::from("=="),
+                    args: vec![lit_str(String::new())],
+                    block: None,
+                    parenthesized: false,
+                },
+            ),
+            Ty::Bool,
+        );
+        let suffix = with_ty(
+            Expr::new(
+                Span::synthetic(),
+                ExprNode::If {
+                    cond: is_absent,
+                    then_branch: lit_str(String::new()),
+                    else_branch: dot_format,
+                },
+            ),
+            Ty::Str,
+        );
+        body = with_ty(
+            Expr::new(
+                Span::synthetic(),
+                ExprNode::Send {
+                    recv: Some(body),
+                    method: Symbol::from("+"),
+                    args: vec![suffix],
+                    block: None,
+                    parenthesized: false,
+                },
+            ),
+            Ty::Str,
+        );
+    }
+    // The monomorphized extension goes exactly where the dynamic one
+    // above would: after the PATH and before the query string. That
+    // placement is the whole point of this variant — `x_path(room_id: 2)
+    // + ".json"` at the call site put it after `?room_id=2`, so the
+    // parameter VALUE became "2.json" and the lookup missed.
+    if let Some(ext) = ext
+        && route.format.as_ref().is_none_or(|default| default.as_str() != ext)
+    {
+        body = with_ty(
+            Expr::new(
+                Span::synthetic(),
+                ExprNode::Send {
+                    recv: Some(body),
+                    method: Symbol::from("+"),
+                    args: vec![lit_str(format!(".{ext}"))],
+                    block: None,
+                    parenthesized: false,
+                },
+            ),
+            Ty::Str,
+        );
+    }
+    // Options a call site passes that name no segment become the query
+    // string. KEYWORD params with `nil` defaults, so the call sites
+    // already written (`autocompletable_users_path(room_id: room.id)`)
+    // bind unchanged and every other caller is unaffected.
+    //
+    // `anchor:` is the one key that is not a query key: `path_for`
+    // applies `add_params` and THEN `add_anchor`, so the fragment
+    // trails the whole query string. Ordering it last in the `def` and
+    // in the signature keeps the two readings of the helper agreeing.
+    let (anchor_keys, plain_keys): (Vec<QueryKey>, Vec<QueryKey>) =
+        query_keys.iter().cloned().partition(|k| k.anchor);
+    let ordered_keys: Vec<QueryKey> =
+        plain_keys.iter().chain(anchor_keys.iter()).cloned().collect();
+    let query_keys: &[QueryKey] = &ordered_keys;
+    let mut query_sig: Vec<crate::ty::Param> = Vec::new();
+    if !query_keys.is_empty() {
+        for key in query_keys {
+            let sym = Symbol::from(key.name.clone());
+            params.push(Param::keyword(sym.clone(), Some(nil_default())));
+            // KEYWORD in the signature too, not just in the `def`.
+            // `fn_sig` types every param `Required`, which renders the
+            // `.rbs` as a positional — spinel binds from the signature,
+            // so a keyword declared positionally is a call it cannot
+            // make.
+            // An array key takes `Array[T]`, where T is what the
+            // SINGULAR key would have been: `user_ids: [ user.id ]`
+            // carries ids, and `param_ty` is name-based, so the
+            // singular is what it must be asked about.
+            // A query value is a String on the wire. `id` / `*_id` stay
+            // Integer because call sites pass `record.id` and the helper
+            // calls `to_s` itself. Every other key — including a RECORD
+            // standing in for `before:` / `after:` — is projected to
+            // `.id.to_s` at the call site (`project_route_helper_ids`),
+            // so typing it Integer is a seed that contradicts the emit:
+            // spinel refuses `before: message.id.to_s` against `Integer?`.
+            // A slug `to_param` is already a String. `record_slug:
+            // Some(false)` used to override to Integer and is what made
+            // campfire's messages_controller_test never link.
+            let value_ty = if key.array {
+                Ty::Array { elem: std::sync::Arc::new(param_ty(singular_key(&key.name), false)) }
+            } else if key.record_slug == Some(true) {
+                Ty::Str
+            } else {
+                param_ty(&key.name, false)
+            };
+            query_sig.push(crate::ty::Param {
+                name: sym,
+                ty: Ty::Union { variants: vec![value_ty, Ty::Nil].into() }.into(),
+                kind: crate::ty::ParamKind::Keyword { required: false },
+            });
+        }
+        body = append_query_string(body, &plain_keys);
+        if let Some(anchor) = anchor_keys.first() {
+            body = append_anchor(body, &anchor.name);
+        }
+    }
+    // The signature must agree with the `def` above about which params
+    // are optional: `fn_sig` marks every param Required, so a helper
+    // whose Ruby reads `def f(x = nil)` was declaring `(T x)` in its
+    // `.rbs`. Harmless while nothing checked, and not harmless on a
+    // strict target reading the sidecar as a seed — a 0-arg call site
+    // against a Required declaration is the exact contradiction
+    // spinel#3977 was about. `optional_names` is the set the `def`
+    // actually defaulted, defaults-from-`scope` and trailing
+    // nil-optionals alike.
+    let optional_names: crate::det::HashSet<Symbol> = params
+        .iter()
+        .filter(|p| p.default.is_some())
+        .map(|p| p.name.clone())
+        .collect();
+    let mark_optional = |t: Ty| -> Ty {
+        let Ty::Fn { params, block, ret, effects } = t else { return t };
+        Ty::Fn {
+            params: params
+                .into_iter()
+                .map(|mut tp| {
+                    if optional_names.contains(&tp.name) {
+                        tp.kind = crate::ty::ParamKind::Optional;
+                    }
+                    tp
+                })
+                .collect(),
+            block,
+            ret,
+            effects,
+        }
+    };
+    // Segment keywords ride with the query keywords: both are keyword
+    // params in the `def`, and `fn_sig` types every param Required, so
+    // declaring one positionally is a call spinel cannot make.
+    query_sig.splice(0..0, segment_keyword_sig);
+    let signature = match mark_optional(fn_sig(sig_params, Ty::Str)) {
+        Ty::Fn { mut params, block, ret, effects } if !query_sig.is_empty() => {
+            params.extend(query_sig);
+            Ty::Fn { params, block, ret, effects }
+        }
+        other => other,
+    };
+    LibraryFunction {
+        module_path: module_path.to_vec(),
+        name: Symbol::from(helper_name),
+        params,
+        unsupported_formals: None,
+        has_anonymous_block: false,
+        body,
+        signature: Some(signature),
+        effects: EffectSet::default(),
+        is_async: false,
+    }
+}
+
+/// Keyword names a call site may pass that are NOT query params, so
+/// the demand survey must not turn them into one.
+///
+///   * `format:` is already handled — `lower::route_format_suffix`
+///     monomorphizes the helper and removes the key ahead of this
+///     survey, so a `format` reaching here is one that pass declined;
+///   * the HOST-ONLY half of Rails' `RESERVED_OPTIONS` — `host:`,
+///     `protocol:`, `port:`, and friends. `url_for` deletes all twelve
+///     reserved keys before generating a path, and these seven describe
+///     the host, which a `_path` renders not at all.
+///     `lower::route_url_options` strips them at the call site; this
+///     list is what stops the survey growing a parameter for one that
+///     reaches it by another route (a `_url` spelling folded onto its
+///     `_path` twin, say).
+///
+/// `anchor:` is deliberately NOT here. It is Rails' FRAGMENT, it does
+/// belong on a path, and it IS harvested — as a [`QueryKey`] flagged
+/// `anchor`, rendered `#tag` after the query string. Excluding it grew
+/// no parameter while the call sites kept passing one, which is an
+/// arity error on every lobsters page that links to `settings#external`.
+///
+/// A key naming one of the route's own path segments is excluded at the
+/// call-site survey instead (it varies per route).
+fn is_non_query_option(key: &str) -> bool {
+    // `params:` is the query itself, rendered at run time through
+    // `query_suffix` (`rewrites::route_helper_query_splat_index`), not
+    // a key named "params".
+    key == "format"
+        || key == "params"
+        || crate::lower::route_url_options::HOST_ONLY_OPTIONS.contains(&key)
+}
+
+/// One query key a helper must accept, and whether every call site
+/// passes it an ARRAY (`user_ids: [ user.id ]`), which Rails renders as
+/// repeated `k[]=v` pairs rather than one `k=v`.
+///
+/// Mixed usage across call sites resolves to SCALAR: one helper, one
+/// signature, and the scalar rendering is the one that was already
+/// shipping. A wrong URL is worse than a missing helper — the same
+/// reasoning that kept arrays out entirely until now.
+#[derive(Clone, Debug)]
+pub(crate) struct QueryKey {
+    pub(crate) name: String,
+    pub(crate) array: bool,
+    /// Rails' `anchor:` — rendered `#tag` AFTER every query key, which
+    /// is the order `path_for` applies them in (`add_params` then
+    /// `add_anchor`). Derived from the name, not surveyed: `anchor` is
+    /// reserved, so a helper option spelled that way is the fragment
+    /// whatever the caller meant by it.
+    pub(crate) anchor: bool,
+    /// Some site passes a model RECORD for this key; Rails renders it
+    /// with `to_param`, and the call-site pass projects it the same way
+    /// (`emit::ruby::library::project_record_arg`). `Some(true)` when
+    /// that model overrides `to_param` (a slug: the key is a String),
+    /// `Some(false)` when it does not (the id: an Integer).
+    pub(crate) record_slug: Option<bool>,
+}
+
+/// Query-string keys each route helper is actually called with —
+/// `autocompletable_users_path(room_id: room.id)` demands `room_id`.
+///
+/// Rails turns every option that is not a path segment into a query
+/// param at call time; a generated helper has a fixed signature, so the
+/// keys have to be known to appear in it. DEMAND-GATED for the same
+/// reason the association-scope pass is: a helper nobody passes options
+/// to keeps exactly the signature it had, so no corpus call site moves.
+///
+/// Surveyed over every body INCLUDING views, which is where most URL
+/// helpers are called from and which the hook-body walk does not cover.
+/// Segments a CALL SITE demonstrably fills with a String.
+///
+/// `param_ty` types an `id`-shaped segment Integer from its NAME. That
+/// is a claim about the value, and a name cannot support it: campfire
+/// writes `resources :qr_code` with no `QrCode` model behind it and
+/// calls `qr_code_path(Base64.urlsafe_encode64(url))`. The generated
+/// signature said `(Integer id)`, and on a strict target that is not a
+/// warning — "a seed is trusted, so the emitted code would reinterpret
+/// the value rather than convert it."
+///
+/// Answering it by NAME the other way (no model behind the route ⇒
+/// String) was tried and is wrong: a route's name flattens what a
+/// model's name nests (`Rooms::OpensController` ⇒ `rooms_open`), and an
+/// `id` routinely belongs to a model the route never names —
+/// campfire's `account_bot_path` carries a User id. Both misses retype
+/// a segment whose call sites pass `record.id`, which breaks the emit
+/// in the same direction it was meant to fix.
+///
+/// So the evidence is the call site itself, read off the analyzer's
+/// type: only a segment somebody actually fills with a String is
+/// demoted, and a helper nobody calls keeps the name-based default.
+fn string_segment_demand(
+    app: &App,
+    helpers: &crate::det::HashMap<String, (Vec<String>, usize)>,
+) -> crate::det::HashMap<String, crate::det::HashSet<String>> {
+    type Demand = crate::det::HashMap<String, crate::det::HashSet<String>>;
+    let mut out: Demand = Default::default();
+    // A record whose model fills a segment with a String (its own `to_param`, a uuid key) is a String at that position too
+    let string_keyed: crate::det::HashSet<String> = app
+        .models
+        .iter()
+        .map(|m| m.name.0.as_str().to_string())
+        .filter(|name| named_model_overrides_to_param(&crate::naming::underscore(name), app))
+        .collect();
+    let mut collect = |e: &Expr| {
+        fn walk(
+            e: &Expr,
+            helpers: &crate::det::HashMap<String, (Vec<String>, usize)>,
+            string_keyed: &crate::det::HashSet<String>,
+            out: &mut Demand,
+        ) {
+            if let ExprNode::Send { recv: None, method, args, .. } = &*e.node {
+                if let Some((segments, _)) = helpers.get(method.as_str()) {
+                    // Positionals only — a trailing kwargs hash is the
+                    // query/keyword half and names its own keys.
+                    let positional = args
+                        .iter()
+                        .filter(|a| !matches!(&*a.node, ExprNode::Hash { kwargs: true, .. }))
+                        .collect::<Vec<_>>();
+                    let helper = method
+                        .as_str()
+                        .strip_suffix("_url")
+                        .map(|stem| format!("{stem}_path"))
+                        .unwrap_or_else(|| method.as_str().to_string());
+                    for (i, arg) in positional.iter().enumerate() {
+                        let Some(seg) = segments.get(i) else { break };
+                        // A String that can be nil (a nullable column read off a
+                        // record that can be nil, `note.route_param`) is the same
+                        // evidence: Rails writes either with `to_param`.
+                        let arg_ty = arg.ty.as_ref().map(Ty::peel_nilable);
+                        let string_record = matches!(arg_ty, Some(Ty::Class { id, .. }) if string_keyed.contains(id.0.as_str()));
+                        if matches!(arg_ty, Some(Ty::Str)) || string_record {
+                            out.entry(helper.clone()).or_default().insert(seg.clone());
+                        }
+                    }
+                }
+            }
+            e.node.for_each_child(&mut |c| walk(c, helpers, string_keyed, out));
+        }
+        walk(e, helpers, &string_keyed, &mut out);
+    };
+    for_each_route_call_site(app, &mut collect);
+
+    // `direct :name do |…| route_for :target, arg… end` — a call site
+    // for `<target>_path` that no walk above reaches, because it lives
+    // in `config/routes.rb` and names its target with a SYMBOL rather
+    // than calling the helper.
+    //
+    // campfire's is the whole reason this arm exists:
+    //
+    //     direct :fresh_user_avatar do |user, options|
+    //       route_for :user_avatar, user.avatar_token, v: …
+    //     end
+    //
+    // `avatar_token` is a `signed_id`, so `user_avatar_path`'s `user_id`
+    // segment is a String — and this is its ONLY filling call site. The
+    // controller agrees: `User.from_avatar_token(params[:user_id])`.
+    // Left unread, the segment kept its name-based Integer default and
+    // spinel refused the build on a signature contradicting the one call
+    // that fills it.
+    //
+    // The argument types come from `Analyzer::type_direct_helper_bodies`,
+    // which types these bodies with the block parameters seeded from the
+    // helper's own call sites — without it every node here is `ty: None`
+    // and this walk finds nothing.
+    for helper in &app.routes.direct_helpers {
+        route_for_string_segments(&helper.body, helpers, &mut out);
+    }
+    out
+}
+
+/// Record the segments a `route_for :target, arg…` fills with a String.
+/// Mirrors `direct::rewrite_route_for`'s reading of the same node — the
+/// symbol names the target, the trailing kwargs hash is the query half
+/// and never a segment.
+fn route_for_string_segments(
+    e: &Expr,
+    helpers: &crate::det::HashMap<String, (Vec<String>, usize)>,
+    out: &mut crate::det::HashMap<String, crate::det::HashSet<String>>,
+) {
+    if let ExprNode::Send { recv: None, method, args, .. } = &*e.node {
+        if method.as_str() == "route_for" && !args.is_empty() {
+            if let ExprNode::Lit { value: crate::expr::Literal::Sym { value: target } } =
+                &*args[0].node
+            {
+                let helper = format!("{}_path", target.as_str());
+                if let Some((segments, _)) = helpers.get(&helper) {
+                    for (i, arg) in args[1..]
+                        .iter()
+                        .filter(|a| !matches!(&*a.node, ExprNode::Hash { kwargs: true, .. }))
+                        .enumerate()
+                    {
+                        let Some(seg) = segments.get(i) else { break };
+                        if matches!(arg.ty.as_ref().map(Ty::peel_nilable), Some(Ty::Str)) {
+                            out.entry(helper.clone()).or_default().insert(seg.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    e.node.for_each_child(&mut |c| route_for_string_segments(c, helpers, out));
+}
+
+fn query_param_demand(
+    app: &App,
+    helpers: &crate::det::HashMap<String, (Vec<String>, usize)>,
+) -> crate::det::HashMap<String, Vec<QueryKey>> {
+    type Demand = crate::det::HashMap<String, std::collections::BTreeMap<String, bool>>;
+    type Records = crate::det::HashMap<(String, String), bool>;
+    let models: crate::det::HashMap<String, bool> = app
+        .models
+        .iter()
+        .map(|m| {
+            let slug = m.body.iter().any(|item| matches!(
+                item,
+                crate::dialect::ModelBodyItem::Method { method, .. }
+                    if method.name.as_str() == "to_param"
+            ));
+            (m.name.0.as_str().to_string(), slug)
+        })
+        .collect();
+    let mut out: Demand = Default::default();
+    let mut records: Records = Default::default();
+    let mut collect = |e: &Expr| {
+        fn walk(
+            e: &Expr,
+            helpers: &crate::det::HashMap<String, (Vec<String>, usize)>,
+            out: &mut Demand,
+            models: &crate::det::HashMap<String, bool>,
+            records: &mut Records,
+        ) {
+            if let ExprNode::Send { recv: None, method, args, .. } = &*e.node {
+                if let Some((segments, required)) = helpers.get(method.as_str()) {
+                    if let Some(last) = args.last() {
+                        // A call that does not fill the helper's required
+                        // segments is not a query call — lobsters writes
+                        // `user_path(:user => name)` against `/u/:username`,
+                        // which names no segment and supplies none either.
+                        // Rails raises on it; adding a `user:` keyword
+                        // would only change WHICH error it is, on a page
+                        // that renders (a junk URL) today.
+                        if args.len() - 1 < *required {
+                            e.node.for_each_child(&mut |c| walk(c, helpers, out, models, records));
+                            return;
+                        }
+                        if let ExprNode::Hash { entries, kwargs: true } = &*last.node {
+                            for (k, v) in entries {
+                                let ExprNode::Lit { value: Literal::Sym { value: key } } = &*k.node
+                                else {
+                                    continue;
+                                };
+                                let key = key.as_str();
+                                if is_non_query_option(key)
+                                    || segments.iter().any(|s| s.as_str() == key)
+                                {
+                                    continue;
+                                }
+                                // An Array value renders as `k[]=a&k[]=b`
+                                // in Rails (lobsters/campfire both write
+                                // one), which is why the key carries
+                                // whether every site passes one — the
+                                // helper needs a different parameter TYPE
+                                // and a different rendering, not just a
+                                // different value.
+                                let is_array = matches!(&*v.node, ExprNode::Array { .. });
+                                let helper = method
+                                    .as_str()
+                                    .strip_suffix("_url")
+                                    .map(|stem| format!("{stem}_path"))
+                                    .unwrap_or_else(|| method.as_str().to_string());
+                                let helper_key = helper.clone();
+                                let seen = out
+                                    .entry(helper)
+                                    .or_default()
+                                    .entry(key.to_string())
+                                    .or_insert(is_array);
+                                // Any scalar site demotes the key: see
+                                // `QueryKey`.
+                                *seen = *seen && is_array;
+                                if let Some(slug) = record_model_slug(v, models) {
+                                    records.insert((helper_key.clone(), key.to_string()), slug);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            e.node.for_each_child(&mut |c| walk(c, helpers, out, models, records));
+        }
+        walk(e, helpers, &mut out, &models, &mut records);
+    };
+    for_each_route_call_site(app, &mut collect);
+    out.into_iter()
+        .map(|(helper, keys)| {
+            (
+                helper.clone(),
+                keys.into_iter()
+                    .map(|(name, array)| QueryKey {
+                        anchor: name == "anchor",
+                        record_slug: records.get(&(helper.clone(), name.clone())).copied(),
+                        name,
+                        array,
+                    })
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+/// A query-option value that is a model record: by its analyzed type,
+/// or — for a view body, whose args reach here untyped — by the naming
+/// convention the call-site pass also reads (`@user`, `@showing_user`:
+/// the name, or its `_<model>` suffix, is a model's). Answers whether
+/// that model overrides `to_param`.
+fn record_model_slug(v: &Expr, models: &crate::det::HashMap<String, bool>) -> Option<bool> {
+    if let Some(crate::ty::Ty::Class { id, .. }) = v.ty.as_ref().map(crate::ty::Ty::peel_nilable) {
+        if let Some(slug) = models.get(id.0.as_str()) {
+            return Some(*slug);
+        }
+    }
+    let name = match &*v.node {
+        ExprNode::Ivar { name } | ExprNode::Var { name, .. } => name.as_str(),
+        _ => return None,
+    };
+    let segs: Vec<&str> = name.trim_start_matches('@').split('_').collect();
+    (0..segs.len())
+        .map(|i| crate::naming::camelize(&segs[i..].join("_")))
+        .find_map(|camel| models.get(&camel).copied())
+}
+
+/// The `(route, format)` pairs a call site asked for, as
+/// `<as_name>_<ext>_path` -> `(as_name, ext)`.
+///
+/// `lower::route_format_suffix` has already rewritten
+/// `x_path(…, format: :json)` to `x_json_path(…)`, so the demand is
+/// readable straight off the call sites — the same survey shape
+/// `query_param_demand` uses, and for the same reason: the generator
+/// takes an `&App`, not a channel from the earlier pass.
+///
+/// MONOMORPHIZED rather than a `format:` parameter on the base helper.
+/// Rust and Go have no default arguments, so widening one shared
+/// signature charges every caller for the handful that asked; and the
+/// concat form it replaced (`x_path(…) + ".json"`) put the extension
+/// after the QUERY STRING, which is a different URL. A function per pair
+/// costs nothing to the callers that never mention a format.
+fn format_variant_demand(
+    app: &App,
+    declared: &crate::det::HashSet<String>,
+) -> std::collections::BTreeMap<String, (String, String)> {
+    let mut out: std::collections::BTreeMap<String, (String, String)> = Default::default();
+    // `<as_name>` for every named route, longest first: `story_path` and
+    // `story_comments_path` both end in `_path`, and a name must split
+    // against the LONGEST route name it starts with or `story_comments`
+    // reads as route `story` with format `comments`.
+    let mut names: Vec<String> =
+        flatten_routes_for_helpers(app).into_iter().filter(|r| r.named).map(|r| r.as_name).collect();
+    names.sort();
+    names.dedup();
+    names.sort_by_key(|n| std::cmp::Reverse(n.len()));
+    let mut collect = |e: &Expr| {
+        fn walk(
+            e: &Expr,
+            names: &[String],
+            declared: &crate::det::HashSet<String>,
+            out: &mut std::collections::BTreeMap<String, (String, String)>,
+        ) {
+            // Only a call the `format:` lowering renamed. Any other
+            // `<route>_<word>_url` is the app's own method (`widget_from_url`
+            // in a class that defines it), or no helper at all in Rails.
+            if let ExprNode::Send { recv: None, method, .. } = &*e.node
+                && e.decisions & crate::expr::FORMAT_VARIANT_CALL != 0
+            {
+                let raw = method.as_str();
+                if let Some(stem) = raw.strip_suffix("_path").or_else(|| raw.strip_suffix("_url")) {
+                    // A real helper of that name wins — never shadow a
+                    // route the app actually declared.
+                    if !declared.contains(&format!("{stem}_path")) {
+                        for n in names {
+                            if let Some(ext) = stem.strip_prefix(n.as_str()).and_then(|r| r.strip_prefix('_')) {
+                                if !ext.is_empty()
+                                    && ext.chars().all(|c| c.is_ascii_lowercase() || c == '_')
+                                {
+                                    out.insert(
+                                        format!("{stem}_path"),
+                                        (n.clone(), ext.to_string()),
+                                    );
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            e.node.for_each_child(&mut |c| walk(c, names, declared, out));
+        }
+        walk(e, &names, declared, &mut out);
+    };
+    for_each_route_call_site(app, &mut collect);
+    out
+}
+
+/// Every body a route helper can be called from. `for_each_hook_body_ref`
+/// covers models/controllers/library classes, views carry most URL calls
+/// — and TEST bodies call them too, which is where campfire's
+/// `room_messages_url(@room, format: :turbo_stream)` lives. A test that
+/// the emit ships is a call site like any other; leaving it out of the
+/// survey means the helper it calls is built without the parameter it
+/// needs, and the test fails on arity.
+fn for_each_route_call_site(app: &App, f: &mut impl FnMut(&Expr)) {
+    crate::lower::for_each_hook_body_ref(app, f);
+    for view in &app.views {
+        f(&view.body);
+    }
+    for tm in &app.test_modules {
+        if let Some(setup) = &tm.setup {
+            f(setup);
+        }
+        for t in &tm.tests {
+            f(&t.body);
+        }
+        for m in &tm.helpers {
+            f(&m.body);
+        }
+    }
+}
+
+/// Append `?k=v&k2=v2` for the query keys this helper accepts, skipping
+/// each one the caller left `nil`.
+///
+/// Built as ONE expression rather than statements: each key contributes
+/// a conditional whose separator is `?` when every earlier key was also
+/// omitted and `&` otherwise, so any subset of the keys renders a
+/// well-formed query string. Values go through the same `url_encode` the
+/// view helpers use — a raw `q=` value carrying a space or `&` would
+/// otherwise produce a URL that means something else.
+fn append_query_string(path: Expr, keys: &[QueryKey]) -> Expr {
+    let mut out = path;
+    for (i, key) in keys.iter().enumerate() {
+        // Not `var_ref`'s own type: an omitted key is nil, and a `nil?` on a non-nilable receiver folds to `false` on Rust.
+        let is_nil = |k: &str| -> Expr {
+            let var = var_ref(k);
+            let ty = var.ty.clone().map(|t| Ty::Union { variants: vec![t, Ty::Nil].into() });
+            with_ty(send_method(Expr { ty, ..var }, "nil?", Vec::new()), Ty::Bool)
+        };
+        let key_name = key.name.as_str();
+        // `?` only while nothing earlier was rendered. The first key
+        // needs no test — nothing can precede it.
+        let separator = if i == 0 {
+            None
+        } else {
+            Some({
+            let mut cond = is_nil(&keys[0].name);
+            for earlier in keys[1..i].iter().map(|k| k.name.as_str()) {
+                cond = Expr::new(
+                    Span::synthetic(),
+                    ExprNode::BoolOp {
+                        op: crate::expr::BoolOpKind::And,
+                        surface: Default::default(),
+                        left: cond,
+                        right: is_nil(earlier),
+                    },
+                );
+            }
+            with_ty(
+                Expr::new(
+                    Span::synthetic(),
+                    ExprNode::If {
+                        cond,
+                        then_branch: lit_str("?".to_string()),
+                        else_branch: lit_str("&".to_string()),
+                    },
+                ),
+                Ty::Str,
+            )
+            })
+        };
+        let url_encode = |value: Expr| -> Expr {
+            with_ty(
+                Expr::new(
+                    Span::synthetic(),
+                    ExprNode::Send {
+                        recv: Some(Expr::new(
+                            Span::synthetic(),
+                            ExprNode::Const {
+                                path: vec![Symbol::from("ActionView"), Symbol::from("ViewHelpers")],
+                            },
+                        )),
+                        method: Symbol::from("url_encode"),
+                        args: vec![with_ty(send_method(value, "to_s", Vec::new()), Ty::Str)],
+                        block: None,
+                        parenthesized: true,
+                    },
+                ),
+                Ty::Str,
+            )
+        };
+        // Rails renders an Array option as one `k[]=v` pair per
+        // element, percent-encoding the brackets. Built with
+        // `map { … }.join("&")` rather than a loop: the same
+        // records-to-strings shape the association `_ids` reader uses,
+        // and the one every target compiles (a `while` over an index
+        // does not survive the block-free targets).
+        let pair = if key.array {
+            let elem = Symbol::from("rh_query_value");
+            let body = send_method(
+                lit_str(format!("{key_name}%5B%5D=")),
+                "+",
+                vec![url_encode(Expr::new(
+                    Span::synthetic(),
+                    ExprNode::Var { id: crate::ident::VarId(0), name: elem.clone() },
+                ))],
+            );
+            let mapped = Expr::new(
+                Span::synthetic(),
+                ExprNode::Send {
+                    recv: Some(var_ref(key_name)),
+                    method: Symbol::from("map"),
+                    args: Vec::new(),
+                    block: Some(Expr::new(
+                        Span::synthetic(),
+                        ExprNode::Lambda { extra_params: Vec::new(), rest_param: None,
+                            params: vec![elem],
+                            block_param: None,
+                            body,
+                            block_style: crate::expr::BlockStyle::Brace,
+                        },
+                    )),
+                    parenthesized: false,
+                },
+            );
+            let joined = send_method(mapped, "join", vec![lit_str("&".to_string())]);
+            let mut parts: Vec<InterpPart> = Vec::new();
+            match separator {
+                None => parts.push(InterpPart::Text { value: "?".to_string() }),
+                Some(sep) => parts.push(InterpPart::Expr { expr: sep }),
+            }
+            parts.push(InterpPart::Expr { expr: joined });
+            with_ty(Expr::new(Span::synthetic(), ExprNode::StringInterp { parts }), Ty::Str)
+        } else {
+            let mut parts: Vec<InterpPart> = Vec::new();
+            match separator {
+                None => parts.push(InterpPart::Text { value: format!("?{key_name}=") }),
+                Some(sep) => {
+                    parts.push(InterpPart::Expr { expr: sep });
+                    parts.push(InterpPart::Text { value: format!("{key_name}=") });
+                }
+            }
+            parts.push(InterpPart::Expr { expr: url_encode(var_ref(key_name)) });
+            with_ty(Expr::new(Span::synthetic(), ExprNode::StringInterp { parts }), Ty::Str)
+        };
+        let arm = with_ty(
+            Expr::new(
+                Span::synthetic(),
+                ExprNode::If {
+                    cond: is_nil(key_name),
+                    then_branch: lit_str(String::new()),
+                    else_branch: pair,
+                },
+            ),
+            Ty::Str,
+        );
+        out = with_ty(send_method(out, "+", vec![arm]), Ty::Str);
+    }
+    out
+}
+
+/// Append `#tag` for the `anchor:` a call site passes, skipping it when
+/// the caller left it `nil`.
+///
+/// Last, after the query string: that is the order `path_for` builds a
+/// path in (`add_params`, then `add_anchor`), and an anchor ahead of a
+/// `?` would put the query INSIDE the fragment.
+///
+/// DIVERGENCE: Rails escapes a fragment with
+/// `Journey::Router::Utils.escape_fragment`, which leaves `/`, `?` and
+/// `:` alone; we reuse the `url_encode` the query keys use, which
+/// percent-encodes them. Every anchor the corpus writes is a slug, a
+/// tag or a `dom_id`, so no call site can tell the difference today.
+fn append_anchor(path: Expr, name: &str) -> Expr {
+    let escaped = Expr::new(
+        Span::synthetic(),
+        ExprNode::Send {
+            recv: Some(Expr::new(
+                Span::synthetic(),
+                ExprNode::Const {
+                    path: vec![Symbol::from("ActionView"), Symbol::from("ViewHelpers")],
+                },
+            )),
+            method: Symbol::from("url_encode"),
+            args: vec![send_method(var_ref(name), "to_s", Vec::new())],
+            block: None,
+            parenthesized: true,
+        },
+    );
+    let frag = Expr::new(
+        Span::synthetic(),
+        ExprNode::StringInterp {
+            parts: vec![
+                InterpPart::Text { value: "#".to_string() },
+                InterpPart::Expr { expr: escaped },
+            ],
+        },
+    );
+    let arm = Expr::new(
+        Span::synthetic(),
+        ExprNode::If {
+            cond: send_method(var_ref(name), "nil?", Vec::new()),
+            then_branch: lit_str(String::new()),
+            else_branch: frag,
+        },
+    );
+    send_method(path, "+", vec![arm])
+}
+
+fn send_method(recv: Expr, method: &str, args: Vec<Expr>) -> Expr {
+    Expr::new(
+        Span::synthetic(),
+        ExprNode::Send {
+            recv: Some(recv),
+            method: Symbol::from(method),
+            args,
+            block: None,
+            parenthesized: true,
+        },
+    )
+}
+
+/// `id`-shape params (`id`, `<x>_id`) are integer; everything else is
+/// a string. Matches the existing emitter convention — EXCEPT when
+/// the route's model overrides `to_param` (`slug_id`): Rails fills
+/// the segment from the override's (string) value, so the helper
+/// takes a String.
+/// `user_ids` -> `user_id`, so `param_ty`'s name-based rule sees the
+/// shape it knows. Anything not plural is its own singular.
+fn singular_key(name: &str) -> &str {
+    name.strip_suffix('s').unwrap_or(name)
+}
+
+fn param_ty(name: &str, slug_id: bool) -> Ty {
+    if name == "id" || name.ends_with("_id") {
+        if slug_id { Ty::Str } else { Ty::Int }
+    } else {
+        Ty::Str
+    }
+}
+
+/// Walk the path template and build a `StringInterp` expression with
+/// literal text segments and `Var` substitutions for `:param`s. A
+/// param-less path collapses to a plain `Lit::Str`.
+fn build_path_expr(
+    path: &str,
+    path_params: &[String],
+    slug_params: &crate::det::HashSet<String>,
+) -> Expr {
+    if path_params.is_empty() {
+        return lit_str(path.to_string());
+    }
+    let mut parts: Vec<InterpPart> = Vec::new();
+    let mut buf = String::new();
+    let mut chars = path.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == ':' {
+            // Read identifier
+            let mut ident = String::new();
+            while let Some(&nc) = chars.peek() {
+                if nc.is_alphanumeric() || nc == '_' {
+                    ident.push(nc);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            if !ident.is_empty() && path_params.iter().any(|p| p == &ident) {
+                if !buf.is_empty() {
+                    parts.push(InterpPart::Text { value: std::mem::take(&mut buf) });
+                }
+                parts.push(InterpPart::Expr {
+                    expr: var_ref_slug(&ident, slug_params.contains(&ident)),
+                });
+            } else {
+                buf.push(':');
+                buf.push_str(&ident);
+            }
+        } else {
+            buf.push(c);
+        }
+    }
+    if !buf.is_empty() {
+        parts.push(InterpPart::Text { value: buf });
+    }
+    with_ty(
+        Expr::new(Span::synthetic(), ExprNode::StringInterp { parts }),
+        Ty::Str,
+    )
+}
+
+/// Build a path expr for a route whose trailing params come from Rails
+/// optional groups: the required prefix always renders, each optional
+/// param's segment is appended only when the arg is non-nil.
+/// `/top(/:length(/page/:page))` (required=0) →
+/// `"/top" + (length.nil? ? "" : "/#{length}")
+///        + (page.nil?   ? "" : "/page/#{page}")`.
+/// The leading `/` of an optional group stays with its chunk, so
+/// `top_path()` yields `"/top"`, not `"/top/"`.
+fn build_optional_path_expr(
+    path: &str,
+    seg_params: &[String],
+    required: usize,
+    slug_params: &crate::det::HashSet<String>,
+) -> Expr {
+    let optional: crate::det::HashSet<&str> =
+        seg_params[required..].iter().map(|s| s.as_str()).collect();
+    let mut base_parts: Vec<InterpPart> = Vec::new();
+    // (param-name, its conditionally-appended segment parts)
+    let mut chunks: Vec<(String, Vec<InterpPart>)> = Vec::new();
+    let mut buf = String::new();
+    let mut in_optional = false;
+    let mut chars = path.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != ':' {
+            buf.push(c);
+            continue;
+        }
+        let mut ident = String::new();
+        while let Some(&nc) = chars.peek() {
+            if nc.is_alphanumeric() || nc == '_' {
+                ident.push(nc);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        if !seg_params.iter().any(|p| p == &ident) {
+            buf.push(':');
+            buf.push_str(&ident);
+            continue;
+        }
+        if optional.contains(ident.as_str()) {
+            let mut chunk: Vec<InterpPart> = Vec::new();
+            if !in_optional {
+                // First optional param: split pending text at its last `/`
+                // — that slash opens the optional group and belongs to the
+                // chunk; everything before it is the always-present base.
+                let split = buf.rfind('/').unwrap_or(0);
+                let (base_text, chunk_prefix) = buf.split_at(split);
+                if !base_text.is_empty() {
+                    base_parts.push(InterpPart::Text { value: base_text.to_string() });
+                }
+                if !chunk_prefix.is_empty() {
+                    chunk.push(InterpPart::Text { value: chunk_prefix.to_string() });
+                }
+                in_optional = true;
+            } else if !buf.is_empty() {
+                chunk.push(InterpPart::Text { value: buf.clone() });
+            }
+            chunk.push(InterpPart::Expr { expr: var_ref_slug(&ident, slug_params.contains(&ident)) });
+            chunks.push((ident.clone(), chunk));
+            buf.clear();
+        } else {
+            // Required param — stays in the always-present base.
+            if !buf.is_empty() {
+                base_parts.push(InterpPart::Text { value: std::mem::take(&mut buf) });
+            }
+            base_parts.push(InterpPart::Expr { expr: var_ref_slug(&ident, slug_params.contains(&ident)) });
+        }
+    }
+    if !buf.is_empty() {
+        match chunks.last_mut() {
+            Some((_, last)) => last.push(InterpPart::Text { value: buf }),
+            None => base_parts.push(InterpPart::Text { value: buf }),
+        }
+    }
+    let mut result = parts_to_expr(base_parts);
+    for (pname, chunk) in chunks {
+        // `<param>.nil? ? "" : "<segment>"`
+        let cond = with_ty(
+            Expr::new(
+                Span::synthetic(),
+                ExprNode::Send {
+                    recv: Some(var_ref(&pname)),
+                    method: Symbol::from("nil?"),
+                    args: vec![],
+                    block: None,
+                    parenthesized: false,
+                },
+            ),
+            Ty::Bool,
+        );
+        let ternary = with_ty(
+            Expr::new(
+                Span::synthetic(),
+                ExprNode::If {
+                    cond,
+                    then_branch: lit_str(String::new()),
+                    else_branch: parts_to_expr(chunk),
+                },
+            ),
+            Ty::Str,
+        );
+        result = with_ty(
+            Expr::new(
+                Span::synthetic(),
+                ExprNode::Send {
+                    recv: Some(result),
+                    method: Symbol::from("+"),
+                    args: vec![ternary],
+                    block: None,
+                    parenthesized: false,
+                },
+            ),
+            Ty::Str,
+        );
+    }
+    result
+}
+
+/// Collapse `InterpPart`s to an expr: empty → `""`, a lone text →
+/// `Lit::Str`, otherwise a `StringInterp` typed `Str`.
+fn parts_to_expr(parts: Vec<InterpPart>) -> Expr {
+    match parts.as_slice() {
+        [] => lit_str(String::new()),
+        [InterpPart::Text { value }] => lit_str(value.clone()),
+        _ => with_ty(
+            Expr::new(Span::synthetic(), ExprNode::StringInterp { parts }),
+            Ty::Str,
+        ),
+    }
+}
+
+/// Does any call site hand a route helper one positional argument more
+/// than its route has segments, with something that is not a keyword
+/// hash? That is an erased `**splat`: `ingest_hash_literal` rewrites a
+/// double splat into the merge chain it is defined to be, which drops
+/// the `kwargs` flag, so by the time a lowering runs `f(**h)` and
+/// `f(h)` are the same tree (see `lower::kwsplat`, which recovers the
+/// same shape for app methods). A route helper takes only segments
+/// positionally, so an extra one could not have been written any other
+/// way.
+fn app_splats_into_a_route_helper(app: &App) -> bool {
+    let shapes = crate::lower::routes::helper_id_segments(app);
+    let mut found = false;
+    let mut look = |e: &Expr| {
+        if !found {
+            found = expr_splats_into_a_route_helper(e, &shapes);
+        }
+    };
+    for_each_route_call_site(app, &mut look);
+    found
+}
+
+/// A view merging a runtime Hash into a url-options hash
+/// (`{controller:, action:, page:}.merge(extra)`) — the view lowering
+/// renders the merged keys through `query_suffix`.
+fn app_merges_into_url_options(app: &App) -> bool {
+    fn walk(e: &Expr) -> bool {
+        if let ExprNode::Send { recv: Some(base), method, args, .. } = &*e.node {
+            if method.as_str() == "merge" && args.len() == 1 {
+                if let ExprNode::Hash { entries, .. } = &*base.node {
+                    let named = |k: &str| {
+                        entries.iter().any(|(key, _)| {
+                            matches!(&*key.node, ExprNode::Lit { value: Literal::Sym { value } } if value.as_str() == k)
+                        })
+                    };
+                    if named("controller") && named("action") {
+                        return true;
+                    }
+                }
+            }
+        }
+        let mut found = false;
+        e.node.for_each_child(&mut |c| {
+            if !found {
+                found = walk(c);
+            }
+        });
+        found
+    }
+    app.views.iter().any(|v| walk(&v.body))
+}
+
+fn expr_splats_into_a_route_helper(
+    e: &Expr,
+    shapes: &crate::det::HashMap<String, Vec<bool>>,
+) -> bool {
+    if let ExprNode::Send { recv: None, method, args, .. } = &*e.node {
+        if crate::lower::controller_to_library::rewrites::route_helper_query_splat_index(
+            method.as_str(),
+            args,
+            shapes,
+        )
+        .is_some()
+        {
+            return true;
+        }
+    }
+    let mut found = false;
+    e.node.for_each_child(&mut |c| {
+        if !found {
+            found = expr_splats_into_a_route_helper(c, shapes);
+        }
+    });
+    found
+}
+
+/// ```ruby
+/// def self.query_suffix(params)
+///   query = ActionView::ViewHelpers.to_query(params)
+///   query.empty? ? "" : "?" + query
+/// end
+/// ```
+///
+/// The rendering is `Hash#to_query`'s — nested Hashes as `a[b]`, Arrays
+/// as `a[]`, pairs sorted, every key and value through the same
+/// `url_encode` the named keys use — and it lives in the shared runtime
+/// (`ViewHelpers.to_query`) rather than in this IR: a recursive walk
+/// over untyped values is Ruby's to write, and this function is only
+/// the `?` in front of it. A splatted key and a named one still render
+/// identically, because Rails runs both through the same method.
+fn build_query_suffix_helper(module_path: &[Symbol]) -> LibraryFunction {
+    let params_ref = with_ty(
+        Expr::new(
+            Span::synthetic(),
+            ExprNode::Var { id: VarId(0), name: Symbol::from("params") },
+        ),
+        Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(Ty::Untyped) },
+    );
+    let call = |recv: Option<Expr>, m: &str, args: Vec<Expr>, ty: Ty| {
+        with_ty(
+            Expr::new(
+                Span::synthetic(),
+                ExprNode::Send {
+                    recv,
+                    method: Symbol::from(m),
+                    args,
+                    block: None,
+                    parenthesized: true,
+                },
+            ),
+            ty,
+        )
+    };
+    let query_var = with_ty(
+        Expr::new(
+            Span::synthetic(),
+            ExprNode::Var { id: VarId(0), name: Symbol::from("query") },
+        ),
+        Ty::Str,
+    );
+    let rendered = call(
+        Some(Expr::new(
+            Span::synthetic(),
+            ExprNode::Const {
+                path: vec![
+                    Symbol::from("ActionView"),
+                    Symbol::from("ViewHelpers"),
+                ],
+            },
+        )),
+        "to_query",
+        vec![params_ref],
+        Ty::Str,
+    );
+    let assign = Expr::new(
+        Span::synthetic(),
+        ExprNode::Assign {
+            target: crate::expr::LValue::Var { id: VarId(0), name: Symbol::from("query") },
+            value: rendered,
+        },
+    );
+    let with_question = call(
+        Some(lit_str("?".to_string())),
+        "+",
+        vec![query_var.clone()],
+        Ty::Str,
+    );
+    let tail = with_ty(
+        Expr::new(
+            Span::synthetic(),
+            ExprNode::If {
+                cond: call(Some(query_var), "empty?", vec![], Ty::Bool),
+                then_branch: lit_str(String::new()),
+                else_branch: with_question,
+            },
+        ),
+        Ty::Str,
+    );
+    LibraryFunction {
+        module_path: module_path.to_vec(),
+        name: Symbol::from("query_suffix"),
+        unsupported_formals: None,
+        has_anonymous_block: false,
+        params: vec![Param {
+            name: Symbol::from("params"),
+            default: None,
+            keyword: false,
+            rest: false,
+            forwarding: false,
+            from_keyword: false,
+            from_kwrest: false,
+        }],
+        body: Expr::new(Span::synthetic(), ExprNode::Seq { exprs: vec![assign, tail] }),
+        signature: Some(fn_sig(
+            vec![(
+                Symbol::from("params"),
+                Ty::Hash { key: std::sync::Arc::new(Ty::Sym), value: std::sync::Arc::new(Ty::Untyped) },
+            )],
+            Ty::Str,
+        )),
+        effects: EffectSet::default(),
+        is_async: false,
+    }
+}
+
+fn var_ref(name: &str) -> Expr {
+    var_ref_slug(name, false)
+}
+
+fn var_ref_slug(name: &str, slug_id: bool) -> Expr {
+    let sym = Symbol::from(name);
+    with_ty(
+        Expr::new(
+            Span::synthetic(),
+            ExprNode::Var { id: VarId(0), name: sym },
+        ),
+        param_ty(name, slug_id),
+    )
+}
+
+// Avoid unused-import noise — `Literal` is referenced via lit_str helper only.
+#[allow(dead_code)]
+const _: Option<Literal> = None;

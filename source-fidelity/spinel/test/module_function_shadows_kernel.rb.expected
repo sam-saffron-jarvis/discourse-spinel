@@ -1,0 +1,4 @@
+Rt::Trap: integer divide by zero
+2
+["fmt:a", "spf:b", "slept:1", "rand:2", "srand:3", "raise:r", "throw:t", "open:o", "int:i", "flt:f", "str:s", "arr:a", "hsh:h"]
+"07"

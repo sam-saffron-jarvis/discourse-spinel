@@ -1,0 +1,32 @@
+true
+:sym
+optional: no raise
+rest_used: no raise
+rest_unused: no raise
+rest_anon: no raise
+keyword: no raise
+arity: ArgumentError: wrong number of arguments (given 1, expected 2)
+cmethod: NoMethodError
+slice: no raise
+ptr_to_untyped: no raise
+ptr_mismatch: TypeError: wrong argument type Array (expected String)
+ptr_mismatch2: TypeError: wrong argument type String (expected Array)
+unbound_call: NoMethodError
+unbound_aref: NoMethodError
+5
+4
+3
+7
+["x", "y"]
+["x", "y"]
+x
+nil
+toproc_rest: no raise
+toproc_rest_anon: no raise
+false
+toproc_arity: ArgumentError: wrong number of arguments (given 1, expected 2)
+toproc_ptr: TypeError: wrong argument type Integer (expected String)
+5
+"123"
+kernel_zero: NoMethodError
+3

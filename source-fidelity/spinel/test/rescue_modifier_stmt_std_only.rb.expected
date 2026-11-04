@@ -1,0 +1,7 @@
+caught std
+after std
+["outer", "Exception", "raw"]
+["outer", "NotImplementedError"]
+"recovered"
+["rvalue also declined", "Exception"]
+["systemexit reached the outer handler", 3]

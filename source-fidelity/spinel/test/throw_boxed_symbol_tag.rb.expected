@@ -1,0 +1,11 @@
+nil
+nil
+true
+true
+42
+:str
+:int
+"uncaught throw :t1"
+:rescued
+"uncaught throw :other"
+:other

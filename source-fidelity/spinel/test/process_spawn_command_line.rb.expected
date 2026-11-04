@@ -1,0 +1,6 @@
+"ONE TWO\n"
+true
+before after
+still argv
+true
+Errno::ENOENT

@@ -1,0 +1,4 @@
+rescued unwound
+hook 3 (registered last, runs first)
+hook 2 runs and then exits
+hook 1 (registered first, runs last)

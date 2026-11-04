@@ -1,0 +1,7 @@
+[package]
+name = "tempfile"
+
+# Pre-installed spin package: ships with the compiler, versioned with it.
+# `Tempfile.create`, `Tempfile.new` and `Tempfile.open` -- plain Ruby over
+# the tmpdir package and File's exclusive-create mode. See tempfile.rb for
+# how a Tempfile's file is removed, and what is deliberately absent.

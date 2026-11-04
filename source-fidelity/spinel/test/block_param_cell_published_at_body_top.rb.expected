@@ -1,0 +1,7 @@
+false
+false
+[[#<struct Post top_delta=0, pixels=[1, 2]>], [#<struct Post top_delta=1, pixels=[3]>, #<struct Post top_delta=0, pixels=[1, 2]>], [#<struct Post top_delta=1, pixels=[3]>], []]
+9
+10
+11
+12

@@ -1,0 +1,54 @@
+//! Hand-written C# runtime primitives.
+//!
+//! These are the target-specific bottom layer (per `project_two_layer_
+//! runtime.md`): types the transpiled framework runtime / emitted models call
+//! into but that have no Ruby source — they bridge to the .NET stack. The
+//! emitted models reach them by name (same `Roundhouse` namespace).
+//!
+//! **Phase 2:** the base class + the Db/Time/Broadcasts/Errors stubs the model
+//! layer needs to compile (`Db` is a no-op shim until Phase 3 wires
+//! `Microsoft.Data.Sqlite`). Phase 3/4 add `Server`, the real adapter, and
+//! the Cable transport, grown one file at a time like `runtime/kotlin/`.
+
+use std::path::PathBuf;
+
+use crate::emit::EmittedFile;
+
+// `ActiveRecordBase` and `Errors` are now transpiled from `runtime/ruby/` (see
+// `CSHARP_RUNTIME`), so they're no longer shipped as hand-written primitives.
+const ADAPTER_INTERFACE_CS: &str = include_str!("../../../runtime/csharp/AdapterInterface.cs");
+const DB_CS: &str = include_str!("../../../runtime/csharp/Db.cs");
+const PARAMS_CS: &str = include_str!("../../../runtime/csharp/Params.cs");
+const TIME_CS: &str = include_str!("../../../runtime/csharp/Time.cs");
+const BROADCASTS_CS: &str = include_str!("../../../runtime/csharp/Broadcasts.cs");
+const CABLE_CS: &str = include_str!("../../../runtime/csharp/Cable.cs");
+const RH_RUNTIME_CS: &str = include_str!("../../../runtime/csharp/RhRuntime.cs");
+const SERVER_CS: &str = include_str!("../../../runtime/csharp/Server.cs");
+// Native-`DateTimeOffset` seam for temporal columns: `Roundhouse.RhDateTime.
+// Parse` (stored text → DateTimeOffset, the `parse_db_time` intrinsic target)
+// plus the `JsonBuilder.EncodeDatetime(DateTimeOffset?)` overload.
+const RH_DATETIME_CS: &str = include_str!("../../../runtime/csharp/RhDateTime.cs");
+const I18N_HOST_CS: &str = include_str!("../../../runtime/csharp/I18nHost.cs");
+
+/// The hand-written runtime primitives, emitted under `app/runtime/`.
+pub fn primitives() -> Vec<EmittedFile> {
+    let files = [
+        ("app/runtime/AdapterInterface.cs", ADAPTER_INTERFACE_CS),
+        ("app/runtime/Db.cs", DB_CS),
+        ("app/runtime/Params.cs", PARAMS_CS),
+        ("app/runtime/Time.cs", TIME_CS),
+        ("app/runtime/Broadcasts.cs", BROADCASTS_CS),
+        ("app/runtime/Cable.cs", CABLE_CS),
+        ("app/runtime/RhRuntime.cs", RH_RUNTIME_CS),
+        ("app/runtime/Server.cs", SERVER_CS),
+        ("app/runtime/RhDateTime.cs", RH_DATETIME_CS),
+        ("app/runtime/I18nHost.cs", I18N_HOST_CS),
+    ];
+    files
+        .iter()
+        .map(|(path, content)| EmittedFile {
+            path: PathBuf::from(path),
+            content: content.to_string(),
+        })
+        .collect()
+}

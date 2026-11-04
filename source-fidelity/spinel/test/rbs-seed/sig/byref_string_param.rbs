@@ -1,0 +1,18 @@
+module Views
+  module Parts
+    def self.frag_into: (String io, Integer n) -> nil
+  end
+end
+
+module Views
+  module Body
+    def self.frags_into: (String io) -> nil
+  end
+end
+
+module Views
+  module Page
+    def self.show_into: (String io) -> nil
+    def self.show: () -> String
+  end
+end

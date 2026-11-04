@@ -1,0 +1,6 @@
+[package]
+name = "bigdecimal"
+
+# Pre-installed spin package: ships with the compiler, versioned with it.
+# Pure Ruby, no carried C. A minimal BigDecimal (#4881) -- see
+# bigdecimal.rb for what it covers and what it leaves out.

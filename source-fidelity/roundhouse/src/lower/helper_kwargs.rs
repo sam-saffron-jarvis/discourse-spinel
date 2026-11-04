@@ -1,0 +1,557 @@
+//! A helper's NAMED keyword argument, passed as a keyword, bound to the
+//! wrong thing.
+//!
+//! `ingest::library_class` lowers an optional keyword parameter to a
+//! positional-with-default — deliberately, because the trailing-kwargs
+//! normalize path depends on that shape. The call sites were never
+//! moved to match:
+//!
+//! ```text
+//! def self.room_display_name(room, for_user = Current.user)   # def
+//! RoomsHelper.room_display_name(message.room, for_user: nil)  # call
+//! ```
+//!
+//! Ruby binds the trailing `{for_user: nil}` HASH to the positional
+//! `for_user`. campfire's sidebar then reaches
+//! `room.users.without(for_user)`, `excluding` hands that Hash to
+//! `where.not`, and `hash_conditions` takes its nested-table branch —
+//! emitting `NOT (id.for_user IS NULL)`, SQL naming a column that does
+//! not exist.
+//!
+//! WHY THE EXISTING CHECK MISSES IT. `analyze::body::send::
+//! normalize_trailing_kwargs` flips a call's trailing hash to a plain
+//! argument only when the callee's last positional is TYPED `Hash`.
+//! That is right for the `**attributes` helpers — `link_to_room(room,
+//! attributes = {})` called with `id:`/`class:` genuinely wants one
+//! hash — and silent for a named keyword, whose type is whatever the
+//! parameter is. It also cannot fix this one: it takes `&mut [Expr]`, a
+//! slice, and the repair changes the argument COUNT.
+//!
+//! THE RULE IS NAMES, NOT TYPES. If every trailing-kwarg key matches a
+//! positional PARAMETER NAME of the callee, the caller meant those
+//! parameters, so the values are spliced in positionally. `id:` and
+//! `class:` do not match `attributes`, so the splat helpers are
+//! untouched by construction — no marker on the parameter is needed,
+//! and none survives ingest anyway.
+//!
+//! Silent where it does not crash: a keyword whose value happens to be
+//! usable as a hash would simply produce wrong results. That is why
+//! this is a correctness pass rather than a convenience.
+//!
+//! A GAP IS FILLED WITH THE PARAMETER'S OWN DEFAULT. Keywords are
+//! unordered, so a caller may name the second and third and leave the
+//! first to its default — campfire's `stub_successful_request(title:,
+//! description:)` beside a `def stub_successful_request(url: "…",
+//! title: "…", description: "…")`. The slot in between is filled with
+//! the default the definition wrote, which is not an invention: it is
+//! what Ruby binds. Only a CONTEXT-FREE default is moved — a literal, a
+//! constant, an array or hash of those — because the default is now
+//! evaluated at the call site rather than in the callee; one that reads
+//! an earlier parameter (`def f(a, b = a)`) or the callee's `self` means
+//! something different there, and such a call is left alone.
+
+use crate::det::HashMap;
+
+use crate::app::App;
+use crate::expr::{Expr, ExprNode, Literal};
+use crate::ident::Symbol;
+
+mod constructor;
+mod owned;
+use constructor::InstanceCallParams;
+
+pub(super) fn lexical_refinement_calls(app: &App) -> crate::det::HashSet<crate::span::Span> {
+    constructor::lexical_refinement_calls(app)
+}
+
+pub fn apply_helper_kwarg_positional_lowering(app: &mut App) -> Vec<crate::diagnostic::Diagnostic> {
+    // Refused/native markers remain intact for diagnosis; only ordinary
+    // producers rejoin this pass's established positional normalization.
+    apply_to_test_modules(app);
+    let mut diagnostics = Vec::new();
+    let (plans, constructors) =
+        crate::analyze::forwarding::keyword_calls_and_constructor_contracts(app);
+    let constructor_names = super::forwarding::constructor_names(app, &constructors);
+    let instance_params = InstanceCallParams::new(app, constructors, &constructor_names);
+    let class_params = library_class_call_params(app);
+    owned::rewrite_library_classes(app, &mut diagnostics);
+    let _ = super::forwarding::apply_with_plans(app, &plans, &constructor_names);
+    super::for_each_hook_body(app, &mut |expr| {
+        constructor::refuse_keyword_splats(expr, &instance_params, &mut diagnostics);
+    });
+    for view in &mut app.views {
+        constructor::refuse_keyword_splats(&mut view.body, &instance_params, &mut diagnostics);
+    }
+    if !class_params.is_empty()
+        || !instance_params.slots.is_empty()
+        || !instance_params.unknown_new.is_empty()
+    {
+        super::for_each_hook_body(app, &mut |e| {
+            rewrite_class_and_instance(e, &class_params, &instance_params, &mut diagnostics);
+        });
+        for view in &mut app.views {
+            rewrite_class_and_instance(
+                &mut view.body,
+                &class_params,
+                &instance_params,
+                &mut diagnostics,
+            );
+        }
+        // A test calls the app's methods the same way the app does
+        // (`@comment.announce(html: "…")`), against the same flattened
+        // definitions.
+        for tm in &mut app.test_modules {
+            let bodies = tm
+                .setup
+                .iter_mut()
+                .chain(tm.tests.iter_mut().map(|t| &mut t.body))
+                .chain(tm.helpers.iter_mut().map(|m| &mut m.body));
+            for body in bodies {
+                rewrite_class_and_instance(body, &class_params, &instance_params, &mut diagnostics);
+            }
+        }
+    }
+    super::kwsplat::restore_kwrest_in_test_helpers(app);
+    // One call can be reached by the owner-relative walk and by the
+    // typed-receiver one; it is one refusal.
+    let mut seen = crate::det::HashSet::default();
+    diagnostics.retain(|d| !is_flattened_refusal(d) || seen.insert(d.span));
+    let params = helper_param_names(app);
+    if params.is_empty() {
+        return diagnostics;
+    }
+    let mut rewrite = |e: &mut Expr| rewrite_calls(e, &params);
+    super::for_each_hook_body(app, &mut rewrite);
+    for view in &mut app.views {
+        rewrite_calls(&mut view.body, &params);
+    }
+    diagnostics
+}
+
+/// The same repair for a library class's CLASS method called through
+/// its constant — lobsters' `Routes.title_path(story, anchor: a)`
+/// against `def title_path story, anchor: nil` (in `class << self`),
+/// which ingest flattened to `title_path(story, anchor = nil)`. The
+/// trailing `{anchor: a}` bound to `anchor` whole, and the redirect
+/// for a merged story rendered its fragment as `#{anchor: "…"}`.
+///
+/// Narrower than the helper rule on purpose: only slots ingest marked
+/// `from_keyword` may be named. A class method's genuine optional
+/// positional (`def f(x, opts = {})`) called with `f(x, opts: 1)` is
+/// handed the Hash `{opts: 1}` by Ruby, and must keep it.
+fn library_class_call_params(app: &App) -> HashMap<(String, Symbol), Vec<Slot>> {
+    let mut params: HashMap<(String, Symbol), Vec<Slot>> = HashMap::default();
+    for lc in &app.library_classes {
+        for m in &lc.methods {
+            if m.receiver != crate::dialect::MethodReceiver::Class {
+                continue;
+            }
+            let key = (lc.name.0.as_str().to_string(), m.name.clone());
+            // Ruby uses the last definition, including one that cannot
+            // be flattened. Never normalize against its earlier override.
+            params.remove(&key);
+            if m.params.iter().any(|p| p.rest || p.keyword || p.forwarding)
+                || !m.params.iter().any(|p| p.from_keyword)
+            {
+                continue;
+            }
+            params.insert(key, m.params.iter().map(slot_of).collect());
+        }
+    }
+    params
+}
+
+fn rewrite_class_and_instance(
+    e: &mut Expr,
+    class_params: &HashMap<(String, Symbol), Vec<Slot>>,
+    instance_params: &InstanceCallParams,
+    diagnostics: &mut Vec<crate::diagnostic::Diagnostic>,
+) {
+    e.node.for_each_child_mut(&mut |c| {
+        rewrite_class_and_instance(c, class_params, instance_params, diagnostics)
+    });
+    constructor::rewrite_instance_call_node(e, instance_params, diagnostics);
+    rewrite_class_calls_node(e, class_params, instance_params, diagnostics);
+}
+
+fn rewrite_class_calls_node(
+    e: &mut Expr,
+    params: &HashMap<(String, Symbol), Vec<Slot>>,
+    instance_params: &InstanceCallParams,
+    diagnostics: &mut Vec<crate::diagnostic::Diagnostic>,
+) {
+    if matches!(
+        &e.diagnostic(),
+        Some(crate::diagnostic::DiagnosticKind::Unsupported { construct, .. })
+            if construct.as_str() == crate::diagnostic::CONSTRUCTOR_KEYWORD_ARGUMENTS
+    ) {
+        return;
+    }
+    if constructor::rewrite_custom_new_call(e, instance_params, diagnostics) {
+        return;
+    }
+    if params.is_empty() {
+        return;
+    }
+    let ExprNode::Send {
+        recv: Some(recv),
+        method,
+        args,
+        ..
+    } = &mut *e.node
+    else {
+        return;
+    };
+    let ExprNode::Const { path } = &*recv.node else {
+        return;
+    };
+    let class = path
+        .iter()
+        .map(|s| s.as_str())
+        .collect::<Vec<_>>()
+        .join("::");
+    if SEND_METHODS.contains(&method.as_str()) {
+        owned::refuse_send(e.span, args, |name| params.contains_key(&(class.clone(), name.clone())), diagnostics);
+        return;
+    }
+    let Some(slots) = params.get(&(class.clone(), method.clone())) else {
+        return;
+    };
+    if let Err(reason) = respell(args, slots, true) {
+        refuse(e.span, reason, diagnostics);
+    }
+}
+
+/// Refuse a `**h` passed to a flattened optional-keyword group.
+///
+/// Runs before `lower::forwarding` first erases the splat into a plain
+/// positional `h` (the `forwarding_keywords` step), after which
+/// `f(x, **h)` and `f(x, h)` are one tree. The keys the bundle carries,
+/// and so the slots it fills, are known only at run time, and the erased
+/// call binds the whole Hash to the first open slot. A callee with a
+/// flattened `**rest` is left to `kwrest_forward`, which owns that shape.
+pub(crate) fn refuse_flattened_keyword_splats(app: &mut App) -> Vec<crate::diagnostic::Diagnostic> {
+    let mut diagnostics = Vec::new();
+    let class_params = library_class_call_params(app);
+    let index = owned::OwnerIndex::new(app);
+    let instance_slots = index.instance_slots();
+    owned::refuse_library_class_splats(app, &index, &mut diagnostics);
+    super::for_each_hook_body(app, &mut |e| {
+        refuse_typed_splats(e, &class_params, &instance_slots, &mut diagnostics);
+    });
+    let mut seen = crate::det::HashSet::default();
+    diagnostics.retain(|d| !is_flattened_refusal(d) || seen.insert(d.span));
+    diagnostics
+}
+
+fn refuse_typed_splats(
+    e: &mut Expr,
+    class_params: &HashMap<(String, Symbol), Vec<Slot>>,
+    instance_slots: &HashMap<(String, Symbol), Vec<Slot>>,
+    diagnostics: &mut Vec<crate::diagnostic::Diagnostic>,
+) {
+    e.node.for_each_child_mut(&mut |c| refuse_typed_splats(c, class_params, instance_slots, diagnostics));
+    let ExprNode::Send { recv: Some(recv), method, args, .. } = &*e.node else {
+        return;
+    };
+    let slots = match (&*recv.node, &recv.ty) {
+        (ExprNode::Const { path }, _) => {
+            let class = path.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("::");
+            class_params.get(&(class, method.clone()))
+        }
+        (_, Some(crate::ty::Ty::Class { id, .. })) => {
+            instance_slots.get(&(id.0.as_str().to_string(), method.clone()))
+        }
+        _ => None,
+    };
+    if let Some(slots) = slots
+        && splat_into_flattened(args, slots)
+    {
+        refuse(e.span, SPLAT_REFUSAL, diagnostics);
+    }
+}
+
+/// Whether a call passes a `**` bundle.
+fn carries_splat(args: &[Expr]) -> bool {
+    args.iter().any(|arg| {
+        matches!(
+            &*arg.node,
+            ExprNode::KeywordSplat { .. }
+                | ExprNode::ForwardKeywords
+                | ExprNode::ForwardKeywordsWithPairs { .. }
+        )
+    })
+}
+
+/// A `**` argument aimed at flattened optional keywords with no
+/// flattened `**rest` beside them.
+fn splat_into_flattened(args: &[Expr], slots: &[Slot]) -> bool {
+    carries_splat(args) && slots.iter().any(|s| s.from_keyword)
+        && !slots.iter().any(|s| s.from_kwrest)
+}
+
+const SPLAT_REFUSAL: &str = "a `**` splat into optional keywords that are positional slots: which slots its keys fill is only known at run time";
+
+const SEND_METHODS: &[&str] = &["send", "public_send", "__send__"];
+
+/// The gap a call to a flattened keyword group is refused with, when its
+/// keywords cannot be moved into the positional slots: emitted as
+/// written, Ruby would bind the keyword Hash to the first slot.
+const FLATTENED_KEYWORD_ARGUMENTS: &str = "flattened keyword arguments";
+
+fn is_flattened_refusal(d: &crate::diagnostic::Diagnostic) -> bool {
+    matches!(
+        &d.kind,
+        crate::diagnostic::DiagnosticKind::Unsupported { construct, .. }
+            if construct.as_str() == FLATTENED_KEYWORD_ARGUMENTS
+    )
+}
+
+fn refuse(
+    span: crate::span::Span,
+    reason: &str,
+    diagnostics: &mut Vec<crate::diagnostic::Diagnostic>,
+) {
+    diagnostics.push(crate::diagnostic::Diagnostic::unsupported(
+        span,
+        None,
+        FLATTENED_KEYWORD_ARGUMENTS,
+        reason,
+    ));
+}
+
+/// Whether a call passes keywords at all: a literal keyword list, a
+/// `**` splat, or a forwarded `**`.
+fn carries_keywords(args: &[Expr]) -> bool {
+    args.iter().any(|arg| match &*arg.node {
+        ExprNode::KeywordSplat { .. }
+        | ExprNode::ForwardKeywords
+        | ExprNode::ForwardKeywordsWithPairs { .. } => true,
+        ExprNode::Hash { entries, kwargs: true } => !entries.is_empty(),
+        _ => false,
+    })
+}
+
+/// The same repair for an INSTANCE method called on a receiver the
+/// analyzer typed as its class — campfire's
+/// `Opengraph::Fetch.new.fetch_content_type(parsed_url, ip: resolved_ip)`
+/// against `def fetch_content_type(url, ip: …resolve(url.host))`,
+/// which ingest flattened to `fetch_content_type(url, ip = …)`. The
+/// trailing `{ip: "…"}` bound to `ip` whole, `Net::HTTP.start` was
+/// handed the Hash as `ipaddr:`, and every link unfurl failed to
+/// connect.
+///
+/// The same repair inside a TEST CLASS.
+///
+/// Ingest lowers a keyword parameter the same way wherever it is
+/// declared, so a test's own private helper has the identical break:
+///
+/// ```text
+/// def stub_successful_request(url: "https://www.example.com/")   # def
+/// stub_successful_request(url: "https://fxtwitter.com/…")        # call
+/// ```
+///
+/// campfire's `unfurl_links_controller_test` then hands WebMock the
+/// HASH and gets "URI should be a String … Got: Hash" — the same shape
+/// that emitted `NOT (id.for_user IS NULL)` from a view helper.
+///
+/// Resolved PER TEST CLASS, not through `helper_method_index`: the
+/// callee is the class's own method, so there is no cross-module
+/// ambiguity to rule out and no reason to require a globally unique
+/// name. Two helpers in ONE class with the same name are still skipped,
+/// because then the call site genuinely does not say which.
+fn apply_to_test_modules(app: &mut App) {
+    for tm in &mut app.test_modules {
+        let mut params: HashMap<Symbol, Vec<Slot>> = HashMap::default();
+        let mut ambiguous: Vec<Symbol> = Vec::new();
+        for m in &tm.helpers {
+            // Same two exclusions as the module path: a `rest` parameter
+            // ends the simple positional story, and one that SURVIVED as
+            // a keyword is already bound correctly.
+            if m.params.iter().any(|p| p.rest || p.keyword || p.forwarding) {
+                continue;
+            }
+            let names: Vec<Slot> = m.params.iter().map(slot_of).collect();
+            if params.insert(m.name.clone(), names).is_some() {
+                ambiguous.push(m.name.clone());
+            }
+        }
+        for name in ambiguous {
+            params.remove(&name);
+        }
+        if params.is_empty() {
+            continue;
+        }
+        if let Some(setup) = &mut tm.setup {
+            rewrite_calls(setup, &params);
+        }
+        for t in &mut tm.tests {
+            rewrite_calls(&mut t.body, &params);
+        }
+        for m in &mut tm.helpers {
+            rewrite_calls(&mut m.body, &params);
+        }
+    }
+}
+
+/// One positional slot of a helper: its name, and its default when it
+/// has one.
+#[derive(Clone)]
+struct Slot {
+    name: Symbol,
+    default: Option<Expr>,
+    from_keyword: bool,
+    from_kwrest: bool,
+}
+
+fn slot_of(p: &crate::dialect::Param) -> Slot {
+    Slot {
+        name: p.name.clone(),
+        default: p.default.clone(),
+        from_keyword: p.from_keyword,
+        from_kwrest: p.from_kwrest,
+    }
+}
+
+/// Helper name → its parameter slots, in declaration order.
+///
+/// Only helpers whose name is UNIQUE across modules are registered: a
+/// name two modules define is one this pass cannot resolve from the
+/// call site alone, and binding it to the wrong signature is exactly
+/// the failure being fixed.
+fn helper_param_names(app: &App) -> HashMap<Symbol, Vec<Slot>> {
+    let mut out: HashMap<Symbol, Vec<Slot>> = HashMap::default();
+    let mut ambiguous: Vec<Symbol> = Vec::new();
+    for (name, owner) in &app.helper_method_index {
+        let Some(lc) = app.library_classes.iter().find(|c| &c.name == owner) else {
+            continue;
+        };
+        let Some(m) = lc.methods.iter().find(|m| &m.name == name) else {
+            continue;
+        };
+        // A `rest` parameter and the positional story stops being a
+        // simple index. A param that SURVIVED as a keyword
+        // (`keeps_keywords` in ingest) is already bound correctly at the
+        // call site and must not be moved — a signature mixing the two
+        // is the one case where the name rule cannot tell which is
+        // which, so the whole helper is skipped.
+        if m.params.iter().any(|p| p.rest || p.keyword || p.forwarding) {
+            continue;
+        }
+        let names: Vec<Slot> = m.params.iter().map(slot_of).collect();
+        if out.insert(name.clone(), names).is_some() {
+            ambiguous.push(name.clone());
+        }
+    }
+    for name in ambiguous {
+        out.remove(&name);
+    }
+    out
+}
+
+fn rewrite_calls(e: &mut Expr, params: &HashMap<Symbol, Vec<Slot>>) {
+    e.node.for_each_child_mut(&mut |c| rewrite_calls(c, params));
+    let ExprNode::Send {
+        recv, method, args, ..
+    } = &mut *e.node
+    else {
+        return;
+    };
+    // Receiverless only: the bare spelling a view writes, before
+    // `rewrite_helper_calls` prefixes the module at emit time.
+    if recv.is_some() {
+        return;
+    }
+    let Some(slots) = params.get(method) else {
+        return;
+    };
+    let _ = respell(args, slots, false);
+}
+
+/// Move a call's trailing keywords into the positional slots they
+/// name. `keyword_slots_only` limits the names to slots ingest
+/// flattened from keywords.
+///
+/// `Err` names why the keywords cannot be moved. A helper call
+/// (`keyword_slots_only` false) treats that as "not this rule's call"
+/// and leaves it alone, because a helper's genuine trailing options Hash
+/// (`link_to_room(room, id: …)` against `attributes = {}`) is the same
+/// shape. Against slots ingest flattened from keywords, there is no such
+/// reading: the source could only have meant the keywords, so the caller
+/// refuses the call rather than emit it binding the Hash to a slot.
+fn respell(args: &mut Vec<Expr>, slots: &[Slot], keyword_slots_only: bool) -> Result<(), &'static str> {
+    let Some(last) = args.last() else { return Ok(()) };
+    let ExprNode::Hash {
+        entries,
+        kwargs: true,
+    } = &*last.node
+    else {
+        return Ok(());
+    };
+    if entries.is_empty() {
+        return Ok(());
+    }
+    // Every key must be a Symbol naming a parameter this call has not
+    // already filled positionally. Anything else and the call means
+    // something this pass cannot prove.
+    let filled = args.len() - 1;
+    let mut supplied: Vec<(usize, Expr)> = Vec::new();
+    for (k, v) in entries {
+        let ExprNode::Lit {
+            value: Literal::Sym { value },
+        } = &*k.node
+        else {
+            return Err("a keyword key that is not a literal symbol cannot be matched to a positional slot");
+        };
+        let Some(pos) = slots.iter().position(|s| s.name == *value) else {
+            return Err("a keyword names no parameter of the method");
+        };
+        if keyword_slots_only && !slots[pos].from_keyword {
+            return Err("a keyword names a positional parameter");
+        }
+        if pos < filled {
+            return Err("a positional argument already fills a keyword's slot");
+        }
+        supplied.push((pos, v.clone()));
+    }
+    supplied.sort_by_key(|(pos, _)| *pos);
+    // From the first unfilled slot up to the last one named: a slot the
+    // call skipped takes the parameter's own default — the value Ruby
+    // binds — when that default means the same thing at the call site.
+    // A required parameter, or a default that reads the callee's
+    // context, is a gap this pass cannot fill.
+    let last_pos = supplied.last().map(|(pos, _)| *pos).unwrap_or(filled);
+    let mut moved: Vec<Expr> = Vec::new();
+    let mut supplied = supplied.into_iter().peekable();
+    for pos in filled..=last_pos {
+        if let Some((p, _)) = supplied.peek() {
+            if *p == pos {
+                moved.push(supplied.next().map(|(_, v)| v).expect("peeked"));
+                continue;
+            }
+        }
+        let Some(default) = slots[pos].default.as_ref() else {
+            return Err("a skipped slot before a passed keyword has no default to fill it");
+        };
+        if !is_context_free(default) {
+            return Err("a skipped keyword's default is not a literal or constant, so it cannot be evaluated at the call site");
+        }
+        moved.push(default.clone());
+    }
+    args.pop();
+    args.extend(moved);
+    Ok(())
+}
+
+/// An expression that evaluates to the same thing wherever it is
+/// written: a literal, a constant, or an array or hash of those.
+fn is_context_free(e: &Expr) -> bool {
+    match &*e.node {
+        ExprNode::Lit { .. } | ExprNode::Const { .. } => true,
+        ExprNode::Array { elements, .. } => elements.iter().all(is_context_free),
+        ExprNode::Hash { entries, .. } => entries
+            .iter()
+            .all(|(k, v)| is_context_free(k) && is_context_free(v)),
+        _ => false,
+    }
+}

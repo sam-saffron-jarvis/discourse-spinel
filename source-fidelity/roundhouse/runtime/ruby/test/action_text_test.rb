@@ -1,0 +1,862 @@
+# frozen_string_literal: true
+require_relative "test_helper"
+
+# Direct unit tests for `runtime/ruby/action_text.rb`.
+#
+# EVERY `to_plain_text` expectation below was MEASURED, not reasoned
+# about: each input was run through Rails' own
+# `ActionText::PlainTextConversion.node_to_plain_text` (actiontext
+# 8.1.3, over a `Nokogiri::HTML5.fragment`) and the string it returned
+# is what is asserted here. That is the same discipline the inflector
+# tests follow — port the framework's answers, don't derive them —
+# and it is what makes the surprising cases (`<h2>` is transparent,
+# `<pre>` is transparent, a blockquote gets curly quotes, an empty
+# `<div>` still contributes its newline) trustworthy rather than
+# accidental.
+#
+# The one deliberate departure is attachments: the oracle above is the
+# NODE converter, which renders an `<action-text-attachment>` as
+# nothing. `ActionText::Content#to_plain_text` — the method this file
+# implements — first runs `render_attachments(&:to_plain_text)`, so
+# the caption survives. `test_attachment_renders_its_caption` asserts
+# the Content-level behavior, not the node-level oracle.
+# NOTE on the shape: every case spells `ActionText::Content.new(x)
+# .to_plain_text` out in full rather than routing through a `plain(x)`
+# helper. The helper is nicer to read and does not survive the spinel
+# lane — a test-local method has no RBS, so its return widened to
+# untyped and every `assert_equal` became an equality between a String
+# literal and an unknown, which the strict target refuses. Spelling the
+# call out keeps both lanes on the same file.
+class ActionTextContentTest < Minitest::Test
+  # With no app layout, `to_s` is Action Text's own: the gem's
+  # `layouts/action_text/contents/_content.html.erb` around the node.
+  def test_the_default_render_is_action_texts_own_layout
+    html = %(<action-text-attachment sgid="x"></action-text-attachment>)
+    assert_equal "<div class=\"trix-content\">\n  " + html + "\n</div>\n", ActionText::Content.new(html).to_s
+    assert_equal html, ActionText::Content.new(html).to_html
+  end
+
+  def test_plain_div_is_its_text
+    assert_equal "Hello world", ActionText::Content.new("<div>Hello world</div>").to_plain_text
+  end
+
+  def test_sibling_divs_are_newline_separated
+    assert_equal "Hello\nWorld", ActionText::Content.new("<div>Hello</div><div>World</div>").to_plain_text
+  end
+
+  def test_empty_div_still_contributes_its_newline
+    # The case that a whole-accumulator chomp gets wrong: the middle
+    # div has no text but its trailing newline is still emitted.
+    assert_equal "line1\n\nline3",
+      ActionText::Content.new("<div>line1</div><div></div><div>line3</div>").to_plain_text
+  end
+
+  def test_paragraphs_are_blank_line_separated
+    assert_equal "one\n\ntwo", ActionText::Content.new("<p>one</p><p>two</p>").to_plain_text
+  end
+
+  def test_h1_is_a_block_but_h2_is_transparent
+    assert_equal "Funny times!", ActionText::Content.new("<h1>Funny times!</h1>").to_plain_text
+    # Rails aliases the block rule to `h1` and `p` ONLY.
+    assert_equal "Subafter", ActionText::Content.new("<h2>Sub</h2><div>after</div>").to_plain_text
+  end
+
+  def test_pre_is_transparent
+    assert_equal "code here", ActionText::Content.new("<pre>code here</pre>").to_plain_text
+  end
+
+  def test_inline_elements_are_transparent
+    assert_equal "italic and bold",
+      ActionText::Content.new("<em>italic</em> and <strong>bold</strong>").to_plain_text
+  end
+
+  def test_br_is_a_newline
+    assert_equal "a\nb", ActionText::Content.new("<div>a<br>b</div>").to_plain_text
+    assert_equal "para with \n break", ActionText::Content.new("<p>para with <br> break</p>").to_plain_text
+  end
+
+  def test_unordered_list_items_get_bullets
+    assert_equal "• a\n• b", ActionText::Content.new("<ul><li>a</li><li>b</li></ul>").to_plain_text
+  end
+
+  def test_ordered_list_items_get_ordinals
+    assert_equal "1. one\n2. two\n3. three",
+      ActionText::Content.new("<ol><li>one</li><li>two</li><li>three</li></ol>").to_plain_text
+  end
+
+  def test_nested_lists_indent_and_break
+    assert_equal "• a\n  • inner\n• b",
+      ActionText::Content.new("<ul><li>a<ul><li>inner</li></ul></li><li>b</li></ul>").to_plain_text
+    assert_equal "1. a\n  1. a1\n  2. a2\n2. b",
+      ActionText::Content.new("<ol><li>a<ol><li>a1</li><li>a2</li></ol></li><li>b</li></ol>").to_plain_text
+  end
+
+  def test_list_inside_a_div_does_not_break_before_itself
+    # `break_if_nested_list` fires only for a list inside another
+    # LIST, so the "a" runs straight into the first bullet.
+    assert_equal "a• x\n• y\n\nb",
+      ActionText::Content.new("<div>a<ul><li>x</li><li>y</li></ul>b</div>").to_plain_text
+  end
+
+  def test_blockquote_gets_curly_quotes
+    assert_equal "“quoted”", ActionText::Content.new("<blockquote>quoted</blockquote>").to_plain_text
+    assert_equal "x\n“q”\n\ny",
+      ActionText::Content.new("<div>x</div><blockquote>q</blockquote><div>y</div>").to_plain_text
+  end
+
+  def test_empty_blockquote_is_bare_quotes
+    assert_equal "“”", ActionText::Content.new("<blockquote></blockquote>").to_plain_text
+  end
+
+  def test_blockquote_quotes_sit_inside_surrounding_space
+    assert_equal "  “spaced”  ", ActionText::Content.new("<blockquote>  spaced  </blockquote>").to_plain_text
+  end
+
+  def test_figcaption_is_bracketed
+    assert_equal "[cap]", ActionText::Content.new("<figcaption>cap</figcaption>").to_plain_text
+  end
+
+  def test_script_and_style_content_is_dropped
+    assert_equal "safe", ActionText::Content.new("<div>safe<script>unsafe()</script></div>").to_plain_text
+    assert_equal "visible", ActionText::Content.new("<style>.x{}</style><div>visible</div>").to_plain_text
+  end
+
+  # A `<` that opens no tag is TEXT (HTML5's tag-open rule). Every
+  # scanner here took any `<` for a tag, so `< 2 && 3 >` read as an
+  # element: its plain text lost the span, and campfire's SanitizeTags
+  # removed it and the rest of the message. Both answers are Rails',
+  # from once-campfire-rust's rich-text corpus ("plain text with markup
+  # characters", "malformed bogus comment") as our oracle recorded them.
+  def test_a_bare_less_than_is_text
+    assert_equal %(1 < 2 && 3 > 2 "quoted" 'single'),
+      ActionText::Content.new(%(1 < 2 && 3 > 2 "quoted" 'single')).to_plain_text
+  end
+
+  def test_declarations_and_bogus_end_tags_are_dropped
+    assert_equal "abcd", ActionText::Content.new("a<!x>b<?pi?>c</ >d").to_plain_text
+  end
+
+  def test_a_bare_less_than_neither_opens_nor_ends_an_element
+    fragment = ActionText::Content.new("1 < 2 && <b>a < b</b> c").fragment
+    assert_equal ["<b>a < b</b>"], fragment.find_all("b").map { |node| node.to_s }
+  end
+
+  def test_entities_decode
+    assert_equal "Tom & Jerry", ActionText::Content.new("<div>Tom &amp; Jerry</div>").to_plain_text
+    assert_equal "nbsp here", ActionText::Content.new("<div>nbsp&nbsp;here</div>").to_plain_text
+    assert_equal "\"quoted\" 'single'",
+      ActionText::Content.new("<div>&quot;quoted&quot; &#39;single&#39;</div>").to_plain_text
+  end
+
+  def test_escaped_markup_decodes_to_visible_text
+    # Rails documents this exact pair: the return value is NOT html
+    # safe, which is the whole reason `to_plain_text` is never rendered
+    # without re-escaping.
+    assert_equal "<script>alert()</script>",
+      ActionText::Content.new("&lt;script&gt;alert()&lt;/script&gt;").to_plain_text
+  end
+
+  def test_unknown_entity_passes_through
+    # Stated divergence: only the named entities Rails' own escaper
+    # emits are decoded. An exotic name stays verbatim rather than
+    # decoding, because decoding needs a codepoint intrinsic the
+    # framework runtime does not carry.
+    assert_equal "5 &lowast; 3", ActionText::Content.new("<div>5 &lowast; 3</div>").to_plain_text
+  end
+
+  def test_empty_content_is_empty
+    assert_equal "", ActionText::Content.new("").to_plain_text
+    assert_equal "", ActionText::Content.new("<div></div>").to_plain_text
+  end
+
+  def test_trailing_newlines_are_removed
+    assert_equal "trailing", ActionText::Content.new("<div>trailing</div>\n\n").to_plain_text
+  end
+
+  def test_attachment_renders_its_caption
+    html = '<div>hi <action-text-attachment sgid="abc" caption="A cap">' \
+           "</action-text-attachment> there</div>"
+    assert_equal "hi A cap there", ActionText::Content.new(html).to_plain_text
+  end
+
+  # An sgid nothing resolves is a `MissingAttachable`, which has no
+  # plain-text representation of its own, so the node is its caption
+  # and nothing else — NOT its filename. (Measured: Rails answers "" for
+  # this node. "[racecar.jpg]" is what a BLOB's sgid would give, and
+  # this one resolves to no blob.)
+  def test_an_unresolved_attachment_without_a_caption_is_nothing
+    html = '<action-text-attachment sgid="abc" filename="racecar.jpg">' \
+           "</action-text-attachment>"
+    assert_equal "", ActionText::Content.new(html).to_plain_text
+  end
+
+  # An attachment's CHILDREN are not text: Rails replaces the whole
+  # node, and Trix stores an unfurled link's rendered `<figure>` inside
+  # it. (Measured.)
+  def test_an_attachments_children_are_not_text
+    html = '<div>see <action-text-attachment sgid="abc" caption="cap">' \
+           "<figure><a href=\"http://x/\">Title</a><div>blurb</div></figure></action-text-attachment> now</div>"
+    assert_equal "see cap now", ActionText::Content.new(html).to_plain_text
+  end
+
+  # A node with a `url` and an image content type and no sgid is
+  # Action Text's own `RemoteImage`: "[caption]", "[Image]" without one.
+  def test_a_remote_image_is_bracketed
+    html = '<div>x<action-text-attachment content-type="image/png" url="http://x/1.png">' \
+           "</action-text-attachment></div>"
+    assert_equal "x[Image]", ActionText::Content.new(html).to_plain_text
+    html = '<div>x<action-text-attachment content-type="image/png" url="http://x/1.png" caption="pic">' \
+           "</action-text-attachment></div>"
+    assert_equal "x[pic]", ActionText::Content.new(html).to_plain_text
+  end
+
+  def test_links_are_extracted_in_order_without_duplicates
+    html = '<div><a href="http://a.example/">A</a> ' \
+           '<a href="http://b.example/">B</a> ' \
+           '<a href="http://a.example/">A again</a></div>'
+    assert_equal ["http://a.example/", "http://b.example/"],
+      ActionText::Content.new(html).links
+  end
+
+  def test_links_ignores_anchors_without_href
+    assert_equal [], ActionText::Content.new("<div><a>plain</a></div>").links
+  end
+
+  def test_attachments_parse_every_attribute
+    html = '<action-text-attachment sgid="SGID" content-type="image/jpeg" ' \
+           'caption="Cap" filename="racecar.jpg" url="http://x/1"></action-text-attachment>'
+    attachments = ActionText::Content.new(html).attachments
+    assert_equal 1, attachments.length
+    a = attachments[0]
+    assert_equal "SGID", a.sgid
+    assert_equal "image/jpeg", a.content_type
+    assert_equal "Cap", a.caption
+    assert_equal "racecar.jpg", a.filename.to_s
+    assert_equal "http://x/1", a.url
+  end
+
+  def test_attachment_attributes_are_entity_decoded
+    html = '<action-text-attachment caption="Tom &amp; Jerry"></action-text-attachment>'
+    assert_equal "Tom & Jerry", ActionText::Content.new(html).attachments[0].caption
+  end
+
+  def test_attachables_is_empty_by_design
+    # DIVERGENCE, pinned so it is a decision and not a surprise:
+    # dereferencing an attachment's signed GlobalID back to a record
+    # needs SignedGlobalID verification, which does not exist here yet.
+    html = '<action-text-attachment sgid="SGID"></action-text-attachment>'
+    assert_equal [], ActionText::Content.new(html).attachables
+  end
+
+  def test_to_html_is_the_stored_markup_and_to_s_wraps_it
+    html = "<div>Hello <b>world</b></div>"
+    content = ActionText::Content.new(html)
+    assert_equal html, content.to_html
+    assert_equal "<div class=\"trix-content\">\n  " + html + "\n</div>\n", content.to_s
+  end
+
+  # Rails' `Content#blank?` is `to_html.blank?` (actiontext 8.1.4,
+  # content.rb: `delegate :blank?, … to: :to_html`): whitespace-only
+  # MARKUP is blank, and any element — an empty shell, an attachment —
+  # is not. An attachment-only body is a message with a link preview.
+  def test_blank_is_the_markup_blank
+    assert ActionText::Content.new("").blank?
+    assert ActionText::Content.new("   \n\t").blank?
+    assert ActionText::Content.new("\u000b").blank?
+    assert ActionText::Content.new("\u0085").blank?
+    assert ActionText::Content.new("\u00a0").blank?
+    refute ActionText::Content.new("<div></div>").blank?
+    refute ActionText::Content.new("<div><br></div>").blank?
+    refute ActionText::Content.new("&nbsp;").blank?
+    refute ActionText::Content.new(%(<action-text-attachment content-type="application/vnd.actiontext.opengraph-embed" url="u"></action-text-attachment>)).blank?
+    refute ActionText::Content.new("<div>x</div>").blank?
+    assert ActionText::Content.new("<div>x</div>").present?
+  end
+
+  def test_to_plain_text_is_memoized
+    content = ActionText::Content.new("<div>Hello world</div>")
+    first = content.to_plain_text
+    second = content.to_plain_text
+    assert_equal "Hello world", first
+    assert_same first, second
+  end
+
+  def test_tag_name_is_the_canonical_attachment_element
+    assert_equal "action-text-attachment", ActionText::Attachment.tag_name
+  end
+
+  def test_canonicalize_keyword_is_accepted
+    # A filter chain constructs its result with `canonicalize: false`
+    # — "I have just rewritten this markup, do not rewrite it again".
+    # Nothing here canonicalizes, so the keyword is accepted and
+    # ignored; ABSENT it was an ArgumentError on every filtered
+    # message, inside an app-level rescue that turned it into an empty
+    # body.
+    assert_equal "<p>x</p>", ActionText::Content.new("<p>x</p>", canonicalize: false).to_html
+  end
+end
+
+# `ActionText::Fragment` — the element view a `Content::Filter` works
+# through. Rails wraps Nokogiri and takes any CSS or XPath; this is a
+# scanner over the same string, answering the selector shapes an app's
+# filters actually write and REFUSING the rest. The refusal is the part
+# worth testing: a filter chain runs inside a rescue in every app that
+# has one, so a selector quietly matching nothing is indistinguishable
+# from a message with no content.
+class ActionTextFragmentTest < Minitest::Test
+  def test_find_all_by_element_name_returns_outer_html
+    fragment = ActionText::Content.new("<div>Hello <b>world</b>!</div>").fragment
+    assert_equal ["<b>world</b>"], fragment.find_all("b").map { |node| node.to_s }
+  end
+
+  def test_to_plain_text_converts_fragment_markup
+    fragment = ActionText::Fragment.wrap("<div>Hello <b>world</b> &amp;<br>again</div>")
+    assert_equal "Hello world &\nagain", fragment.to_plain_text
+  end
+
+  def test_find_all_descends_into_matched_elements
+    fragment = ActionText::Content.new("<div><div>inner</div></div>").fragment
+    assert_equal 2, fragment.find_all("div").length
+  end
+
+  def test_find_all_matches_attribute_predicates
+    html = "<action-text-attachment content-type=\"embed\" url=\"https://pbs.twimg.com/x\"></action-text-attachment>" \
+      "<action-text-attachment content-type=\"mention\"></action-text-attachment>"
+    fragment = ActionText::Content.new(html).fragment
+    # `@name` is the XPath spelling of the same attribute test, which is
+    # how campfire's filters write it.
+    assert_equal 1, fragment.find_all("action-text-attachment[@content-type='embed']").length
+    assert_equal 1, fragment.find_all("action-text-attachment[content-type='mention']").length
+    assert_equal 0, fragment.find_all("action-text-attachment[@content-type='other']").length
+    # `*=` is a substring test; both predicates must hold on ONE element.
+    assert_equal 1,
+      fragment.find_all("action-text-attachment[@content-type='embed'][url*='pbs.twimg.com']").length
+    assert_equal 0,
+      fragment.find_all("action-text-attachment[@content-type='mention'][url*='pbs.twimg.com']").length
+  end
+
+  def test_a_node_reads_its_attributes
+    html = "<action-text-attachment href=\"https://example.com/a\"></action-text-attachment>"
+    node = ActionText::Content.new(html).fragment.find_all("action-text-attachment").first
+    assert_equal "https://example.com/a", node["href"]
+    assert_nil node["sgid"]
+    assert_equal "action-text-attachment", node.name
+  end
+
+  def test_replace_rewrites_the_whole_element
+    fragment = ActionText::Content.new("<div>a<b>keep</b></div>").fragment
+    assert_equal "<em>gone</em>", fragment.replace("div") { "<em>gone</em>" }.to_s
+  end
+
+  def test_replace_with_a_nil_block_removes_the_element_and_its_children
+    fragment = ActionText::Content.new("<div>a<script>evil()</script>b</div>").fragment
+    # `:not(…)` is how an allow-list sanitizer spells itself.
+    assert_equal "<div>ab</div>", fragment.replace(":not(div)") { nil }.to_s
+  end
+
+
+  # campfire's own allow-list, at full width — 45 `:not` segments — over
+  # the exact body `scripts/campfire-compare` first posted. Pinned
+  # because the day that comparator ran, the binary kept `alert(1)`:
+  # NOT this scanner's fault (this test passes under the spinel harness
+  # too), but matz/spinel#4240 — `replace` is a builtin-owned name, and
+  # through the filter chain's UNTYPED slot the call runs the builtin's
+  # semantics instead of this method. A green run here plus a red
+  # campfire-compare --spinel is that dispatch bug, not a scanner one.
+  def test_replace_with_campfires_own_allow_list
+    allowed = %w[ a abbr acronym address b big blockquote br cite code dd del dfn div dl dt em h1 h2 h3 h4 h5 h6 hr i ins kbd li ol
+      p pre samp small span strong sub sup time tt ul var ] + [ "action-text-attachment", "figure", "figcaption" ]
+    sel = allowed.map { |tag| ":not(#{tag})" }.join("")
+    fragment = ActionText::Content.new("<div>rich <strong>bold</strong> <script>alert(1)</script></div>").fragment
+    assert_equal "<div>rich <strong>bold</strong> </div>", fragment.replace(sel) { nil }.to_s
+  end
+
+  def test_replace_leaves_an_allowed_document_alone
+    html = "<div>Hello <b>world</b>!</div>"
+    fragment = ActionText::Content.new(html).fragment
+    assert_equal html, fragment.replace(":not(div):not(b)") { nil }.to_s
+  end
+
+  def test_nested_elements_of_the_same_name_close_correctly
+    fragment = ActionText::Content.new("<div><div>in</div>out</div>tail").fragment
+    assert_equal "<div><div>in</div>out</div>", fragment.find_all("div").first.to_s
+  end
+
+  def test_a_void_element_is_its_own_tag
+    fragment = ActionText::Content.new("<div>a<br>b</div>").fragment
+    assert_equal "<br>", fragment.find_all("br").first.to_s
+  end
+
+  # The WRITE side, which campfire's two mutating filters use: a node
+  # handed out by `replace` takes `inner_html=` and is spliced back as
+  # rewritten, and an `update` block writes through `at_css` into the
+  # copy it was handed. Every expectation measured against Rails'
+  # Nokogiri-backed Fragment.
+  def test_replace_can_rewrite_a_nodes_inner_html
+    fragment = ActionText::Content.new("<div>a<b>k</b></div>").fragment
+    out = fragment.replace("div") { |node| node.tap { |n| n.inner_html = "<i>in</i>" } }
+    assert_equal "<div><i>in</i></div>", out.to_s
+  end
+
+  def test_update_writes_an_attribute_through_at_css
+    fragment = ActionText::Content.new("<div>a<b>k</b></div>").fragment
+    out = fragment.update { |source| source.at_css("div")["class"] = "x" }
+    assert_equal "<div class=\"x\">a<b>k</b></div>", out.to_s
+    # The receiver is untouched, as Rails' is: `update` works on a copy.
+    assert_equal "<div>a<b>k</b></div>", fragment.to_s
+  end
+
+  def test_update_removes_disallowed_nodes_and_their_contents
+    html = "<p>keep</p><svg><script>nested</script><a>gone</a></svg><iframe>frame</iframe><div><script>alert(1)</script>ok<span>stay</span></div>"
+    fragment = ActionText::Content.new(html).fragment
+    out = fragment.update do |source|
+      source.css("*").each do |node|
+        node.remove unless %w[ a div p span ].include?(node.name)
+      end
+    end
+    assert_equal "<p>keep</p><div>ok<span>stay</span></div>", out.to_s
+    assert_equal html, fragment.to_s
+  end
+
+  def test_update_removes_malformed_nested_elements_in_reverse_order
+    out = ActionText::Fragment.new("<b><i></b></i>").update do |source|
+      nodes = source.css("*")
+      nodes[1].remove
+      nodes[0].remove
+    end
+
+    assert_equal "", out.to_s
+  end
+
+  def test_update_removes_stale_crossing_element_after_serialization
+    html = "<script><iframe></script></iframe>alert(1)</script><p>keep</p>"
+    out = ActionText::Fragment.new(html).update do |source|
+      nodes = source.css("*")
+      nodes[1].remove
+      assert_equal "<script>alert(1)</script><p>keep</p>", source.to_s
+      nodes[0].remove
+    end
+
+    assert_equal "<p>keep</p>", out.to_s
+  end
+
+  def test_replace_observes_a_pending_remove
+    fragment = ActionText::Fragment.new("<script>gone</script><div>keep</div>")
+    fragment.css("script")[0].remove
+
+    out = fragment.replace("div") { |node| node.to_s }
+
+    assert_equal "<div>keep</div>", out.to_s
+  end
+
+  def test_writing_a_parent_after_removing_a_child_does_not_restore_the_child
+    out = ActionText::Fragment.new("<div><script>unsafe</script><span>keep</span></div>").update do |source|
+      nodes = source.css("*")
+      nodes[1].remove
+      nodes[0]["class"] = "safe"
+    end
+
+    assert_equal "<div class=\"safe\"><span>keep</span></div>", out.to_s
+  end
+
+  def test_rewriting_parent_inner_html_after_removing_a_child_does_not_restore_it
+    out = ActionText::Fragment.new("<div><script>unsafe</script><span>keep</span></div>").update do |source|
+      parent = source.css("div")[0]
+      child = source.css("script")[0]
+      child.remove
+      parent.inner_html = parent.inner_html + "<b>added</b>"
+    end
+
+    assert_equal "<div><span>keep</span><b>added</b></div>", out.to_s
+  end
+
+  def test_overlapping_malformed_element_removals_keep_later_nodes_removable
+    fragment = ActionText::Fragment.new("<x><y>" + ("a" * 50) + "</x></y><script>alert(1)</script>")
+    nodes = fragment.css("*")
+
+    nodes[0].remove
+    nodes[1].remove
+    assert_equal "<script>alert(1)</script>", fragment.to_s
+
+    nodes[2].remove
+    assert_equal "", fragment.to_s
+  end
+
+  def test_separately_scanned_nodes_preserve_each_others_attribute_writes
+    fragment = ActionText::Fragment.new("<div>keep</div>")
+    first = fragment.css("div")[0]
+    second = fragment.css("div")[0]
+
+    first["id"] = "one"
+    assert_equal "one", second["id"]
+    assert_equal "one", second.attributes["id"]
+    assert_equal "<div id=\"one\">keep</div>", second.to_s
+    second["class"] = "two"
+
+    assert_equal "<div id=\"one\" class=\"two\">keep</div>", fragment.to_s
+  end
+
+  def test_remove_detaches_the_node_from_its_fragment
+    out = ActionText::Fragment.new("<script>unsafe</script><p>safe</p>")
+    removed = out.css("*")[0]
+
+    removed.remove
+    removed["class"] = "detached"
+
+    assert_equal "<p>safe</p>", out.to_s
+    assert_equal "<script class=\"detached\">unsafe</script>", removed.to_s
+  end
+
+  def test_remove_after_a_write_to_an_earlier_node_uses_the_shifted_offset
+    out = ActionText::Fragment.new("<div></div><script>x</script><p>keep</p>").update do |source|
+      nodes = source.css("*")
+      nodes[0]["class"] = "long-value"
+      nodes[1].remove
+    end
+
+    assert_equal "<div class=\"long-value\"></div><p>keep</p>", out.to_s
+  end
+
+  def test_writes_to_a_captured_descendant_do_not_reach_a_removed_parent
+    out = ActionText::Fragment.new("<svg><a>gone</a></svg><p>keep</p>")
+    nodes = out.css("*")
+    nodes[0].remove
+    nodes[1]["class"] = "detached"
+
+    assert_equal "<p>keep</p>", out.to_s
+    assert_equal "<a class=\"detached\">gone</a>", nodes[1].to_s
+  end
+
+  def test_a_fresh_scan_after_a_write_uses_current_fragment_offsets
+    out = ActionText::Fragment.new("<div></div><p>first</p><p>second</p>").update do |source|
+      source.css("div")[0]["class"] = "long-value"
+      source.css("p")[1]["class"] = "target"
+    end
+
+    assert_equal "<div class=\"long-value\"></div><p>first</p><p class=\"target\">second</p>", out.to_s
+  end
+
+  def test_a_fresh_scan_inside_replaced_inner_html_uses_current_offsets
+    out = ActionText::Fragment.new("<div><i>old</i></div>").update do |source|
+      root = source.css("div")[0]
+      stale_child = source.css("i")[0]
+      root.inner_html = "<script>unsafe</script><span>keep</span>"
+      source.css("script")[0].remove
+      stale_child["class"] = "detached"
+    end
+
+    assert_equal "<div><span>keep</span></div>", out.to_s
+  end
+
+  def test_setting_an_attribute_replaces_it_in_place_or_appends_it
+    fragment = ActionText::Content.new("<div class=\"a\" id=\"b\">t</div>").fragment
+    out = fragment.update do |source|
+      div = source.at_css("div")
+      div["class"] = "q\"&x"
+      div["title"] = "t"
+    end
+    assert_equal "<div class=\"q&quot;&amp;x\" id=\"b\" title=\"t\">t</div>", out.to_s
+  end
+
+  def test_a_void_element_takes_an_attribute_but_no_inner_html
+    fragment = ActionText::Content.new("<div>a<br>b</div>").fragment
+    out = fragment.update do |source|
+      source.at_css("br")["class"] = "c"
+      source.at_css("br").inner_html = "zzz"
+    end
+    assert_equal "<div>a<br class=\"c\">b</div>", out.to_s
+  end
+
+  def test_a_node_reads_its_own_pieces
+    node = ActionText::Content.new("<div>a<b>k</b></div>").fragment.find_all("div").first
+    assert_equal "a<b>k</b>", node.inner_html
+    node["class"] = "x"
+    assert_equal "x", node["class"]
+    assert_equal "<div class=\"x\">a<b>k</b></div>", node.to_s
+  end
+
+  def test_wrap_takes_a_string_or_a_fragment
+    fragment = ActionText::Fragment.wrap("<div>x</div>")
+    assert_equal "<div>x</div>", fragment.to_s
+    assert_equal fragment.to_s, ActionText::Fragment.wrap(fragment).to_s
+  end
+
+  def test_an_unreadable_selector_raises_rather_than_matching_nothing
+    fragment = ActionText::Content.new("<div><span>x</span></div>").fragment
+    assert_raises(RuntimeError) { fragment.find_all("div > span") }
+    assert_raises(RuntimeError) { fragment.find_all(".cls") }
+    assert_raises(RuntimeError) { fragment.find_all("div[disabled]") }
+  end
+
+  # ── Attachment.from_node / #attachable ─────────────────────────
+  #
+  # `ActionText::Attachable.locate` is REDEFINED per app in the emitted
+  # tree's global_id_locator.rb (see action_text.rb's `Attachable`
+  # note); here the shared default (nil) is in force, and a test-local
+  # redefinition stands in for the generated one, answering exactly one
+  # record, then the default is put back.
+
+  FakeUser = Struct.new(:id)
+
+  def with_locator
+    ActionText::Attachable.define_singleton_method(:locate) do |model_name, id|
+      model_name == "User" && id == 7 ? FakeUser.new(7) : nil
+    end
+    Rails.secret_key_base = "test-secret"
+    yield
+  ensure
+    ActionText::Attachable.define_singleton_method(:locate) { |_model_name, _id| nil }
+    Rails.secret_key_base = nil
+  end
+
+  def test_attachable_is_missing_under_the_default_locator
+    Rails.secret_key_base = "test-secret"
+    sgid = ActionText::SignedGlobalId.generate("User", 7)
+    attachable = attachment_for(%(<action-text-attachment sgid="#{sgid}"></action-text-attachment>)).attachable
+    assert_kind_of ActionText::Attachables::MissingAttachable, attachable
+  ensure
+    Rails.secret_key_base = nil
+  end
+
+  def attachment_for(html)
+    node = ActionText::Fragment.wrap(html).find_all(ActionText::Attachment.tag_name).first
+    ActionText::Attachment.from_node(node)
+  end
+
+  def test_from_node_carries_the_nodes_attributes
+    attachment = attachment_for(%(<action-text-attachment sgid="x" caption="hi"></action-text-attachment>))
+    assert_equal "x", attachment.sgid
+    assert_equal "hi", attachment.caption
+  end
+
+  def test_attachable_resolves_a_verified_sgid_through_the_locator
+    with_locator do
+      sgid = ActionText::SignedGlobalId.generate("User", 7)
+      attachment = attachment_for(%(<action-text-attachment sgid="#{sgid}"></action-text-attachment>))
+      assert_equal 7, attachment.attachable.id
+    end
+  end
+
+  def test_attachable_is_missing_without_an_sgid
+    with_locator do
+      attachable = attachment_for("<action-text-attachment></action-text-attachment>").attachable
+      assert_kind_of ActionText::Attachables::MissingAttachable, attachable
+      assert_equal "action_text/attachables/missing_attachable", attachable.to_partial_path
+    end
+  end
+
+  def test_attachable_is_missing_for_a_tampered_sgid
+    with_locator do
+      message, _signature = ActionText::SignedGlobalId.generate("User", 7).split("--")
+      attachable = attachment_for(%(<action-text-attachment sgid="#{message}--invalid"></action-text-attachment>)).attachable
+      assert_kind_of ActionText::Attachables::MissingAttachable, attachable
+    end
+  end
+
+  def test_attachable_is_missing_when_the_locator_has_no_row
+    with_locator do
+      sgid = ActionText::SignedGlobalId.generate("User", 8)
+      attachable = attachment_for(%(<action-text-attachment sgid="#{sgid}"></action-text-attachment>)).attachable
+      assert_kind_of ActionText::Attachables::MissingAttachable, attachable
+    end
+  end
+
+  # ── The wire format is Rails' ───────────────────────────────────
+  #
+  # `User.new(id: 7).attachable_sgid` under campfire on Rails 8.2 with
+  # `SECRET_KEY_BASE=test-secret`, copied from that process. Minting
+  # the same bytes and reading them back is what makes an sgid a real
+  # Rails wrote — every @mention in an existing database — resolve
+  # here, and the literal is the discriminator: a change to the salt,
+  # the digest, the padding or the `?expires_in` fails it.
+  RAILS_MINTED_SGID = "eyJfcmFpbHMiOnsiZGF0YSI6ImdpZDovL2NhbXBmaXJlL1VzZXIvNz9leHBpcmVzX2luIiwicHVyIjoiYXR0YWNoYWJsZSJ9fQ==--8c250383b1669d154e58c89f7b60a493c02aa10f"
+
+  # The app name is half the gid, and the shared default is "app";
+  # the emitted tree overrides it on the Application reopen from
+  # config/application.rb, which is what this stands in for
+  # (`Rails.application` is a fresh instance per call, so the class,
+  # not one instance, carries the override).
+  def as_campfire
+    Rails::Application.define_method(:global_id_app) { "campfire" }
+    yield
+  ensure
+    Rails::Application.define_method(:global_id_app) { "app" }
+  end
+
+  def test_generate_mints_the_bytes_rails_mints
+    as_campfire do
+      Rails.secret_key_base = "test-secret"
+      assert_equal RAILS_MINTED_SGID, ActionText::SignedGlobalId.generate("User", 7)
+    end
+  ensure
+    Rails.secret_key_base = nil
+  end
+
+  def test_an_sgid_rails_minted_verifies_here
+    as_campfire do
+      with_locator do
+        assert_equal "User", ActionText::SignedGlobalId.model_of(RAILS_MINTED_SGID)
+        assert_equal 7, ActionText::SignedGlobalId.id_of(RAILS_MINTED_SGID)
+        attachable = attachment_for(%(<action-text-attachment sgid="#{RAILS_MINTED_SGID}"></action-text-attachment>)).attachable
+        assert_equal 7, attachable.id
+      end
+    end
+  end
+
+  def test_an_sgid_under_another_secret_does_not_verify
+    as_campfire do
+      with_locator do
+        Rails.secret_key_base = "rotated"
+        assert_equal "", ActionText::SignedGlobalId.model_of(RAILS_MINTED_SGID)
+        assert_equal 0, ActionText::SignedGlobalId.id_of(RAILS_MINTED_SGID)
+      end
+    end
+  end
+
+  # ── The app's tolerance for a rotated secret ────────────────────
+  #
+  # `Attachment.permitted_without_signature` is REDEFINED per app from
+  # the reopen campfire's lib/ carries (see action_text.rb); the
+  # default is empty, and this stands in for the generated one.
+  def permitting(models)
+    ActionText::Attachment.define_singleton_method(:permitted_without_signature) { models }
+    yield
+  ensure
+    ActionText::Attachment.define_singleton_method(:permitted_without_signature) { [] }
+  end
+
+  def test_unverified_uri_reads_the_data_envelope
+    as_campfire do
+      message, _signature = RAILS_MINTED_SGID.split("--")
+      assert_equal "gid://campfire/User/7?expires_in", ActionText::SignedGlobalId.unverified_uri(message + "--invalid")
+      assert_equal "gid://campfire/User/7?expires_in", ActionText::SignedGlobalId.unverified_uri(message)
+    end
+  end
+
+  def test_unverified_uri_reads_the_marshal_envelope
+    as_campfire do
+      # Rails 7's shape: the gid is a String inside a Marshal dump,
+      # base64'd into `message`. The bytes around it are Marshal's
+      # own (`\x04\b` header, `I"` string, a length byte, the
+      # encoding ivar) — what an unverified read must not unmarshal.
+      marshaled = "\x04\bI\"\x1Agid://campfire/User/7\x06:\x06ET"
+      env = "{\"_rails\":{\"message\":\"" + Base64.strict_encode64(marshaled) + "\",\"exp\":null,\"pur\":\"attachable\"}}"
+      sgid = Base64.strict_encode64(env) + "--invalid"
+      assert_equal "gid://campfire/User/7", ActionText::SignedGlobalId.unverified_uri(sgid)
+    end
+  end
+
+  def test_unverified_uri_is_empty_for_noise
+    as_campfire do
+      assert_equal "", ActionText::SignedGlobalId.unverified_uri("")
+      assert_equal "", ActionText::SignedGlobalId.unverified_uri("not base64 at all--x")
+      assert_equal "", ActionText::SignedGlobalId.unverified_uri(Base64.strict_encode64("{}") + "--x")
+      other = "{\"_rails\":{\"data\":\"gid://elsewhere/User/7\",\"pur\":\"attachable\"}}"
+      assert_equal "", ActionText::SignedGlobalId.model_in(ActionText::SignedGlobalId.unverified_uri(Base64.urlsafe_encode64(other)))
+    end
+  end
+
+  def test_a_permitted_model_resolves_with_a_bad_signature
+    as_campfire do
+      with_locator do
+        permitting(["User"]) do
+          message, _signature = RAILS_MINTED_SGID.split("--")
+          attachable = attachment_for(%(<action-text-attachment sgid="#{message}--invalid"></action-text-attachment>)).attachable
+          assert_equal 7, attachable.id
+        end
+      end
+    end
+  end
+
+  def test_an_unlisted_model_is_missing_with_a_bad_signature
+    as_campfire do
+      with_locator do
+        permitting(["Room"]) do
+          message, _signature = RAILS_MINTED_SGID.split("--")
+          attachable = attachment_for(%(<action-text-attachment sgid="#{message}--invalid"></action-text-attachment>)).attachable
+          assert_kind_of ActionText::Attachables::MissingAttachable, attachable
+        end
+      end
+    end
+  end
+
+  # ── to_s renders attachments, then the layout ─────────────────────
+  #
+  # `Content.render_attachment` is GENERATED per app (one arm per
+  # attachable model with a partial); the shared default answers "".
+  # A test-local redefinition stands in for the generated one, the
+  # same way `with_locator` does above, and the default is put back.
+  # In THIS class rather than ActionTextContentTest for the reason the
+  # locator tests are: the transpiled rungs compile the first class of
+  # the file and a singleton redefinition does not take there, so a
+  # test that needs the stand-in runs under CRuby only.
+  def with_render(render)
+    ActionText::Content.define_singleton_method(:render_attachment, &render)
+    yield
+  ensure
+    ActionText::Content.define_singleton_method(:render_attachment) { |_attachment| "" }
+  end
+
+  def test_render_attachments_renders_each_attachment_node_inside_its_tag
+    with_render(->(a) { "<b>#{a["filename"]}</b>" }) do
+      html = %(<div>Hey <action-text-attachment sgid="x" filename="one"></action-text-attachment> and <action-text-attachment filename="two"></action-text-attachment>!</div>)
+      assert_equal %(<div>Hey <action-text-attachment sgid="x" filename="one"><b>one</b></action-text-attachment> and <action-text-attachment filename="two"><b>two</b></action-text-attachment>!</div>),
+        ActionText::Content.new(html).render_attachments
+    end
+  end
+
+  def test_render_attachments_replaces_children_a_node_already_carries
+    with_render(->(_a) { "NEW" }) do
+      html = %(<action-text-attachment sgid="x"><figure>old</figure></action-text-attachment>)
+      assert_equal %(<action-text-attachment sgid="x">NEW</action-text-attachment>), ActionText::Content.new(html).render_attachments
+    end
+  end
+
+  def test_render_attachments_leaves_a_self_closing_node_and_plain_markup_alone
+    with_render(->(_a) { "NEW" }) do
+      html = %(<div><action-text-attachment sgid="x"/> <p>text</p></div>)
+      assert_equal html, ActionText::Content.new(html).render_attachments
+      assert_equal "<div>no nodes</div>", ActionText::Content.new("<div>no nodes</div>").render_attachments
+    end
+  end
+
+  # campfire's own tests write a mention node with the rendered
+  # mention in its `content` attribute — a `>` inside a quoted value.
+  def test_a_quoted_gt_inside_an_attribute_does_not_end_the_tag
+    with_render(->(a) { "[#{a["sgid"]}]" }) do
+      html = %(<div>Hey <action-text-attachment sgid="x" content="<div class=&quot;mention&quot;>y</div>"></action-text-attachment></div>)
+      assert_equal %(<div>Hey <action-text-attachment sgid="x" content="<div class=&quot;mention&quot;>y</div>">[x]</action-text-attachment></div>),
+        ActionText::Content.new(html).render_attachments
+      assert_equal ["x"], ActionText::Content.new(html).attachments.map { |a| a["sgid"] }
+    end
+  end
+end
+
+# The two runtime pieces the Lexxy editor brought: `Node#at_css` (a
+# paragraph asked whether it holds an attachment) and the editor's
+# `value` (lexxy's `render_custom_attachments_in`). Written without
+# `assert_nil` and without test-local helpers, for the strict lanes.
+class ActionTextLexxyTest < Minitest::Test
+  def test_a_node_answers_its_first_matching_descendant
+    fragment = ActionText::Fragment.new(%(<p>see <action-text-attachment sgid="x"></action-text-attachment></p><p>none</p>))
+    paragraphs = fragment.find_all("p")
+    assert_equal "action-text-attachment", paragraphs[0].at_css("action-text-attachment").name
+    assert paragraphs[1].at_css("action-text-attachment").nil?
+  end
+
+  def test_a_blank_body_gives_the_editor_no_value
+    assert ActionText.lexxy_editor_value("").nil?
+    assert ActionText.lexxy_editor_value("  \n").nil?
+  end
+
+  def test_an_attachment_without_a_url_carries_its_render_as_json
+    html = %(<p>hi <action-text-attachment sgid="x" content-type="application/vnd.campfire.mention"></action-text-attachment></p>)
+    assert_equal %(<p>hi <action-text-attachment sgid="x" content-type="application/vnd.campfire.mention" content="&quot;&quot;"></action-text-attachment></p>),
+      ActionText.lexxy_editor_value(html).to_s
+  end
+
+  def test_an_attachment_with_a_url_is_left_alone
+    html = %(<action-text-attachment url="https://example.com/a.png" content-type="image/png"></action-text-attachment>)
+    assert_equal html, ActionText.lexxy_editor_value(html).to_s
+  end
+end
