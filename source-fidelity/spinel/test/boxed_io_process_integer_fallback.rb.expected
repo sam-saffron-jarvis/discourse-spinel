@@ -1,0 +1,7 @@
+true
+no-thread-pid
+{kind: "user-pid"}
+"dynamic-pid"
+true
+{kind: "user-fd"}
+"dynamic-fd"

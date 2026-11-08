@@ -10,6 +10,9 @@ require_relative "active_record/base"
 # (`connection`/`transaction`); loading it first would define an empty
 # Base the real one then clobbers.
 require_relative "active_record/connection"
+require_relative "active_record/connection_pool_executor"
+require_relative "active_record/query_cache_scope"
+require_relative "active_record/asynchronous_queries_tracker"
 # Signed ids (`record.signed_id` / `Model.find_signed`) — like
 # connection.rb a reopen-tier file the strict targets do not stage: it
 # calls into ActionController::MessageVerifier, whose PBKDF2/HMAC

@@ -1,0 +1,29 @@
+module ActiveSupport
+  module Dependencies
+    INTERLOCK: Interlock
+    def self.interlock: () -> ::ActiveSupport::Dependencies::Interlock
+    class RunningShare
+      @thread: ::Thread
+      @depth: Integer
+      def initialize: (::Thread thread) -> void
+      def thread: () -> ::Thread
+      def depth: () -> Integer
+      def depth=: (Integer value) -> Integer
+    end
+    class Interlock
+      @mutex: ::Mutex
+      @changed: ::ConditionVariable
+      @sharing: Array[::ActiveSupport::Dependencies::RunningShare]
+      @exclusive_thread: ::Thread?
+      @exclusive_depth: Integer
+      @waiting_writers: Integer
+      def initialize: () -> void
+      def empty_shares: () -> Array[::ActiveSupport::Dependencies::RunningShare]
+      def running_depth: () -> Integer
+      def start_running: () -> Integer
+      def done_running: () -> nil
+      def start_unloading: () -> bool
+      def done_unloading: () -> nil
+    end
+  end
+end

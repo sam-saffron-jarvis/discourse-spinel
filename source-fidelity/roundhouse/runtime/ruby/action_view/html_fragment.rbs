@@ -1,0 +1,9 @@
+module ActionView
+  class HtmlFragment
+    @text: String
+    def initialize: (String text) -> void
+    def html_safe?: () -> bool
+    def html_safe: () -> HtmlFragment
+    def to_s: () -> String
+  end
+end

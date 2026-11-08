@@ -8,6 +8,7 @@ use crate::det::{HashMap, HashSet};
 
 /// One expanded `delegate` entry: `<name>` forwards to `<target>.<method>`.
 pub(super) struct Delegation {
+    pub(super) receiver: MethodReceiver,
     pub(super) method: Symbol,
     pub(super) target: Symbol,
     pub(super) name: String,
@@ -84,6 +85,21 @@ impl<'a> DelegateEligibility<'a> {
         if declaration.has_unsupported_option {
             return None;
         }
+        let receiver = if call.decisions & crate::expr::SINGLETON_BODY != 0 {
+            // Only the directly owned `class << self` is marked by ingest.
+            // These calls define class methods, never instance forwarders.
+            MethodReceiver::Class
+        } else {
+            MethodReceiver::Instance
+        };
+        if receiver == MethodReceiver::Class
+            && declaration.names.iter().any(|method| {
+                let name = method.as_str().trim_end_matches(['?', '!', '=']);
+                !valid_identifier(name)
+            })
+        {
+            return None;
+        }
         let file = super::super::sources::path_of(call.span.file).unwrap_or_default();
         let visibility_defaults =
             self.visibility_cache
@@ -122,6 +138,13 @@ impl<'a> DelegateEligibility<'a> {
             return None;
         };
 
+        // The macro module_evals its definitions with public visibility;
+        // the caller's eigenclass lexical `private` default does not apply.
+        let visibility = if receiver == MethodReceiver::Class {
+            MethodVisibility::Public
+        } else {
+            visibility
+        };
         let mut entries = Vec::new();
         for method in &declaration.names {
             // Rails' allow_nil forwarder is `_ = target; _.m if !_.nil? ||
@@ -129,45 +152,36 @@ impl<'a> DelegateEligibility<'a> {
             // exactly, unless nil answers `m` itself (`to_s`, `blank?`, …),
             // which Rails calls on nil. A setter or an operator is not
             // reproduced with allow_nil either.
-            if declaration.allow_nil
+            if receiver == MethodReceiver::Instance
+                && declaration.allow_nil
                 && (NIL_PUBLIC_METHODS.contains(&method.as_str())
                     || method.as_str().ends_with('=')
                     || super::operator_forwarder("", method.as_str()).is_some())
             {
                 return None;
             }
-            let name = generated_name(
-                method.as_str(),
-                &declaration.prefix,
-                declaration.target.as_str(),
-            );
+            let name = generated_name(method.as_str(), &declaration.prefix, declaration.target.as_str());
             let earlier_local_definition = self.methods.iter().any(|definition| {
-                definition.receiver == MethodReceiver::Instance
+                definition.receiver == receiver
                     && definition.name.as_str() == name
                     && definition.name_span.file == call.span.file
                     && definition.name_span.start < call.span.start
             });
             let later_local_definition = self.methods.iter().any(|definition| {
-                definition.receiver == MethodReceiver::Instance
+                definition.receiver == receiver
                     && definition.name.as_str() == name
                     && definition.name_span.file == call.span.file
                     && definition.name_span.start > call.span.start
             });
-            if self.blocked_names.contains(&name)
-                && (!earlier_local_definition || later_local_definition)
-            {
+            if self.blocked_names.contains(&name) && (!earlier_local_definition || later_local_definition) {
                 return None;
             }
-            if !method.as_str().ends_with('=') {
+            if receiver == MethodReceiver::Instance && !method.as_str().ends_with('=') {
                 if let Some(calls) = self.called_with_args.get(&name) {
                     let forwardable_operator = super::operator_forwarder("", method.as_str())
                         .map(|(params, _)| params.split(", ").count())
                         .is_some_and(|arity| {
-                            !calls.has_block
-                                && calls
-                                    .positional_arities
-                                    .iter()
-                                    .all(|call_arity| *call_arity == arity)
+                            !calls.has_block && calls.positional_arities.iter().all(|call_arity| *call_arity == arity)
                         });
                     if !forwardable_operator {
                         return None;
@@ -175,6 +189,7 @@ impl<'a> DelegateEligibility<'a> {
                 }
             }
             entries.push(Delegation {
+                receiver,
                 method: method.clone(),
                 target: declaration.target.clone(),
                 name,
@@ -245,7 +260,16 @@ pub(super) fn take_delegate_decls_from_calls(
         }
         // An unsupported later declaration still replaces an earlier method
         // with the same generated name in Ruby's source order.
-        out.retain(|existing| !generated_names.contains(&existing.name));
+        let receiver = if call.decisions & crate::expr::SINGLETON_BODY != 0 {
+            MethodReceiver::Class
+        } else {
+            MethodReceiver::Instance
+        };
+        out.retain(|existing| {
+            receiver == MethodReceiver::Class
+                || existing.receiver != receiver
+                || !generated_names.contains(&existing.name)
+        });
         let Some(entries) = eligibility.eligible_entries(call, &parsed) else {
             return true;
         };

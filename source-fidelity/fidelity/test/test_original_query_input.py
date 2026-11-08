@@ -40,6 +40,7 @@ class OriginalQueryInputTest(unittest.TestCase):
     def test_real_plugin_state_mismatch_is_not_trimmed_or_accepted(self):
         with tempfile.TemporaryDirectory() as temp:
             run = QueryRun.__new__(QueryRun)
+            run.trace_activation = False
             run.path = Path(temp)
             run.evidence = {}
             rows = {"native-page0": [{"kind": "initializer", "input_page": 0}],

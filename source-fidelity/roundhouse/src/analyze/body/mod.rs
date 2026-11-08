@@ -3517,6 +3517,18 @@ impl<'a> BodyTyper<'a> {
                     && let Some(expected) = ctx.ivar_bindings.get(name) {
                     propagate_expected_to_empty_container(value, expected);
                 }
+                // The per-key empty seed has the receiver Hash's value
+                // contract too: `@sites[site] ||= {}` must retain the nested
+                // element types established by actual writes through its reader.
+                // This annotates only a genuine empty literal; no source index
+                // value, lookup, allocation or short-circuit effect is replaced.
+                if *op == crate::expr::OpAssignOp::OrOr && let LValue::Index { recv, index } = target {
+                    self.analyze_expr(recv, ctx);
+                    self.analyze_expr(index, ctx);
+                    if let Some(Ty::Hash { value: expected, .. }) = recv.ty.as_ref().map(Ty::peel_nilable) {
+                        propagate_expected_to_empty_container(value, expected);
+                    }
+                }
                 // Same recursion shape as Assign: walk target's child
                 // Exprs + walk value. Short-circuit-aware type
                 // narrowing (suppressing the union-widen on `||=` when
@@ -3527,7 +3539,7 @@ impl<'a> BodyTyper<'a> {
                 if let LValue::Attr { recv, .. } = target {
                     self.analyze_expr(recv, ctx);
                 }
-                if let LValue::Index { recv, index } = target {
+                if *op != crate::expr::OpAssignOp::OrOr && let LValue::Index { recv, index } = target {
                     self.analyze_expr(recv, ctx);
                     self.analyze_expr(index, ctx);
                 }
@@ -6780,6 +6792,24 @@ fn time_parse_ty(recv: &Expr, method: &Symbol, args: &[Expr]) -> Option<Ty> {
 }
 
 impl BodyTyper<'_> {
+    /// Ordered declaration events may retain an evaluated call argument in
+    /// a hygienic lexical local across separate seed/definition events. Carry
+    /// its TYPE forward, never a folded value or an ivar/cvar storage fact.
+    /// Reset this lexical environment for each typing pass.
+    pub(super) fn analyze_declaration_initializers(&self, initializers: &mut [Expr], ctx: &Ctx) {
+        let mut current = ctx.clone();
+        for initializer in initializers {
+            self.analyze_expr(initializer, &current);
+            if initializer.declaration_step().is_some()
+                && let ExprNode::Assign { target: LValue::Var { name, .. }, value } = &*initializer.node
+                && !name.as_str().starts_with('@') && !name.as_str().starts_with('$')
+                && let Some(ty) = value.ty.clone().filter(|ty| !ty.is_open())
+            {
+                current.local_bindings.insert(name.clone(), ty);
+            }
+        }
+    }
+
     pub(super) fn global_constructor_overridden(&self) -> bool {
         let name = Symbol::from("new");
         self.classes().get(&ClassId(Symbol::from("Class"))).is_some_and(|class| {

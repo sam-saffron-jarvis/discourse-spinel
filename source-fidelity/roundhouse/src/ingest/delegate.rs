@@ -162,6 +162,10 @@ pub(super) fn expand_delegates(
     method_targets: &crate::det::HashSet<String>,
     sources: &[crate::span::SourceFile],
 ) -> Vec<MethodDef> {
+    if !unknown_calls.iter().any(is_delegate_declaration) {
+        return Vec::new();
+    }
+    let original_calls = unknown_calls.clone();
     let called_with_args = names_called_with_arguments(methods, additional_method_bodies);
     let mut eligibility = DelegateEligibility::new(
         methods,
@@ -182,33 +186,51 @@ pub(super) fn expand_delegates(
     // can't render its parse errors against an unrelated real
     // file (see `ingest::sources`'s module doc for how that
     // happened before this existed).
-    let (parsed, diags) = crate::ingest::prism::scope(|| {
-        crate::ingest::ingest_library_classes(src.as_bytes(), "<delegate>")
-    });
+    let (parsed, diags) =
+        crate::ingest::prism::scope(|| crate::ingest::ingest_library_classes(src.as_bytes(), "<delegate>"));
     match parsed {
-        Ok(classes) if diags.is_empty() => classes
-            .into_iter()
-            .flat_map(|class| class.methods)
-            .map(|mut method| {
-                if let Some(delegate) = delegates
-                    .iter()
-                    .find(|delegate| delegate.name == method.name.as_str())
-                {
+        Ok(classes) if diags.is_empty() => {
+            let declarations = emitted_delegates(methods, &delegates);
+            let parsed: Vec<_> = classes.into_iter().flat_map(|class| class.methods).collect();
+            assert_eq!(
+                parsed.len(),
+                declarations.len(),
+                "delegate synthesis changed declaration count"
+            );
+            let mut ordinals = crate::det::HashMap::<crate::span::Span, u32>::default();
+            parsed
+                .into_iter()
+                .zip(declarations)
+                .map(|(mut method, delegate)| {
+                    assert_eq!(method.name.as_str(), delegate.name);
+                    assert_eq!(method.receiver, delegate.receiver);
                     method.visibility = delegate.visibility;
                     method.name_span = crate::span::Span {
                         file: delegate.declaration_span.file,
                         start: delegate.declaration_span.start,
                         end: delegate.declaration_span.start,
                     };
-                }
-                method
-            })
-            .collect(),
+                    if delegate.receiver == MethodReceiver::Class {
+                        method.enclosing_class = Some(name.0.clone());
+                        method.name_span = delegate.declaration_span;
+                        let ordinal = ordinals.entry(delegate.declaration_span).or_default();
+                        *ordinal += 1;
+                        method.body.set_declaration_step(crate::expr::DeclarationStep {
+                            call: delegate.declaration_span,
+                            ordinal: *ordinal,
+                        });
+                    }
+                    method
+                })
+                .collect()
+        }
         Ok(_) => {
+            *unknown_calls = original_calls;
             record_synthesis_failure(&delegates, &diags);
             Vec::new()
         }
         Err(err) => {
+            *unknown_calls = original_calls;
             super::survey::record(&err);
             Vec::new()
         }
@@ -298,32 +320,59 @@ fn operator_forwarder(t: &str, m: &str) -> Option<(&'static str, String)> {
     }
 }
 
-fn synthesized_source(
-    name: &crate::ident::ClassId,
-    methods: &[MethodDef],
-    delegates: &[Delegation],
-) -> String {
-    let defined_after = |name: &str, declaration: crate::span::Span| {
-        methods.iter().any(|method| {
-            method.receiver == MethodReceiver::Instance
-                && method.name.as_str() == name
-                && method.name_span.file == declaration.file
-                && method.name_span.start > declaration.start
-        })
-    };
+fn emitted_delegates<'a>(methods: &[MethodDef], delegates: &'a [Delegation]) -> Vec<&'a Delegation> {
+    // Singleton declarations are real ordered definition events, including
+    // replacements. The emitter positions their DeclarationSteps between real
+    // defs/calls. Legacy instance specialization retains its existing policy.
+    let mut out: Vec<_> = delegates
+        .iter()
+        .filter(|d| d.receiver == MethodReceiver::Class)
+        .collect();
+    let mut generated = crate::det::HashSet::default();
+    for d in delegates
+        .iter()
+        .rev()
+        .filter(|d| d.receiver == MethodReceiver::Instance)
+    {
+        let later = methods.iter().any(|method| {
+            method.receiver == d.receiver
+                && method.name.as_str() == d.name
+                && method.name_span.file == d.declaration_span.file
+                && method.name_span.start > d.declaration_span.start
+        });
+        if !later && generated.insert(d.name.as_str()) {
+            out.push(d);
+        }
+    }
+    out
+}
+
+fn synthesized_source(name: &crate::ident::ClassId, methods: &[MethodDef], delegates: &[Delegation]) -> String {
     let mut body = String::new();
-    let mut generated_names = crate::det::HashSet::default();
-    for d in delegates.iter().rev() {
-        // A later explicit definition wins, while a delegate declaration
-        // that follows an earlier definition replaces it just as Rails does.
-        if defined_after(&d.name, d.declaration_span) {
-            continue;
-        }
-        if !generated_names.insert(d.name.as_str()) {
-            continue;
-        }
+    for d in emitted_delegates(methods, delegates) {
         let (target, m) = (receiver(d.target.as_str()), d.method.as_str());
         let t = target.as_ref();
+        if d.receiver == MethodReceiver::Class {
+            // ActiveSupport's literal method target has no receiver_class to
+            // specialize its signature: readers keep `...`, writers take arg.
+            // Retain the target-once and genuine nil-target rescue contract,
+            // rather than claiming a zero-arg native wrapper is equivalent.
+            let params = if m.ends_with('=') { "arg" } else { "..." };
+            let call = format!("_.{m}({params})");
+            let operation = if d.allow_nil {
+                format!("if !_.nil? || nil.respond_to?(:{m})\n      {call}\n    end")
+            } else {
+                format!(
+                    "{call}\n  rescue ::NoMethodError => e\n    if _.nil? && e.name == :{m}\n      ::Kernel.raise ::ActiveSupport::DelegationError.nil_target(:{}, :'{t}')\n    else\n      ::Kernel.raise\n    end",
+                    d.name
+                )
+            };
+            body.push_str(&format!(
+                "  def self.{}({params})\n    _ = {t}\n    {operation}\n  end\n\n",
+                d.name
+            ));
+            continue;
+        }
         // A setter takes the one argument Ruby's own assignment syntax
         // supplies (with `prefix: true`, `d.name` is already
         // `<prefix>_name=`); an operator takes its fixed operands.
@@ -700,3 +749,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "singleton_delegate_tests.rs"]
+mod singleton_tests;

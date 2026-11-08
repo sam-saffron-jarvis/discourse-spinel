@@ -909,7 +909,11 @@ module ActionController
       @body   = body
       @status = resolve_status(status)
       @performed = true
-      @content_type = content_type unless content_type.nil?
+      unless content_type.nil?
+        # ActionDispatch::Response retains its default UTF-8 charset when
+        # setting a media type; an explicitly supplied charset wins.
+        @content_type = content_type.include?("charset=") ? content_type : content_type + "; charset=utf-8"
+      end
       @location = ActionController.sanitize_location(location) unless location.nil?
       apply_vary_header
       nil

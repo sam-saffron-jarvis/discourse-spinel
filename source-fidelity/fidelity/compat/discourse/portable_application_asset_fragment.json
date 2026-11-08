@@ -1,0 +1,49 @@
+{
+  "pin": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+  "source": "app/views/layouts/application.html.erb",
+  "source_sha256": "c9c62986b9c9f70ef776d6ba89a9b6a243b275a67df39ef62e2a959d599743d4",
+  "selected_span": {
+    "start_byte": 2286,
+    "end_byte": 2545,
+    "text_sha256": "b83b35daa91adbf4b84a5e3736e4d6995f362d9557f165706857d571b5ab6994"
+  },
+  "expressions": [
+    {
+      "ruby": "script_asset_path \"js/browser-update\"",
+      "return_boundary": "escaped_string",
+      "start_byte": 2316,
+      "end_byte": 2360
+    },
+    {
+      "ruby": "csp_nonce_placeholder",
+      "return_boundary": "escaped_string",
+      "start_byte": 2381,
+      "end_byte": 2409
+    },
+    {
+      "ruby": "preload_script 'js/browser-detect'",
+      "return_boundary": "trusted_fragment",
+      "start_byte": 2417,
+      "end_byte": 2458
+    },
+    {
+      "ruby": "module_preloads_for \"discourse\", (staff? ? \"admin/compat-modules\" : nil)",
+      "return_boundary": "trusted_fragment",
+      "start_byte": 2464,
+      "end_byte": 2543
+    }
+  ],
+  "candidate_sha256": "afc36885dc845b8d38c14beaabc597acb0bef225b902f0211443bb8081dc55cf",
+  "original_erb_engine": "ActionView::Template::Handlers::ERB::Erubi escape:false/trim:true, actual OutputBuffer.append= semantics",
+  "original_compiled_sha256": "7e2cb49f43d1553018a573f1878c5acd8bafcfd3071bb79142d6aba84f07cdf4",
+  "transformations": [
+    "Exact original literal bytes retained; each Ruby expression executes once",
+    "Source-backed String expressions escape; existing typed trusted fragments append raw; explicit result wrapper",
+    "No other layout branch removed or represented as rendered; this is only the selected source span"
+  ],
+  "context": "Unit settings/roles and isolated CSP headers/env, real file resolver/genuine graph; NOT a request/page or production configuration",
+  "original_html_accepted": false,
+  "native_html_accepted": false,
+  "browser_accepted": false,
+  "page_accepted": false
+}

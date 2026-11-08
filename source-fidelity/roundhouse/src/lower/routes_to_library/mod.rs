@@ -1708,7 +1708,7 @@ fn record_model_slug(v: &Expr, models: &crate::det::HashMap<String, bool>) -> Op
 /// concat form it replaced (`x_path(…) + ".json"`) put the extension
 /// after the QUERY STRING, which is a different URL. A function per pair
 /// costs nothing to the callers that never mention a format.
-fn format_variant_demand(
+pub(crate) fn format_variant_demand(
     app: &App,
     declared: &crate::det::HashSet<String>,
 ) -> std::collections::BTreeMap<String, (String, String)> {

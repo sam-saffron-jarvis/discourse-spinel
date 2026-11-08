@@ -18,6 +18,7 @@ pub(super) struct SourceGem {
     pub mount: PathBuf,
     installed: PathBuf,
     files: BTreeSet<PathBuf>,
+    name: String,
 }
 
 pub(super) fn resolve<V: Vfs + ?Sized>(
@@ -48,10 +49,127 @@ pub(super) fn resolve<V: Vfs + ?Sized>(
         };
         // Not lexical first: a `..` after a linked app dir resolves through the link, as the OS reads it
         let installed = vfs.canonical(&installed).unwrap_or_else(|| normalize(&installed));
-        let files = required_files(vfs, &installed, name, lock.gemfile_requires.get(name))?;
-        gems.push(SourceGem { mount: dir.join(MOUNT).join(format!("{name}-{version}")), installed, files });
+        let files = required_files(vfs, &installed, name, lock.gemfile_requires.get(name), None)?;
+        gems.push(SourceGem { mount: dir.join(MOUNT).join(format!("{name}-{version}")), installed, files, name: name.clone() });
     }
     Ok(gems)
+}
+
+/// A target-aware ingest may distinguish mutually exclusive source files only
+/// for engine tests that agree on Ruby and Spinel. Source consumers retain the
+/// unspecialized inventory. The caller records this restricted runtime profile.
+pub(super) fn specialize_ruby_family<V: Vfs + ?Sized>(
+    vfs: &V, dir: &Path, lock: Option<&Lockfile>, gems: &mut [SourceGem],
+) -> Result<bool, String> {
+    use ruby_prism::Visit;
+    struct World(bool, bool, usize);
+    impl<'pr> Visit<'pr> for World {
+        fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
+            let path = node.constant_path();
+            if matches!(path.location().as_slice(), b"String" | b"::String" | b"Object" | b"::Object" | b"BasicObject" | b"Class" | b"Module" | b"TrueClass" | b"FalseClass" | b"NilClass") { self.0 = false; }
+            self.2 += 1;
+            ruby_prism::visit_class_node(self, node);
+            self.2 -= 1;
+        }
+        fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
+            self.2 += 1;
+            ruby_prism::visit_module_node(self, node);
+            self.2 -= 1;
+        }
+        fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
+            self.2 += 1;
+            ruby_prism::visit_def_node(self, node);
+            self.2 -= 1;
+        }
+        fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+            let method = node.name();
+            // App lib/model file-level calls do not have gem FileProgram IR.
+            // A computed/opaque call there could load the alternative or change
+            // engine lookup and otherwise disappear before the finite guard.
+            if self.1 && self.2 == 0 {
+                let literal_require = node.receiver().is_none()
+                    && matches!(method.as_slice(), b"require" | b"require_relative")
+                    && node.arguments().is_some_and(|args| {
+                        let args: Vec<_> = args.arguments().iter().collect();
+                        matches!(args.as_slice(), [arg] if arg.as_string_node().is_some())
+                    });
+                if !literal_require { self.0 = false; }
+            }
+            if matches!(method.as_slice(), b"const_set" | b"remove_const" | b"refine" | b"using") { self.0 = false; }
+            if node.receiver().is_some_and(|receiver| matches!(receiver.location().as_slice(), b"String" | b"::String" | b"Object" | b"::Object" | b"BasicObject" | b"Class" | b"Module" | b"TrueClass" | b"FalseClass" | b"NilClass"))
+                && matches!(method.as_slice(), b"define_method" | b"define_singleton_method" | b"prepend" | b"include" | b"extend" | b"class_eval" | b"module_eval" | b"instance_eval" | b"send" | b"public_send" | b"__send__") { self.0 = false; }
+            ruby_prism::visit_call_node(self, node);
+        }
+    }
+    fn fixed(text: &str, unretained_root: bool) -> bool {
+        // Any spelling of an assignment, including a lexical shadow or a
+        // compound write, invalidates use of the builtin engine binding.
+        for (_, rest) in text.match_indices("RUBY_ENGINE").map(|(at, name)| (at, &text[at + name.len()..])) {
+            let rest = rest.trim_start();
+            if (rest.starts_with('=') && !rest.starts_with("==") && !rest.starts_with("=~"))
+                || rest.starts_with("||=") || rest.starts_with("&&=") { return false; }
+        }
+        let parsed = super::prism::parse_silent(text.as_bytes());
+        if parsed.errors().next().is_some() { return false; }
+        let mut world = World(true, unretained_root, 0);
+        world.visit(&parsed.node());
+        world.0
+    }
+    if gems.is_empty() { return Ok(false); }
+    let Some(lock) = lock else { return Ok(false); };
+    let mut pending = ["app", "lib", "config", "Gemfile"].map(|path| dir.join(path)).to_vec();
+    let mut checked = BTreeSet::new();
+    let mut application_edges = Vec::new();
+    while let Some(path) = pending.pop() {
+        if !checked.insert(path.clone()) { continue; }
+        if vfs.is_symlink(&path) { return Ok(false); }
+        if vfs.is_dir(&path) {
+            let Ok(entries) = vfs.read_dir(&path) else { return Ok(false); };
+            pending.extend(entries);
+        } else if path.extension().is_some_and(|extension| extension == "rb") || path.file_name().is_some_and(|name| name == "Gemfile") {
+            if !vfs.exists(&path) { continue; }
+            let Ok(text) = vfs.read_to_string(&path) else { return Ok(false); };
+            if !fixed(&text, path.starts_with(dir.join("app")) || path.starts_with(dir.join("lib"))) { return Ok(false); }
+            application_edges.extend(requires_for_engines(&text, Some(&["ruby", "spinel"])).into_iter().map(|(relative, feature)| (path.clone(), relative, feature)));
+        }
+    }
+    for gem in gems.iter() {
+        for file in gem.files.iter().filter(|file| file.extension().is_some_and(|extension| extension == "rb")) {
+            let path = gem.installed.join(file);
+            if path.ancestors().take_while(|path| *path != gem.installed).any(|path| vfs.is_symlink(path)) { return Ok(false); }
+            let text = vfs.read_to_string(&path).map_err(|error| error.to_string())?;
+            if !fixed(&text, false) { return Ok(false); }
+        }
+    }
+    let selections: Vec<_> = gems.iter().map(|gem| required_files(vfs, &gem.installed, &gem.name, lock.gemfile_requires.get(&gem.name), Some(&["ruby", "spinel"]))).collect::<Result<_, _>>()?;
+    // An explicit app or cross-gem require can still load the alternative.
+    // Do not remove it merely because one registration branch is false.
+    for (gem, selected) in gems.iter().zip(&selections) {
+        for file in selected.iter().filter(|file| file.extension().is_some_and(|extension| extension == "rb")) {
+            let path = gem.installed.join(file);
+            let text = vfs.read_to_string(&path).map_err(|error| error.to_string())?;
+            application_edges.extend(requires_for_engines(&text, Some(&["ruby", "spinel"])).into_iter().map(|(relative, feature)| (path.clone(), relative, feature)));
+        }
+    }
+    for (from, relative, feature) in &application_edges {
+        let file = if feature.ends_with(".rb") { feature.clone() } else { format!("{feature}.rb") };
+        for (gem, selected) in gems.iter().zip(&selections) {
+            for excluded in gem.files.difference(selected) {
+                let referenced = if *relative {
+                    normalize(&from.parent().unwrap().join(&file)) == normalize(&gem.installed.join(excluded))
+                } else {
+                    excluded == &PathBuf::from("lib").join(&file)
+                };
+                if referenced { return Ok(false); }
+            }
+        }
+    }
+    let mut changed = false;
+    for (gem, selected) in gems.iter_mut().zip(selections) {
+        changed |= selected != gem.files;
+        gem.files = selected;
+    }
+    Ok(changed)
 }
 
 fn required_files<V: Vfs + ?Sized>(
@@ -59,6 +177,7 @@ fn required_files<V: Vfs + ?Sized>(
     gem: &Path,
     name: &str,
     gemfile_requires: Option<&Vec<String>>,
+    engines: Option<&[&str]>,
 ) -> Result<BTreeSet<PathBuf>, String> {
     let lib = gem.join("lib");
     // Not the gem's name when the app's Gemfile says what Bundler requires (svg-graph has no `svg-graph.rb`).
@@ -108,7 +227,7 @@ fn required_files<V: Vfs + ?Sized>(
                 }
             }
         }
-        for (relative, feature) in requires(&text) {
+        for (relative, feature) in requires_for_engines(&text, engines) {
             let base = if relative { file.parent().unwrap().to_path_buf() } else { lib.clone() };
             let path = base.join(if feature.ends_with(".rb") { feature } else { format!("{feature}.rb") });
             let path = normalize(&path);
@@ -156,9 +275,23 @@ fn zeitwerk_ignores(text: &str, dir: &Path) -> Option<Vec<PathBuf>> {
     Some(out)
 }
 
+#[cfg(test)]
 fn requires(text: &str) -> Vec<(bool, String)> {
-    struct Finder(Vec<(bool, String)>, usize);
-    impl<'pr> ruby_prism::Visit<'pr> for Finder {
+    requires_for_engines(text, None)
+}
+
+fn requires_for_engines(text: &str, engines: Option<&[&str]>) -> Vec<(bool, String)> {
+    struct Finder<'a>(Vec<(bool, String)>, usize, Option<&'a [&'a str]>);
+    impl<'pr> ruby_prism::Visit<'pr> for Finder<'_> {
+        fn visit_if_node(&mut self, node: &ruby_prism::IfNode<'pr>) {
+            let choice = self.2.and_then(|engines| engine_consensus(&node.predicate(), engines));
+            match choice {
+                Some(true) => { if let Some(body) = node.statements() { self.visit(&body.as_node()); } }
+                Some(false) => { if let Some(body) = node.subsequent() { self.visit(&body); } }
+                None => ruby_prism::visit_if_node(self, node),
+            }
+        }
+
         fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
             self.1 += 1;
             ruby_prism::visit_def_node(self, node);
@@ -187,9 +320,55 @@ fn requires(text: &str) -> Vec<(bool, String)> {
         }
     }
     let parsed = super::prism::parse_silent(text.as_bytes());
-    let mut finder = Finder(Vec::new(), 0);
+    let mut finder = Finder(Vec::new(), 0, engines);
     ruby_prism::Visit::visit(&mut finder, &parsed.node());
     finder.0
+}
+
+/// Only engine predicates agreeing on BOTH the original CRuby reference and
+/// native Spinel can select this source inventory. Other conditions retain all
+/// dependencies. This changes no source expression or loader execution order.
+fn engine_consensus(node: &ruby_prism::Node<'_>, engines: &[&str]) -> Option<bool> {
+    fn truth(node: &ruby_prism::Node<'_>, engine: &str) -> Option<bool> {
+        if node.as_true_node().is_some() { return Some(true); }
+        if node.as_false_node().is_some() || node.as_nil_node().is_some() { return Some(false); }
+        let call = node.as_call_node()?;
+        if call.block().is_some() { return None; }
+        let receiver = call.receiver()?;
+        let args: Vec<_> = call.arguments().map(|args| args.arguments().iter().collect()).unwrap_or_default();
+        if call.name().as_slice() == b"!" && args.is_empty() { return truth(&receiver, engine).map(|value| !value); }
+        let [argument] = args.as_slice() else { return None; };
+        let equal = match call.name().as_slice() { b"==" => true, b"!=" => false, _ => return None };
+        let (constant, literal) = if receiver.as_constant_read_node().is_some() { (&receiver, argument) } else { (argument, &receiver) };
+        if constant.as_constant_read_node()?.name().as_slice() != b"RUBY_ENGINE" { return None; }
+        let literal = literal.as_string_node()?;
+        Some((literal.unescaped() == engine.as_bytes()) == equal)
+    }
+    let first = truth(node, *engines.first()?)?;
+    engines.iter().all(|engine| truth(node, engine) == Some(first)).then_some(first)
+}
+
+/// The shared IR form of the same guarded Ruby/Spinel engine consensus.
+/// Only callers with the validated inventory profile may use this proof.
+pub(crate) fn ruby_family_truth(expr: &crate::expr::Expr) -> Option<bool> {
+    use crate::expr::{ExprNode, Literal};
+    match &*expr.node {
+        ExprNode::Lit { value: Literal::Bool { value } } => Some(*value),
+        ExprNode::Lit { value: Literal::Nil } => Some(false),
+        ExprNode::Send { recv: Some(recv), method, args, block: None, .. }
+            if method.as_str() == "!" && args.is_empty() => ruby_family_truth(recv).map(|value| !value),
+        ExprNode::Send { recv: Some(recv), method, args, block: None, .. }
+            if matches!(method.as_str(), "==" | "!=") && args.len() == 1 => {
+            let (constant, literal) = if matches!(&*recv.node, ExprNode::Const { .. }) { (recv, &args[0]) } else { (&args[0], recv) };
+            if !matches!(&*constant.node, ExprNode::Const { path } if path.len() == 1 && path[0].as_str() == "RUBY_ENGINE") { return None; }
+            let ExprNode::Lit { value: Literal::Str { value } } = &*literal.node else { return None; };
+            let equal = method.as_str() == "==";
+            let ruby = (value == "ruby") == equal;
+            let spinel = (value == "spinel") == equal;
+            (ruby == spinel).then_some(ruby)
+        }
+        _ => None,
+    }
 }
 
 fn normalize(path: &Path) -> PathBuf {
@@ -281,6 +460,28 @@ impl<V: Vfs + ?Sized> Vfs for MountVfs<'_, V> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn engine_dependency_prototype_requires_ruby_native_consensus() {
+        let source = r#"module Example
+  if RUBY_ENGINE == 'jruby'
+    autoload :Connection, 'example/jdbc'
+  else
+    autoload :Connection, 'example/native'
+  end
+end
+"#;
+        assert_eq!(requires(source), vec![(false, "example/jdbc".into()), (false, "example/native".into())]);
+        assert_eq!(requires_for_engines(source, Some(&["ruby", "spinel"])), vec![(false, "example/native".into())]);
+        // A predicate that disagrees between the reference and native runtime
+        // cannot select either source inventory for a shared proof.
+        let divergent = source.replace("'jruby'", "'ruby'");
+        assert_eq!(requires_for_engines(&divergent, Some(&["ruby", "spinel"])).len(), 2);
+        let unknown = source.replace("RUBY_ENGINE == 'jruby'", "ENV['ADAPTER'] == 'jdbc'");
+        assert_eq!(requires_for_engines(&unknown, Some(&["ruby", "spinel"])).len(), 2);
+        let opposite = source.replace("RUBY_ENGINE == 'jruby'", "'jruby' != RUBY_ENGINE");
+        assert_eq!(requires_for_engines(&opposite, Some(&["ruby", "spinel"])), vec![(false, "example/jdbc".into())]);
+    }
 
     #[test]
     fn a_bundle_path_above_the_app_keeps_the_required_files() {

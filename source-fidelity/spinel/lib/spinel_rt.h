@@ -20563,8 +20563,9 @@ static sp_mutex *sp_poly_mutex_recv(sp_RbVal v) {
 #ifdef SPINEL_EXT_HOST
 int sp_Kernel_require(const char *feature, int *loaded, void (*top)(void));
 int sp_Kernel_require_relative(const char *feature, int *loaded, void (*top)(void));
+int sp_autoload_require(const char *feature, int *loaded, void (*top)(void), int *presence);
 #else
-static int sp_load_file(const char *feature, int *loaded, void (*top)(void)) {
+static int sp_load_file(const char *feature, int *loaded, void (*top)(void), int *autoload_presence) {
   if (!top) sp_raise_load_error(feature);
   if (*loaded) return 0;
   *loaded = 1;
@@ -20581,6 +20582,11 @@ static int sp_load_file(const char *feature, int *loaded, void (*top)(void)) {
   sp_exc_top--;
   sp_gc_nroots = sp_exc_rootmark[sp_exc_top]; sp_rescue_sp = sp_rescue_mark[sp_exc_top];
   *loaded = 0;
+  /* An autoload publishes its binding only after the feature completes.
+     A class/constant written before a failed load must not let the next
+     read bypass that still-pending autoload. Ordinary require keeps its
+     partial definitions; only the autoload's own presence flag rolls back. */
+  if (autoload_presence) *autoload_presence = 0;
   if (sp_unwind_kind != SP_UNWIND_NONE) sp_unwind_resume();
   emsg = sp_exc_msg[sp_exc_top]; ecls = sp_exc_cls[sp_exc_top]; eobj = sp_exc_obj[sp_exc_top];
   /* the exception passes on: it keeps the frames of the raise in the file */
@@ -20594,10 +20600,13 @@ static int sp_load_file(const char *feature, int *loaded, void (*top)(void)) {
    methods are in a --debug build: a static function has no symbol in an ELF
    backtrace. A release link drops them from a program that loads no file. */
 int sp_Kernel_require(const char *feature, int *loaded, void (*top)(void)) {
-  return sp_load_file(feature, loaded, top);
+  return sp_load_file(feature, loaded, top, NULL);
 }
 int sp_Kernel_require_relative(const char *feature, int *loaded, void (*top)(void)) {
-  return sp_load_file(feature, loaded, top);
+  return sp_load_file(feature, loaded, top, NULL);
+}
+int sp_autoload_require(const char *feature, int *loaded, void (*top)(void), int *presence) {
+  return sp_load_file(feature, loaded, top, presence);
 }
 #endif
 static sp_RbVal sp_Mutex_synchronize_proc(sp_mutex *m, sp_Proc *blk) {

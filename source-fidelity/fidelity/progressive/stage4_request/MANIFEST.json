@@ -1,0 +1,362 @@
+{
+  "profile": "WIP shared latest controller action and guarded real actor; NOT native request acceptance",
+  "baseline_revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+  "source_sha256": {
+    "app/controllers/list_controller.rb": "dbced8e36813d9d6221cb6316b48e1e3eb4ad70ecdec58f319f9569ba5f9edc0",
+    "lib/auth/default_current_user_provider.rb": "6a698b688a91aa2d02d204b16faf96fd9853f9c649bf0367cd485fbf2061b98e",
+    "lib/middleware/overload_protections.rb": "ff648f739f9797a0731383a5158e318d2a350125669eba7fe26cd58ffd10d620",
+    "lib/json_error.rb": "70a66221b15a9b548a347cf9eaae35ffa5fa2f3ec3a5e92dd756b8bbacd8bd71",
+    "app/controllers/application_controller.rb": "793f89f85258089376c4e09da54030919afa29fc7b2cb3fad0109a3637ae012f",
+    "lib/git_utils.rb": "9b39f2b22e2aa376af6525cb96429ad7521f0b31476eaa0bd1873c62d3886a6b",
+    "lib/http_language_parser.rb": "2a6220a9affe8600cecc8b83dcc00b14bf16f2325ac31ac1cd52a5a2adfc0aed",
+    "lib/freedom_patches/translate_accelerator.rb": "fd96706f4ff1c6d3e06c3432445c3bd1de273f508e6a406907d9f9fa5c1783e8",
+    "config/locales/server.fr.yml": "4bf761084ece61969f3f86ed945a0114bdc64201f4e7bab3882d2ada27b1f0c0",
+    "config/locales/client.fr.yml": "9ff678dac528021b565cc286123e4860aeabed497cee5c65f00dc1e7eba97acd",
+    "lib/read_only_mixin.rb": "403e40baa6b2e61242c0874fbeacd67f0932d2a4c3c5f6c7d5138683ec8a1f0c",
+    "lib/archived_site_mixin.rb": "dde4b70db26e396728d1741c04266f68c3762212eaa22a330e3c6e208ff8c67e",
+    "lib/discourse.rb": "1330fdf219417287e80958fae9e90e9a15eff984d298e1203f301ff25f0e6aba",
+    "lib/markdown_endpoint/controller_support.rb": "fb062ada8d830ce2972ff1697ed7a3ca1114c59bc1ba1ea22037c8a2defeedce",
+    "config/initializers/markdown_endpoints.rb": "18057a2c8b2eec326403bfa79ccf7357a8416bf963b0e655425eaf437a3e4f4b",
+    "lib/theme_resolver.rb": "4e70b3cfa8a25ab5fe63a1d9382644cd4fd83b74be5cb44eec57fbf5f6b79e0c",
+    "lib/mobile_detection.rb": "3fe460ff9f600326e2d704540afbc404786bf3bf93441d8edefdc74456e3baa9",
+    "lib/application_layout_preloader.rb": "d1527e34b8ed09cbbe2b1e9fc5f2f472bf58d26e4036ff8611e531099c86335d",
+    "app/helpers/application_helper.rb": "657c2c838b498ba38ed7bb5d4a7f31c73ee5ee2bf98f629c192a1897ca862034",
+    "lib/crawler_detection.rb": "6de07eb4720e031c5835182a340e009120c884aba1b07d63399f8b25e51324c0",
+    "lib/topic_query_params.rb": "930fdf22110573de49155ffcc53f944d7615edb4cc4b8165702e6e8f0cc2ebdd",
+    "config/application.rb": "789086c01435a0fc91651bf3ad098e10e5f8bea96fd84569e91e2b7f38db1d58",
+    "lib/auth.rb": "197d81a48ec0cab3539743ccc88b09a879ce07936a8e18878a1880df2bc73e84",
+    "lib/current_user.rb": "93c780941ae8f92387608c04ffadc929f6f1e1cfd8a026e44d0d67afa00e04de",
+    "lib/topic_list_responder.rb": "aa029946c01a1cd803504af21e9960f2d259482f67656b4a6d151da3e985704b",
+    "lib/vary_header.rb": "304d143208d9629c9a5e5ed2aed4314a52ad8979ea0f11c48389494edde41e54"
+  },
+  "candidate_source_sha256": {
+    "lib/portable_latest_json_action.rb": "0d6884041f1b8f49bf4c1a62d39b502942024dda452934d7165ca14bd55a9b07",
+    "app/controllers/list_controller.rb": "d836e6e7550fe8e1e54f304a08c94145665e9b61b88eb2727935ffcfd29e7df6",
+    "lib/auth/default_current_user_provider.rb": "11ea2e44182302dcdc3ee21bad128a2a86ecc01d5bd81b26a0ea15db753eb26b",
+    "lib/middleware/overload_protections.rb": "f7580939d68e4305681f3db32afac20092309ada78a1a3292099d7b520903cb0",
+    "lib/json_error.rb": "cbc699855adbd141d68553753eca9724dd70208454432f1912607ddeee52f0b6",
+    "lib/portable_controller_login_policy.rb": "bc6b1bb575a68471722b8ded1d2ec491b26f5ed74ed3e60db05af998e5c10bfd",
+    "app/controllers/application_controller.rb": "705a71b195d18cebc5e5bd485048204cbb733bca1159450e93d72c9bec68beca",
+    "lib/read_only_mixin.rb": "1463e0a48909f96a99435b603def6d02290704f9630ad8b0c30c5887e8f6a881",
+    "lib/archived_site_mixin.rb": "536cfd9c2088ec1ad8a23bc92f161f92e11fc78b95c3ecb31a045eda951cfdc3",
+    "lib/portable_readonly_declarations.rb": "a1c19159a838500b9aad37b053d84392f42ab2f484c9544fc5f260e09bfd838f",
+    "lib/markdown_endpoint/controller_support.rb": "dd15c8d14a1ea048eefeb2aa05683a55d1a9d303c6c555cc2af9214a23050fed",
+    "lib/theme_resolver.rb": "dcb3e6cebd52222890d1caa5a7eb025d56d9681a68d8adac32b41ac9477fe142",
+    "lib/crawler_detection.rb": "3858c9c2c992991e6435b5be7835e881ac5debd739f02bfe30592794518fa141",
+    "lib/topic_query_params.rb": "20a68d1209acc3368e1288c64badd3f4a83ad57042f948a34bdacac43c2cc92d"
+  },
+  "guarded_changes": [
+    {
+      "source": "app/controllers/list_controller.rb",
+      "start_byte": 17560,
+      "end_byte": 18767,
+      "text_sha256": "820d454e5aeea1bcdedd8cb1757f2dd962dfa4fcb6a22a46826cbe0c4175a5bc",
+      "reason": "Preserve real paging/route helper algorithm; enabled unicode URL routing explicitly refuses instead of importing unrelated encoding families"
+    },
+    {
+      "source": "app/controllers/list_controller.rb",
+      "start_byte": 13315,
+      "end_byte": 13393,
+      "text_sha256": "e1cf4b118e1f480825fd967c2d37c3ef0ddffdc0d6e7824527812d485cba844c",
+      "reason": "Actual paging helper; route guard proves set_category callback does not run for list/latest, so original @category is implicitly nil"
+    },
+    {
+      "source": "app/controllers/list_controller.rb",
+      "start_byte": 13397,
+      "end_byte": 13555,
+      "text_sha256": "726c0bb89680b2ff9acefe23ba97d7b539a72ff68182083424cea2424a960b0b",
+      "reason": "Actual paging helper; route guard proves set_category callback does not run for list/latest, so original @category is implicitly nil"
+    },
+    {
+      "source": "app/controllers/list_controller.rb",
+      "start_byte": 14465,
+      "end_byte": 14804,
+      "text_sha256": "b021bf4f58df8144d9979207d62e5d129a041d58e52d623d7d600b5f3741b52b",
+      "reason": "Actual paging helper; route guard proves set_category callback does not run for list/latest, so original @category is implicitly nil"
+    },
+    {
+      "source": "app/controllers/list_controller.rb",
+      "start_byte": 2268,
+      "end_byte": 4602,
+      "text_sha256": "7682ee7615d6e6ec257b70623e8147979904bc3a918051fd37ca655e35276b7e",
+      "reason": "Expand actual :latest action; fixed dispatch; defer page-only metadata for JSON while retaining original HTML branch"
+    },
+    {
+      "source": "lib/auth/default_current_user_provider.rb",
+      "start_byte": 3700,
+      "end_byte": 3816,
+      "text_sha256": "2df55f63610b90a816c7b06c9314e2897439e8e04c27dc37cfeba3058e153a90",
+      "reason": "Use actual Rails ActionDispatch::Request subclass instead of Rack::Request for identical no-credential param/env reads"
+    },
+    {
+      "source": "lib/auth/default_current_user_provider.rb",
+      "start_byte": 3870,
+      "end_byte": 8050,
+      "text_sha256": "5d730fa552c1c32a2b0cd9e3972a93d9338443170057959430484b50b9ea5fb4",
+      "reason": "Real default actor's guarded no-credential completion; every credential/preauthenticated branch explicitly refuses, never a fake user or permission interface"
+    },
+    {
+      "source": "lib/auth/default_current_user_provider.rb",
+      "start_byte": 8054,
+      "end_byte": 9064,
+      "text_sha256": "3a6e7a1402385bb199a01ff2ccc1a0bef042cbe6dc35474d1a1cdf54f8be6d79",
+      "reason": "Share actual anonymous refresh boundaries and token-cookie deletion; authenticated token rotation explicitly refuses"
+    },
+    {
+      "source": "lib/auth/default_current_user_provider.rb",
+      "start_byte": 3183,
+      "end_byte": 3652,
+      "text_sha256": "c74688751ac9e086c950004b75d2fcbc247c417a9a1eef20221ff8adfa677181",
+      "reason": "Share actual no-cookie cached nil completion; encrypted/credential-bearing overload profiles explicitly refuse"
+    },
+    {
+      "source": "lib/middleware/overload_protections.rb",
+      "start_byte": 131,
+      "end_byte": 412,
+      "text_sha256": "f744eb676ce742698b2e188fb84486933ccbce66bb77467eea2c59a663af0d07",
+      "reason": "Execute original overload predicate/503 response before profiler; source queue parser and live threshold retained, unimplemented authentication explicitly refuses"
+    },
+    {
+      "source": "lib/json_error.rb",
+      "start_byte": 337,
+      "end_byte": 1438,
+      "text_sha256": "e5a36787f1c06bbad19b2c5bc80b1c80472b3db00837b953d6f76ced41a6f59f",
+      "reason": "Retain actual String-message error representation; non-String actor/record/error families explicitly refuse"
+    },
+    {
+      "source": "app/controllers/application_controller.rb",
+      "start_byte": 3738,
+      "end_byte": 4068,
+      "text_sha256": "9bb4059d9bb546d1877dae18b90e3cf0062036ce31e8d2de045d373bfa748964",
+      "reason": "Response cache_control is always a nonnil Hash/store; empty? preserves blank? without dynamic Object reflection"
+    },
+    {
+      "source": "app/controllers/application_controller.rb",
+      "start_byte": 15798,
+      "end_byte": 16122,
+      "text_sha256": "39b60a6b302e6486b8dfdb15e2ebdfdc89f11a54ca6d5b466bd1ae2c6f09fa64",
+      "reason": "Explicit nil checks preserve actual User-or-nil guardian refresh without relying on Object#blank? core extensions"
+    },
+    {
+      "source": "app/controllers/application_controller.rb",
+      "start_byte": 21224,
+      "end_byte": 21336,
+      "text_sha256": "2b0e6a9f7b3fcc06cb2c660f796e75b33f3b02ee612adb4f4a10c8fb912d1ab2",
+      "reason": "Explicit format nil check preserves safe-navigation semantics and permits ordinary shared MIME lowering"
+    },
+    {
+      "source": "app/controllers/application_controller.rb",
+      "start_byte": 34222,
+      "end_byte": 34412,
+      "text_sha256": "021458436449c2a22a57d59988d539f312a621274cf7da47368973177560edee",
+      "reason": "String key access is equivalent for real Rails Parameters and framework parsed params"
+    },
+    {
+      "source": "app/controllers/application_controller.rb",
+      "start_byte": 7367,
+      "end_byte": 7758,
+      "text_sha256": "674feaa91042064a91b2fb83be6e93e3b36684afef2085121c7a585b4417fb38",
+      "reason": "Share actual JSON parameter error formatting at original outer rescue_from boundary; retain original other-format handler"
+    },
+    {
+      "source": "app/controllers/application_controller.rb",
+      "start_byte": 12962,
+      "end_byte": 13164,
+      "text_sha256": "a903d640d10f0c519b10d026b30c80b7414fc958c9955fecba4105d27cdef545",
+      "reason": "Separate actual anonymous JSON logging completion, guarded by real current_user.nil?; retain original other profiles"
+    },
+    {
+      "source": "app/controllers/application_controller.rb",
+      "start_byte": 37742,
+      "end_byte": 38456,
+      "text_sha256": "ee31b0c270f7ec147f123adba66b50e405defdb5ae89825b72038c2a52fa743b",
+      "reason": "Separate actual anonymous JSON logging completion, guarded by real current_user.nil?; retain original other profiles"
+    },
+    {
+      "source": "app/controllers/application_controller.rb",
+      "start_byte": 24775,
+      "end_byte": 24844,
+      "text_sha256": "a99864819e95f4fbee233a646d00e4f661f5bae1de7c6f8c9f5cca5af383ecf8",
+      "reason": "Store original writable per-named-controller login policy in shared portable registry"
+    },
+    {
+      "source": "app/controllers/application_controller.rb",
+      "start_byte": 24848,
+      "end_byte": 24905,
+      "text_sha256": "c049bf6d59382dc6856fc2b4efb685a30b2e5c1be6527fb039b9101b803b7844",
+      "reason": "Store original writable per-named-controller login policy in shared portable registry"
+    },
+    {
+      "source": "app/controllers/application_controller.rb",
+      "start_byte": 13168,
+      "end_byte": 13491,
+      "text_sha256": "9019330311e7112d537ef9c59efb3121bc9ad1c041a33c30738987900764036f",
+      "reason": "Share real profiler snapshot fields with child-free live GitUtils filesystem version reader; transporter profiles explicitly refuse"
+    },
+    {
+      "source": "app/controllers/application_controller.rb",
+      "start_byte": 14280,
+      "end_byte": 14872,
+      "text_sha256": "0f375373016b3a05cf900e07e1402d1d6eaeeca019abd8ac260eedcd8f0195c1",
+      "reason": "Execute real default-anonymous locale scope; selected locale overrides/non-default source locale explicitly refuse, actual values never forced off"
+    },
+    {
+      "source": "app/controllers/application_controller.rb",
+      "start_byte": 21340,
+      "end_byte": 21614,
+      "text_sha256": "b79b089d67a24d6061152e81e18b885974ccbfdce6ee2c240a7e316a3cf0c9a3",
+      "reason": "Share real preloader allocation; call original MobileDetection directly instead of allocating a page view context for JSON"
+    },
+    {
+      "source": "app/controllers/application_controller.rb",
+      "start_byte": 20312,
+      "end_byte": 20485,
+      "text_sha256": "2c3c9af63ac74a331901dcf0777a56993c9f0956d28d538bdd4e05d05965771d",
+      "reason": "Actual no-user login-method return; authenticated OAuth/local branch explicitly refuses for JSON"
+    },
+    {
+      "source": "app/controllers/application_controller.rb",
+      "start_byte": 29331,
+      "end_byte": 30388,
+      "text_sha256": "d28ff7c38930ee1a0c04cd65a6474cd9b30312b2e518f088af1bd90f80ed5bd9",
+      "reason": "Share actual JSON early return; authenticated/HTML profile redirects remain in original method"
+    },
+    {
+      "source": "app/controllers/application_controller.rb",
+      "start_byte": 13495,
+      "end_byte": 14276,
+      "text_sha256": "c62423d9ef748a2fc87e5042c0fa3e475c77cdd2923c42d7a012f1301ff49bfb",
+      "reason": "Retain actual actor/readonly predicate in shared anonymous JSON branch; notification mutations explicitly unsupported"
+    },
+    {
+      "source": "app/controllers/application_controller.rb",
+      "start_byte": 23278,
+      "end_byte": 23763,
+      "text_sha256": "54bec3eaf7f2290f35e9a6c731d239ad59a12d655ccc55133506d20e9fdf5fcd",
+      "reason": "Share actual available/development profiler predicates; encrypted-cookie authorization outside this profile refuses"
+    },
+    {
+      "source": "app/controllers/application_controller.rb",
+      "start_byte": 27098,
+      "end_byte": 28783,
+      "text_sha256": "9008a60bcd883609142ce1b1c4ae63dec0430aa4d4b4994be20d7fb7ed634f5e",
+      "reason": "Share actual API/user/login-required guards; unsupported OAuth/2FA profiles explicitly refuse instead of anonymizing"
+    },
+    {
+      "source": "app/controllers/application_controller.rb",
+      "start_byte": 25239,
+      "end_byte": 25325,
+      "text_sha256": "4ca39a58d683db6b0218a46aace9b08be1c842001a0ceba71bde1adf2c02d323",
+      "reason": "Equivalent nil predicate on actual User-or-nil actor contract; preserve original NotLoggedIn error"
+    },
+    {
+      "source": "lib/read_only_mixin.rb",
+      "start_byte": 1427,
+      "end_byte": 1708,
+      "text_sha256": "d690bf03c98a4c8c256e3b3583915dc735b26407a76b605e3ffa8a5db3533aa0",
+      "reason": "Share actual GET/HEAD early return; mutating JSON policy remains explicitly unsupported"
+    },
+    {
+      "source": "lib/read_only_mixin.rb",
+      "start_byte": 796,
+      "end_byte": 1116,
+      "text_sha256": "aa347f7574504fbe006173041510e9cfc72418214a44851501126f6cfe1167da",
+      "reason": "Same actual readonly/staff state transitions with live shared Redis/force/error-time reader; no frozen mode or fake cache"
+    },
+    {
+      "source": "lib/archived_site_mixin.rb",
+      "start_byte": 793,
+      "end_byte": 1003,
+      "text_sha256": "46b9b49738f77aed32322be65e5490168835e2827e113e9a0c8c8e4521ae455e",
+      "reason": "Share actual GET/HEAD early return; mutating JSON policy remains explicitly unsupported"
+    },
+    {
+      "source": "lib/discourse.rb",
+      "start_byte": 22441,
+      "end_byte": 22494,
+      "text_sha256": "9d1a2df9c9239a783b2eca3f4fcefb8c705c77076abb2f2e2af31cd199b418a1",
+      "reason": "Actual pinned readonly key declarations, never an observed mode"
+    },
+    {
+      "source": "lib/discourse.rb",
+      "start_byte": 22527,
+      "end_byte": 22562,
+      "text_sha256": "4809264356ed31fd3e2e31936921ae2c838b12c1c66d7e98d3c9c3959f4512a7",
+      "reason": "Actual pinned readonly key declarations, never an observed mode"
+    },
+    {
+      "source": "lib/discourse.rb",
+      "start_byte": 22565,
+      "end_byte": 22612,
+      "text_sha256": "75a46bfb232f44ac81226a352265c15e8fdfd8c7b5b2549b8897318bc7d03fd2",
+      "reason": "Actual pinned readonly key declarations, never an observed mode"
+    },
+    {
+      "source": "lib/discourse.rb",
+      "start_byte": 22648,
+      "end_byte": 22693,
+      "text_sha256": "a760cf334cfd9bf0d566fd138eb09b93839f8813b41d7e17845834aac68db288",
+      "reason": "Actual pinned readonly key declarations, never an observed mode"
+    },
+    {
+      "source": "lib/discourse.rb",
+      "start_byte": 22696,
+      "end_byte": 22755,
+      "text_sha256": "c28a7c6943d8ddaee2fd80ff99e3377900d152c7196b3dbaf53291932c4c6b90",
+      "reason": "Actual pinned readonly key declarations, never an observed mode"
+    },
+    {
+      "source": "lib/discourse.rb",
+      "start_byte": 22813,
+      "end_byte": 22875,
+      "text_sha256": "ba4086272b660f2f226bdbc99e3dc5fd79e0d4915ff4b39008c3dc66c9d62a23",
+      "reason": "Actual pinned readonly key declarations, never an observed mode"
+    },
+    {
+      "source": "lib/discourse.rb",
+      "start_byte": 22879,
+      "end_byte": 23009,
+      "text_sha256": "0733da57448210269b05597b27be498c62aca4b3285c8ebde9176da1882f401d",
+      "reason": "Actual pinned readonly key declarations, never an observed mode"
+    },
+    {
+      "source": "lib/markdown_endpoint/controller_support.rb",
+      "start_byte": 1643,
+      "end_byte": 2167,
+      "text_sha256": "519d360c4c4920e3e43f6cd5a60d5041683329edabf8dab6654e31d3247def54",
+      "reason": "Shared actual Markdown guards; non-JSON response/negotiation effects explicitly refuse in this component"
+    },
+    {
+      "source": "lib/markdown_endpoint/controller_support.rb",
+      "start_byte": 2173,
+      "end_byte": 2565,
+      "text_sha256": "35f566fb9f4f41b07ac8bfc10e27096480dec154a3f33dda7b5ca22a24a83f90",
+      "reason": "Shared actual Markdown guards; non-JSON response/negotiation effects explicitly refuse in this component"
+    },
+    {
+      "source": "lib/theme_resolver.rb",
+      "start_byte": 54,
+      "end_byte": 1086,
+      "text_sha256": "d0cf847e1fa8aff4fa35a0279967ab867fb49238646bd68139565965b79da1c3",
+      "reason": "Share anonymous default-theme algorithm with live permissions; preview/cookie/user themes explicitly refuse; private env memoization uses a String key"
+    },
+    {
+      "source": "lib/crawler_detection.rb",
+      "start_byte": 1932,
+      "end_byte": 2459,
+      "text_sha256": "898d7421a149e9eee0f10f479ec6115b328383dbb7ec354fe933d0bb9ac1600b",
+      "reason": "Shared genuine nil/agent/media/format guards; HTML crawler determination stays in original method"
+    },
+    {
+      "source": "lib/topic_query_params.rb",
+      "start_byte": 57,
+      "end_byte": 561,
+      "text_sha256": "19254f55a514739a30ed77d74d4df544be69e9508118ea2285482b58049f5dea",
+      "reason": "String keys work identically in Rails Parameters and framework parsed Hashes; no request option or validator is dropped"
+    }
+  ],
+  "effective_values_or_observed_payloads_used": false,
+  "json_request_accepted": false,
+  "full_query_accepted": false,
+  "page_accepted": false
+}

@@ -1124,6 +1124,9 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
         ("parse", Ty::Untyped), ("join", Ty::Untyped),
         ("escape", Ty::Str), ("unescape", Ty::Str),
         ("encode_www_form", Ty::Str), ("decode_www_form", Ty::Untyped),
+        // Rack::Utils.unescape delegates here; the genuine stdlib/bundled
+        // implementation returns decoded text (or raises on malformed input).
+        ("decode_www_form_component", Ty::Str),
     ], &[]);
     for parser in ["URI::RFC2396_Parser", "URI::RFC3986_Parser"] {
         register_stdlib_class(classes, parser, &[], &[("escape", Ty::Str), ("unescape", Ty::Str)]);
@@ -1313,6 +1316,12 @@ pub(in crate::analyze) fn register(classes: &mut HashMap<ClassId, ClassInfo>) {
     // of that constant and Mutex.new retain their source expressions.
     // Do not invent member or synchronization return types here.
     register_stdlib_class(classes, "Struct", &[], &[]);
+    // OpenStruct is supplied by CRuby's ostruct default gem and Spinel's
+    // native runtime. Keep the constructor and arbitrary field values intact;
+    // this is availability, not a model of dynamically generated accessors.
+    register_stdlib_class(classes, "OpenStruct", &[], &[
+        ("[]", Ty::Untyped), ("[]=", Ty::Untyped), ("to_h", Ty::Untyped),
+    ]);
     // `Range.new(0, n)` (flag_shih_tzu); its answer is typed off the bounds in dispatch.
     register_stdlib_class(classes, "Range", &[], &[]);
     // `default.is_a?(Proc) ? default.call : default` (rails-settings-cached):

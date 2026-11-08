@@ -143,7 +143,7 @@ module ActionDispatch
     # every target and names neither parser.
     attr_accessor :query_parameters
 
-    def initialize
+    def initialize(env = {})
       @remote_ip = "127.0.0.1"
       @path = "/"
       @query_string = +""
@@ -181,6 +181,23 @@ module ActionDispatch
       # a before_action and the header writer share the narrowed policy.
       @csp_ready = false
       @content_security_policy = nil
+      # Rails' new(env), over a framework-preparsed parameter context. The
+      # in-process and HTTP dispatchers own parsing. Never silently answer an
+      # empty params hash for an unparsed nonempty query string.
+      env.each { |key, value| @env[key.to_s] = value }
+      @request_method = (env["REQUEST_METHOD"] || "GET").to_s
+      @path = (env["PATH_INFO"] || "/").to_s
+      @query_string = (env["QUERY_STRING"] || "").to_s
+      @script_name = (env["SCRIPT_NAME"] || "").to_s
+      @host = (env["HTTP_HOST"] || env["SERVER_NAME"] || "localhost").to_s
+      @remote_ip = (env["REMOTE_ADDR"] || "127.0.0.1").to_s
+      @user_agent = (env["HTTP_USER_AGENT"] || "").to_s
+      cached_params = env["action_dispatch.request.parameters"]
+      if cached_params.is_a?(Hash)
+        cached_params.each { |key, value| @params[key.to_s] = value }
+      elsif !@query_string.empty?
+        raise ArgumentError, "Request.new(env) requires parsed query context"
+      end
     end
 
     # Rack's per-request session options. The one key the corpus writes

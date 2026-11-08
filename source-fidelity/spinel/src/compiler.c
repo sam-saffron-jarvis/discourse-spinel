@@ -1299,6 +1299,28 @@ int comp_cvar_index(ClassInfo *ci, const char *name) {
    underscore or a byte of a non-ASCII character first, digits after)? A
    class_variable_get / _set / _defined? with a literal name that is not one
    raises CRuby's NameError when it runs, and declares nothing. */
+const char *comp_cvar_literal_name(Compiler *c, int node) {
+  const NodeTable *nt = c->nt;
+  NodeKind k = nt_kind(nt, node);
+  if (k == NK_SymbolNode) return nt_str(nt, node, "value");
+  int string = comp_class_index(c, "String");
+  /* A prior literal-folding pass may already have simplified +"text".
+     Do not claim a closed String-name world when String#+@ is reopened,
+     even if this argument currently looks like a bare String literal. */
+  if (string >= 0 && comp_method_in_chain(c, string, "+@", NULL) >= 0) return NULL;
+  if (k == NK_CallNode && sp_streq(nt_str(nt, node, "name"), "+@") &&
+      nt_ref(nt, node, "arguments") < 0 && nt_ref(nt, node, "block") < 0) {
+    int recv = nt_ref(nt, node, "receiver");
+    /* Only the builtin literal-copy operation proves unchanged bytes. */
+    if (nt_kind(nt, recv) != NK_StringNode) return NULL;
+    node = recv;
+    k = NK_StringNode;
+  }
+  if (k != NK_StringNode) return NULL;
+  const char *name = nt_str(nt, node, "content");
+  return name ? name : nt_str(nt, node, "unescaped");
+}
+
 int cvar_name_ok(const char *n) {
   if (!n || n[0] != '@' || n[1] != '@') return 0;
   const unsigned char *p = (const unsigned char *)n + 2;

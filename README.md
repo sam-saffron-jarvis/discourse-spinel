@@ -1,22 +1,16 @@
 # Discourse on Spinel — work in progress
 
-**Latest source checkpoint: [the original-source fidelity effort](source-fidelity/README.md), captured November4,2026.** It includes the current Roundhouse and Spinel source trees, fidelity probes, active uncommitted source work and preserved unintegrated lanes.
+**Current committed migration checkpoints: [source-fidelity](source-fidelity/README.md).**
+Updated as development proceeds; exact capture time and component commits are
+recorded in the [snapshot manifest](source-fidelity/SNAPSHOT.json).
 
-**The original native `/latest` page is not complete.** Read [current status and limitations](source-fidelity/STATUS.md) before interpreting tests or trying the code. The working adapted backend below is an older strategy, not proof of the newer original-source goal.
+**The complete original-source native `/latest` page is not yet accepted.** Read
+[status and limitations](source-fidelity/STATUS.md). The backend below is the
+older manual/adapted experiment, not proof of the newer migration.
 
-### Current source entry points
-
-| Area | Browse |
-|---|---|
-| Current implementation and component pins | [source-fidelity](source-fidelity/README.md) |
-| Current proof versus remaining gaps | [status](source-fidelity/STATUS.md) |
-| Original application source locks/probes | [fidelity](source-fidelity/fidelity/) |
-| Rails compatibility/compiler source | [Roundhouse](source-fidelity/roundhouse/) |
-| Native compiler source | [Spinel](source-fidelity/spinel/) |
-| Local committed/uncommitted deltas | [changes](source-fidelity/changes/) |
-| Separate helper work not yet integrated | [parallel lanes](source-fidelity/parallel-lanes/) |
-
-No database, credentials, raw captures, generated assets or binaries are published. This is a source snapshot, not a release or new deployment. Component licenses remain intact.
+[Publication policy](source-fidelity/PUBLICATION.md): committed source only,
+per-file integrity and secret scanning; no databases, credentials, raw runtime
+captures, generated bundles or binaries. Publication is not deployment.
 
 ---
 

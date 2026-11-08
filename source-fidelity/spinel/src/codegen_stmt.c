@@ -6225,7 +6225,7 @@ int emit_nilfree_cmp_operand(Compiler *c, int v, const char *op, int left, const
    The caller has emitted the indent. Answers 1 when it emitted the write. */
 const char *g_opa_niltest = NULL, *g_opa_clear = NULL;
 int emit_scalar_op_assign(Compiler *c, const char *lval, TyKind t, const char *op,
-                          int v, int capture, int lhs_nil, int lhs_plain, Buf *b) {
+                          int v, int capture, int lhs_nil, int lhs_plain, int lhs_volatile, Buf *b) {
   const NodeTable *nt = c->nt;
   if (!op) return 0;
   /* a field with a nil bit: the plain field, tested for its bit (the
@@ -6258,13 +6258,19 @@ int emit_scalar_op_assign(Compiler *c, const char *lval, TyKind t, const char *o
      binary `nil + 1` -- and the result goes back wrapped (wo / wc). */
   int onil = lhs_nil && oint_kind(t);
   const char *wo = onil ? (t == TY_FLOAT ? "sp_ofloat_of(" : "sp_oint_of(") : "(", *wc = ")";
-  char srcbuf[320];
+  char srcbuf[1152];
   const char *src = lval;
+  char volatile_read[768];
+  if (onil && lhs_volatile) {
+    snprintf(volatile_read, sizeof volatile_read, "((%s){ .v = (%s).v, .nil = (%s).nil })", oint_ctype(t), lval, lval);
+    src = volatile_read;
+  }
+  const char *capture_base = src;
   size_t pre_mark = g_pre ? g_pre->len : 0;
   char tn[32];
   if (capture) {
     char ct[48]; snprintf(ct, sizeof ct, "%s ", onil ? oint_ctype(t) : c_type_name(t));
-    src = op_assign_slot_src(c, lval, ct, t == TY_BIGINT, v, pre_mark, tn, sizeof tn, b);
+    src = op_assign_slot_src(c, capture_base, ct, t == TY_BIGINT, v, pre_mark, tn, sizeof tn, b);
   }
   const char *captured = src;
   if (onil) { snprintf(srcbuf, sizeof srcbuf, "%s(%s, \"%s\")", oint_val(t), src, op); src = srcbuf; }
@@ -6277,7 +6283,7 @@ int emit_scalar_op_assign(Compiler *c, const char *lval, TyKind t, const char *o
     emit_int_expr(c, v, b);
     buf_printf(b, "); %s(_t%d, _t%d); });", op[0] == '>' ? "sp_bigint_shr" : "sp_bigint_shl", tr, tk);
     if (bclr) buf_printf(b, " %s;", bclr);
-    op_assign_slot_end(captured, lval, b);
+    op_assign_slot_end(captured, capture_base, b);
     return 1;
   }
   if (is_shift && nt_kind(nt, v) == NK_IntegerNode) {
@@ -6285,7 +6291,7 @@ int emit_scalar_op_assign(Compiler *c, const char *lval, TyKind t, const char *o
     if (sp_streq(op, "<<") || vlit < 0 || vlit >= 64) {
       buf_printf(b, "%s = %ssp_int_%s(%s, %lldLL)%s;", lval, wo, sp_streq(op, "<<") ? "shl" : "shr", src, vlit, wc);
       if (bclr) buf_printf(b, " %s;", bclr);
-      op_assign_slot_end(captured, lval, b);
+      op_assign_slot_end(captured, capture_base, b);
       return 1;
     }
   }
@@ -6329,7 +6335,7 @@ int emit_scalar_op_assign(Compiler *c, const char *lval, TyKind t, const char *o
   else if (src == lval) buf_printf(b, "%s %s= %s;", lval, op, rhs);
   else buf_printf(b, "%s = %s%s %s (%s)%s;", lval, wo, src, op, rhs, wc);
   if (bclr) buf_printf(b, " %s;", bclr);
-  op_assign_slot_end(captured, lval, b);
+  op_assign_slot_end(captured, capture_base, b);
   free(rb.p);
   return 1;
 }
@@ -6437,7 +6443,7 @@ static int emit_slot_op_assign(Compiler *c, const char *ref, TyKind t, const cha
                                int v, int oint, Buf *b) {
   if (emit_array_op_assign(c, ref, t, op, v, b)) return 1;
   if (t == TY_POLY && emit_poly_op_assign(c, ref, op, v, 1, b)) return 1;
-  return emit_scalar_op_assign(c, ref, t, op, v, 1, oint, 0, b);
+  return emit_scalar_op_assign(c, ref, t, op, v, 1, oint, 0, 0, b);
 }
 
 /* The RHS of a String `+=`: a poly RHS (a destructured `[Int, String]`
@@ -6562,7 +6568,7 @@ static void emit_op_assign_lv(Compiler *c, int id, Buf *b, int indent,
     buf_printf(b, "%s = %s %s ", lval, lval, op); emit_expr(c, v, b); buf_puts(b, ";\n");
     return;
   }
-  if (emit_scalar_op_assign(c, lval, t, op, v, cap, lv && slot_is_oint(lv), 0, b)) return;
+  if (emit_scalar_op_assign(c, lval, t, op, v, cap, lv && slot_is_oint(lv), 0, lv && lv->stack_volatile, b)) return;
   if (t == TY_COMPLEX && (is_add_or_mul(op))) {
     /* coerce the rhs like the binary path does: an Integer, a Float or a boxed
        value all have to reach sp_complex_* as an sp_Complex */
@@ -20436,7 +20442,7 @@ static int emit_ivar_cvar_write_stmt(Compiler *c, int id, Buf *b, int indent, co
         char ont[200], ocl[200], opf[128]; snprintf(opf, sizeof opf, "%s%s", g_self, g_self_deref);
         int armed = ok == 1 && opa_arm_ivar(c, ocid, oiv, opf, ont, sizeof ont, ocl, sizeof ocl);
         int soint = ok == 2 && civ_is_oint(c, ocid, oiv);
-        if (emit_scalar_op_assign(c, ref, vt, op, ival, 1, armed ? 0 : soint, 0, b)) return 1; }
+        if (emit_scalar_op_assign(c, ref, vt, op, ival, 1, armed ? 0 : soint, 0, 0, b)) return 1; }
       buf_printf(b, "%s %s= ", ref, op ? op : "+");
       /* a poly RHS feeding an int/float ivar op-assign needs coercing to the
          scalar before the C operator (e.g. `@bg_pattern |= chr_mem[i] * 256`). */
@@ -20785,7 +20791,7 @@ static int emit_attr_global_const_write_stmt(Compiler *c, int id, Buf *b, int in
         /* the backing ivar's nil bit, as `@x op= v` takes it */
         { char ont[200], ocl[200], opf[64]; snprintf(opf, sizeof opf, "_t%d%s", trecv, acc);
           opa_arm_ivar(c, rdcls, ivx, opf, ont, sizeof ont, ocl, sizeof ocl);
-          if (emit_scalar_op_assign(c, lval, ivt, op, val, 1, 0, 0, b)) return 1; }
+          if (emit_scalar_op_assign(c, lval, ivt, op, val, 1, 0, 0, 0, b)) return 1; }
         buf_printf(b, "_t%d%siv_%s = _t%d%siv_%s %s ", trecv, acc, iv_c(rn), trecv, acc, iv_c(rn), op ? op : "+");
         if (rhstr.kind == RK_BOXED && (ivt == TY_INT || ivt == TY_BOOL)) {
           buf_puts(b, op_assign_int_conv(ivt, op)); emit_expr(c, val, b); buf_puts(b, ")");
@@ -20949,7 +20955,7 @@ static int emit_attr_global_const_write_stmt(Compiler *c, int id, Buf *b, int in
           char lval[320]; snprintf(lval, sizeof lval, "_o->iv_%s", iv_c(rn));
           char ont[200], ocl[200];
           opa_arm_ivar(c, pdcls, ivx, "_o->", ont, sizeof ont, ocl, sizeof ocl);
-          if (emit_scalar_op_assign(c, lval, ivt, op, val, 0, 0, 0, b)) {
+          if (emit_scalar_op_assign(c, lval, ivt, op, val, 0, 0, 0, 0, b)) {
             emit_indent(b, indent + 1); buf_puts(b, "break; }\n");
             continue;
           }

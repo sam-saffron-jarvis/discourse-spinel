@@ -2,7 +2,7 @@
 //! in its factory; only its method receiver becomes an explicit argument. No
 //! native method is installed ahead of its original runtime event.
 use crate::app::RuntimeDefinitionFamily;
-use crate::dialect::{LibraryClass, MethodReceiver};
+use crate::dialect::{LibraryClass, MethodReceiver, ModelBodyItem};
 use crate::expr::{Expr, ExprNode, LValue, Literal};
 use crate::span::Span;
 use crate::ty::Ty;
@@ -20,6 +20,7 @@ struct Site {
     names: Names,
     open_name: bool,
     result: Ty,
+    arity: i64,
 }
 #[derive(Clone)]
 struct Family {
@@ -38,6 +39,8 @@ struct Family {
     storage_patterns: Vec<crate::app::RuntimeClassStoragePattern>,
     parents: BTreeMap<Symbol, Option<ClassId>>,
     callback: bool,
+    /// Analysis-only source model class-side view; never emitted as a second class.
+    model_surface: Option<LibraryClass>,
 }
 
 pub(crate) fn prepare(app: &mut App, target: crate::build_target::BuildTarget) -> bool {
@@ -48,7 +51,7 @@ pub(crate) fn prepare(app: &mut App, target: crate::build_target::BuildTarget) -
     let mut families = Vec::new();
     for class in &app.library_classes {
         let mut index = families.len();
-        while let Some(family) = discover(app, class, index) {
+        while let Some(family) = discover(app, class, index, false) {
             if families
                 .iter()
                 .any(|prior: &Family| prior.registry == family.registry)
@@ -56,6 +59,30 @@ pub(crate) fn prepare(app: &mut App, target: crate::build_target::BuildTarget) -
                 index += 1;
                 continue;
             }
+            families.push(family);
+            break;
+        }
+    }
+    for model in &app.models {
+        let mut producer = app.runtime_extension_events.iter().any(|event| event.owner == model.name);
+        for method in model.methods().filter(|method| method.receiver == MethodReceiver::Class) {
+            walk(&method.body, &mut |expr| producer |= matches!(&*expr.node,
+                ExprNode::Send { method, .. } if method.as_str() == "define_singleton_method"));
+        }
+        if !producer { continue; }
+        // Use the SAME shared model projection as emission for state/constants;
+        // keep source methods, not synthesized query APIs, in the proof walk.
+        let mut surface = super::model_to_library::lower_model_to_library_class(model, &app.schema);
+        surface.methods = model.methods().cloned().collect();
+        surface.unknown_calls = model.body.iter().filter_map(|item| match item {
+            ModelBodyItem::Unknown { expr, .. }
+                if !super::model_to_library::writes_class_ivar(expr)
+                    && !matches!(&*expr.node, ExprNode::Assign { target: LValue::Const { .. }, .. }) => Some(expr.clone()),
+            _ => None,
+        }).collect();
+        let mut index = families.len();
+        while let Some(family) = discover(app, &surface, index, true) {
+            if families.iter().any(|prior: &Family| prior.registry == family.registry) { index += 1; continue; }
             families.push(family);
             break;
         }
@@ -155,14 +182,46 @@ pub(crate) fn prepare(app: &mut App, target: crate::build_target::BuildTarget) -
                 rewrite(init, family, class_side, &mut Env::new());
             }
         }
-        // Library roots need their class-side context and must not be visited
-        // twice: a fallback query must not recursively wrap itself. Survey the
-        // remaining executable inventory without removing any emitted source.
+        let mut models = std::mem::take(&mut app.models);
+        for model in &mut models {
+            let owner = family.descendants.contains(&model.name.0);
+            for item in &mut model.body {
+                match item {
+                    ModelBodyItem::Method { method, .. } => {
+                        let context = owner && method.receiver == MethodReceiver::Class;
+                        rewrite(&mut method.body, family, context, &mut Env::new());
+                        for value in method.params.iter_mut().filter_map(|param| param.default.as_mut()) {
+                            rewrite(value, family, context, &mut Env::new());
+                        }
+                    }
+                    ModelBodyItem::Unknown { expr, .. } => rewrite(expr, family, owner, &mut Env::new()),
+                    _ => {}
+                }
+            }
+        }
+        // Ordinary model callback/scope/association roots still participate in
+        // the shared walk, with no implicit Class receiver. Class-side roots
+        // above are temporarily removed to avoid recursive fallback wrapping.
+        let mut method_roots = Vec::new();
+        for model in &mut models {
+            let mut roots = Vec::new();
+            for (index, item) in model.body.iter_mut().enumerate() {
+                if matches!(item, ModelBodyItem::Method { .. } | ModelBodyItem::Unknown { .. }) {
+                    roots.push((index, std::mem::replace(item, ModelBodyItem::Unknown {
+                        expr: Expr::new(Span::synthetic(), ExprNode::Lit { value: Literal::Nil }),
+                        leading_comments: Vec::new(), leading_blank_line: false,
+                    })));
+                }
+            }
+            method_roots.push(roots);
+        }
+        app.models = models;
         let libraries = std::mem::take(&mut app.library_classes);
-        super::for_each_emit_body(app, &mut |body| {
-            rewrite(body, family, false, &mut Env::new())
-        });
+        super::for_each_emit_body(app, &mut |body| rewrite(body, family, false, &mut Env::new()));
         app.library_classes = libraries;
+        for (model, roots) in app.models.iter_mut().zip(method_roots) {
+            for (index, root) in roots { model.body[index] = root; }
+        }
         app.runtime_definition_families
             .push(RuntimeDefinitionFamily {
                 owner: family.owner.clone(),
@@ -201,18 +260,69 @@ pub(crate) fn prepare(app: &mut App, target: crate::build_target::BuildTarget) -
     true
 }
 
-fn discover(app: &App, class: &LibraryClass, index: usize) -> Option<Family> {
+fn model_owner_is_closed(app: &App, class: &LibraryClass) -> bool {
+    use crate::ingest::prism_api::PrismLocation;
+    use ruby_prism::Visit;
+    let Some(model) = app.models.iter().find(|model| model.name == class.name) else { return false; };
+    if model.span.is_synthetic() { return false; }
+    let Some(owner_source) = app.sources.get(model.span.file.0 as usize - 1) else { return false; };
+    struct Proof<'a> { owner: &'a str, declarations: usize, valid: bool }
+    impl<'pr> Visit<'pr> for Proof<'_> {
+        fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
+            let path = node.constant_path();
+            let name = std::str::from_utf8(path.location().as_slice()).unwrap_or("").trim_start_matches("::");
+            if name == self.owner { self.declarations += 1; }
+            if matches!(name, "ActiveRecord" | "ActiveRecord::Base") { self.valid = false; }
+            ruby_prism::visit_class_node(self, node);
+        }
+        fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
+            let path = node.constant_path();
+            let name = std::str::from_utf8(path.location().as_slice()).unwrap_or("").trim_start_matches("::");
+            if name == self.owner || matches!(name, "ActiveRecord" | "ActiveRecord::Base") { self.valid = false; }
+            ruby_prism::visit_module_node(self, node);
+        }
+        fn visit_constant_write_node(&mut self, node: &ruby_prism::ConstantWriteNode<'pr>) {
+            if node.name().as_slice() == self.owner.as_bytes() { self.valid = false; }
+            ruby_prism::visit_constant_write_node(self, node);
+        }
+        fn visit_constant_path_write_node(&mut self, node: &ruby_prism::ConstantPathWriteNode<'pr>) {
+            if node.target().location().as_slice().strip_prefix(b"::").unwrap_or(node.target().location().as_slice()) == self.owner.as_bytes() { self.valid = false; }
+            ruby_prism::visit_constant_path_write_node(self, node);
+        }
+    }
+    let mut proof = Proof { owner: class.name.0.as_str(), declarations: 0, valid: true };
+    for source in app.sources.iter().filter(|source| source.path.ends_with(".rb")) {
+        // Read-only provenance proof: model ingestion carries its primary class,
+        // not every subsequent declaration in the same source file. Counting IR
+        // records alone would silently admit a discarded reopen.
+        let parsed = ruby_prism::parse(source.text.as_bytes());
+        if parsed.errors().next().is_some() { return false; }
+        let root = parsed.node();
+        if source.path == owner_source.path {
+            let Some(program) = root.as_program_node() else { return false; };
+            let statements: Vec<_> = program.statements().body().iter().collect();
+            if statements.len() != 1 || statements[0].as_class_node().is_none()
+                || statements[0].location().start_offset() != model.span.start as usize
+                || statements[0].location().end_offset() != model.span.end as usize { return false; }
+        }
+        proof.visit(&root);
+    }
+    proof.valid && proof.declarations == 1
+}
+
+fn discover(app: &App, class: &LibraryClass, index: usize, model_owner: bool) -> Option<Family> {
+    if model_owner && (!model_owner_is_closed(app, class)
+        || class.parent.as_ref().map(|parent| parent.0.as_str()) != Some("ActiveRecord::Base")
+        || app.models.iter().filter(|model| model.name == class.name).count() != 1
+        || app.library_classes.iter().any(|other| other.name == class.name
+            || other.name.0.as_str() == "ActiveRecord::Base" || other.parent.as_ref() == Some(&class.name))
+        || app.models.iter().any(|other| other.parent.as_ref() == Some(&class.name))) { return None; }
     if class.is_module
-        || class.parent.is_some()
+        || (!model_owner && class.parent.is_some())
         || !class.includes.is_empty()
         || class.origin.is_some()
         || class.name.0.as_str().contains("::")
-        || app
-            .library_classes
-            .iter()
-            .filter(|other| other.name == class.name)
-            .count()
-            != 1
+        || (!model_owner && app.library_classes.iter().filter(|other| other.name == class.name).count() != 1)
         || app.library_classes.iter().any(|other| {
             matches!(
                 other.name.0.as_str(),
@@ -352,6 +462,10 @@ fn discover(app: &App, class: &LibraryClass, index: usize) -> Option<Family> {
     }
     if names.iter().any(|name| {
         crate::emit::audit::CLASS_METHODS.contains(&name.as_str())
+            || model_owner && app.models.iter().filter(|model| model.name == class.name).any(|model| {
+                super::model_to_library::lower_model_to_library_class(model, &app.schema).methods.iter()
+                    .any(|method| method.receiver == MethodReceiver::Class && &method.name == name)
+            })
             || app
                 .library_classes
                 .iter()
@@ -412,6 +526,7 @@ fn discover(app: &App, class: &LibraryClass, index: usize) -> Option<Family> {
     let parents = app
         .library_classes
         .iter()
+        .chain(model_owner.then_some(class))
         .filter(|class| descendants.contains(&class.name.0))
         .map(|class| (class.name.0.clone(), class.parent.clone()))
         .collect();
@@ -421,6 +536,12 @@ fn discover(app: &App, class: &LibraryClass, index: usize) -> Option<Family> {
         .map(Symbol::from)
         .collect();
     native_names.extend(extension_apis.iter().cloned());
+    if model_owner {
+        for model in app.models.iter().filter(|model| model.name == class.name) {
+            native_names.extend(super::model_to_library::lower_model_to_library_class(model, &app.schema).methods.iter()
+                .filter(|method| method.receiver == MethodReceiver::Class).map(|method| method.name.clone()));
+        }
+    }
     native_names.extend(
         app.library_classes
             .iter()
@@ -449,6 +570,7 @@ fn discover(app: &App, class: &LibraryClass, index: usize) -> Option<Family> {
         result,
         storage,
         parents,
+        model_surface: model_owner.then(|| class.clone()),
         callback: class.methods.iter().any(|method| {
             method.receiver == MethodReceiver::Class
                 && method.name.as_str() == "singleton_method_added"
@@ -536,7 +658,10 @@ fn discover_sites(expr: &Expr, env: &mut Env, sites: &mut Vec<Site>) {
             ..
         } = &*block.node
         && params.is_empty()
-        && extra_params.is_empty()
+        && extra_params.iter().all(|param| {
+            !param.name.as_str().starts_with("__rh_") && !param.keyword && !param.rest && !param.forwarding
+                && matches!(param.default.as_ref().map(|expr| &*expr.node), Some(ExprNode::Lit { value: Literal::Nil }))
+        })
     {
         let names = domain(name, env);
         let open_name = names.is_empty() && name.ty.as_ref().is_some_and(Ty::is_stringish);
@@ -550,6 +675,7 @@ fn discover_sites(expr: &Expr, env: &mut Env, sites: &mut Vec<Site>) {
                 names,
                 open_name,
                 result: result.clone(),
+                arity: if extra_params.is_empty() { 0 } else { -1 },
             });
         }
         return;
@@ -790,26 +916,29 @@ fn rewrite(expr: &mut Expr, family: &Family, self_class: bool, env: &mut Env) {
         else {
             return;
         };
-        let ExprNode::Lambda { body, .. } = &*block.node else {
+        let ExprNode::Lambda { body, extra_params, .. } = &*block.node else {
             return;
         };
         let mut lifted = body.clone();
         lift(&mut lifted);
+        // Keep optional parameters as REAL callable formals. A local assignment
+        // would capture/mutate a same-named factory local instead of shadowing it.
+        let mut callable = lambda(
+            vec!["__rh_method_receiver", "__rh_called_name", "__rh_original_name"],
+            lifted,
+        );
+        if let ExprNode::Lambda { extra_params: formals, .. } = &mut *callable.node {
+            *formals = extra_params.clone();
+        }
         let mut event = service(
             family,
             "install",
             vec![
                 Expr::new(expr.span, ExprNode::SelfRef),
                 send(args[0].clone(), "to_sym", vec![]),
-                lambda(
-                    vec![
-                        "__rh_method_receiver",
-                        "__rh_called_name",
-                        "__rh_original_name",
-                    ],
-                    lifted,
-                ),
+                callable,
                 callback(family),
+                Expr::new(expr.span, ExprNode::Lit { value: Literal::Int { value: site.arity } }),
             ],
         );
         event.span = expr.span;

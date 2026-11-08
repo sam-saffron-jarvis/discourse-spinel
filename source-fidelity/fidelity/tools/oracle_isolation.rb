@@ -7,6 +7,7 @@ require "uri"
 require "digest"
 require "time"
 require "socket"
+require "rbconfig"
 require "pg" unless defined?(PG::Connection)
 require "redis" unless defined?(RedisClient::ConnectionMixin)
 
@@ -74,24 +75,99 @@ module FidelityOracleIsolation
   # writable oracle fixture: allow only that pinned read-only version call,
   # after proving the socket belongs to this process's original worker child.
   # Redis's independent config/dispatch guards still reject EVERY Unix path.
+  def self.original_vips_sources!
+    reference = File.realpath(File.expand_path("../../discourse", __dir__))
+    root = File.realpath(ENV.fetch("FIDELITY_VIPS_ORIGINAL_APPLICATION_ROOT", reference))
+    unless root == reference
+      build = File.realpath(File.expand_path("../build", __dir__))
+      unless root.start_with?(build + File::SEPARATOR)
+        raise UnsafeEndpoint, "vips source root is not the original checkout or an owned build archive"
+      end
+    end
+    expected = JSON.parse(ENV.fetch("FIDELITY_VIPS_ORIGINAL_SOURCE_HASHES"))
+    paths = %w[lib/discourse_vips.rb lib/discourse_vips/worker_process.rb script/discourse_vips_worker]
+    raise UnsafeEndpoint, "missing original vips source attestation" unless expected.is_a?(Hash) && expected.keys.sort == paths.sort
+    paths.each do |relative|
+      unless Digest::SHA256.file(File.join(reference, relative)).hexdigest == expected.fetch(relative) &&
+             Digest::SHA256.file(File.join(root, relative)).hexdigest == expected.fetch(relative)
+        raise UnsafeEndpoint, "original vips source changed"
+      end
+    end
+    root
+  rescue KeyError, JSON::ParserError, Errno::ENOENT
+    raise UnsafeEndpoint, "missing or invalid original vips source attestation"
+  end
+
+  def self.vips_process_identity!(worker)
+    pid = worker.pid
+    raise UnsafeEndpoint, "invalid original vips child PID" unless pid.is_a?(Integer) && pid.positive?
+    status = File.read("/proc/#{pid}/status")
+    start = File.read("/proc/#{pid}/stat").rpartition(") ").last.split.fetch(19)
+    executable = File.realpath("/proc/#{pid}/exe")
+    socket = File.lstat(worker.socket_path)
+    directory = File.lstat(File.dirname(worker.socket_path))
+    unless status.match?(/^PPid:\s+#{Process.pid}$/) && executable == File.realpath(RbConfig.ruby) &&
+           socket.socket? && socket.uid == Process.euid && directory.directory? && directory.uid == Process.euid &&
+           directory.mode & 0o777 == 0o700 && [socket.dev, socket.ino] == worker.instance_variable_get(:@socket_identity)
+      raise UnsafeEndpoint, "vips worker ownership could not be proven"
+    end
+    unless start == File.read("/proc/#{pid}/stat").rpartition(") ").last.split.fetch(19)
+      raise UnsafeEndpoint, "original vips child changed during ownership proof"
+    end
+    { pid: pid, start: start, executable: executable, socket: worker.socket_path, socket_identity: [socket.dev, socket.ino] }
+  rescue Errno::ENOENT, Errno::ESRCH, IndexError
+    raise UnsafeEndpoint, "private vips worker disappeared before ownership proof"
+  end
+
+  def self.attest_original_vips_start!(worker, source)
+    root = original_vips_sources!
+    expected = File.join(root, "lib/discourse_vips/worker_process.rb")
+    unless source == expected && defined?(DiscourseVips::WorkerProcess) && worker.instance_of?(DiscourseVips::WorkerProcess) &&
+           %i[start worker_command worker_environment pid socket_path shutdown discard remove_socket].all? { |name| worker.method(name).source_location&.first == expected } &&
+           Process.method(:spawn).source_location.nil?
+      raise UnsafeEndpoint, "vips start did not use the pinned original worker and core spawn"
+    end
+    identity = vips_process_identity!(worker)
+    @vips_starts ||= {}
+    @vips_starts[worker.object_id] = [worker, identity]
+    log_vips(stage: "original_start_attested", **identity)
+  end
+
+  def self.install_vips_start_observer!
+    return if @vips_start_observer
+    # Observation only: no original method is wrapped/replaced or invoked twice.
+    # start's ensure has run and the original Process.spawn has returned its PID.
+    @vips_start_observer = TracePoint.new(:return) do |event|
+      next unless event.method_id == :start && event.defined_class&.name == "DiscourseVips::WorkerProcess"
+      attest_original_vips_start!(event.self, event.path)
+    end
+    @vips_start_observer.enable
+  end
+
+  def self.attested_vips_identity!(worker)
+    original_vips_sources!
+    observed, original = (@vips_starts || {})[worker.object_id]
+    raise UnsafeEndpoint, "unobserved original vips worker start" unless observed.equal?(worker) && original
+    current = vips_process_identity!(worker)
+    raise UnsafeEndpoint, "original vips child identity changed" unless current == original
+    current
+  end
+
   def self.assert_owned_readonly_vips!(path)
     unless defined?(DiscourseVips::Client) && defined?(DiscourseVips::WorkerProcess)
       raise UnsafeEndpoint, "unowned Unix socket rejected"
     end
     worker = DiscourseVips::Client.instance_variable_get(:@worker_process)
-    root = File.expand_path("../../discourse", __dir__)
+    root = original_vips_sources!
     expected_call = "#{root}/lib/discourse_vips.rb:14:"
     unless worker.is_a?(DiscourseVips::WorkerProcess) && worker.socket_path == path && caller.any? { |frame| frame.start_with?(expected_call) }
       raise UnsafeEndpoint, "Unix socket is not the original private vips version worker"
     end
-    pid = worker.pid
-    status = File.read("/proc/#{pid}/status")
+    identity = attested_vips_identity!(worker)
+    pid = identity.fetch(:pid)
     command = File.binread("/proc/#{pid}/cmdline").split("\0")
-    socket = File.lstat(path)
-    directory = File.lstat(File.dirname(path))
-    unless status.match?(/^PPid:\s+#{Process.pid}$/) && command.include?("#{root}/script/discourse_vips_worker") &&
-           socket.socket? && socket.uid == Process.euid && directory.directory? && directory.uid == Process.euid && directory.mode & 0o777 == 0o700
-      raise UnsafeEndpoint, "vips worker ownership could not be proven"
+    unless command.include?("#{root}/script/discourse_vips_worker") || command == ["discourse vips worker"]
+      raise UnsafeEndpoint, "original vips child command changed"
     end
     @vips_workers ||= {}
     unless @vips_workers.key?(pid)
@@ -109,8 +185,30 @@ module FidelityOracleIsolation
   end
 
   def self.cleanup_vips!
-    (@vips_workers || {}).each do |pid, worker|
-      worker.shutdown
+    # An attested original start is owned even if a later startup failure
+    # prevented the version connection. Never adopt an unobserved process.
+    workers = (@vips_starts || {}).values.to_h { |worker, identity| [identity.fetch(:pid), worker] }
+    workers.merge!(@vips_workers || {})
+    workers.each do |pid, worker|
+      original_vips_sources!
+      zombie = false
+      unless worker.instance_variable_get(:@closed)
+        observed, original = (@vips_starts || {}).fetch(worker.object_id)
+        raise UnsafeEndpoint, "unobserved vips cleanup target" unless observed.equal?(worker) && original.fetch(:pid) == pid
+        fields = File.read("/proc/#{pid}/stat").rpartition(") ").last.split
+        zombie = fields[0] == "Z" && fields[1] == Process.pid.to_s && fields[19] == original.fetch(:start)
+      end
+      if zombie
+        # This same attested child is already dead and cannot reuse its PID
+        # until reaped. Reap it, close only its own pipe/socket, never signal
+        # a process group after the PID has become available for reuse.
+        Process.waitpid(pid)
+        worker.discard
+        worker.send(:remove_socket)
+      else
+        attested_vips_identity!(worker) unless worker.instance_variable_get(:@closed)
+        worker.shutdown
+      end
       begin
         Process.kill(0, pid)
         raise UnsafeEndpoint, "owned vips child did not exit"
@@ -119,6 +217,7 @@ module FidelityOracleIsolation
       end
     end
     @vips_workers = {}
+    @vips_starts = {}
   end
 
   def self.extract_endpoint(config)
@@ -166,6 +265,26 @@ module FidelityOracleIsolation
     true
   end
 
+  # Redis values are bytes (the real profiler stores Marshal payloads), not
+  # necessarily UTF-8 JSON strings. Encode only the TEST evidence copy; never
+  # modify the command or reply sent to/returned from the owned fixture.
+  def self.evidence_value(value)
+    case value
+    when String
+      if value.valid_encoding? && (value.encoding == Encoding::UTF_8 || value.ascii_only?)
+        value
+      else
+        { binary_hex: value.unpack1("H*"), encoding: value.encoding.name }
+      end
+    when Array
+      value.map { |item| evidence_value(item) }
+    when Hash
+      value.to_a.map { |key, item| [evidence_value(key), evidence_value(item)] }
+    else
+      value
+    end
+  end
+
   def self.record_command!(command, response)
     values = command.is_a?(Array) ? command : [command]
     name = values.first.to_s.downcase
@@ -173,9 +292,9 @@ module FidelityOracleIsolation
     log = ENV["FIDELITY_VALKEY_WRITE_LOG"]
     return unless log
     successful = !(defined?(RedisClient::Error) && response.is_a?(RedisClient::Error))
-    record = { stage: successful ? "successful_reply" : "error_reply", command: name, key: values[1],
-               arguments_sha256: Digest::SHA256.hexdigest(JSON.generate(values.drop(1))),
-               response_class: response.class.name, response_sha256: Digest::SHA256.hexdigest(JSON.generate(response)),
+    record = { stage: successful ? "successful_reply" : "error_reply", command: name, key: evidence_value(values[1]),
+               arguments_sha256: Digest::SHA256.hexdigest(JSON.generate(evidence_value(values.drop(1)))),
+               response_class: response.class.name, response_sha256: Digest::SHA256.hexdigest(JSON.generate(evidence_value(response))),
                timestamp: Time.now.utc.iso8601(6), caller: caller(2, 100) }
     append_json!(log, record)
   end
@@ -482,10 +601,15 @@ module FidelityOracleIsolation
   end
 
   def self.install!
+    install_vips_start_observer!
     install_socket!
     install_redis!
     install_pg!
   end
 end
 
+if !ENV["FIDELITY_PRIVATE_PG_MANIFEST"].to_s.empty?
+  require_relative "private_pg_oracle_guard"
+  FidelityPrivatePG.activate!
+end
 FidelityOracleIsolation.install! if defined?(RedisClient::ConnectionMixin) && defined?(PG::Connection)

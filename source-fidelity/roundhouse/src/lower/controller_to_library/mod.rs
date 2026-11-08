@@ -1238,7 +1238,10 @@ fn build_methods(
     // `own_filter_inlining_is_ordered`. When it declines, every own
     // filter falls through to the preamble, which emits them in
     // declaration order.
-    let inlining_ordered = own_filter_inlining_is_ordered(controller, &privs);
+    let has_around = ancestor_chain(controller, all_controllers).iter().copied()
+        .chain(std::iter::once(controller))
+        .any(|c| c.filters().any(|f| matches!(f.kind, FilterKind::Around)));
+    let inlining_ordered = !has_around && own_filter_inlining_is_ordered(controller, &privs);
     let resolve_own = |name: &Symbol, visit: &mut dyn FnMut(&Expr)| {
         if let Some(a) = privs
             .iter()
@@ -2170,6 +2173,9 @@ fn build_filter_preamble(
         && !redeclared
     {
         push_call(&default_forgery_protection(), &mut preamble);
+        if !preamble.is_empty() {
+            wraps.order.push(process_action::FilterOrder::Before(preamble.len() - 1));
+        }
     }
 
     // Ancestors and the controller itself walk the same way, in body
@@ -2203,7 +2209,15 @@ fn build_filter_preamble(
                     {
                         continue; // inlined into action bodies upstream
                     }
-                    push_call(filter, if filter.prepend { &mut prepends } else { &mut preamble });
+                    if filter.prepend {
+                        push_call(filter, &mut prepends);
+                    } else {
+                        let previous = preamble.len();
+                        push_call(filter, &mut preamble);
+                        if preamble.len() > previous {
+                            wraps.order.push(process_action::FilterOrder::Before(previous));
+                        }
+                    }
                 }
                 // `around_action` / `after_action` — carried to the
                 // dispatcher, which wraps the case dispatch in the one
@@ -2218,8 +2232,10 @@ fn build_filter_preamble(
                         continue;
                     }
                     if matches!(f.kind, FilterKind::Around) {
+                        wraps.order.push(process_action::FilterOrder::Around(wraps.around.len()));
                         wraps.around.push(f);
                     } else {
+                        wraps.order.push(process_action::FilterOrder::After(wraps.after.len()));
                         wraps.after.push(PreambleStmt::Call { filter: f, halt_check: false });
                     }
                 }
@@ -2248,10 +2264,12 @@ fn build_filter_preamble(
                         halt_check,
                     };
                     if is_after {
+                        wraps.order.push(process_action::FilterOrder::After(wraps.after.len()));
                         wraps.after.push(stmt);
                     } else if is_prepend {
                         prepends.push(stmt);
                     } else {
+                        wraps.order.push(process_action::FilterOrder::Before(preamble.len()));
                         preamble.push(stmt);
                     }
                 }
@@ -2263,6 +2281,15 @@ fn build_filter_preamble(
     // reverse declaration order — see the comment where `prepends` is
     // declared above.
     if !prepends.is_empty() {
+        let count = prepends.len();
+        for item in &mut wraps.order {
+            if let process_action::FilterOrder::Before(index) = item {
+                *index += count;
+            }
+        }
+        let mut order = (0..count).map(process_action::FilterOrder::Before).collect::<Vec<_>>();
+        order.append(&mut wraps.order);
+        wraps.order = order;
         prepends.reverse();
         prepends.append(&mut preamble);
         preamble = prepends;

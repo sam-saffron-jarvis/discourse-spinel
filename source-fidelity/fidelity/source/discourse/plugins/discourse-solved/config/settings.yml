@@ -1,0 +1,82 @@
+discourse_solved:
+  solved_enabled:
+    default: true
+    client: true
+  solved_allow_multiple_solutions:
+    default: false
+    client: true
+    hidden: true
+  show_who_marked_solved:
+    default: false
+    client: true
+  allow_solved_on_all_topics:
+    default: false
+    client: true
+  allow_solved_in_groups:
+    type: group_list
+    default: ""
+    allow_any: false
+    refresh: true
+  accept_all_solutions_trust_level:
+    default: 4
+    client: true
+    enum: "TrustLevelSetting"
+    hidden: true
+  accept_all_solutions_allowed_groups:
+    default: "1|2|14" # auto group admin, moderators and trust_level_4
+    mandatory_values: "1|2" # auto group admins, moderators
+    type: group_list
+    client: false
+    allow_any: false
+    refresh: true
+    validator: "AtLeastOneGroupValidator"
+  empty_box_on_unsolved:
+    default: false
+    hidden: true
+  solved_quote_length:
+    default: 700
+    client: true
+  solved_topics_auto_close_hours:
+    default: 0
+    min: 0
+    max: 175200 # 20 years
+  show_filter_by_solved_status:
+    default: false
+    client: true
+  notify_on_staff_accept_solved:
+    default: false
+    hidden: true
+  disable_solved_education_message:
+    default: false
+  accept_solutions_topic_author:
+    default: true
+  solved_add_schema_markup:
+    type: enum
+    default: "always"
+    choices:
+      - "never"
+      - "always"
+      - "answered only"
+  prioritize_solved_topics_in_search: false
+  enable_solved_tags:
+    type: tag_list
+    default: ""
+    client: true
+  enable_support_category_type_setup:
+    default: false
+    hidden: true
+    client: true
+    upcoming_change:
+      status: "permanent"
+      impact: "feature,staff"
+      learn_more_url: "https://meta.discourse.org/t/-/398338"
+      # Offers a category type that enables the plugin when chosen, so it must stay
+      # usable while the plugin is disabled.
+      requires_plugin_enabled: false
+  enable_solved_shared_issues:
+    default: true
+    client: true
+  discourse_solved_admin_dashboard_seeded:
+    default: false
+    hidden: true
+

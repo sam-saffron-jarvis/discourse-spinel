@@ -1,0 +1,103 @@
+{
+  "profile": "supported anonymous latest_results ONLY; no list hydration",
+  "baseline_revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+  "source": "lib/topic_query.rb",
+  "source_sha256": "9066840709436451bd392921f1dfaeed121ce0024e63916bb0e388145f8762dc",
+  "methods": [
+    {
+      "name": "latest_results",
+      "start_byte": 18545,
+      "end_byte": 18952,
+      "text_sha256": "dbd5021833e144be3be5689de790b12f939f4ad72e9ccb19e1224eef8a8438a0"
+    },
+    {
+      "name": "remove_muted",
+      "start_byte": 31628,
+      "end_byte": 31970,
+      "text_sha256": "94bebe39779b2956204c3eb51d37581c1d57031c8470ea89cbd54c64729ecdf4"
+    },
+    {
+      "name": "remove_muted_topics",
+      "start_byte": 31974,
+      "end_byte": 32200,
+      "text_sha256": "e09d71a4459b28f3ef89389cd17faabd057ed3fce5db62942901aa9b6f913d57"
+    },
+    {
+      "name": "remove_muted_categories",
+      "start_byte": 32204,
+      "end_byte": 34765,
+      "text_sha256": "a5a20c60303edb2bd36270d8ef52dd47323c60b9a2f22a9fc73505699bd4a765"
+    },
+    {
+      "name": "remove_muted_tags",
+      "start_byte": 34769,
+      "end_byte": 36888,
+      "text_sha256": "0e1f6dd1c3ff1af611becb69a8da5392e86e9a1dde0cd05c7a0ca4c3e9bb2635"
+    },
+    {
+      "name": "apply_shared_drafts",
+      "start_byte": 21767,
+      "end_byte": 22798,
+      "text_sha256": "28414931aed3081353b8f387236aa43999c5436826362c9d2066ddef4f78bff2"
+    }
+  ],
+  "guarded_source_changes": [
+    {
+      "method": "remove_muted_topics",
+      "start_byte": 32014,
+      "end_byte": 32184,
+      "text_sha256": "42919e23af377495c22c6dbd5098b0e5ed61ffd022e937f9aa65b592c1284d80",
+      "replacement_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "reason": "guarded anonymous identity: original nonnil per-user topic state is unsupported"
+    },
+    {
+      "method": "remove_muted_categories",
+      "start_byte": 32319,
+      "end_byte": 34749,
+      "text_sha256": "83faa4cb6f2984fdf9145dc87119fcd3c292a8fb77b2dc781c0fff8d06bfeaac",
+      "replacement_sha256": "ed90a61fcd10de264e7a9b977f49933f69fa97f9e0e98b3382be426d0bd2221e",
+      "reason": "guarded anonymous identity; keep BOTH live mute-all/default-muted category branches"
+    },
+    {
+      "method": "remove_muted_tags",
+      "start_byte": 35676,
+      "end_byte": 35971,
+      "text_sha256": "460fa19a49ae946f960b5d8d590d1f59302d0c4590cfc4cf77ed16cc73b60901",
+      "replacement_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "reason": "guarded anonymous identity: no per-user category notification override"
+    },
+    {
+      "method": "remove_muted_tags",
+      "start_byte": 35342,
+      "end_byte": 35623,
+      "text_sha256": "8df3fad1ec8493c75faee2a21e334ade59fdedadc98c9a55e768439e88090dd8",
+      "replacement_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "reason": "tags request key explicitly refused by supported default_results profile"
+    },
+    {
+      "method": "remove_muted_tags",
+      "start_byte": 34966,
+      "end_byte": 35226,
+      "text_sha256": "dc302cd2261caa56536b59e5550dc86211fb11c83b56f0c6bc70c7e263b69e77",
+      "replacement_sha256": "125baaf84d5b70b171f4e86d0a3d50e033861fc37736c50e6ac2cf069fe582b2",
+      "reason": "anonymous identity: preserve actual default_tags_muted lookup"
+    },
+    {
+      "method": "apply_shared_drafts",
+      "start_byte": 21767,
+      "end_byte": 22798,
+      "text_sha256": "28414931aed3081353b8f387236aa43999c5436826362c9d2066ddef4f78bff2",
+      "replacement_sha256": "69006be9d9effdb07beaab629042e13f59af2b62e1e28e63f668357b24e6ba38",
+      "reason": "enabled shared-drafts site profile explicitly refuses; original empty-setting early return retained"
+    }
+  ],
+  "live_values_used_as_inputs": false,
+  "candidate_sha256": "6d1d05caca5cc800b1e4d790ce3958a027863e352f020e5590535e8fd2cc72f8",
+  "unsupported_live_feature_profiles": [
+    "shared_drafts_category_nonempty"
+  ],
+  "result_filter_registry": "actual TopicQuery cattr_accessor/init/source callback iteration, not an empty replacement",
+  "full_query_accepted": false,
+  "list_hydration_accepted": false,
+  "page_accepted": false
+}

@@ -250,6 +250,31 @@ pub(super) fn collect_storage_fields(
 ) {
     use crate::expr::{LValue, OpAssignOp};
     use crate::ty::Ty;
+    // A per-site reader returns one nested memoized Hash rather than its
+    // whole ivar. Recognize only the exact seed/index-seed shape; retain the
+    // source index TYPE, never its current runtime value or a default site.
+    fn empty_hash(expr: &Expr) -> bool {
+        matches!(&*expr.node, ExprNode::Hash { entries, .. } if entries.is_empty())
+    }
+    fn observed(expr: &Expr) -> Ty {
+        expr.ty.clone().filter(|ty| !ty.mentions_unknown()).unwrap_or(Ty::Untyped)
+    }
+    fn memoized_reader(body: &Expr) -> Option<(crate::Symbol, Vec<Ty>)> {
+        fn seed(expr: &Expr) -> Option<crate::Symbol> {
+            match &*expr.node {
+                ExprNode::OpAssign { target: LValue::Ivar { name }, op: OpAssignOp::OrOr, value }
+                    if empty_hash(value) => Some(name.clone()),
+                _ => None,
+            }
+        }
+        if let Some(name) = seed(body) { return Some((name, Vec::new())); }
+        let ExprNode::Seq { exprs } = &*body.node else { return None; };
+        let [outer, inner] = exprs.as_slice() else { return None; };
+        let name = seed(outer)?;
+        let ExprNode::OpAssign { target: LValue::Index { recv, index }, op: OpAssignOp::OrOr, value } = &*inner.node else { return None; };
+        if !empty_hash(value) || !matches!(&*recv.node, ExprNode::Ivar { name: field } if field == &name) { return None; }
+        Some((name, vec![observed(index)]))
+    }
     let targets = parameter_targets(app);
     for event in &app.runtime_extension_events {
         let Some(module) = app
@@ -269,12 +294,7 @@ pub(super) fn collect_storage_fields(
             if method.params.is_empty()
                 && method.block_param.is_none()
                 && targets.get(&(event.owner.clone(), method.name.clone())) == Some(&event.module)
-                && let ExprNode::OpAssign {
-                    target: LValue::Ivar { name },
-                    op: OpAssignOp::OrOr,
-                    value,
-                } = &*method.body.node
-                && matches!(&*value.node, ExprNode::Hash { entries, .. } if entries.is_empty())
+                && let Some((name, prefix)) = memoized_reader(&method.body)
             {
                 // The empty seed has no elements to constrain: its previous
                 // inferred annotation is not another runtime writer. Rebuild
@@ -289,7 +309,7 @@ pub(super) fn collect_storage_fields(
                             var: crate::ident::TyVar(0),
                         }),
                     });
-                readers.insert(method.name.clone(), name.clone());
+                readers.insert(method.name.clone(), (name, prefix));
             } else {
                 super::extract_ivar_assignments(&method.body, owner_fields);
             }
@@ -323,36 +343,27 @@ pub(super) fn collect_storage_fields(
                         } => (recv, index, value),
                         _ => return,
                     };
-                    let ExprNode::Send {
-                        recv,
-                        method,
-                        args,
-                        block: None,
-                        ..
-                    } = &*receiver.node
-                    else {
-                        return;
-                    };
-                    let Some(field) = readers.get(method) else {
-                        return;
-                    };
-                    if !args.is_empty() || !owner_receiver(recv.as_ref(), &event.owner, implicit) {
-                        return;
+                    // Keep all nested [] indices on the original alias path.
+                    // A different receiver or non-index operation is not this
+                    // reader's storage and contributes no inferred write.
+                    let mut receiver = receiver;
+                    let mut indices = vec![observed(key)];
+                    while let ExprNode::Send { recv: Some(parent), method, args, block: None, .. } = &*receiver.node {
+                        if method.as_str() != "[]" || args.len() != 1 { break; }
+                        indices.push(observed(&args[0]));
+                        receiver = parent;
                     }
-                    // Unknown writers are debt, not permission to invent a key or
-                    // drop a value arm because a different writer was concrete.
-                    let observed = |expr: &Expr| {
-                        expr.ty
-                            .clone()
-                            .filter(|ty| !ty.mentions_unknown())
-                            .unwrap_or(Ty::Untyped)
-                    };
-                    super::widen_hash_ivar_value(
-                        owner_fields,
-                        field,
-                        Some(observed(key)),
-                        observed(value),
-                    );
+                    let ExprNode::Send { recv, method, args, block: None, .. } = &*receiver.node else { return; };
+                    let Some((field, prefix)) = readers.get(method) else { return; };
+                    if !args.is_empty() || !owner_receiver(recv.as_ref(), &event.owner, implicit) { return; }
+                    indices.reverse();
+                    let mut keys = prefix.iter().cloned().chain(indices).collect::<Vec<_>>();
+                    // Unknown writers remain debt, even beside concrete writes.
+                    let mut incoming = observed(value);
+                    while keys.len() > 1 {
+                        incoming = Ty::Hash { key: std::sync::Arc::new(keys.pop().unwrap()), value: std::sync::Arc::new(incoming) };
+                    }
+                    super::widen_hash_ivar_value(owner_fields, field, keys.pop(), incoming);
                 });
             };
         for method in module

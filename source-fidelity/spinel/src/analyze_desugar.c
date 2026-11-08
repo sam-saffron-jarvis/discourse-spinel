@@ -8174,7 +8174,7 @@ int desugar_cmethod_cvar_reflection(Compiler *c) {
     int an = 0; const int *av = args >= 0 ? nt_arr(nt, args, "arguments", &an) : NULL;
     /* a literal name, a Symbol or a String; one that is no class
        variable's raises NameError where the reflection is emitted */
-    if (an < 1 || !vis_arg_name(nt, av[0])) continue;
+    if (an < 1 || !comp_cvar_literal_name(c, av[0])) continue;
     Scope *s = comp_scope_of(c, id);
     if (!s || ie_class_of(c, id) != -1) continue;
     int cid = s->class_id < 0 ? elab_self_at(c, id) : -1;

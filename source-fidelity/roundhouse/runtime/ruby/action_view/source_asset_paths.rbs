@@ -1,0 +1,57 @@
+module Propshaft
+  class Error < StandardError
+  end
+  class MissingAssetError < Error
+    @path: String
+    def initialize: (String path) -> void
+    def message: () -> String
+  end
+end
+module ActionView
+  class SourceAsset
+    @path: String
+    @logical_path: String
+    @version: String
+    @digest: String?
+    @compiled_content: String?
+    def initialize: (String path, String logical_path, String version) -> void
+    def path: () -> String
+    def logical_path: () -> String
+    def content: () -> String
+    def compiled_content: () -> String
+    def content_type_with_charset: () -> String
+    def fresh?: (String? digest) -> bool
+    def digest: () -> String
+    def digested_path: () -> String
+    def already_digested?: () -> bool
+  end
+  class SourceAssetLoadPath
+    @paths: Array[String]
+    @version: String
+    @cached_assets: Hash[String, SourceAsset]?
+    @refresh_mutex: Mutex?
+    def initialize: (Array[String] paths, String version) -> void
+    def refresh!: () -> nil
+    def paths: () -> Array[String]
+    def version: () -> String
+    def find: (String asset_name) -> SourceAsset?
+    def assets_by_path: () -> Hash[String, SourceAsset]
+    def all_files_from_tree: (String path) -> Array[String]
+    def dedup: (Array[String] paths) -> Array[String]
+  end
+  class SourceAssetResolver
+    @load_path: SourceAssetLoadPath
+    @prefix: String
+    def initialize: (SourceAssetLoadPath load_path, String prefix) -> void
+    def load_path: () -> SourceAssetLoadPath
+    def prefix: () -> String
+    def resolve: (String logical_path) -> String?
+  end
+  class SourceAssetPaths
+    @resolver: SourceAssetResolver
+    @relative_url_root: String?
+    @asset_host: String?
+    def initialize: (SourceAssetResolver resolver, String? relative_url_root, String? asset_host) -> void
+    def asset_path: (String source) -> String
+  end
+end

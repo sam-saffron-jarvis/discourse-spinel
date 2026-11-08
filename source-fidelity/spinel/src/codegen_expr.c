@@ -1928,7 +1928,9 @@ static int emit_array_op_assign_value(Compiler *c, const char *ref, TyKind t,
 static int emit_scalar_op_assign_value(Compiler *c, const char *ref, TyKind t,
                                        const char *op, int v, int lhs_nil, int id, Buf *b) {
   Buf ab; memset(&ab, 0, sizeof ab);
-  int ok = emit_scalar_op_assign(c, ref, t, op, v, 1, lhs_nil, 0, &ab);
+  LocalVar *lv = nt_kind(c->nt, id) == NK_LocalVariableOperatorWriteNode
+      ? scope_local(comp_scope_of(c, id), nt_str(c->nt, id, "name")) : NULL;
+  int ok = emit_scalar_op_assign(c, ref, t, op, v, 1, lhs_nil, 0, lv && lv->stack_volatile, &ab);
   if (ok) buf_printf(b, lhs_nil && oint_kind(t) && !node_is_oint(c, id) ? "({ %s%s.v; })" : "({ %s%s; })", ab.p, ref);
   free(ab.p);
   return ok;
@@ -2008,6 +2010,16 @@ static int ivar_class_body_slot(Compiler *c, int id, Scope *s, char *out, size_t
    now either: its kept endpoints stay handles, read where they are used
    (sp_srange_first / sp_srange_last), so the slot form is the read. */
 void emit_slot_expr(Compiler *c, int id, Buf *b) {
+  if (nt_kind(c->nt, id) == NK_ClassVariableReadNode) {
+    HolderRef h;
+    if (holder_of_node_in(c, id, g_class_body_id, &h) && h.idx >= 0) {
+      /* A cvar read includes its assigned-check comma expression, which is
+         not a C lvalue. The caller already evaluated that read before writing
+         back (Range#freeze); name the actual holder slot for the store. */
+      holder_slot_buf(c, &h, b);
+      return;
+    }
+  }
   emit_expr_node(c, id, b);
 }
 /* The receiver of a native class's binding called on an instance of a
@@ -2197,6 +2209,17 @@ int g_oint_read = 0;
    `.v` when the slot is an oint read as a plain scalar. */
 static void emit_local_read_face(Compiler *c, int id, const char *name, LocalVar *lv, Buf *b) {
   int want = g_oint_read; g_oint_read = 0;
+  if (want && slot_is_oint(lv) && lv->stack_volatile && !lv->is_cell) {
+    /* Clang can forward a by-value copy of a volatile aggregate across
+       setjmp (the scalar member loads stay volatile). Materialize the pair
+       from those actual member reads instead of reusing the old copy. */
+    buf_printf(b, "((%s){ .v = ", lv->type == TY_FLOAT ? "sp_ofloat" : "sp_oint");
+    emit_local_ref(c, id, name, b);
+    buf_puts(b, ".v, .nil = ");
+    emit_local_ref(c, id, name, b);
+    buf_puts(b, ".nil })");
+    return;
+  }
   emit_local_ref(c, id, name, b);
   if (slot_is_oint(lv) && !want) buf_puts(b, ".v");
 }
@@ -3096,11 +3119,19 @@ static int emit_ivar_cvar_gvar_expr(Compiler *c, int id, Buf *b, const NodeTable
       return 1;
     }
     if (held && h.idx >= 0) {
+      /* A declared slot is not an assigned Ruby class variable: its only
+         writer may never run, or an overridden storage protocol may decline
+         the write. Use the real runtime flag, never metadata availability. */
+      buf_printf(b, "((cvar_%s_%s__set ? (void)0 : ", c->classes[h.cid].name, h.name + 2);
+      int rcid = holder_cvar_class(c, id, g_class_body_id);
+      emit_cvar_name_error(c, rcid >= 0 ? rcid : h.cid, h.name, b);
+      buf_puts(b, "), ");
       /* --share-strings: a class variable holding the shared handle */
       Buf sref; memset(&sref, 0, sizeof sref);
       if (holder_static_handle_buf(c, id, &sref)) {
         emit_strbuf_slot_read(c, id, repr_of(c, id), sref.p, b);
         free(sref.p);
+        buf_puts(b, ")");
         return 1;
       }
       holder_slot_buf(c, &h, &sref);
@@ -3109,6 +3140,7 @@ static int emit_ivar_cvar_gvar_expr(Compiler *c, int id, Buf *b, const NodeTable
       /* an oint static read as a plain scalar is its value */
       { int want = g_oint_read; g_oint_read = 0;
         if (cvar_is_oint(c, h.cid, h.idx) && !want) buf_puts(b, ".v"); }
+      buf_puts(b, ")");
       return 1;
     }
     unsupported(c, id, held ? "class variable read beside a class_variable_set Spinel cannot place"

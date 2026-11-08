@@ -1,0 +1,20 @@
+module ActiveRecord
+  class RequestQueryScope < QueryCacheScope
+    @owns_execution: bool
+    @completed: bool
+    @interlock_running: bool
+    @cache: QueryCacheScope?
+    @tracker: AsynchronousQueriesTracker?
+    def self.active?: () -> bool
+    def initialize: () -> void
+    def start_interlock: () -> nil
+    def finish_interlock: () -> nil
+    def start_connections: () -> nil
+    def finish_connections: () -> nil
+    def start_context: () -> nil
+    def start_queries: () -> nil
+    def finish_context: () -> nil
+    def finish_queries: () -> nil
+    def complete!: () -> nil
+  end
+end

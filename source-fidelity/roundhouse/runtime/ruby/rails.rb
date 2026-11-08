@@ -20,6 +20,12 @@ require_relative "active_support_notifications"
 require_relative "active_support_configuration_file"
 
 module Rails
+  # The emitted application boots from its serving directory. Capture that
+  # live absolute root when its framework loads, not on each later request:
+  # Dir.chdir must not retarget application resources. This is runtime input,
+  # never the compiler's build directory or a baked application pathname.
+  APPLICATION_ROOT_PATH = File.expand_path(".")
+
   class << self
     # RAILS_ENV, parked by the scaffold main.rb at boot (the runtime
     # typing gate doesn't model `ENV[]`, so the read lives in the
@@ -50,23 +56,14 @@ module Rails
     Env.new(name.nil? || name.empty? ? "development" : name)
   end
 
-  # `Rails.root` — the app root. Rails hands back a Pathname; the
-  # corpus both interpolates it (`"#{Rails.root}/x"` — AppPath#to_s
-  # keeps that byte-identical at ".") and chains `.join("tmp/…")`
-  # (lobsters' blocklist job), so the AppPath stand-in serves both.
-  # The emitted app serves from its root, hence ".".
+  # Keep one absolute path for the default emitted application root.
+  # AppPath is its typed value abstraction; retain the root object's identity.
   def self.root
-    AppPath.new(".")
+    @root_path ||= AppPath.new(APPLICATION_ROOT_PATH)
   end
 
-  # `Rails.public_path` — Rails returns a Pathname; the corpus chains
-  # `.join("avatars/").to_s` (lobsters' avatar cache dir). AppPath is
-  # the minimal typed stand-in: join concatenates with a single
-  # separator, to_s reads the accumulated path. Rooted at "public"
-  # relative to the emitted app root (matching Rails.root's "."
-  # grounding above).
   def self.public_path
-    AppPath.new("public")
+    root.join("public")
   end
 
   # Plain value object, no Pathname subclassing (the runtime stays
@@ -105,8 +102,10 @@ module Rails
       join(part)
     end
 
+    # Pathname returns copies: mutating a caller's string must not retarget
+    # the root or any already-created path value.
     def to_s
-      @base
+      @base.dup
     end
 
     # The implicit path conversion `File.read` / `IO.read` / `File.open`
@@ -117,7 +116,7 @@ module Rails
     # — which is what SearchParser hit through
     # `FetchIanaTldsJob.tlds`, once its rules were emitted at all.
     def to_path
-      @base
+      @base.dup
     end
 
     # Pathname's file readers, which read the file the path names.

@@ -1,13 +1,25 @@
 module ActionDispatch
   class ContentSecurityPolicy
+    class InvalidDirectiveError < StandardError
+    end
+    SOURCE_MAPPINGS: Hash[Symbol, String]
+    SOURCE_DIRECTIVES: Array[String]
     @names: Array[String]
     @values: Array[Array[String]]
+    @bare_names: Array[String]
 
     def initialize: () -> void
     def directives: () -> ContentSecurityPolicy
     def []: (String name) -> Array[String]?
     def []=: (String name, Array[String] value) -> nil
     def set_directive: (String name, Array[String] sources) -> nil
+    def set_source_directive: (String name, Array[String | Symbol] sources) -> nil
+    def set_flag_directive: (String name, bool enabled) -> nil
+    def flag_directive?: (String name) -> bool
+    def remove_directive: (String name) -> nil
+    def map_source: (String | Symbol source) -> String
+    def validate_source: (String name, String source) -> nil
+    def validate_sources: (String name, Array[String] sources) -> nil
     def worker_src: (String source) -> nil
     def build: () -> String
     def dup: () -> ContentSecurityPolicy

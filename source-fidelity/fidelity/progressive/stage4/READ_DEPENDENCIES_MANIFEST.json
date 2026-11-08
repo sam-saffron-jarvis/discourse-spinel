@@ -1,0 +1,283 @@
+{
+  "profile": "Source-derived serializer read dependencies; not request acceptance",
+  "source_sha256": {
+    "lib/content_localization.rb": "5103b856cb6b384bd53b3c75966eeeec928c38f72c122bd74a9aec6d3fdc08e1",
+    "lib/guardian.rb": "d14e82df366bb63d2d2a34add5ae9417dc17ff0d1ad91f991c0582134489645c",
+    "lib/guardian/tag_guardian.rb": "17f20e05e0d86ef1efb1b9ed3236bdac7f1de62894151de4aa3de3f412cb4131",
+    "lib/theme_modifier_helper.rb": "0f949a8476e38435fa2c0e91a906714fd6769ff122573e204d84261b8aa3d713",
+    "db/structure.sql": "b67895df3d6508bd7537c7066d85ef4c1240c036d9df6611b385e99fd1523e63",
+    "app/models/theme.rb": "6240fae13333496c437cd47a2fd9c2d7f6e849bf595829b5d31e99942165d80c",
+    "app/models/theme_modifier_set.rb": "b04fb4f49b36945703d0fc83c08418bf1069f712a16a7084d444eb84fd5ff955",
+    "app/models/emoji.rb": "2b6e655755e8791642a56689448b8645213253fd039226f2882cc5463eddcc71",
+    "app/models/tag.rb": "7a9fbea8e5c4fd398ce88b77069a8b98321964d44f367669976f57b462f23871",
+    "app/models/user.rb": "36d66d4c6fce6b245c505771f5136e65b08c14e964b7665381721fd4a84c9fe2",
+    "lib/letter_avatar.rb": "67bc3333274faf89988b49133e4c1d15aa71e1458bd81ba8b87e050f7ef19df8",
+    "lib/discourse.rb": "1330fdf219417287e80958fae9e90e9a15eff984d298e1203f301ff25f0e6aba",
+    "app/models/user_avatar.rb": "c6752e54850417b1e0dea38096eacda8df4c88b057e78cfa936abc4198575d76",
+    "app/models/group.rb": "4f53a5cfc4e861a7a1ac2d9c6cf131987cdd4e45694b523c551128faef79d91f",
+    "config/database.yml": "a21991bbf63539e8b372aa0521e0e7660362bfcebe76330b397f18559cdf0600",
+    "lib/pinned_check.rb": "e8fb1c0e3e37a792fa0d1aa9b082a7f08766b3b69bb16de28731c1b44e8906c7",
+    "lib/topic_subtype.rb": "555cb5a20243f3f20ca9dc6132a51bde5911456b71923701d7afebcff6e41f1c",
+    "app/models/child_theme.rb": "7c57cbb7d4dbdd26ccbbf2186d1abc904d36a6498a404710a6786dab604e18b8",
+    "app/models/remote_theme.rb": "5e27599e6d622ea8f6fc0a0938338fbf4875b4d501c5ab86cd2eb50075ac2414"
+  },
+  "framework_read_sources": {
+    "source/framework/discourse-emojis-1.0.47/dist/emojis.json": "760785d628114cfdf4ad8d3dd746f58b46ecaa5b6057adb3262aee10a0c73a64",
+    "source/framework/discourse-emojis-1.0.47/dist/tonable_emojis.json": "a5562b7c98d6b43d70dbd6a8c6e2154d435135b09f5a4ab649fd18a7e2bb9734",
+    "source/framework/discourse-emojis-1.0.47/dist/aliases.json": "da6fee5934923cb79212811b6529ac36205244cd064d34aafaf1fdb121b8eba8",
+    "source/framework/discourse-fonts-0.0.19/vendor/assets/fonts/NotoSans-Regular.woff2": "0d352d8a993d3f79d860e44d74ee3e132649253f2af24caad088c3aed6ec08c8",
+    "source/framework/addressable-2.9.0/lib/addressable/uri.rb": "091242d2582f1cfd50ca021e15b12170c2c278af52d4c9d7c0efa25269354384"
+  },
+  "guarded_source_changes": [
+    {
+      "source": "lib/content_localization.rb",
+      "start_byte": 3986,
+      "end_byte": 4125,
+      "text_sha256": "e12c3967ade767686a1dc94ae3ac5dcd08cce060bf0bec83ee92a880eb8c4246",
+      "reason": "Guard enabled localization; return actual live false flag from original leading && clause"
+    },
+    {
+      "source": "lib/content_localization.rb",
+      "start_byte": 3604,
+      "end_byte": 3769,
+      "text_sha256": "4be79f6b80519b0eb105567d4859bc122ba1d98f1577fffa3616e315e133c867",
+      "reason": "Guard enabled localization; return actual live false flag from original leading && clause"
+    },
+    {
+      "source": "lib/content_localization.rb",
+      "start_byte": 1893,
+      "end_byte": 2120,
+      "text_sha256": "828de8c421f669b7776a7f2644daeef97d1e7ce7d50cb44f42dc14cb230aee03",
+      "reason": "Guard enabled localization; return actual live false flag from original leading && clause"
+    },
+    {
+      "source": "lib/guardian.rb",
+      "start_byte": 5948,
+      "end_byte": 6073,
+      "text_sha256": "aa42b6f686606b0186e2bc654a4f2c660a1378c1e481a16e7a9fe3d37d470fb0",
+      "reason": "Ground actual inherited PM tagging method; real authenticated early return and group checks retained"
+    },
+    {
+      "source": "lib/guardian.rb",
+      "start_byte": 4546,
+      "end_byte": 5116,
+      "text_sha256": "f144311e28537ebff5fc9786623730e5b8df76bea4f1eb3b6cdd26a4a4c6e2b6",
+      "reason": "Retain actual anonymous authentication early return; authenticated permission dispatcher explicitly refuses"
+    },
+    {
+      "source": "lib/guardian.rb",
+      "start_byte": 2524,
+      "end_byte": 2567,
+      "text_sha256": "317526ca9b6e36bc13b0c0caacc32e26dc21336a6ed3954523ce5d123151f4bd",
+      "reason": "Explicit valid-identity blank semantics, not a canned anonymous permission interface"
+    },
+    {
+      "source": "lib/guardian.rb",
+      "start_byte": 2417,
+      "end_byte": 2450,
+      "text_sha256": "5b1085f13f03cbd7f5dbe2f68a79dc91bd8a9eaa46eb7ef38cef7c3fa48d0ac9",
+      "reason": "Explicit valid-identity blank semantics, not a canned anonymous permission interface"
+    },
+    {
+      "source": "lib/guardian.rb",
+      "start_byte": 1805,
+      "end_byte": 2148,
+      "text_sha256": "6fd4f4b95d7028811a7631c6e5222e44f5bfaea502f4b53ab9647ebc3b698439",
+      "reason": "Boolean-equivalent permission evaluation skips upcoming flag only where both branches have the same result; everyone-only still reads/refuses real flag"
+    },
+    {
+      "source": "lib/theme_modifier_helper.rb",
+      "start_byte": 200,
+      "end_byte": 332,
+      "text_sha256": "375f149bc0fe1f37ba01c3f7a45071dbc5172e0648a15851dc0a9c77cd49f03e",
+      "reason": "Expand actual fixed serializer demand roots; live Theme.lookup_modifier retained"
+    },
+    {
+      "source": "app/models/theme.rb",
+      "start_byte": 14587,
+      "end_byte": 14766,
+      "text_sha256": "39c49b395bc8dff9375e6be9e8f8a65f1da0e0bc9b99b4ccf9531397f85e016d",
+      "reason": "Fresh actual read instead of distributed cache; cache-effect equivalence not claimed"
+    },
+    {
+      "source": "app/models/theme.rb",
+      "start_byte": 11198,
+      "end_byte": 11577,
+      "text_sha256": "76e52577059893f4444fc63053b0e5c02b97cf7a89dac1c78baccaead969fae4",
+      "reason": "Preserve original no-version-constraints true branch; configured version profiles explicitly refuse"
+    },
+    {
+      "source": "app/models/theme.rb",
+      "start_byte": 10355,
+      "end_byte": 10794,
+      "text_sha256": "65eabb3b4dd3ab2e5854fdfc453bbf8a49185cf9225f4c446476ca72be80c515",
+      "reason": "Fresh actual read instead of distributed cache; cache-effect equivalence not claimed"
+    },
+    {
+      "source": "app/models/theme.rb",
+      "start_byte": 9481,
+      "end_byte": 9613,
+      "text_sha256": "6b129b7021021dd1ccda12238f1e53c0f7cde56c32c5b2268da34c3ffebcafa4",
+      "reason": "Fresh actual read instead of distributed cache; cache-effect equivalence not claimed"
+    },
+    {
+      "source": "app/models/theme.rb",
+      "start_byte": 9220,
+      "end_byte": 9433,
+      "text_sha256": "47b3df959778ab37c7800be0f013be080e674722555dee8b06513d1b6c32b5df",
+      "reason": "Fresh actual read instead of distributed cache; cache-effect equivalence not claimed"
+    },
+    {
+      "source": "app/models/theme.rb",
+      "start_byte": 8618,
+      "end_byte": 8698,
+      "text_sha256": "da66eb096289cfec83e061e1e4c44f5fce77330116c5b4ecae9d7c9d69d5d602",
+      "reason": "Fresh actual read instead of distributed cache; cache-effect equivalence not claimed"
+    },
+    {
+      "source": "app/models/theme.rb",
+      "start_byte": 8417,
+      "end_byte": 8507,
+      "text_sha256": "4f614d889b5bbed768aee9a173df48788bd81e3d549cc85392055a8ead74a2b2",
+      "reason": "Fresh actual read instead of distributed cache; cache-effect equivalence not claimed"
+    },
+    {
+      "source": "app/models/theme.rb",
+      "start_byte": 8318,
+      "end_byte": 8377,
+      "text_sha256": "ad2e51661f32935f6c7982f218e1dcd1d858339eecfed03b5300949a9eab1cb2",
+      "reason": "Fresh actual read instead of distributed cache; cache-effect equivalence not claimed"
+    },
+    {
+      "source": "app/models/theme.rb",
+      "start_byte": 9122,
+      "end_byte": 9439,
+      "text_sha256": "ca7b3b9f8c2834dfb8ace0e3b86a3a50f826293d37361052a23be3a03d3f3069",
+      "reason": "Shared live allowed-theme-repositories accessor; native configuration and Rails GlobalSetting adapter, never captured permissions"
+    },
+    {
+      "source": "app/models/theme_modifier_set.rb",
+      "start_byte": 3528,
+      "end_byte": 4084,
+      "text_sha256": "b0df781059ab54861f8182b8308fc13ae5bf9bce7bd6b2293df94fda5cd5e067",
+      "reason": "Same source schema-derived modifier type metadata through readonly information_schema, never effective values"
+    },
+    {
+      "source": "app/models/emoji.rb",
+      "start_byte": 9709,
+      "end_byte": 9833,
+      "text_sha256": "796e3775680b13c5f53defb97bb35c6ac0abbdc489e10851f60a8254ef80749e",
+      "reason": "Use actual matched token instead of unsupported global match-register lookup; same source regexp and Unicode resolver"
+    },
+    {
+      "source": "app/models/emoji.rb",
+      "start_byte": 8310,
+      "end_byte": 8390,
+      "text_sha256": "4a88c099959204fbb1fcc9a51fac11c59da1a1e42ca19ef802d82d46da1638bf",
+      "reason": "Fresh split array has no aliases: nonmutating Integer map is equivalent and avoids native String-array map! element-type retention"
+    },
+    {
+      "source": "app/models/emoji.rb",
+      "start_byte": 5518,
+      "end_byte": 5605,
+      "text_sha256": "c3172fb829a5e13a5e199343236394880430dde29be2c2070a31437b922630c5",
+      "reason": "Same verified published gem data from shared packaged resources; no observed Unicode/title inputs"
+    },
+    {
+      "source": "app/models/emoji.rb",
+      "start_byte": 5296,
+      "end_byte": 5404,
+      "text_sha256": "14f03ecc23d1acc394a6b4f7b994fa0d6a246cdf3059eb92c467924a8a08e639",
+      "reason": "Same verified published gem data from shared packaged resources; no observed Unicode/title inputs"
+    },
+    {
+      "source": "app/models/emoji.rb",
+      "start_byte": 4912,
+      "end_byte": 4996,
+      "text_sha256": "fa58b5e5a7c9146f99121013b06f1a10e1d514f549401ce23a505f5f33c66cd5",
+      "reason": "Same verified published gem data from shared packaged resources; no observed Unicode/title inputs"
+    },
+    {
+      "source": "app/models/emoji.rb",
+      "start_byte": 1234,
+      "end_byte": 1325,
+      "text_sha256": "a2db29bf726eeeeea399d5a8b8f464c9193c84d504162e53a53822ad18acf419",
+      "reason": "Actual live deny-list read without distributed cache; effect/cache equivalence unclaimed"
+    },
+    {
+      "source": "app/models/tag.rb",
+      "start_byte": 6896,
+      "end_byte": 7091,
+      "text_sha256": "c14f18b7798cdb69134fd9b67ae8a6fab87849a50753ad11152cf9a49927becb",
+      "reason": "Expand actual finite count-column dispatch to source-owned direct column reads, retaining live permission/setting selection"
+    },
+    {
+      "source": "app/models/tag.rb",
+      "start_byte": 5035,
+      "end_byte": 6892,
+      "text_sha256": "509bdd1780df8c43d7dc78e9aa52476f008b48e5ea8e7de5cceee81b7441086e",
+      "reason": "Actual empty-table early exit equals original empty join result; nonempty tag profile explicitly refuses, no frozen tag/setting values"
+    },
+    {
+      "source": "app/models/user.rb",
+      "start_byte": 41271,
+      "end_byte": 41578,
+      "text_sha256": "570ead94cbe8981fb5d503c1f51a5aa53544386f9e57288b52ead8e5b79c7d40",
+      "reason": "Retain real system/default/uploaded avatar branching and live Upload row; common actual configuration CDN guard"
+    },
+    {
+      "source": "app/models/user.rb",
+      "start_byte": 41206,
+      "end_byte": 41267,
+      "text_sha256": "b90276dcec02458bba2ebe8fcde369365ff7cdff1191f886ea22d8b434f32d53",
+      "reason": "Ground actual source SYSTEM_USER_ID declaration; no runtime actor/session data frozen"
+    },
+    {
+      "source": "app/models/user.rb",
+      "start_byte": 40584,
+      "end_byte": 41092,
+      "text_sha256": "b51de5fec0a8c1500f458017285dd1a02f64c3424f77e83b3ec6f7a7097495dd",
+      "reason": "Read same pinned source palette through ordinary shared constant, not cached production colors"
+    },
+    {
+      "source": "app/models/user.rb",
+      "start_byte": 39765,
+      "end_byte": 40580,
+      "text_sha256": "3e1571668ca75417a88b9cc6c2e46052c5c920a3114aa9ab62352a634b10a6b7",
+      "reason": "Preserve complete real external/default avatar branching, live settings/color/URL encoding and runtime library/font fallback hash"
+    },
+    {
+      "source": "app/models/user.rb",
+      "start_byte": 39465,
+      "end_byte": 39761,
+      "text_sha256": "e622d0cfff3b76370086cbf713d890ac0b60e55b4280e0cc918dd86b600f81be",
+      "reason": "Real single-site hostname configuration through shared context; not a captured hostname"
+    },
+    {
+      "source": "app/models/user.rb",
+      "start_byte": 16613,
+      "end_byte": 16722,
+      "text_sha256": "a53ac3698aa4857e1498f580ed7bd6d6a1d9fe0c51b4de5760948f8c6aea0c4b",
+      "reason": "ASCII NFC is identity and its first character is its first grapheme; non-ASCII normalization explicitly refuses rather than pretending Unicode support"
+    },
+    {
+      "source": "app/models/user_avatar.rb",
+      "start_byte": 6167,
+      "end_byte": 6359,
+      "text_sha256": "a1d1aa17b1578e443f6857ef114852d7ad71e8df99c7bb9d936b019db428fc10",
+      "reason": "Same source avatar path with actual shared application base-path configuration"
+    },
+    {
+      "source": "app/models/group.rb",
+      "start_byte": 31170,
+      "end_byte": 31312,
+      "text_sha256": "aa7e6ab8982fb3c57c79083d2cfc1964fadf7476e1f83c8ebb8c3dfecbfd72f7",
+      "reason": "Preserve icon/image/nil selection; common actual configuration CDN guard"
+    }
+  ],
+  "distributed_cache_equivalence_accepted": false,
+  "captured_effective_values": false,
+  "json_request_accepted": false,
+  "full_query_accepted": false,
+  "page_accepted": false
+}

@@ -27,6 +27,51 @@ class EvidenceToolsTest(unittest.TestCase):
             with self.assertRaisesRegex(AssertionError, "scope/query/type"):
                 verify.equal_records(rows, wrong)
 
+    def test_activation_projection_preserves_whole_producers_and_labels_partial_eval(self):
+        from probe_original_query import audit_projection
+        with tempfile.TemporaryDirectory(dir=ROOT / "build") as temp:
+            for mode in (None, "--eval-prefix"):
+                target = Path(temp) / (mode or "whole")
+                args = ["ruby", str(ROOT / "tools/project_plugin_activation.rb"), str(ROOT / "source/discourse"), str(target)]
+                if mode:
+                    args.append(mode)
+                subprocess.run(args, check=True)
+                maps = audit_projection(target)
+                item = next(m for m in maps if m["source"] == "lib/plugin/instance.rb")
+                roles = [span["role"] for span in item["selected_spans"]]
+                text = (target / item["generated"]).read_text()
+                self.assertIn("original_memo_reader_loop", roles)
+                self.assertIn("instance_eval File.read(path), path", text)
+                self.assertIn("class_eval %Q{", text)
+                if mode:
+                    self.assertIn("original_evaluation_statement_ONLY", roles)
+                    self.assertNotIn("whole_method:activate!", roles)
+                    self.assertNotIn("write_extra_js!", text)
+                else:
+                    self.assertIn("whole_method:activate!", roles)
+                    self.assertIn("whole_method:notify_after_initialize", roles)
+                    self.assertIn("whole_method:reloadable_patch", roles)
+                    self.assertIn("write_extra_js!", text)
+                    self.assertIn("ensure_images_symlink!", text)
+                    self.assertNotIn("PARTIAL_activate_header", roles)
+
+    def test_metadata_prefix_retains_real_parser_and_original_argument_producer(self):
+        with tempfile.TemporaryDirectory(dir=ROOT / "build") as temp:
+            app = Path(temp)
+            subprocess.run(["ruby", str(ROOT / "tools/project_plugin_activation.rb"), str(ROOT / "source/discourse"), str(app), "--metadata-prefix"], check=True)
+            from probe_original_query import audit_projection
+            maps = audit_projection(app)
+            instance = next(item for item in maps if item["source"] == "lib/plugin/instance.rb")
+            roles = [span["role"] for span in instance["selected_spans"]]
+            self.assertIn("whole_method:parse_from_source", roles)
+            self.assertNotIn("whole_method:activate!", roles)
+            for source, generated in (("lib/plugin/metadata.rb", "app/models/plugin/metadata.rb"), ("config/official_plugins.json", "config/official_plugins.json")):
+                self.assertEqual((ROOT / "source/discourse" / source).read_bytes(), (app / generated).read_bytes())
+            text = (app / instance["generated"]).read_text()
+            self.assertIn("metadata = Plugin::Metadata.parse(source)", text)
+            self.assertIn("new(metadata, path)", text)
+            self.assertNotIn("def activate!", text)
+
     def test_projection_copies_selected_ast_nodes_at_original_offsets(self):
         build = ROOT / "build"
         build.mkdir(exist_ok=True)

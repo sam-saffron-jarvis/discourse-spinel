@@ -41,16 +41,9 @@ module ActionDispatch
       out
     end
 
-    # ActiveSupport's `blank?` for a header value: empty or whitespace.
+    # ActiveSupport's String#blank? predicate, before ID sanitization.
     def self.blank?(value)
-      i = 0
-      n = value.bytesize
-      while i < n
-        b = value.getbyte(i)
-        return false unless b == 32 || (b >= 9 && b <= 13)
-        i += 1
-      end
-      true
+      value.match?(/\A[[:space:]]*\z/)
     end
   end
 

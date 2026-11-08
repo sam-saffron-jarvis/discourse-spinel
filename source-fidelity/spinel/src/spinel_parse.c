@@ -6822,7 +6822,10 @@ static void sp_graph_inherit(SpLoadGraph *g, int f);
    *tier (0 for a relative one). */
 static int sp_load_find(SpLoadGraph *g, int from, int rel, const char *path, char *found, size_t cap, int *tier) {
   *tier = 0;
-  if (rel) {
+  /* A literal absolute require is already a filename, not a library name
+     to search under -I. Autoload and __dir__ path builders already reach
+     this path; the plain literal spelling must share their feature ID. */
+  if (rel || path[0] == '/') {
     sp_load_rel_path(g, from, path, found, cap);
     size_t fl = strlen(found);
     if (fl < cap - 4 && (fl < 3 || strcmp(found + fl - 3, ".rb") != 0)) strcat(found, ".rb");

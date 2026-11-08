@@ -23,7 +23,7 @@ const SPINEL_TEST_HELPER: &str =
 
 pub(crate) mod expr;
 mod library;
-pub(crate) use library::install_lookup_indexes;
+pub(crate) use library::{install_lookup_indexes, with_file_program_headers};
 mod rbs;
 pub mod survey;
 /// Host-only, like the `project` tree passes that run it and whose RBS

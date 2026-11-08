@@ -1082,6 +1082,25 @@ int emit_op_hash_compact(Compiler *c, const BopCtx *x, Buf *b) {
   return 1;
 }
 
+/* A composed OpenStruct can receive a boxed String/Symbol key even when
+   the receiver is statically known. Do not force that Symbol through the
+   String argument conversion. Keep the same to_sym error as the boxed path. */
+static void emit_openstruct_key(Compiler *c, int key, Buf *b) {
+  if (comp_ntype(c, key) == TY_SYMBOL) {
+    emit_expr(c, key, b);
+  } else if (repr_of(c, key).kind == RK_BOXED) {
+    int t = ++g_tmp;
+    buf_printf(b, "({ sp_RbVal _t%d = sp_poly_strbuf_deref(", t);
+    emit_boxed(c, key, b);
+    buf_printf(b, "); SP_GC_ROOT_RBVAL(_t%d); _t%d.tag == SP_TAG_SYM ? (sp_sym)_t%d.v.i"
+                  " : (_t%d.tag == SP_TAG_STR ? sp_sym_intern_n(_t%d.v.s, sp_str_byte_len(_t%d.v.s))"
+                  " : (sp_raise_poly_nomethod(\"to_sym\", _t%d), (sp_sym)0)); })",
+               t, t, t, t, t, t, t);
+  } else {
+    buf_puts(b, "sp_sym_intern("); emit_str_expr(c, key, b); buf_puts(b, ")");
+  }
+}
+
 /* an OpenStruct's methods (the TY_OPENSTRUCT arm): [] / []=, to_h, respond_to?, to_s / inspect,
    freeze / frozen?, dup / clone, instance_of? */
 int emit_call_openstruct_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv) {
@@ -1137,8 +1156,7 @@ int emit_call_openstruct_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
     }
     if (sp_streq(name, "[]") && argc == 1) {
       buf_puts(b, "sp_OpenStruct_get("); emit_expr(c, recv, b); buf_puts(b, ", ");
-      if (comp_ntype(c, argv[0]) == TY_SYMBOL) emit_expr(c, argv[0], b);
-      else { buf_puts(b, "sp_sym_intern("); emit_str_expr(c, argv[0], b); buf_puts(b, ")"); }
+      emit_openstruct_key(c, argv[0], b);
       buf_puts(b, ")");
       return 1;
     }
@@ -1146,8 +1164,7 @@ int emit_call_openstruct_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
       int tv = ++g_tmp;
       buf_printf(b, "({ sp_RbVal _v%d = ", tv); emit_boxed(c, argv[1], b);
       buf_printf(b, "; SP_GC_ROOT_RBVAL(_v%d); sp_OpenStruct_set(", tv); emit_expr(c, recv, b); buf_puts(b, ", ");
-      if (comp_ntype(c, argv[0]) == TY_SYMBOL) emit_expr(c, argv[0], b);
-      else { buf_puts(b, "sp_sym_intern("); emit_str_expr(c, argv[0], b); buf_puts(b, ")"); }
+      emit_openstruct_key(c, argv[0], b);
       buf_printf(b, ", _v%d); _v%d; })", tv, tv);
       return 1;
     }

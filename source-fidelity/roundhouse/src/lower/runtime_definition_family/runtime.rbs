@@ -2,10 +2,12 @@ module __REGISTRY__
   class __ENTRY__
     @token: Integer
     @original_name: Symbol
+    @arity: Integer
     @body: ^(singleton(__OWNER__), Symbol called_name, Symbol original_name) -> __RESULT__
 
-    def initialize: (Integer token, Symbol original_name, ^(singleton(__OWNER__), Symbol called_name, Symbol original_name) -> __RESULT__ body) -> void
+    def initialize: (Integer token, Symbol original_name, ^(singleton(__OWNER__), Symbol called_name, Symbol original_name) -> __RESULT__ body, Integer arity) -> void
     def token: () -> Integer
+    def arity: () -> Integer
     def original_name: () -> Symbol
     def body: () -> ^(singleton(__OWNER__), Symbol called_name, Symbol original_name) -> __RESULT__
   end
@@ -51,7 +53,7 @@ module __REGISTRY__
   def self.extension_api_name: (Symbol name) -> bool
   def self.empty_slots: () -> Hash[Symbol, ::__REGISTRY__::__SLOT__]
   def self.ensure_virtual_name: (singleton(__OWNER__) owner, Symbol name) -> nil
-  def self.install: (singleton(__OWNER__) owner, Symbol name, ^(singleton(__OWNER__), Symbol called_name, Symbol original_name) -> __RESULT__ body, ^(singleton(__OWNER__), Symbol name) -> nil callback) -> Symbol
+  def self.install: (singleton(__OWNER__) owner, Symbol name, ^(singleton(__OWNER__), Symbol called_name, Symbol original_name) -> __RESULT__ body, ^(singleton(__OWNER__), Symbol name) -> nil callback, Integer arity) -> Symbol
   def self.parent_of: (singleton(__OWNER__) receiver) -> singleton(__OWNER__)?
   def self.lookup: (singleton(__OWNER__) receiver, Symbol name, bool inherit) -> ::__REGISTRY__::__SLOT__?
   def self.alias_name: (singleton(__OWNER__) owner, Symbol to, Symbol from, ^(singleton(__OWNER__), Symbol name) -> nil callback) -> Symbol

@@ -358,8 +358,7 @@ class PgConn
     @config = config
     @client = nil
     @stmts = []
-    @free_slots = [0]
-    @free_slots.delete_at(0)
+    @free_slots = []
     @serial = 0
     @changes = 0
     @last_tag = ""

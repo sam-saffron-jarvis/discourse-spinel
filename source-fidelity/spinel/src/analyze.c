@@ -19316,6 +19316,13 @@ static int hla_args(Compiler *c, const char *name, int pidx) {
     hla_pool = malloc(sizeof(int) * (size_t)hla_pcap);
     if (!hla_pool) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
   }
+  /* A new list needs its count slot even when no call supplies this
+     parameter. Grow before reserving it, not only before appending items. */
+  if (hla_pn == hla_pcap) {
+    hla_pcap *= 2;
+    hla_pool = realloc(hla_pool, sizeof(int) * (size_t)hla_pcap);
+    if (!hla_pool) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  }
   int off = hla_pn++, n = 0;
   for (int id = an_calls_named_first(c, name); id >= 0; id = an_calls_named_next(id)) {
     if (nt_kind(nt, id) != NK_CallNode) continue;

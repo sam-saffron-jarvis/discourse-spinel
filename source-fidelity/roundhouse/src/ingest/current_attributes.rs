@@ -6,7 +6,7 @@
 //! the class-level `Current.user` is `method_missing` forwarding to a
 //! per-thread singleton, and an app's own `def user=` reaches the
 //! generated writer through `super`. None of that survives into an
-//! emitted tree — the runtime has no `ActiveSupport::CurrentAttributes`,
+//! emitted tree — attribute declarations must be expanded,
 //! and a target that resolves calls statically cannot follow
 //! `method_missing` at all ([[feedback_runtime_must_be_statically_resolvable]]).
 //!
@@ -17,7 +17,7 @@
 //!
 //! ## What it becomes
 //!
-//! * one `@__instance` singleton plus `self.instance` / `self.reset`;
+//! * one instance per ExecutionContext frame, plus `self.instance` / `self.reset`;
 //! * a reader and writer per declared attribute, storing in an ivar;
 //! * `delegate … to: :x, prefix: true, allow_nil: true` expanded to real
 //!   methods (`request_host` → `@request.nil? ? nil : @request.host`);
@@ -80,10 +80,9 @@ pub fn lower_current_attributes(app: &mut crate::App) {
                 Vec::new()
             }
         };
-        // The base is gone: nothing is inherited any more. Record the
-        // name first — clearing the parent is exactly what makes this
-        // class unrecognizable to everything downstream.
-        lc.parent = None;
+        // Keep the concrete reset interface inherited from the runtime base.
+        // The registry is heterogeneous but typed as CurrentAttributes; its
+        // clear_all dispatches to each actual instance, including held references.
         lowered.push(lc.name.clone());
         generated.push((i, methods));
     }
@@ -117,6 +116,12 @@ fn take_attribute_decls(lc: &mut LibraryClass) -> (Vec<Symbol>, Vec<(Symbol, cra
         };
         let ExprNode::Send { recv: None, method, args, .. } = &*call.node else { return true };
         if method.as_str() != "attribute" {
+            return true;
+        }
+        if args.iter().any(|a| !matches!(&*a.node,
+            ExprNode::Lit { value: Literal::Sym { .. } })) {
+            // Defaults/options need their own owning implementation. Do not
+            // silently consume them and reset to nil instead of the default.
             return true;
         }
         let names: Vec<Symbol> = args
@@ -275,31 +280,21 @@ fn synthesized_source(
     };
 
     let mut body = String::new();
-    // ONE INSTANCE PER THREAD, which is what `CurrentAttributes` means:
-    // Rails keeps the instance in `IsolatedExecutionState`, so two
-    // requests served at once each see their own `Current.user`. A
-    // class-level `@__instance` was one instance for the whole process
-    // -- correct under the single-fiber server the binary used to run,
-    // and a cross-request identity leak the moment two green threads (or
-    // two Puma threads on the CRuby lane) dispatch at once. The slot is
-    // `Thread.current[...]`, keyed per class so two CurrentAttributes
-    // classes in one app do not share it; spinel types thread-local
-    // storage by key from its assignments, the way it types ivars, so
-    // the reader below narrows to the class and every forwarder stays
-    // typed.
-    //
-    // `reset` REPLACES the instance rather than nilling it. Rails'
-    // `CurrentAttributes.reset` sets every attribute back to its
-    // default, which a fresh instance is -- and a reader that ever
-    // answered a nilable made `Current.instance.user` fail to dispatch
-    // and EVERY class-level forwarder register `Untyped`. The reader
-    // narrows its slot read behind `is_a?`, not `nil?`, for the same
-    // reason: `Thread#[]` answers untyped, and a `nil?` test leaves it so.
-    let key = format!("__current_attrs_{}", class.replace("::", "_"));
+    // Rails scopes the instance to the execution-context frame, not merely
+    // the thread. Retaining the instance on reset is observable through references
+    // held by callers, and pop must restore an enclosing frame's instances.
+    let key = format!("{class:?}");
     body.push_str(&format!(
-        "  def self.instance\n    c = Thread.current[:{key}]\n    return c if c.is_a?({class})\n    c = {class}.new\n    Thread.current[:{key}] = c\n    c\n  end\n\n\
-         \x20 def self.reset\n    Thread.current[:{key}] = {class}.new\n    nil\n  end\n\n"
+        "  def self.instance\n    instances = ActiveSupport::ExecutionContext.current_attributes_instances\n    c = instances[:{key}]\n    return c if c.is_a?({class})\n    c = {class}.new\n    instances[:{key}] = c\n    c\n  end\n\n\
+         \x20 def self.reset\n    {class}.instance.reset\n    nil\n  end\n\n"
     ));
+    if !defines("reset") {
+        body.push_str("  def reset\n");
+        for attr in attrs {
+            body.push_str(&format!("    @{} = nil\n", attr.as_str()));
+        }
+        body.push_str("    nil\n  end\n\n");
+    }
 
     for a in attrs {
         let a = a.as_str();

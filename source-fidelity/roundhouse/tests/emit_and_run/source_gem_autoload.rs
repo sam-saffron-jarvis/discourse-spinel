@@ -21,6 +21,17 @@ fn app() -> emit_and_run::Overlay {
 }
 
 #[test]
+fn leading_autoload_is_registered_before_the_modules_carried_body_runs() {
+    app()
+        .write(
+            "vendor/bundle/ruby/3.4.0/gems/greetings-1.0/lib/greetings.rb",
+            "module Greetings\n  autoload :Formatter, \"greetings/formatter\"\n  @registered = !autoload?(:Formatter).nil?\n  def self.registered\n    @registered\n  end\nend\n",
+        )
+        .run_ruby("raise 'autoload registration moved after body' unless Greetings.registered\nputs 'autoload prefix order PASS'\n")
+        .assert_passes();
+}
+
+#[test]
 fn a_class_the_gem_autoloads_runs_from_the_gem_source() {
     app()
         .run_ruby(

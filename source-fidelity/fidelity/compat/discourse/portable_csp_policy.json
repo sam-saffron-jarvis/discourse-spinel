@@ -1,0 +1,146 @@
+{
+  "pin": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+  "original_source_sha256": {
+    "lib/content_security_policy/default.rb": "55609df6c201c35fb6b91d766c84b8099505061271b1bd027243d21a754bb268",
+    "lib/content_security_policy/builder.rb": "db43ae4c1c1ae793ed8e4de53532c2c4cc62119fe0867bd3ff15ec7fa652b62f",
+    "lib/content_security_policy.rb": "c74b5cb31482c96ac813059d812a50616764365be06a05fb85091a055890b635",
+    "lib/content_security_policy/extension.rb": "02aada991a17572ef95ffd31d411c9d2defbd5e86afb8658b2bed691e0954229"
+  },
+  "selected_spans": [
+    {
+      "source": "lib/content_security_policy/default.rb",
+      "start_byte": 95,
+      "end_byte": 1856,
+      "text_sha256": "08d0527fc5150d51ee5751d4de1e275084e1bf39ba88637509ceeaf5b22f5865"
+    },
+    {
+      "source": "lib/content_security_policy/builder.rb",
+      "start_byte": 103,
+      "end_byte": 3058,
+      "text_sha256": "cb90e213a3a4cac9513fa69546b67db56a11a1f9dbb6ef12c88d454e7dc9fba5"
+    },
+    {
+      "source": "lib/content_security_policy.rb",
+      "start_byte": 822,
+      "end_byte": 1191,
+      "text_sha256": "53408b950750e58159a91728853d401088f082022db2d7f48a19fa04d134a2a8"
+    },
+    {
+      "source": "lib/content_security_policy/extension.rb",
+      "start_byte": 98,
+      "end_byte": 212,
+      "text_sha256": "88143037da8c6d277e69847103d2b101d3b181065f5383733806e996b8f4c578"
+    }
+  ],
+  "actionpack_package": {
+    "gem": "actionpack-8.1.4",
+    "package_sha256": "245493cc51be195a7645e6fc184880fa7e5b32ff1a08e053ee31f58c76e30ea4",
+    "member": "lib/action_dispatch/http/content_security_policy.rb",
+    "member_sha256": "c663836c79885ac98331f4ec032054fafd92513b8ff4ad275ef99ac2b94e09fc"
+  },
+  "framework_spans": [
+    {
+      "name": "MAPPINGS",
+      "node_type": "Prism::ConstantWriteNode",
+      "source": "actionpack-8.1.4/lib/action_dispatch/http/content_security_policy.rb",
+      "start_byte": 3959,
+      "end_byte": 4668,
+      "text_sha256": "784330aad7dbd26718d3d49d2b70d78ab02c42af35c065eb4b9f07650a1eb23d"
+    },
+    {
+      "name": "DIRECTIVES",
+      "node_type": "Prism::ConstantWriteNode",
+      "source": "actionpack-8.1.4/lib/action_dispatch/http/content_security_policy.rb",
+      "start_byte": 4674,
+      "end_byte": 5793,
+      "text_sha256": "9692c2b28484113b8e44a3b3fe82d1174f5c2c13d0a5de19f66b03b669e3c4eb"
+    },
+    {
+      "name": "HASH_SOURCE_ALGORITHM_PREFIXES",
+      "node_type": "Prism::ConstantWriteNode",
+      "source": "actionpack-8.1.4/lib/action_dispatch/http/content_security_policy.rb",
+      "start_byte": 5799,
+      "end_byte": 5872,
+      "text_sha256": "d3059c62fbaf8379e1daff697e700e297863189bdfac6899e1aa122c15cf4d22"
+    },
+    {
+      "name": "upgrade_insecure_requests",
+      "node_type": "Prism::DefNode",
+      "source": "actionpack-8.1.4/lib/action_dispatch/http/content_security_policy.rb",
+      "start_byte": 9000,
+      "end_byte": 9203,
+      "text_sha256": "9ac0543af08712c00c6cc0abd58be69e93317a5a52a75f0758e7f304403d6064"
+    },
+    {
+      "name": "build",
+      "node_type": "Prism::DefNode",
+      "source": "actionpack-8.1.4/lib/action_dispatch/http/content_security_policy.rb",
+      "start_byte": 9209,
+      "end_byte": 9429,
+      "text_sha256": "5fccefeb45a6ce3eedcf066ca9efe4ab573a76534d14e0669280c1ebd9abf65c"
+    },
+    {
+      "name": "apply_mappings",
+      "node_type": "Prism::DefNode",
+      "source": "actionpack-8.1.4/lib/action_dispatch/http/content_security_policy.rb",
+      "start_byte": 9449,
+      "end_byte": 9909,
+      "text_sha256": "48863c7b12e2777839f44a9ea0c0b85bd343d78893393f3ed9299ce2b390a1d0"
+    },
+    {
+      "name": "apply_mapping",
+      "node_type": "Prism::DefNode",
+      "source": "actionpack-8.1.4/lib/action_dispatch/http/content_security_policy.rb",
+      "start_byte": 9917,
+      "end_byte": 10097,
+      "text_sha256": "06992786a71846537ae6169e5c41c59950846b1d651216a22750852352ff2da7"
+    },
+    {
+      "name": "build_directives",
+      "node_type": "Prism::DefNode",
+      "source": "actionpack-8.1.4/lib/action_dispatch/http/content_security_policy.rb",
+      "start_byte": 10105,
+      "end_byte": 10648,
+      "text_sha256": "48a24bc19b29d60539144a1837418ab35ef68658fbee40fe8298d8d50ea85fde"
+    },
+    {
+      "name": "validate",
+      "node_type": "Prism::DefNode",
+      "source": "actionpack-8.1.4/lib/action_dispatch/http/content_security_policy.rb",
+      "start_byte": 10656,
+      "end_byte": 11141,
+      "text_sha256": "b6489176cd8c01a35f6bc638ac58f17bf9c26a2bd3ace916c8f67918a1f6d121"
+    },
+    {
+      "name": "build_directive",
+      "node_type": "Prism::DefNode",
+      "source": "actionpack-8.1.4/lib/action_dispatch/http/content_security_policy.rb",
+      "start_byte": 11149,
+      "end_byte": 11338,
+      "text_sha256": "cefead74b4b55a3583ef81fe4fb613dcd93df438bc00b2059fa98782ff891acc"
+    },
+    {
+      "name": "resolve_source",
+      "node_type": "Prism::DefNode",
+      "source": "actionpack-8.1.4/lib/action_dispatch/http/content_security_policy.rb",
+      "start_byte": 11346,
+      "end_byte": 11900,
+      "text_sha256": "7f930b8aaf2374de59d18cb71f0aa9baee2180a0f9c2231d2402c1316fe074be"
+    }
+  ],
+  "candidate_sha256": "8857ea8e2b02ae3cb3866becad9aa8ce1fca1c05966980b901234b6e6946741f",
+  "original_projection_sha256": "e41cd984cac89520e2336c5f9a2a525e8330c15e7060462759e33b2b4c7ce322",
+  "runtime_sha256": "e7c5cc2bea093f3409d19b056835d834d37eba897813b3d42450c15d78b1410a",
+  "transformations": [
+    "Original Default+Builder+orchestrator retained, supplied unit context replaces globals/acquisition only",
+    "Actual ActionDispatch serializer reused via typed directive-DSL bridge, not a separate header formatter",
+    "Actual fast_blank String/nil presence profile; original POSIX whitespace validation preserved",
+    "Original squished warn text lowers to equivalent whitespace substitution/strip and real owned Logger effect",
+    "String-only extension admission excludes unreachable URI::ParseError rescue; unsupported profiles refuse before mutation"
+  ],
+  "context": "UNIT settings/base URLs/EmbeddableHost vectors/extensions/log fixtures, never real Site/settings/theme preloads or full Extension baking",
+  "original_html_accepted": false,
+  "native_html_accepted": false,
+  "browser_accepted": false,
+  "page_accepted": false
+}

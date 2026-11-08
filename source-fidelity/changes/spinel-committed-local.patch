@@ -35,8 +35,27 @@ index 5c48dd135..4720eacfd 100644
  `send`/`public_send`/`__send__` with a **non-literal** name (`send(meth)`) is
  partially supported: an explicit-receiver send lowers to a static dispatch over
  the method names that appear as symbol/string **literals** anywhere in the
+diff --git a/lib/sp_poly_cold.c b/lib/sp_poly_cold.c
+index f5581672a..303c5b52a 100644
+--- a/lib/sp_poly_cold.c
++++ b/lib/sp_poly_cold.c
+@@ -875,6 +875,14 @@ sp_RbVal sp_poly_slice_or_call(sp_RbVal v, sp_RbVal a, sp_RbVal b)
+       b.tag == SP_TAG_INT) {
+     sp_int n = b.v.i;
+     if (sp_re_match((mrb_regexp_pattern *)a.v.p, v.v.s ? v.v.s : "") < 0) return sp_box_nil();
++    if (n < 0 || n > 9) {
++      sp_MatchData *match = sp_re_last_matchdata();
++      if (n < 0) {
++        n += match->ncap;
++        if (n <= 0) return sp_box_nil(); /* negative indexes exclude group 0 */
++      }
++      return sp_box_nullable_str(sp_MatchData_aref(match, n));
++    }
+     if (n == 0) return sp_box_nullable_str(sp_re_match_str);
+     if (n >= 1 && n <= 9) return sp_box_nullable_str(sp_re_captures[n]);
+     return sp_box_nil();
 diff --git a/lib/spinel_rt.h b/lib/spinel_rt.h
-index 3d6a7ff4b..b9e4cf453 100644
+index 3d6a7ff4b..5b4b6a054 100644
 --- a/lib/spinel_rt.h
 +++ b/lib/spinel_rt.h
 @@ -10630,7 +10630,7 @@ static void sp_SymPolyHash_grow(sp_SymPolyHash*h){ sp_gc_wb((void*)h);sp_int oc=
@@ -48,8 +67,47 @@ index 3d6a7ff4b..b9e4cf453 100644
  static void sp_SymPolyHash_set(sp_SymPolyHash*h,sp_sym k,sp_RbVal v){sp_gc_wb((void*)h); if(h->len*2>=h->cap)sp_SymPolyHash_grow(h);sp_int idx=(sp_int)(((sp_int)k)&h->mask);while(h->keys[idx]>=0){if(h->keys[idx]==k){h->vals[idx]=v;return;}idx=(idx+1)&h->mask;}h->keys[idx]=k;h->vals[idx]=v;h->order[h->len]=k;h->len++;}
  static sp_bool sp_SymPolyHash_has_key(sp_SymPolyHash*h,sp_sym k){sp_int idx=(sp_int)(((sp_int)k)&h->mask);while(h->keys[idx]>=0){if(h->keys[idx]==k)return TRUE;idx=(idx+1)&h->mask;}return FALSE;}
  static sp_int sp_SymPolyHash_length(sp_SymPolyHash*h){return h->len;}
+@@ -20563,8 +20563,9 @@ static sp_mutex *sp_poly_mutex_recv(sp_RbVal v) {
+ #ifdef SPINEL_EXT_HOST
+ int sp_Kernel_require(const char *feature, int *loaded, void (*top)(void));
+ int sp_Kernel_require_relative(const char *feature, int *loaded, void (*top)(void));
++int sp_autoload_require(const char *feature, int *loaded, void (*top)(void), int *presence);
+ #else
+-static int sp_load_file(const char *feature, int *loaded, void (*top)(void)) {
++static int sp_load_file(const char *feature, int *loaded, void (*top)(void), int *autoload_presence) {
+   if (!top) sp_raise_load_error(feature);
+   if (*loaded) return 0;
+   *loaded = 1;
+@@ -20581,6 +20582,11 @@ static int sp_load_file(const char *feature, int *loaded, void (*top)(void)) {
+   sp_exc_top--;
+   sp_gc_nroots = sp_exc_rootmark[sp_exc_top]; sp_rescue_sp = sp_rescue_mark[sp_exc_top];
+   *loaded = 0;
++  /* An autoload publishes its binding only after the feature completes.
++     A class/constant written before a failed load must not let the next
++     read bypass that still-pending autoload. Ordinary require keeps its
++     partial definitions; only the autoload's own presence flag rolls back. */
++  if (autoload_presence) *autoload_presence = 0;
+   if (sp_unwind_kind != SP_UNWIND_NONE) sp_unwind_resume();
+   emsg = sp_exc_msg[sp_exc_top]; ecls = sp_exc_cls[sp_exc_top]; eobj = sp_exc_obj[sp_exc_top];
+   /* the exception passes on: it keeps the frames of the raise in the file */
+@@ -20594,10 +20600,13 @@ static int sp_load_file(const char *feature, int *loaded, void (*top)(void)) {
+    methods are in a --debug build: a static function has no symbol in an ELF
+    backtrace. A release link drops them from a program that loads no file. */
+ int sp_Kernel_require(const char *feature, int *loaded, void (*top)(void)) {
+-  return sp_load_file(feature, loaded, top);
++  return sp_load_file(feature, loaded, top, NULL);
+ }
+ int sp_Kernel_require_relative(const char *feature, int *loaded, void (*top)(void)) {
+-  return sp_load_file(feature, loaded, top);
++  return sp_load_file(feature, loaded, top, NULL);
++}
++int sp_autoload_require(const char *feature, int *loaded, void (*top)(void), int *presence) {
++  return sp_load_file(feature, loaded, top, presence);
+ }
+ #endif
+ static sp_RbVal sp_Mutex_synchronize_proc(sp_mutex *m, sp_Proc *blk) {
 diff --git a/src/analyze.c b/src/analyze.c
-index 80206852a..db95e6720 100644
+index 80206852a..e22fe638f 100644
 --- a/src/analyze.c
 +++ b/src/analyze.c
 @@ -7443,6 +7443,52 @@ static const char *seed_type_of_param(const Scope *s, const char *list, int slot
@@ -127,7 +185,21 @@ index 80206852a..db95e6720 100644
            }
          }
        }
-@@ -35190,8 +35245,35 @@ static void check_seed_contradictions(Compiler *c) {
+@@ -19261,6 +19316,13 @@ static int hla_args(Compiler *c, const char *name, int pidx) {
+     hla_pool = malloc(sizeof(int) * (size_t)hla_pcap);
+     if (!hla_pool) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+   }
++  /* A new list needs its count slot even when no call supplies this
++     parameter. Grow before reserving it, not only before appending items. */
++  if (hla_pn == hla_pcap) {
++    hla_pcap *= 2;
++    hla_pool = realloc(hla_pool, sizeof(int) * (size_t)hla_pcap);
++    if (!hla_pool) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
++  }
+   int off = hla_pn++, n = 0;
+   for (int id = an_calls_named_first(c, name); id >= 0; id = an_calls_named_next(id)) {
+     if (nt_kind(nt, id) != NK_CallNode) continue;
+@@ -35190,8 +35252,35 @@ static void check_seed_contradictions(Compiler *c) {
    char _sn1[192], _sn2[192];
    SeedIvarReport *reported = NULL;
    int nreported = 0;
@@ -164,7 +236,7 @@ index 80206852a..db95e6720 100644
      const char *nm = nt_str(nt, id, "name");
      int v = nt_ref(nt, id, "value");
      if (!nm || v < 0) continue;
-@@ -35199,10 +35281,21 @@ static void check_seed_contradictions(Compiler *c) {
+@@ -35199,10 +35288,21 @@ static void check_seed_contradictions(Compiler *c) {
      int cid = sc ? sc->class_id : -1;
      if (cid < 0) continue;
      ClassInfo *ci = &c->classes[cid];
@@ -188,7 +260,7 @@ index 80206852a..db95e6720 100644
      /* `@a = @b = nil` assigns @a the nil at the bottom of the chain, not
         @b's slot type: the write's value is what was written */
      for (int d = 0; d < 32; d++) {
-@@ -35224,13 +35317,15 @@ static void check_seed_contradictions(Compiler *c) {
+@@ -35224,13 +35324,15 @@ static void check_seed_contradictions(Compiler *c) {
          (val == TY_STR_ARRAY))
        continue;
      if (slot == TY_STR_POLY_HASH && val == TY_STR_STR_HASH) continue;
@@ -206,7 +278,7 @@ index 80206852a..db95e6720 100644
      /* A write in a mixed-in module's method is cloned into each includer's
         copy, and the clone carries the annotation, so one assignment in the
         source can contradict the pin twice: it is reported once. */
-@@ -35263,6 +35358,7 @@ static void check_seed_contradictions(Compiler *c) {
+@@ -35263,6 +35365,7 @@ static void check_seed_contradictions(Compiler *c) {
      if (!collect_mode()) exit(1);
      g_seed_bad = 1;
    }
@@ -214,8 +286,48 @@ index 80206852a..db95e6720 100644
    free(reported);
    /* The same contradiction on a RETURN. A seeded return is trusted, so the
       emitted function carries the pinned C type and the body's value is placed
+diff --git a/src/analyze_const.c b/src/analyze_const.c
+index 21c8390a5..1819cb36e 100644
+--- a/src/analyze_const.c
++++ b/src/analyze_const.c
+@@ -55,7 +55,7 @@ typedef struct {
+   char *seen;        /* per constant: a settled assignment has run */
+   char *plain;       /* per constant: ... of a value built of literals alone */
+   int clean;         /* nothing that has run so far can run the program's code */
+-  const int *par;    /* the parent map */
++  int *par;          /* owned parent-map snapshot; nested elaboration may replace the compiler cache */
+   char **crefs;      /* the lexical names of the classes and modules flagged reads are written in, as an error shows them */
+   int ncrefs, ccrefs;
+   int hooks;         /* a definition can run a hook of the program's */
+@@ -334,13 +334,16 @@ static int const_class_presence(Compiler *c, int id, int program);
+    (see the header comment). */
+ void an_const_presence(Compiler *c) {
+   const NodeTable *nt = c->nt;
+-  ConstWalk w = { .c = c, .nt = nt, .clean = 1, .par = comp_parent_map(c) };
++  /* This pass annotates nodes, invalidating the compiler's cached parent map.
++     Elaboration queries below can rebuild that cache while the walk still uses
++     it, so retain an owned structural snapshot until this pass completes. */
++  ConstWalk w = { .c = c, .nt = nt, .clean = 1, .par = an_parent_map(nt) };
+   size_t nn = (size_t)(nt->count > 0 ? nt->count : 1), nc = (size_t)(c->nconsts > 0 ? c->nconsts : 1);
+   w.settled = calloc(nn, 1);
+   w.seen = calloc(nc, 1);
+   w.plain = calloc(nc, 1);
+   char *listed_only = calloc(nc, 1);      /* per constant: early only to a `constants` listing */
+-  if (!w.settled || !w.seen || !w.plain ||
++  if (!w.par || !w.settled || !w.seen || !w.plain ||
+       !listed_only) {
+     fprintf(stderr, "spinel: out of memory\n"); exit(1);
+   }
+@@ -426,6 +429,7 @@ void an_const_presence(Compiler *c) {
+   free(cref);
+   for (int i = 0; i < w.ncrefs; i++) free(w.crefs[i]);
+   free(w.crefs);
++  free(w.par);
+   free(w.settled);
+   free(w.seen); free(w.plain); free(listed_only);
+   free(first_settled); free(early_reads);
 diff --git a/src/analyze_desugar.c b/src/analyze_desugar.c
-index 84f03aa95..96e3e3dbc 100644
+index 84f03aa95..1a93f66ee 100644
 --- a/src/analyze_desugar.c
 +++ b/src/analyze_desugar.c
 @@ -4391,11 +4391,13 @@ int send_family_program_owns(Compiler *c, const char *name) {
@@ -233,6 +345,53 @@ index 84f03aa95..96e3e3dbc 100644
    int own = send_family_program_owns(c, name);
    if (own != 1) return own == 2;
    if (recv < 0 || nt_kind(c->nt, recv) == NK_SelfNode) {
+@@ -8172,7 +8174,7 @@ int desugar_cmethod_cvar_reflection(Compiler *c) {
+     int an = 0; const int *av = args >= 0 ? nt_arr(nt, args, "arguments", &an) : NULL;
+     /* a literal name, a Symbol or a String; one that is no class
+        variable's raises NameError where the reflection is emitted */
+-    if (an < 1 || !vis_arg_name(nt, av[0])) continue;
++    if (an < 1 || !comp_cvar_literal_name(c, av[0])) continue;
+     Scope *s = comp_scope_of(c, id);
+     if (!s || ie_class_of(c, id) != -1) continue;
+     int cid = s->class_id < 0 ? elab_self_at(c, id) : -1;
+diff --git a/src/analyze_elab.c b/src/analyze_elab.c
+index 08a056a7d..fa6cf147f 100644
+--- a/src/analyze_elab.c
++++ b/src/analyze_elab.c
+@@ -2454,6 +2454,11 @@ void elab_program(Compiler *c, struct HostStep *h) {
+   lr_later_settle(c);
+   lr_record_unplaced(c);
+   r->recorded = 1;
++  /* A compact header may precede its namespace in the order deferred
++     files are discovered, although the namespace is loaded first at run
++     time. Rebuild binding ownership once those literal links are known;
++     do not move their load/presence events or relax unknown-owner guards. */
++  if (settle_header_namespaces(c)) lr_record_again(&x);
+   if (r->check) {   /* the same record made after the walk, as a check */
+     char *walked = lr_dump_text(c);
+     lr_record_again(&x);
+@@ -7054,7 +7059,20 @@ int elab_autoload_read(Compiler *c, int id) {
+   LoadPoint p = elab_point_from(c, id), at = elab_point_of(c, id);
+   int par = k == NK_ConstantPathNode ? nt_ref(nt, id, "parent") : -1;
+   int lexical = k == NK_ConstantReadNode && !lr_root_read(nt, id), owner = LR_MAIN, found;
+-  if (!lexical && par >= 0 && (owner = lr_class_ref_at(c, par, NULL)) < LR_MAIN) return 0;
++  if (!lexical && par >= 0) {
++    owner = lr_class_ref_at(c, par, NULL);
++    /* A deferred file makes presence uncertain, not necessarily identity.
++       The existing closed candidate proof can establish one literal owner
++       while the emitted parent read still checks its runtime presence.
++       Never guess an owner from a leaf name or a mixed/opaque world. */
++    if (owner < LR_MAIN && c->lrec->recorded && !c->lrec->walk) {
++      int *possible = NULL;
++      int n = elab_class_candidates(c, par, &possible);
++      if (n == 1) owner = possible[0];
++      free(possible);
++    }
++    if (owner < LR_MAIN) return 0;
++  }
+   /* a constant of the name proves no file is left to run, unless a
+      registration comes first on the lookup's way (an inner scope's, or the
+      scope's own ahead of an ancestor's constant) */
 diff --git a/src/analyze_infer.c b/src/analyze_infer.c
 index 5b15d1cb3..efb75ea07 100644
 --- a/src/analyze_infer.c
@@ -256,10 +415,18 @@ index 5b15d1cb3..efb75ea07 100644
      if (argc == 0 && sp_streq(name, "singleton_class?")) { *out = TY_BOOL; return 1; }
      if (argc == 0 && sp_streq(name, "singleton_class") && nt_ref(nt, id, "block") < 0) { *out = TY_CLASS; return 1; }
 diff --git a/src/analyze_internal.h b/src/analyze_internal.h
-index b418d5de3..d18940fcd 100644
+index b418d5de3..3d181adba 100644
 --- a/src/analyze_internal.h
 +++ b/src/analyze_internal.h
-@@ -952,6 +952,7 @@ int desugar_env_enum(Compiler *c);
+@@ -445,6 +445,7 @@ int elab_header_entity(Compiler *c, int node, const ElabPos *pos);
+ void elab_header_opened(Compiler *c, int node, int cls, int made);
+ int elab_rec_open(Compiler *c, int node, int cp, const char *cname, int encl);
+ void header_parent_encloses(Compiler *c, int par, int child, const char *leaf, int named);
++int settle_header_namespaces(Compiler *c);
+ void elab_load_sites(Compiler *c, int stmt, void (*fn)(void *ud, int load, int in_place), void *ud);
+ void walk_scope_stmt(Compiler *c, int stmt, int k, int scope_idx, ElabPos pos);
+ int scope_own_defaults(Compiler *c, int di);
+@@ -952,6 +953,7 @@ int desugar_env_enum(Compiler *c);
  int desugar_dir_surface(Compiler *c);
  int local_write_binds_value(NodeKind k);
  int desugar_enumerable_chain(Compiler *c);
@@ -268,10 +435,52 @@ index b418d5de3..d18940fcd 100644
  int desugar_public_send_recv(Compiler *c);
  int type_block_rest_params(Compiler *c);
 diff --git a/src/analyze_scope.c b/src/analyze_scope.c
-index 8740334a1..c9581aab5 100644
+index 8740334a1..6ed7ded92 100644
 --- a/src/analyze_scope.c
 +++ b/src/analyze_scope.c
-@@ -6584,6 +6584,12 @@ static void check_builtin_subclasses(Compiler *c) {
+@@ -1460,15 +1460,38 @@ void header_parent_encloses(Compiler *c, int par, int child, const char *leaf, i
+     c->classes[child].enclosing_class = pc;
+     return;
+   }
+-  char head[64];
+-  snprintf(head, sizeof head, "%.*s", (int)strcspn(path, ":"), path);
+-  if (!has_path || named || !leaf || !(is_builtin_class_name(head) || is_builtin_module_name(head))) return;
++  /* The namespace may be a required file whose header the graph walk has
++     not visited yet. Its absence from the class table is not evidence that
++     this compact header belongs to the top level (or the surrounding cref).
++     Retain the explicit Ruby path without making that namespace present. */
++  if (!has_path) return;
++  c->classes[child].enclosing_class = -1;
++  if (named || !leaf) return;
+   char rn[320];
+   snprintf(rn, sizeof rn, "%s::%s", path, leaf);
+   c->classes[child].ruby_name_cache = strdup(rn);
+ }
+ 
+ 
++/* Resolve only deferred explicit namespace links after all graph-file
++   headers have been registered. This changes metadata ownership, never a
++   load point or a runtime presence flag. */
++int settle_header_namespaces(Compiler *c) {
++  if (!prog_has_files(c)) return 0;
++  int changed = 0;
++  for (int ci = 0; ci < c->nclasses; ci++) {
++    ClassInfo *cls = &c->classes[ci];
++    if (cls->enclosing_class >= 0 || !cls->ruby_name_cache) continue;
++    int cp = class_def_path(c->nt, cls->def_node);
++    if (cp < 0 || nt_kind(c->nt, cp) != NK_ConstantPathNode) continue;
++    int par = nt_ref(c->nt, cp, "parent");
++    if (par < 0 || !nt_kind_is_constant(nt_kind(c->nt, par))) continue;
++    header_parent_encloses(c, par, ci, nt_str(c->nt, cp, "name"), 1);
++    if (cls->enclosing_class >= 0) { comp_touch_class(cls->idx); changed = 1; }
++  }
++  return changed;
++}
++
+ /* `class C < S` (or `C = Class.new(S) do ... end`) where the constant S
+    names nothing where the header stands (elab_const_ref_at): CRuby raises
+    NameError there, before the class exists or its body runs. The header
+@@ -6584,6 +6607,12 @@ static void check_builtin_subclasses(Compiler *c) {
      const int *av = args >= 0 ? nt_arr(nt, args, "arguments", &ac) : NULL;
      if (!av || ac != 1) continue;
      const char *par = builtin_value_superclass(c, av[0]);
@@ -284,7 +493,7 @@ index 8740334a1..c9581aab5 100644
      if (is_embedding_builtin(par)) {
        /* no class of the program's own stands for a class made by the call */
        char msg[300];
-@@ -8424,6 +8430,21 @@ static int cm_call_on_self(const NodeTable *nt, int id) {
+@@ -8424,6 +8453,21 @@ static int cm_call_on_self(const NodeTable *nt, int id) {
    return r < 0 || nt_kind(nt, r) == NK_SelfNode;
  }
  
@@ -306,7 +515,7 @@ index 8740334a1..c9581aab5 100644
  /* Does the inherited cls method `mi` (defined on def_cls), run as a class method
     of `ci`, reach a bare cmethod call that resolves to a DIFFERENT method for ci
     -- directly, or TRANSITIVELY through a non-overriding intermediate cmethod?
-@@ -8496,7 +8517,7 @@ static int cmethod_reaches_class_ivar_walk(Compiler *c, int mi, int def_cls, uns
+@@ -8496,7 +8540,7 @@ static int cmethod_reaches_class_ivar_walk(Compiler *c, int mi, int def_cls, uns
    for (int id = sn_next(c, mi, -1); id >= 0; id = sn_next(c, mi, id)) {
      if (nt_kind(nt, id) != NK_CallNode) continue;
      if (!cm_call_on_self(nt, id)) continue;
@@ -315,7 +524,7 @@ index 8740334a1..c9581aab5 100644
      if (!nm || sp_streq(nm, "new")) continue;
      /* a `class << self` accessor's @ivar is per class too (`self.x = v`) */
      if (def_cls >= 0 && def_cls < c->nclasses) {
-@@ -8650,7 +8671,7 @@ static void specialize_cmethod_for(Compiler *c, int mi, int def_cls, int ci, int
+@@ -8650,7 +8694,7 @@ static void specialize_cmethod_for(Compiler *c, int mi, int def_cls, int ci, int
      NodeKind k = nt_kind(nt, id);
      if (k != NK_CallNode) continue;
      if (!cm_call_on_self(nt, id)) continue;
@@ -324,7 +533,7 @@ index 8740334a1..c9581aab5 100644
      if (!nm || sp_streq(nm, "new")) continue;
      int sub_def = -1;
      int sub_mi = call_target(c, id, ci, nm, CT_CMETHOD, &sub_def);
-@@ -8734,6 +8755,8 @@ static const char *cls_call_name(Compiler *c, int id) {
+@@ -8734,6 +8778,8 @@ static const char *cls_call_name(Compiler *c, int id) {
    const char *nm = nt_str(c->nt, id, "name");
    int named = nm && (sp_streq(nm, "method") || sp_streq(nm, "send") || sp_streq(nm, "__send__") ||
                       sp_streq(nm, "public_send"));
@@ -333,7 +542,29 @@ index 8740334a1..c9581aab5 100644
    const char *sym = named ? method_sym_arg(c, id) : NULL;
    return sym ? sym : nm;
  }
-@@ -11182,6 +11205,14 @@ static int infer_ivar_set_call(Compiler *c, int id, NilWrites *writes) {
+@@ -9715,9 +9761,7 @@ int infer_cvar_types(Compiler *c, int nil_only) {
+     int cci = recv >= 0 && nt_kind(nt, recv) == NK_ConstantReadNode ? const_node_class_index(c, recv) : -1;
+     int args = nt_ref(nt, id, "arguments");
+     int an = 0; const int *av = args >= 0 ? nt_arr(nt, args, "arguments", &an) : NULL;
+-    NodeKind ak = an == 2 && av ? nt_kind(nt, av[0]) : NK_NilNode;
+-    const char *cvn = (ak == NK_SymbolNode) ? nt_str(nt, av[0], "value")
+-                    : (ak == NK_StringNode) ? nt_str(nt, av[0], "content") : NULL;
++    const char *cvn = an == 2 && av ? comp_cvar_literal_name(c, av[0]) : NULL;
+     /* a name written out that is no class variable name raises when the
+        call runs (cvar_name_ok): it declares nothing */
+     if (cvn && !cvar_name_ok(cvn)) continue;
+@@ -9731,6 +9775,10 @@ int infer_cvar_types(Compiler *c, int nil_only) {
+     if (nil_only && scl->cvar_types[idx] != TY_BOOL &&
+         scl->cvar_types[idx] != TY_SYMBOL) continue;
+     TyKind vt = infer_type(c, av[1]);
++    /* A real Module protocol store has the same nil semantics as @@x = nil.
++       Bool/Symbol have no nil inhabitant; the late nil-only pass must widen
++       them too, rather than collapsing a nil seed into false/:empty. */
++    if (vt == TY_NIL) vt = nil_write_type(scl->cvar_types[idx]);
+     if (vt == TY_NIL || vt == TY_UNKNOWN) continue;
+     TyKind merged = ty_unify(scl->cvar_types[idx], vt);
+     if (merged != scl->cvar_types[idx]) { cvar_set_type(scl, idx, merged); changed = 1; }
+@@ -11182,6 +11230,14 @@ static int infer_ivar_set_call(Compiler *c, int id, NilWrites *writes) {
        else if (san == 2 && sav && !(a0ty && (sp_streq(a0ty, "SymbolNode") || sp_streq(a0ty, "StringNode")))) {
          int ivrecv = nt_ref(nt, id, "receiver");
          TyKind rt = ivrecv >= 0 ? comp_ntype(c, ivrecv) : TY_UNKNOWN;
@@ -348,6 +579,79 @@ index 8740334a1..c9581aab5 100644
          int self_recv = ivrecv < 0 || (nt_kind(nt, ivrecv) == NK_SelfNode && rt != TY_POLY);
          int scid = -1;
          if (self_recv) {
+diff --git a/src/analyze_util.c b/src/analyze_util.c
+index 30d359672..01f7cb58c 100644
+--- a/src/analyze_util.c
++++ b/src/analyze_util.c
+@@ -118,13 +118,17 @@ static int class_may_have_const(Compiler *c, int k, const char *nm, int *sub, in
+       *sub = j;
+       return 1;
+     }
+-  /* a class declared under a qualified name (native_struct "M::Leaf") is
+-     keyed by its leaf, with no enclosing link to check */
++  /* A compact/native header can carry its full Ruby path before its
++     namespace's deferred header is registered. Match the owner too: a
++     matching leaf alone must not expose A::Value through B::Value. */
+   size_t nl = strlen(nm);
++  const char *owner = class_ruby_name(c, k);
++  size_t ol = owner ? strlen(owner) : 0;
+   for (int j = 0; j < c->nclasses; j++) {
+     const char *rn = c->classes[j].enclosing_class < 0 ? c->classes[j].ruby_name_cache : NULL;
+     size_t rl = rn ? strlen(rn) : 0;
+-    if (rl > nl + 2 && sp_streq(rn + rl - nl, nm) && !strncmp(rn + rl - nl - 2, "::", 2)) { *sub = j; return 1; }
++    if (owner && rl == ol + nl + 2 && !strncmp(rn, owner, ol) &&
++        !strncmp(rn + ol, "::", 2) && sp_streq(rn + ol + 2, nm)) { *sub = j; return 1; }
+   }
+   const char *kl = class_leaf_name(ki->name);
+   if (program_writes_const_in(c, ki->name, nm) || (kl != ki->name && program_writes_const_in(c, kl, nm))) {
+@@ -242,19 +246,15 @@ int const_path_misses_member(Compiler *c, int id) {
+    class whose parent, a class or module of the program, holds no member of
+    that name: an explicit scope does not fall back to Object's constants
+    (Holder::Target with Target defined at the top level names nothing,
+-   #10577). Only a top-level class is checked: a nested one a path reaches
+-   through a constant write or a compact class header (AS::CoreExt::Err =
+-   ..., `class Invoice::Line` in a subclass) is a member the walk does not
+-   list, and so is one a constant holding a module reaches. Any other node
+-   is its name's. */
++   #10577). Deferred compact headers retain their explicit namespace too,
++   so a nested class is not evidence for the same leaf under another owner.
++   Constant-held aliases and native-class namespaces keep the conservative
++   exceptions below. Any other node is its name's. */
+ int const_node_class_index(Compiler *c, int id) {
+   const NodeTable *nt = c->nt;
+   int k = comp_class_index(c, nt_str(nt, id, "name"));
+-  /* (a class named under another by a compact header carries that name,
+-     ruby_name_cache, P::Foo for `class AliasP::Foo`: no top-level one; nor
+-     is a native struct, whose module the walk does not list it in) */
+-  if (k < 0 || c->classes[k].enclosing_class >= 0 || c->classes[k].ruby_name_cache ||
+-      c->classes[k].is_native_class || nt_kind(nt, id) != NK_ConstantPathNode) return k;
++  /* Native-class namespaces are not exhaustively listed by the walk. */
++  if (k < 0 || c->classes[k].is_native_class || nt_kind(nt, id) != NK_ConstantPathNode) return k;
+   /* (nor a path whose leaf the qualifying pass found a member for and
+      renamed, qc_orig_name: module M; A = Foo; end makes M::A Foo, renamed
+      to the alias's class afterwards) */
+@@ -585,6 +585,21 @@ static int builtin_scope_lacks_member(Compiler *c, int seg) {
+      mixins are recorded, so it cannot tell yet) */
+   int k = comp_class_index(c, nt_str(nt, seg, "name"));
+   if (!is_constless_builtin_name(pn)) return 0;
++  /* Compact headers under a reopened builtin deliberately keep a full Ruby
++     path rather than an enclosing link. Use the same owner-aware member
++     proof as program namespaces; a cache alone is not a blanket exemption. */
++  int owner = comp_class_index(c, pn), member = -1;
++  if (owner >= 0 && class_may_have_const(c, owner, nm, &member, 0)) return 0;
++  /* A compact header need not reopen its builtin owner, so there may be
++     no owner class entry to walk. Its resolved Ruby path is still exact
++     membership evidence, not permission to use the same leaf under any
++     other builtin. Keep literal `__` in the written leaf intact. */
++  if (k >= 0) {
++    const char *rn = c->classes[k].ruby_name_cache;
++    const char *leaf = wn ? wn : nt_str(nt, seg, "name");
++    size_t pl = strlen(pn);
++    if (rn && leaf && !strncmp(rn, pn, pl) && !strncmp(rn + pl, "::", 2) && sp_streq(rn + pl + 2, leaf)) return 0;
++  }
+   /* a top-level builtin class or module (Array::String) is no member
+      either, unless the program reopens it or gives it its own entry */
+   int top_builtin = k < 0 && !strchr(nm, ':') && builtin_class_id(nm) != 0 &&
 diff --git a/src/call_plan.c b/src/call_plan.c
 index 988abd525..34d44e16c 100644
 --- a/src/call_plan.c
@@ -389,8 +693,143 @@ index 988abd525..34d44e16c 100644
    int owner = -1;
    int vis = comp_cmethod_vis_declared(c, ci, name, &owner);
    if (vis == SP_VIS_PROTECTED && !nt_str(c->nt, id, "vis_enforce")) {
+diff --git a/src/codegen.c b/src/codegen.c
+index 8d6a70336..c58644750 100644
+--- a/src/codegen.c
++++ b/src/codegen.c
+@@ -3447,6 +3447,7 @@ void declare_local(Compiler *c, Buf *b, LocalVar *lv, int vol) {
+    method-scope locals under per-frame unique names so a same-named caller
+    local in an argument expression is not captured by the declaration. */
+ void declare_local_named(Compiler *c, Buf *b, LocalVar *lv, const char *name, int vol) {
++  lv->stack_volatile = vol;
+   TyKind t = lv->type;
+   Buf cty; memset(&cty, 0, sizeof cty);
+   const char *init = "0";
+@@ -3960,6 +3961,7 @@ void emit_scope_decls_ends(Compiler *c, Scope *s, Buf *b, size_t *ends) {
+       /* a parameter the body reassigns inside a begin and reads after the
+          rescue or a retry's longjmp: a volatile local copy of the incoming
+          value (the signature names it lv_<name>__in) (#6552) */
++      lv->stack_volatile = 1;
+       LocalVar cp = *lv; cp.is_param = 0;
+       Buf d; memset(&d, 0, sizeof d);
+       declare_local(c, &d, &cp, 1);
+@@ -9512,7 +9514,8 @@ void emit_local_ctype(Compiler *c, TyKind ty, int vol, Buf *b) {
+ 
+ /* emit_local_ctype for a local's own slot: an Integer or Float slot that
+    holds its nil beside the value (slot_is_oint) is its oint type */
+-static void emit_local_slot_ctype(Compiler *c, const LocalVar *lv, TyKind ty, int vol, Buf *b) {
++static void emit_local_slot_ctype(Compiler *c, LocalVar *lv, TyKind ty, int vol, Buf *b) {
++  if (lv) lv->stack_volatile = vol;
+   if (!lv || !slot_is_oint(lv)) { emit_local_ctype(c, ty, vol, b); return; }
+   if (vol) buf_puts(b, "volatile ");
+   emit_slot_ctype(c, lv, b);
+diff --git a/src/codegen_call.c b/src/codegen_call.c
+index 49b5ad5c6..912dd83d1 100644
+--- a/src/codegen_call.c
++++ b/src/codegen_call.c
+@@ -6535,11 +6535,14 @@ static int emit_poly_builtin_method(Compiler *c, int id, Buf *b) {
+     }
+     if (ps_pid_fn) {
+       int tv = ++g_tmp;
++      int boxed_pid_result = repr_of(c, id).kind == RK_BOXED;
++      if (boxed_pid_result) buf_puts(b, "sp_box_int(");
+       buf_printf(b, "({ sp_RbVal _t%d = ", tv); emit_expr(c, recv, b);
+       buf_printf(b, "; _t%d.tag == SP_TAG_OBJ && _t%d.cls_id == SP_BUILTIN_PROCESS_STATUS"
+                     " ? %s((sp_ProcessStatus *)_t%d.v.p)"
+                     " : (sp_int)(sp_raise_nomethod(sp_nomethod_msg(\"%s\", _t%d)), 0); })",
+                  tv, tv, ps_pid_fn, tv, name, tv);
++      if (boxed_pid_result) buf_puts(b, ")");
+       return 1;
+     }
+     /* Process::Tms: the four Float fields the typed arm reads, behind a
+@@ -6589,11 +6592,16 @@ static int emit_poly_builtin_method(Compiler *c, int id, Buf *b) {
+   }
+   if (tf) {
+     int tv = ++g_tmp;
++    /* A user/Date accessor beside Time's may make the dispatch's builtin
++       answer itself boxed. Honor that slot, not just the raw Time result. */
++    int boxed_time_field = repr_of(c, id).kind == RK_BOXED;
++    if (boxed_time_field) buf_puts(b, "sp_box_int(");
+     buf_printf(b, "({ sp_RbVal _t%d = ", tv); emit_expr(c, recv, b);
+     buf_printf(b, "; _t%d.tag == SP_TAG_OBJ && _t%d.cls_id == SP_BUILTIN_TIME"
+                   " ? sp_time_%s((sp_Time *)_t%d.v.p)"
+                   " : (sp_int)(sp_raise_nomethod(sp_nomethod_msg(\"%s\", _t%d)), 0); })",
+                tv, tv, tf, tv, name, tv);
++    if (boxed_time_field) buf_puts(b, ")");
+     return 1;
+   }
+   /* The Time methods that answer a Time. The surface had the scalar reads and
+@@ -19742,6 +19750,10 @@ void refl_builtin_singleton_methods(const char *cls, int all, ReflNames *r) {
+ }
+ 
+ int builtin_super_cmethod_known(const char *cls, const char *name) {
++  /* Every class/module object inherits Module's storage protocol, even a
++     program class with no builtin class-table id. Until that builtin super
++     dispatch is supported, reject it rather than emit a false NoMethodError. */
++  if (cls && is_cvar_reflection_name(name)) return 1;
+   if (is_kernel_module_name(cls) && builtin_cmethod_known(cls, name)) return 1;
+   int bid = builtin_class_id(cls);
+   if (!bid) return 0;
+@@ -32335,6 +32347,35 @@ int bool_side_responds(Compiler *c, const char *qm, int include_all, int foldabl
+   *ta = ans[0]; *fa = ans[1];
+   return 1;
+ }
++/* A source-owned top-level local binding to one already-bound class. This
++   is intentionally narrower than class_var_static_ci: one plain direct
++   program statement in this file, before the read, and no other writes in
++   its scope. A factory, conditional binding, parameter, captured writer or
++   reassignable alias is not a load-point identity witness. */
++static int rto_bound_class_local(Compiler *c, int recv) {
++  const NodeTable *nt = c->nt;
++  if (nt_kind(nt, recv) != NK_LocalVariableReadNode) return -1;
++  const char *name = nt_str(nt, recv, "name");
++  Scope *sc = comp_scope_of(c, recv);
++  if (!name || !sc || sc->def_node >= 0) return -1;
++  int binding = -1;
++  for (int w = comp_lvw_first_sc(c, (int)(sc - c->scopes), name); w >= 0; w = comp_lvw_next_sc(c, w)) {
++    if (comp_scope_of(c, w) != sc) continue;
++    if (binding >= 0 || nt_kind(nt, w) != NK_LocalVariableWriteNode) return -1;
++    binding = w;
++  }
++  if (binding < 0 || nt_int(nt, binding, "node_file", -1) != nt_int(nt, recv, "node_file", -2) ||
++      nt_int(nt, binding, "node_line", 0) <= 0 ||
++      nt_int(nt, binding, "node_line", 0) >= nt_int(nt, recv, "node_line", 0)) return -1;
++  int direct = 0;
++  NT_FOREACH_KIND(nt, NK_ProgramNode, p) {
++    int n = 0; const int *body = nt_arr(nt, nt_ref(nt, p, "statements"), "body", &n);
++    for (int j = 0; j < n; j++) if (body[j] == binding) direct = 1;
++  }
++  if (!direct) return -1;
++  return cplan_const_recv_class(c, binding, nt_ref(nt, binding, "value"));
++}
++
+ int respond_to_static_answer(Compiler *c, int id, int recv, TyKind rt, const char *qm,
+                                     int argc, const int *argv) {
+   const NodeTable *nt = c->nt;
+@@ -32504,9 +32545,18 @@ int respond_to_static_answer(Compiler *c, int id, int recv, TyKind rt, const cha
+     int cobj = rk == NK_ConstantReadNode && ty_is_object(rt) &&
+                nt_str(nt, recv, "name") && const_node_class_index(c, recv) < 0 &&
+                builtin_class_id(nt_str(nt, recv, "name")) == 0;
+-    if (rk == NK_ConstantReadNode && !cobj) {
+-      const char *rcn = nt_str(nt, recv, "name");
+-      int ci = comp_class_index(c, rcn);
++    /* A qualified constant that names a class has the same load-point
++       method history as a bare class constant. Falling through to the
++       type probe/runtime Class table used the program-end surface instead,
++       exposing a later reopen's methods from an earlier namespace prelude. */
++    int path_ci = rk == NK_ConstantPathNode && rt == TY_CLASS ? const_node_class_index(c, recv) : -1;
++    int bound_ci = rt == TY_CLASS && foldable ? rto_bound_class_local(c, recv) : -1;
++    if (bound_ci >= 0 && (comp_cmethod_in_chain(c, bound_ci, "respond_to?", NULL) >= 0 ||
++                          comp_cmethod_in_chain(c, bound_ci, "respond_to_missing?", NULL) >= 0)) return -1;
++    if (path_ci < 0) path_ci = bound_ci;
++    if ((rk == NK_ConstantReadNode && !cobj) || path_ci >= 0) {
++      const char *rcn = path_ci >= 0 ? c->classes[path_ci].name : nt_str(nt, recv, "name");
++      int ci = path_ci >= 0 ? path_ci : comp_class_index(c, rcn);
+       /* `Struct` and `Data` are core class objects with no user entry, and
+          the synthesized probe cannot type a bare `Struct.new` (it is the
+          class-building call, not a value), so both answered false for the
 diff --git a/src/codegen_call_class.c b/src/codegen_call_class.c
-index 5fa0efae4..88bea8de5 100644
+index 5fa0efae4..ddf543ef7 100644
 --- a/src/codegen_call_class.c
 +++ b/src/codegen_call_class.c
 @@ -452,6 +452,94 @@ static int obj_defines_own(Compiler *c, int recv, const char *name) {
@@ -498,6 +937,127 @@ index 5fa0efae4..88bea8de5 100644
      else if (recv >= 0 && rt != TY_CLASS && nt_kind(nt, argv[0]) != NK_SplatNode &&
               respond_to_runtime_reaches(c, rt)) {
        emit_respond_to_runtime_name(c, id, b, recv, argc, argv);
+@@ -3645,9 +3736,7 @@ static int emit_class_value_singleton_methods(Compiler *c, int id, Buf *b, const
+ static int emit_cvar_reflection(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name,
+                                 int recv, int argc, const int *argv) {
+   if (!is_cvar_reflection_name(name) || argc < 1) return 0;
+-  NodeKind aty2_k = nt_kind(nt, argv[0]);
+-  const char *cvn = (aty2_k == NK_SymbolNode) ? nt_str(nt, argv[0], "value")
+-                  : (aty2_k == NK_StringNode) ? nt_str(nt, argv[0], "content") : NULL;
++  const char *cvn = comp_cvar_literal_name(c, argv[0]);
+   NodeKind rty2_k = nt_kind(nt, recv);
+   int ccid = (rty2_k == NK_ConstantReadNode) ? const_node_class_index(c, recv) : -1;
+   if (cvn && cvn[0] == '@' && cvn[1] == '@' && ccid < 0)
+diff --git a/src/codegen_call_hash.c b/src/codegen_call_hash.c
+index 9e06c763a..ca57e904b 100644
+--- a/src/codegen_call_hash.c
++++ b/src/codegen_call_hash.c
+@@ -1082,6 +1082,25 @@ int emit_op_hash_compact(Compiler *c, const BopCtx *x, Buf *b) {
+   return 1;
+ }
+ 
++/* A composed OpenStruct can receive a boxed String/Symbol key even when
++   the receiver is statically known. Do not force that Symbol through the
++   String argument conversion. Keep the same to_sym error as the boxed path. */
++static void emit_openstruct_key(Compiler *c, int key, Buf *b) {
++  if (comp_ntype(c, key) == TY_SYMBOL) {
++    emit_expr(c, key, b);
++  } else if (repr_of(c, key).kind == RK_BOXED) {
++    int t = ++g_tmp;
++    buf_printf(b, "({ sp_RbVal _t%d = sp_poly_strbuf_deref(", t);
++    emit_boxed(c, key, b);
++    buf_printf(b, "); SP_GC_ROOT_RBVAL(_t%d); _t%d.tag == SP_TAG_SYM ? (sp_sym)_t%d.v.i"
++                  " : (_t%d.tag == SP_TAG_STR ? sp_sym_intern_n(_t%d.v.s, sp_str_byte_len(_t%d.v.s))"
++                  " : (sp_raise_poly_nomethod(\"to_sym\", _t%d), (sp_sym)0)); })",
++               t, t, t, t, t, t, t);
++  } else {
++    buf_puts(b, "sp_sym_intern("); emit_str_expr(c, key, b); buf_puts(b, ")");
++  }
++}
++
+ /* an OpenStruct's methods (the TY_OPENSTRUCT arm): [] / []=, to_h, respond_to?, to_s / inspect,
+    freeze / frozen?, dup / clone, instance_of? */
+ int emit_call_openstruct_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv) {
+@@ -1137,8 +1156,7 @@ int emit_call_openstruct_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
+     }
+     if (sp_streq(name, "[]") && argc == 1) {
+       buf_puts(b, "sp_OpenStruct_get("); emit_expr(c, recv, b); buf_puts(b, ", ");
+-      if (comp_ntype(c, argv[0]) == TY_SYMBOL) emit_expr(c, argv[0], b);
+-      else { buf_puts(b, "sp_sym_intern("); emit_str_expr(c, argv[0], b); buf_puts(b, ")"); }
++      emit_openstruct_key(c, argv[0], b);
+       buf_puts(b, ")");
+       return 1;
+     }
+@@ -1146,8 +1164,7 @@ int emit_call_openstruct_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
+       int tv = ++g_tmp;
+       buf_printf(b, "({ sp_RbVal _v%d = ", tv); emit_boxed(c, argv[1], b);
+       buf_printf(b, "; SP_GC_ROOT_RBVAL(_v%d); sp_OpenStruct_set(", tv); emit_expr(c, recv, b); buf_puts(b, ", ");
+-      if (comp_ntype(c, argv[0]) == TY_SYMBOL) emit_expr(c, argv[0], b);
+-      else { buf_puts(b, "sp_sym_intern("); emit_str_expr(c, argv[0], b); buf_puts(b, ")"); }
++      emit_openstruct_key(c, argv[0], b);
+       buf_printf(b, ", _v%d); _v%d; })", tv, tv);
+       return 1;
+     }
+diff --git a/src/codegen_call_io.c b/src/codegen_call_io.c
+index 4e668a61e..b09d1fcf4 100644
+--- a/src/codegen_call_io.c
++++ b/src/codegen_call_io.c
+@@ -573,8 +573,12 @@ static int socket_send_call(const NodeTable *nt, const char *name, int argc, con
+ }
+ 
+ /* The socket calls emit_io_socket_opt_call answers, at the arities it does */
+-static int boxed_socket_opt(const char *name, int argc) {
+-  return (sp_streq(name, "connect_nonblock") && argc >= 1 && argc <= 3) ||
++static int boxed_socket_opt(const NodeTable *nt, const char *name, int argc, const int *argv) {
++  int positional = nt_argv_kwh(nt, argv, argc) >= 0 ? argc - 1 : argc;
++  /* A user protocol (SSLSocket included) can take exception: alone. That
++     keyword hash is not the socket's required address operand; claiming it
++     here emitted an empty, void-valued fallback after the user-class arm. */
++  return (sp_streq(name, "connect_nonblock") && (positional == 1 || positional == 2)) ||
+          (sp_streq(name, "setsockopt") && argc == 3) || (sp_streq(name, "getsockopt") && argc == 2);
+ }
+ 
+@@ -859,7 +863,7 @@ int emit_call_poly_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
+        sp_streq(name, "readpartial") ||
+        /* a socket read back out of a container: its non-blocking connect and
+           its options, as the typed socket arms answer them */
+-       (boxed_socket_opt(name, argc) && sp_feature_required("socket")) ||
++       (boxed_socket_opt(nt, name, argc, argv) && sp_feature_required("socket")) ||
+        /* a socket's addresses: a connection passed into a Thread arrives
+           boxed, and a server reads REMOTE_ADDR from it */
+        ((is_socket_address(name)) && argc <= 1 && !nt_argv_has_splat(nt, argv, argc) &&
+@@ -1074,7 +1078,7 @@ int emit_call_poly_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
+         return 1;
+       }
+       int sockcall = socket_handle_call(nt, name, argc, argv);
+-      if (boxed_socket_opt(name, argc) || sockcall) {
++      if (boxed_socket_opt(nt, name, argc, argv) || sockcall) {
+         /* the receiver first, then the typed arm's call on the unboxed handle */
+         int trv = ++g_tmp;
+         buf_printf(b, "({ sp_RbVal _t%d = ", trv);
+@@ -1203,6 +1207,14 @@ int emit_call_poly_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
+       int qname = argc == 0 && (sp_streq(name, "close") || sp_streq(name, "closed?"));
+       /* and a boxed Mutex answers owned? itself, where a stat answers its own */
+       int mname = argc == 0 && sp_streq(name, "owned?");
++      /* LoadError#path and user readers can widen the same call to boxed.
++         IO/Dir still answer a String, boxed once into that shared slot. */
++      int boxed_path_result = is_path_reader(name) && repr_of(c, id).kind == RK_BOXED;
++      int boxed_sync_result = argc == 0 && sp_streq(name, "sync") && repr_of(c, id).kind == RK_BOXED;
++      int boxed_fileno_result = argc == 0 && sp_streq(name, "fileno") && repr_of(c, id).kind == RK_BOXED;
++      if (boxed_path_result) buf_puts(b, "sp_box_str(");
++      if (boxed_sync_result) buf_puts(b, "sp_box_bool(");
++      if (boxed_fileno_result) buf_puts(b, "sp_box_int(");
+       int tdr = 0;
+       if (dirfn || qname || mname) {
+         tdr = ++g_tmp;
+@@ -1584,6 +1596,7 @@ int emit_call_poly_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
+                    sp_streq(name, "read_nonblock") ? "(const char *)NULL" : "(sp_int)0");
+       else buf_printf(b, "sp_File_fileno(_t%d); })", tio2);
+       if (tdr) buf_puts(b, "; })");
++      if (boxed_path_result || boxed_sync_result || boxed_fileno_result) buf_puts(b, ")");
+       return 1;
+     }
+   }
 diff --git a/src/codegen_call_kernel.c b/src/codegen_call_kernel.c
 index a29f69cd6..be045e967 100644
 --- a/src/codegen_call_kernel.c
@@ -535,7 +1095,7 @@ index a29f69cd6..be045e967 100644
      else buf_puts(b, "sp_box_nil()");
      return 1;
 diff --git a/src/codegen_call_recv.c b/src/codegen_call_recv.c
-index 382728e10..f20fd015d 100644
+index 382728e10..ca9fe5eb7 100644
 --- a/src/codegen_call_recv.c
 +++ b/src/codegen_call_recv.c
 @@ -17574,7 +17574,59 @@ static void emit_poly_ivar_set_computed(Compiler *c, int id, int recv, TyKind rt
@@ -598,11 +1158,189 @@ index 382728e10..f20fd015d 100644
    /* an exception class of the program's that defines the method answers it */
    if (rt == TY_EXCEPTION && exc_class_defines(c, name)) return 0;
    /* instance_variable_get with a computed name on a POLY receiver: the
+@@ -18670,8 +18722,8 @@ int emit_poly_call(Compiler *c, int id, Buf *b) {
+           buf_printf(b, "sp_poly_index_poly(_t%d, ", tsv); emit_boxed(c, argv[0], b); buf_puts(b, ")");
+         }
+         else {
+-          buf_printf(b, "sp_poly_slice(_t%d, sp_poly_arg_int_chk(", tsv); emit_boxed(c, argv[0], b);
+-          buf_puts(b, "), sp_poly_arg_int_chk("); emit_boxed(c, argv[1], b); buf_puts(b, "))");
++          buf_printf(b, "sp_poly_slice_or_call(_t%d, ", tsv); emit_boxed(c, argv[0], b);
++          buf_puts(b, ", "); emit_boxed(c, argv[1], b); buf_puts(b, ")");
+         }
+       }
+       else {
+diff --git a/src/codegen_expr.c b/src/codegen_expr.c
+index d673dd925..5647da614 100644
+--- a/src/codegen_expr.c
++++ b/src/codegen_expr.c
+@@ -1928,7 +1928,9 @@ static int emit_array_op_assign_value(Compiler *c, const char *ref, TyKind t,
+ static int emit_scalar_op_assign_value(Compiler *c, const char *ref, TyKind t,
+                                        const char *op, int v, int lhs_nil, int id, Buf *b) {
+   Buf ab; memset(&ab, 0, sizeof ab);
+-  int ok = emit_scalar_op_assign(c, ref, t, op, v, 1, lhs_nil, 0, &ab);
++  LocalVar *lv = nt_kind(c->nt, id) == NK_LocalVariableOperatorWriteNode
++      ? scope_local(comp_scope_of(c, id), nt_str(c->nt, id, "name")) : NULL;
++  int ok = emit_scalar_op_assign(c, ref, t, op, v, 1, lhs_nil, 0, lv && lv->stack_volatile, &ab);
+   if (ok) buf_printf(b, lhs_nil && oint_kind(t) && !node_is_oint(c, id) ? "({ %s%s.v; })" : "({ %s%s; })", ab.p, ref);
+   free(ab.p);
+   return ok;
+@@ -2008,6 +2010,16 @@ static int ivar_class_body_slot(Compiler *c, int id, Scope *s, char *out, size_t
+    now either: its kept endpoints stay handles, read where they are used
+    (sp_srange_first / sp_srange_last), so the slot form is the read. */
+ void emit_slot_expr(Compiler *c, int id, Buf *b) {
++  if (nt_kind(c->nt, id) == NK_ClassVariableReadNode) {
++    HolderRef h;
++    if (holder_of_node_in(c, id, g_class_body_id, &h) && h.idx >= 0) {
++      /* A cvar read includes its assigned-check comma expression, which is
++         not a C lvalue. The caller already evaluated that read before writing
++         back (Range#freeze); name the actual holder slot for the store. */
++      holder_slot_buf(c, &h, b);
++      return;
++    }
++  }
+   emit_expr_node(c, id, b);
+ }
+ /* The receiver of a native class's binding called on an instance of a
+@@ -2197,6 +2209,17 @@ int g_oint_read = 0;
+    `.v` when the slot is an oint read as a plain scalar. */
+ static void emit_local_read_face(Compiler *c, int id, const char *name, LocalVar *lv, Buf *b) {
+   int want = g_oint_read; g_oint_read = 0;
++  if (want && slot_is_oint(lv) && lv->stack_volatile && !lv->is_cell) {
++    /* Clang can forward a by-value copy of a volatile aggregate across
++       setjmp (the scalar member loads stay volatile). Materialize the pair
++       from those actual member reads instead of reusing the old copy. */
++    buf_printf(b, "((%s){ .v = ", lv->type == TY_FLOAT ? "sp_ofloat" : "sp_oint");
++    emit_local_ref(c, id, name, b);
++    buf_puts(b, ".v, .nil = ");
++    emit_local_ref(c, id, name, b);
++    buf_puts(b, ".nil })");
++    return;
++  }
+   emit_local_ref(c, id, name, b);
+   if (slot_is_oint(lv) && !want) buf_puts(b, ".v");
+ }
+@@ -3096,11 +3119,19 @@ static int emit_ivar_cvar_gvar_expr(Compiler *c, int id, Buf *b, const NodeTable
+       return 1;
+     }
+     if (held && h.idx >= 0) {
++      /* A declared slot is not an assigned Ruby class variable: its only
++         writer may never run, or an overridden storage protocol may decline
++         the write. Use the real runtime flag, never metadata availability. */
++      buf_printf(b, "((cvar_%s_%s__set ? (void)0 : ", c->classes[h.cid].name, h.name + 2);
++      int rcid = holder_cvar_class(c, id, g_class_body_id);
++      emit_cvar_name_error(c, rcid >= 0 ? rcid : h.cid, h.name, b);
++      buf_puts(b, "), ");
+       /* --share-strings: a class variable holding the shared handle */
+       Buf sref; memset(&sref, 0, sizeof sref);
+       if (holder_static_handle_buf(c, id, &sref)) {
+         emit_strbuf_slot_read(c, id, repr_of(c, id), sref.p, b);
+         free(sref.p);
++        buf_puts(b, ")");
+         return 1;
+       }
+       holder_slot_buf(c, &h, &sref);
+@@ -3109,6 +3140,7 @@ static int emit_ivar_cvar_gvar_expr(Compiler *c, int id, Buf *b, const NodeTable
+       /* an oint static read as a plain scalar is its value */
+       { int want = g_oint_read; g_oint_read = 0;
+         if (cvar_is_oint(c, h.cid, h.idx) && !want) buf_puts(b, ".v"); }
++      buf_puts(b, ")");
+       return 1;
+     }
+     unsupported(c, id, held ? "class variable read beside a class_variable_set Spinel cannot place"
+diff --git a/src/codegen_internal.h b/src/codegen_internal.h
+index 95b855a90..fe49ad932 100644
+--- a/src/codegen_internal.h
++++ b/src/codegen_internal.h
+@@ -2893,7 +2893,7 @@ void emit_assign(Compiler *c, int id, Buf *b, int indent);
+ void emit_op_assign(Compiler *c, int id, Buf *b, int indent);
+ int emit_array_op_assign(Compiler *c, const char *lval, TyKind t, const char *op, int v, Buf *b);
+ int emit_scalar_op_assign(Compiler *c, const char *lval, TyKind t, const char *op,
+-                          int v, int capture, int lhs_nil, int lhs_plain, Buf *b);
++                          int v, int capture, int lhs_nil, int lhs_plain, int lhs_volatile, Buf *b);
+ const char *poly_pow_fn(TyKind rt);   /* sp_poly_pow, or sp_poly_pow_recv for a receiver that may lack `**` */
+ int emit_poly_op_assign(Compiler *c, const char *lval, const char *op, int v,
+                         int capture, Buf *b);
 diff --git a/src/codegen_stmt.c b/src/codegen_stmt.c
-index e7e9634d3..6042d7753 100644
+index e7e9634d3..2f23d4221 100644
 --- a/src/codegen_stmt.c
 +++ b/src/codegen_stmt.c
-@@ -8642,7 +8642,10 @@ static int emit_pm_cond_value(Compiler *c, int pat, int t, TyKind pt, int subj,
+@@ -6225,7 +6225,7 @@ int emit_nilfree_cmp_operand(Compiler *c, int v, const char *op, int left, const
+    The caller has emitted the indent. Answers 1 when it emitted the write. */
+ const char *g_opa_niltest = NULL, *g_opa_clear = NULL;
+ int emit_scalar_op_assign(Compiler *c, const char *lval, TyKind t, const char *op,
+-                          int v, int capture, int lhs_nil, int lhs_plain, Buf *b) {
++                          int v, int capture, int lhs_nil, int lhs_plain, int lhs_volatile, Buf *b) {
+   const NodeTable *nt = c->nt;
+   if (!op) return 0;
+   /* a field with a nil bit: the plain field, tested for its bit (the
+@@ -6258,13 +6258,19 @@ int emit_scalar_op_assign(Compiler *c, const char *lval, TyKind t, const char *o
+      binary `nil + 1` -- and the result goes back wrapped (wo / wc). */
+   int onil = lhs_nil && oint_kind(t);
+   const char *wo = onil ? (t == TY_FLOAT ? "sp_ofloat_of(" : "sp_oint_of(") : "(", *wc = ")";
+-  char srcbuf[320];
++  char srcbuf[1152];
+   const char *src = lval;
++  char volatile_read[768];
++  if (onil && lhs_volatile) {
++    snprintf(volatile_read, sizeof volatile_read, "((%s){ .v = (%s).v, .nil = (%s).nil })", oint_ctype(t), lval, lval);
++    src = volatile_read;
++  }
++  const char *capture_base = src;
+   size_t pre_mark = g_pre ? g_pre->len : 0;
+   char tn[32];
+   if (capture) {
+     char ct[48]; snprintf(ct, sizeof ct, "%s ", onil ? oint_ctype(t) : c_type_name(t));
+-    src = op_assign_slot_src(c, lval, ct, t == TY_BIGINT, v, pre_mark, tn, sizeof tn, b);
++    src = op_assign_slot_src(c, capture_base, ct, t == TY_BIGINT, v, pre_mark, tn, sizeof tn, b);
+   }
+   const char *captured = src;
+   if (onil) { snprintf(srcbuf, sizeof srcbuf, "%s(%s, \"%s\")", oint_val(t), src, op); src = srcbuf; }
+@@ -6277,7 +6283,7 @@ int emit_scalar_op_assign(Compiler *c, const char *lval, TyKind t, const char *o
+     emit_int_expr(c, v, b);
+     buf_printf(b, "); %s(_t%d, _t%d); });", op[0] == '>' ? "sp_bigint_shr" : "sp_bigint_shl", tr, tk);
+     if (bclr) buf_printf(b, " %s;", bclr);
+-    op_assign_slot_end(captured, lval, b);
++    op_assign_slot_end(captured, capture_base, b);
+     return 1;
+   }
+   if (is_shift && nt_kind(nt, v) == NK_IntegerNode) {
+@@ -6285,7 +6291,7 @@ int emit_scalar_op_assign(Compiler *c, const char *lval, TyKind t, const char *o
+     if (sp_streq(op, "<<") || vlit < 0 || vlit >= 64) {
+       buf_printf(b, "%s = %ssp_int_%s(%s, %lldLL)%s;", lval, wo, sp_streq(op, "<<") ? "shl" : "shr", src, vlit, wc);
+       if (bclr) buf_printf(b, " %s;", bclr);
+-      op_assign_slot_end(captured, lval, b);
++      op_assign_slot_end(captured, capture_base, b);
+       return 1;
+     }
+   }
+@@ -6329,7 +6335,7 @@ int emit_scalar_op_assign(Compiler *c, const char *lval, TyKind t, const char *o
+   else if (src == lval) buf_printf(b, "%s %s= %s;", lval, op, rhs);
+   else buf_printf(b, "%s = %s%s %s (%s)%s;", lval, wo, src, op, rhs, wc);
+   if (bclr) buf_printf(b, " %s;", bclr);
+-  op_assign_slot_end(captured, lval, b);
++  op_assign_slot_end(captured, capture_base, b);
+   free(rb.p);
+   return 1;
+ }
+@@ -6437,7 +6443,7 @@ static int emit_slot_op_assign(Compiler *c, const char *ref, TyKind t, const cha
+                                int v, int oint, Buf *b) {
+   if (emit_array_op_assign(c, ref, t, op, v, b)) return 1;
+   if (t == TY_POLY && emit_poly_op_assign(c, ref, op, v, 1, b)) return 1;
+-  return emit_scalar_op_assign(c, ref, t, op, v, 1, oint, 0, b);
++  return emit_scalar_op_assign(c, ref, t, op, v, 1, oint, 0, 0, b);
+ }
+ 
+ /* The RHS of a String `+=`: a poly RHS (a destructured `[Int, String]`
+@@ -6562,7 +6568,7 @@ static void emit_op_assign_lv(Compiler *c, int id, Buf *b, int indent,
+     buf_printf(b, "%s = %s %s ", lval, lval, op); emit_expr(c, v, b); buf_puts(b, ";\n");
+     return;
+   }
+-  if (emit_scalar_op_assign(c, lval, t, op, v, cap, lv && slot_is_oint(lv), 0, b)) return;
++  if (emit_scalar_op_assign(c, lval, t, op, v, cap, lv && slot_is_oint(lv), 0, lv && lv->stack_volatile, b)) return;
+   if (t == TY_COMPLEX && (is_add_or_mul(op))) {
+     /* coerce the rhs like the binary path does: an Integer, a Float or a boxed
+        value all have to reach sp_complex_* as an sp_Complex */
+@@ -8642,7 +8648,10 @@ static int emit_pm_cond_value(Compiler *c, int pat, int t, TyKind pt, int subj,
             (validated to succeed above) */
          int vtmp = ++g_tmp;
          emit_indent(hs, hi);
@@ -614,7 +1352,7 @@ index e7e9634d3..6042d7753 100644
          emit_ctype(c, hvt, hs);
          buf_printf(hs, " _t%d = sp_%sHash_get(_t%d, ", vtmp, hn, t);
          emit_hash_key(c, key, ty_hash_key(pt), hs); buf_puts(hs, "); ");
-@@ -8656,7 +8659,7 @@ static int emit_pm_cond_value(Compiler *c, int pat, int t, TyKind pt, int subj,
+@@ -8656,7 +8665,7 @@ static int emit_pm_cond_value(Compiler *c, int pat, int t, TyKind pt, int subj,
        if (hvt == TY_POLY) {
          int vtmp = ++g_tmp;
          emit_indent(hs, hi);
@@ -623,7 +1361,7 @@ index e7e9634d3..6042d7753 100644
          emit_hash_key(c, key, ty_hash_key(pt), hs); buf_puts(hs, "); ");
          char vn[24]; snprintf(vn, sizeof vn, "_t%d", vtmp);
          Buf cw; memset(&cw, 0, sizeof cw);
-@@ -9912,15 +9915,18 @@ static void emit_case_match_in(Compiler *c, int id, Buf *b, int indent, int tail
+@@ -9912,15 +9921,18 @@ static void emit_case_match_in(Compiler *c, int id, Buf *b, int indent, int tail
                nt_kind(nt, vchk) != NK_ImplicitNode) {
              int vtmp = ++g_tmp;
              emit_indent(b, indent + 1);
@@ -643,6 +1381,189 @@ index e7e9634d3..6042d7753 100644
              free(vcb.p);
            }
          }
+@@ -20430,7 +20442,7 @@ static int emit_ivar_cvar_write_stmt(Compiler *c, int id, Buf *b, int indent, co
+         char ont[200], ocl[200], opf[128]; snprintf(opf, sizeof opf, "%s%s", g_self, g_self_deref);
+         int armed = ok == 1 && opa_arm_ivar(c, ocid, oiv, opf, ont, sizeof ont, ocl, sizeof ocl);
+         int soint = ok == 2 && civ_is_oint(c, ocid, oiv);
+-        if (emit_scalar_op_assign(c, ref, vt, op, ival, 1, armed ? 0 : soint, 0, b)) return 1; }
++        if (emit_scalar_op_assign(c, ref, vt, op, ival, 1, armed ? 0 : soint, 0, 0, b)) return 1; }
+       buf_printf(b, "%s %s= ", ref, op ? op : "+");
+       /* a poly RHS feeding an int/float ivar op-assign needs coercing to the
+          scalar before the C operator (e.g. `@bg_pattern |= chr_mem[i] * 256`). */
+@@ -20779,7 +20791,7 @@ static int emit_attr_global_const_write_stmt(Compiler *c, int id, Buf *b, int in
+         /* the backing ivar's nil bit, as `@x op= v` takes it */
+         { char ont[200], ocl[200], opf[64]; snprintf(opf, sizeof opf, "_t%d%s", trecv, acc);
+           opa_arm_ivar(c, rdcls, ivx, opf, ont, sizeof ont, ocl, sizeof ocl);
+-          if (emit_scalar_op_assign(c, lval, ivt, op, val, 1, 0, 0, b)) return 1; }
++          if (emit_scalar_op_assign(c, lval, ivt, op, val, 1, 0, 0, 0, b)) return 1; }
+         buf_printf(b, "_t%d%siv_%s = _t%d%siv_%s %s ", trecv, acc, iv_c(rn), trecv, acc, iv_c(rn), op ? op : "+");
+         if (rhstr.kind == RK_BOXED && (ivt == TY_INT || ivt == TY_BOOL)) {
+           buf_puts(b, op_assign_int_conv(ivt, op)); emit_expr(c, val, b); buf_puts(b, ")");
+@@ -20943,7 +20955,7 @@ static int emit_attr_global_const_write_stmt(Compiler *c, int id, Buf *b, int in
+           char lval[320]; snprintf(lval, sizeof lval, "_o->iv_%s", iv_c(rn));
+           char ont[200], ocl[200];
+           opa_arm_ivar(c, pdcls, ivx, "_o->", ont, sizeof ont, ocl, sizeof ocl);
+-          if (emit_scalar_op_assign(c, lval, ivt, op, val, 0, 0, 0, b)) {
++          if (emit_scalar_op_assign(c, lval, ivt, op, val, 0, 0, 0, 0, b)) {
+             emit_indent(b, indent + 1); buf_puts(b, "break; }\n");
+             continue;
+           }
+diff --git a/src/codegen_util.c b/src/codegen_util.c
+index 6ec93ade9..beda2d11e 100644
+--- a/src/codegen_util.c
++++ b/src/codegen_util.c
+@@ -2089,11 +2089,11 @@ const char *nil_value(TyKind t) {
+   return tr ? tr->nil : NULL;
+ }
+ 
+-/* Does the program ask whether class variable `nm` ("@@x") is set yet --
+-   `defined?(@@x)`, `class_variable_defined?(:@@x)`, or
+-   `class_variable_get(:@@x)`, which raises while it is not? Only such a
+-   cvar carries a cvar_<C>_<x>__set flag, so every other program's writes
+-   stay plain stores. */
++/* Does the program read class variable `nm` ("@@x") or ask whether it is
++   set yet -- a direct read, `defined?(@@x)`, class_variable_defined? or
++   class_variable_get? Declaring a slot is not assigning it: a writer may
++   never run and an overridden storage protocol may decline the write.
++   Such cvars carry cvar_<C>_<x>__set runtime flags. */
+ int cvar_defined_probed(Compiler *c, const char *nm) {
+   const NodeTable *nt = c->nt;
+   if (!nm) return 0;
+@@ -2101,6 +2101,7 @@ int cvar_defined_probed(Compiler *c, const char *nm) {
+     const char *kt = nt_type(nt, k);
+     NodeKind kk = nt_kind(nt, k);
+     if (!kt) continue;
++    if (kk == NK_ClassVariableReadNode && sp_streq(nt_str(nt, k, "name"), nm)) return 1;
+     if (kk == NK_DefinedNode) {
+       int v = nt_ref(nt, k, "value");
+       NodeKind vk = nt_kind(nt, v);
+@@ -2112,10 +2113,7 @@ int cvar_defined_probed(Compiler *c, const char *nm) {
+       int an = 0; int aa = nt_ref(nt, k, "arguments");
+       const int *av = aa >= 0 ? nt_arr(nt, aa, "arguments", &an) : NULL;
+       if (an < 1) continue;
+-      const char *at = nt_type(nt, av[0]);
+-      NodeKind ak = nt_kind(nt, av[0]);
+-      const char *s = !at ? NULL : ak == NK_SymbolNode ? nt_str(nt, av[0], "value")
+-                    : ak == NK_StringNode ? nt_str(nt, av[0], "content") : NULL;
++      const char *s = comp_cvar_literal_name(c, av[0]);
+       if (s && sp_streq(s, nm)) return 1;
+     }
+   }
+@@ -4751,6 +4749,18 @@ static void emit_const_recv_class(Compiler *c, int par, Buf *b) {
+   if (repr_of(c, par).kind == RK_BOXED) { buf_puts(b, "sp_unbox_class("); emit_boxed(c, par, b); buf_puts(b, ")"); }
+   else emit_expr(c, par, b);
+ }
++/* A failed autoload rolls back only its own published binding. Ordinary
++   require must keep its partial constants/classes. Carry that binding's
++   runtime flag to the loader, rather than treating an early header/write
++   as proof that the feature completed. */
++static void emit_autoload_require(ConstReadEffect ce, Buf *b) {
++  buf_printf(b, "sp_autoload_require(sp_auto_%d_feature, sp_auto_%d_loaded, sp_auto_%d_top, ",
++             ce.autoload, ce.autoload, ce.autoload);
++  if (ce.class_presence) buf_printf(b, "&sp_class_present_%d", ce.class_presence - 1);
++  else if (ce.presence) buf_printf(b, "&cst_%s__set", ce.presence->name);
++  else buf_puts(b, "NULL");
++  buf_puts(b, ")");
++}
+ static void emit_const_read_open_checked(Compiler *c, int id, ConstReadEffect ce, Buf *b) {
+   const LocalVar *lv = ce.presence;
+   if (ce.autoload) {
+@@ -4758,9 +4768,9 @@ static void emit_const_read_open_checked(Compiler *c, int id, ConstReadEffect ce
+     buf_puts(b, "((");
+     if (ce.class_presence) buf_printf(b, "sp_class_present_%d ? (void)0 : ", ce.class_presence - 1);
+     else if (ce.presence) buf_printf(b, "cst_%s__set ? (void)0 : ", ce.presence->name);
+-    buf_printf(b, "sp_auto_%d_registered ? (void)sp_Kernel_require(sp_auto_%d_feature, sp_auto_%d_loaded, sp_auto_%d_top)"
+-                  " : sp_raise_cls(\"NameError\", \"uninitialized constant %s\")), ",
+-               ce.autoload, ce.autoload, ce.autoload, ce.autoload, nm);
++    buf_printf(b, "sp_auto_%d_registered ? (void)", ce.autoload);
++    emit_autoload_require(ce, b);
++    buf_printf(b, " : sp_raise_cls(\"NameError\", \"uninitialized constant %s\")), ", nm);
+   }
+   if (ce.class_presence) {
+     char nm[256]; const_read_name(c, id, nm, sizeof nm);
+@@ -4798,8 +4808,9 @@ int emit_const_autoload_run(Compiler *c, int id, Buf *b) {
+   buf_puts(b, n ? "" : "(");
+   if (ce.class_presence) buf_printf(b, "sp_class_present_%d ? (void)0 : ", ce.class_presence - 1);
+   else if (ce.presence) buf_printf(b, "cst_%s__set ? (void)0 : ", ce.presence->name);
+-  buf_printf(b, "sp_auto_%d_registered ? (void)sp_Kernel_require(sp_auto_%d_feature, sp_auto_%d_loaded, sp_auto_%d_top) : (void)0, ",
+-             ce.autoload, ce.autoload, ce.autoload, ce.autoload);
++  buf_printf(b, "sp_auto_%d_registered ? (void)", ce.autoload);
++  emit_autoload_require(ce, b);
++  buf_puts(b, " : (void)0, ");
+   return 1;
+ }
+ void emit_const_read_open(Compiler *c, int id, const LocalVar *lv, Buf *b) {
+diff --git a/src/compiler.c b/src/compiler.c
+index 2dc6e82dd..5152a3a59 100644
+--- a/src/compiler.c
++++ b/src/compiler.c
+@@ -1299,6 +1299,28 @@ int comp_cvar_index(ClassInfo *ci, const char *name) {
+    underscore or a byte of a non-ASCII character first, digits after)? A
+    class_variable_get / _set / _defined? with a literal name that is not one
+    raises CRuby's NameError when it runs, and declares nothing. */
++const char *comp_cvar_literal_name(Compiler *c, int node) {
++  const NodeTable *nt = c->nt;
++  NodeKind k = nt_kind(nt, node);
++  if (k == NK_SymbolNode) return nt_str(nt, node, "value");
++  int string = comp_class_index(c, "String");
++  /* A prior literal-folding pass may already have simplified +"text".
++     Do not claim a closed String-name world when String#+@ is reopened,
++     even if this argument currently looks like a bare String literal. */
++  if (string >= 0 && comp_method_in_chain(c, string, "+@", NULL) >= 0) return NULL;
++  if (k == NK_CallNode && sp_streq(nt_str(nt, node, "name"), "+@") &&
++      nt_ref(nt, node, "arguments") < 0 && nt_ref(nt, node, "block") < 0) {
++    int recv = nt_ref(nt, node, "receiver");
++    /* Only the builtin literal-copy operation proves unchanged bytes. */
++    if (nt_kind(nt, recv) != NK_StringNode) return NULL;
++    node = recv;
++    k = NK_StringNode;
++  }
++  if (k != NK_StringNode) return NULL;
++  const char *name = nt_str(nt, node, "content");
++  return name ? name : nt_str(nt, node, "unescaped");
++}
++
+ int cvar_name_ok(const char *n) {
+   if (!n || n[0] != '@' || n[1] != '@') return 0;
+   const unsigned char *p = (const unsigned char *)n + 2;
+diff --git a/src/compiler.h b/src/compiler.h
+index db513e9ea..6efadf20f 100644
+--- a/src/compiler.h
++++ b/src/compiler.h
+@@ -183,6 +183,9 @@ typedef struct {
+                        shared-object semantics. Implies is_cell (body reads and
+                        writes go through *_cell_<name>), but the cell is the
+                        caller's slot -- no heap cell is allocated on entry. */
++  int stack_volatile; /* codegen: this frame's C stack slot is volatile across
++                         setjmp; read nullable aggregates memberwise so Clang
++                         cannot reuse a pre-setjmp by-value temporary */
+   int borrowed_volatile; /* codegen: this String slot, or a slot borrowed here,
+                            is live across setjmp; propagate through lending */
+   int inline_alias; /* (params of a yielding method, codegen only) how many
+@@ -2159,6 +2162,7 @@ int        comp_cvar_index(ClassInfo *ci, const char *name);  /* class var; -1 i
+ int        comp_cvar_intern(ClassInfo *ci, const char *name); /* find or add; returns index */
+ int        comp_cvar_owner(const Compiler *c, int cid, const char *name); /* the class whose slot holds @@name */
+ int        cvar_name_ok(const char *n);   /* `@@` and an identifier: a reflection call's literal name that is not one raises NameError */
++const char *comp_cvar_literal_name(Compiler *c, int node); /* literal String/Symbol, including a fresh builtin +String literal */
+ /* 1 iff method m's param idx is a byref string out-param (LocalVar.byref_out):
+    passed as const char** so callee mutation lands in the caller's variable. */
+ int        comp_byref_param(Compiler *c, Scope *m, int idx);
+diff --git a/src/spinel_parse.c b/src/spinel_parse.c
+index eaf7a4ca9..ef6faf8a8 100644
+--- a/src/spinel_parse.c
++++ b/src/spinel_parse.c
+@@ -6822,7 +6822,10 @@ static void sp_graph_inherit(SpLoadGraph *g, int f);
+    *tier (0 for a relative one). */
+ static int sp_load_find(SpLoadGraph *g, int from, int rel, const char *path, char *found, size_t cap, int *tier) {
+   *tier = 0;
+-  if (rel) {
++  /* A literal absolute require is already a filename, not a library name
++     to search under -I. Autoload and __dir__ path builders already reach
++     this path; the plain literal spelling must share their feature ID. */
++  if (rel || path[0] == '/') {
+     sp_load_rel_path(g, from, path, found, cap);
+     size_t fl = strlen(found);
+     if (fl < cap - 4 && (fl < 3 || strcmp(found + fl - 3, ".rb") != 0)) strcat(found, ".rb");
 diff --git a/test/alias_captured_callee_identity.rb b/test/alias_captured_callee_identity.rb
 new file mode 100644
 index 000000000..37f23d33f
@@ -733,6 +1654,164 @@ index 000000000..95774463c
 +:__send__
 +public_send rejected
 +direct call rejected
+diff --git a/test/boxed_io_process_integer_fallback.rb b/test/boxed_io_process_integer_fallback.rb
+new file mode 100644
+index 000000000..07ab176b4
+--- /dev/null
++++ b/test/boxed_io_process_integer_fallback.rb
+@@ -0,0 +1,34 @@
++# Integer IO/process accessors must box into widened dynamic result slots.
++# No child process or network connection is created by this regression.
++require "ostruct"
++class OtherIntegerAccessors
++  def pid = {kind: "user-pid"}
++  def fileno = {kind: "user-fd"}
++end
++
++def pid_of(value)
++  value.pid
++end
++
++def fileno_of(value)
++  value.fileno
++end
++
++class CurrentProcessId
++  def pid = Process.pid
++end
++
++p pid_of(CurrentProcessId.new) == Process.pid
++begin
++  pid_of(Thread.current)
++rescue NoMethodError
++  puts "no-thread-pid"
++end
++p pid_of(OtherIntegerAccessors.new)
++p pid_of(OpenStruct.new(pid: "dynamic-pid"))
++File.open(__FILE__) do |file|
++  number = fileno_of(file)
++  p number.is_a?(Integer) && number >= 0
++end
++p fileno_of(OtherIntegerAccessors.new)
++p fileno_of(OpenStruct.new(fileno: "dynamic-fd"))
+diff --git a/test/boxed_io_process_integer_fallback.rb.expected b/test/boxed_io_process_integer_fallback.rb.expected
+new file mode 100644
+index 000000000..4168599a7
+--- /dev/null
++++ b/test/boxed_io_process_integer_fallback.rb.expected
+@@ -0,0 +1,7 @@
++true
++no-thread-pid
++{kind: "user-pid"}
++"dynamic-pid"
++true
++{kind: "user-fd"}
++"dynamic-fd"
+diff --git a/test/boxed_io_sync_fallback.rb b/test/boxed_io_sync_fallback.rb
+new file mode 100644
+index 000000000..edd620dfa
+--- /dev/null
++++ b/test/boxed_io_sync_fallback.rb
+@@ -0,0 +1,18 @@
++# A built-in IO Boolean must be boxed in a widened user-method dispatch.
++require "ostruct"
++class OtherSyncResult
++  def sync = {kind: "user"}
++end
++
++def sync_of(value)
++  value.sync
++end
++
++File.open(__FILE__) do |file|
++  file.sync = false
++  p sync_of(file)
++  file.sync = true
++  p sync_of(file)
++end
++p sync_of(OtherSyncResult.new)
++p sync_of(OpenStruct.new(sync: "dynamic"))
+diff --git a/test/boxed_io_sync_fallback.rb.expected b/test/boxed_io_sync_fallback.rb.expected
+new file mode 100644
+index 000000000..eafa441a7
+--- /dev/null
++++ b/test/boxed_io_sync_fallback.rb.expected
+@@ -0,0 +1,4 @@
++false
++true
++{kind: "user"}
++"dynamic"
+diff --git a/test/boxed_path_day_fallback.rb b/test/boxed_path_day_fallback.rb
+new file mode 100644
+index 000000000..8a3199b4f
+--- /dev/null
++++ b/test/boxed_path_day_fallback.rb
+@@ -0,0 +1,23 @@
++# The built-in fallback must fit the boxed result beside user returns.
++require "ostruct"
++require "date"
++class OtherResult
++  def path = {unit: "path"}
++  def day = {unit: "day"}
++end
++def path_of(value)
++  value.path
++end
++def day_of(value)
++  value.day
++end
++File.open(__FILE__) do |file|
++  puts path_of(file).end_with?("boxed_path_day_fallback.rb")
++end
++Dir.open(".") do |directory|
++  p path_of(directory)
++end
++p path_of(OtherResult.new)
++p day_of(Time.utc(2026, 11, 5))
++p day_of(Date.new(2026, 11, 6))
++p day_of(OtherResult.new)
+diff --git a/test/boxed_path_day_fallback.rb.expected b/test/boxed_path_day_fallback.rb.expected
+new file mode 100644
+index 000000000..876ac56dc
+--- /dev/null
++++ b/test/boxed_path_day_fallback.rb.expected
+@@ -0,0 +1,6 @@
++true
++"."
++{unit: "path"}
++5
++6
++{unit: "day"}
+diff --git a/test/boxed_socket_keyword_only_protocol.rb b/test/boxed_socket_keyword_only_protocol.rb
+new file mode 100644
+index 000000000..df56baaa5
+--- /dev/null
++++ b/test/boxed_socket_keyword_only_protocol.rb
+@@ -0,0 +1,16 @@
++# A boxed user protocol sharing Socket#connect_nonblock's name may accept
++# exception: alone. The native socket arm must not count it as an address or
++# emit an empty C expression for the default arm. No socket is opened here.
++require "socket"
++class KeywordOnlyChannel
++  def connect_nonblock(exception: true)
++    exception ? :connected : :wait_readable
++  end
++end
++[KeywordOnlyChannel.new, nil].each do |channel|
++  begin
++    p channel.connect_nonblock(exception: false)
++  rescue NoMethodError => error
++    p error.class
++  end
++end
+diff --git a/test/boxed_socket_keyword_only_protocol.rb.expected b/test/boxed_socket_keyword_only_protocol.rb.expected
+new file mode 100644
+index 000000000..851c68250
+--- /dev/null
++++ b/test/boxed_socket_keyword_only_protocol.rb.expected
+@@ -0,0 +1,2 @@
++:wait_readable
++NoMethodError
 diff --git a/test/class_value_runtime_respond_to.rb b/test/class_value_runtime_respond_to.rb
 new file mode 100644
 index 000000000..27f82782b
@@ -875,6 +1954,57 @@ index d23d16b7a..6d01b81f7 100644
  == test/reject/computed_ivar_set_poly_user_method.rb [default] rc=1
  spinel: test/reject/computed_ivar_set_poly_user_method.rb:13: Object#instance_variable_set with a non-literal name on a receiver that may be an instance of a class defining its own instance_variable_set is not supported (see docs/limitations.md)
  spinel: 1 refusal, nothing written
+diff --git a/test/compact_builtin_without_owner_membership.rb b/test/compact_builtin_without_owner_membership.rb
+new file mode 100644
+index 000000000..4cb25827a
+--- /dev/null
++++ b/test/compact_builtin_without_owner_membership.rb
+@@ -0,0 +1,30 @@
++# Compact headers create real members even without a standalone reopening
++# of the builtin owner. Exact membership must not expose that leaf through
++# another builtin; literal double underscores are part of the Ruby name.
++class String::Compact__Marker
++  def self.answer = 41
++end
++module Comparable::CompactOpen
++end
++p String::Compact__Marker.answer
++p String::Compact__Marker.name
++p defined?(::String::Compact__Marker)
++p Comparable::CompactOpen.name
++p defined?(Comparable::CompactOpen)
++begin
++  StandardError::Compact__Marker
++rescue NameError
++  puts "wrong exception owner rejected"
++end
++begin
++  Hash::CompactOpen
++rescue NameError
++  puts "wrong class owner rejected"
++end
++p defined?(Array::CompactOpen)
++class OnlyAtTop; end
++begin
++  Comparable::OnlyAtTop
++rescue NameError
++  puts "top-level fallback rejected"
++end
+diff --git a/test/compact_builtin_without_owner_membership.rb.expected b/test/compact_builtin_without_owner_membership.rb.expected
+new file mode 100644
+index 000000000..c45d96e52
+--- /dev/null
++++ b/test/compact_builtin_without_owner_membership.rb.expected
+@@ -0,0 +1,9 @@
++41
++"String::Compact__Marker"
++"constant"
++"Comparable::CompactOpen"
++"constant"
++wrong exception owner rejected
++wrong class owner rejected
++nil
++top-level fallback rejected
 diff --git a/test/computed_class_ivar_cache.rb b/test/computed_class_ivar_cache.rb
 new file mode 100644
 index 000000000..c9f463eff
@@ -983,6 +2113,116 @@ index 000000000..d0bf1a0a2
 +static Class slot refused
 +17
 +encoding boundary refused
+diff --git a/test/const_path_compact_builtin_owner.rb b/test/const_path_compact_builtin_owner.rb
+new file mode 100644
+index 000000000..53d011a7e
+--- /dev/null
++++ b/test/const_path_compact_builtin_owner.rb
+@@ -0,0 +1,17 @@
++# A compact class under a builtin has exact namespace identity even though
++# builtin namespaces do not get an enclosing-class link in the class table.
++class StandardError
++end
++class String
++end
++class StandardError::CompactMember
++  def self.answer = 19
++end
++p StandardError::CompactMember.answer
++p StandardError::CompactMember.name
++p defined?(StandardError::CompactMember)
++begin
++  String::CompactMember
++rescue NameError
++  puts "wrong builtin owner rejected"
++end
+diff --git a/test/const_path_compact_builtin_owner.rb.expected b/test/const_path_compact_builtin_owner.rb.expected
+new file mode 100644
+index 000000000..a5db503b2
+--- /dev/null
++++ b/test/const_path_compact_builtin_owner.rb.expected
+@@ -0,0 +1,4 @@
++19
++"StandardError::CompactMember"
++"constant"
++wrong builtin owner rejected
+diff --git a/test/cvar_protocol_nonwriting_override.rb b/test/cvar_protocol_nonwriting_override.rb
+new file mode 100644
+index 000000000..b869fb197
+--- /dev/null
++++ b/test/cvar_protocol_nonwriting_override.rb
+@@ -0,0 +1,16 @@
++# A writer declaration/metadata slot does not assign storage. The actual
++# overridable protocol can decline the write; readers must still raise.
++module NonWritingCvarProtocol
++  def self.class_variable_set(name, value) = value
++  class_variable_set("@@value", nil) unless class_variable_defined?("@@value")
++  def self.value = @@value
++  def self.value=(value); @@value = value; end
++  p class_variable_defined?("@@value")
++  begin
++    value
++  rescue NameError => error
++    puts error.message
++  end
++  self.value = 29
++  p value
++end
+diff --git a/test/cvar_protocol_nonwriting_override.rb.expected b/test/cvar_protocol_nonwriting_override.rb.expected
+new file mode 100644
+index 000000000..ed2777b50
+--- /dev/null
++++ b/test/cvar_protocol_nonwriting_override.rb.expected
+@@ -0,0 +1,3 @@
++false
++uninitialized class variable @@value in NonWritingCvarProtocol
++29
+diff --git a/test/cvar_reflection_fresh_literal.rb b/test/cvar_reflection_fresh_literal.rb
+new file mode 100644
+index 000000000..228430c77
+--- /dev/null
++++ b/test/cvar_reflection_fresh_literal.rb
+@@ -0,0 +1,26 @@
++# Literal fresh String names keep ordinary storage/query semantics. The
++# String copy's bytes are proven; an overriding storage method still receives
++# the actual mutable String argument, not a rewritten Symbol/frozen literal.
++module FreshCvarNames
++  class_variable_set(+"@@flag", nil)
++  class_variable_set(+"@@tag", nil)
++  def self.flag = @@flag
++  def self.tag = @@tag
++  p class_variable_defined?(+"@@flag"), class_variable_get(+"@@flag")
++  p flag.nil?, tag.nil?
++  @@flag = false
++  @@tag = :ready
++  p flag, tag
++end
++module FreshCvarOverride
++  EVENTS = []
++  def self.class_variable_set(name, value)
++    EVENTS << name.is_a?(String).to_s
++    EVENTS << name.frozen?.to_s
++    name << "_seen"
++    @@stored = value
++  end
++  class_variable_set(+"@@stored", 23)
++  p EVENTS
++  p @@stored
++end
+diff --git a/test/cvar_reflection_fresh_literal.rb.expected b/test/cvar_reflection_fresh_literal.rb.expected
+new file mode 100644
+index 000000000..aad933ea8
+--- /dev/null
++++ b/test/cvar_reflection_fresh_literal.rb.expected
+@@ -0,0 +1,8 @@
++true
++nil
++true
++true
++false
++:ready
++["true", "false"]
++23
 diff --git a/test/deferred_builtin_class_new.sh b/test/deferred_builtin_class_new.sh
 new file mode 100644
 index 000000000..a7f1be7b4
@@ -1172,6 +2412,476 @@ index 000000000..6c05c3c65
 +[:target]
 +[:target]
 +[:target, :target]
+diff --git a/test/load_graph/autoload_retry.rb b/test/load_graph/autoload_retry.rb
+new file mode 100644
+index 000000000..9c4f00551
+--- /dev/null
++++ b/test/load_graph/autoload_retry.rb
+@@ -0,0 +1,31 @@
++# A feature that writes the autoloaded class/constant and then raises has
++# not published that binding. Its next read must retry the feature, not
++# bypass the pending autoload because the header/write already ran.
++$retry_class_loads = 0
++$retry_value_loads = 0
++module RetryOwner
++  autoload :Item, File.join(__dir__, "autoload_retry_class_lib")
++  autoload :Value, File.join(__dir__, "autoload_retry_value_lib")
++end
++begin
++  RetryOwner::Item.answer
++rescue ArgumentError => error
++  puts error.message
++end
++p defined?(RetryOwner::Item)
++p $retry_class_loads
++p RetryOwner::Item.answer
++p $retry_class_loads
++p RetryOwner::Item.answer
++p $retry_class_loads
++p require_relative("autoload_retry_class_lib.rb")
++begin
++  p RetryOwner::Value
++rescue ArgumentError => error
++  puts error.message
++end
++p defined?(RetryOwner::Value)
++p $retry_value_loads
++p RetryOwner::Value
++p $retry_value_loads
++p require_relative("autoload_retry_value_lib")
+diff --git a/test/load_graph/autoload_retry.rb.expected b/test/load_graph/autoload_retry.rb.expected
+new file mode 100644
+index 000000000..9bb286538
+--- /dev/null
++++ b/test/load_graph/autoload_retry.rb.expected
+@@ -0,0 +1,14 @@
++class load failed
++"constant"
++1
++7
++2
++7
++2
++false
++value load failed
++"constant"
++1
++11
++2
++false
+diff --git a/test/load_graph/autoload_retry_class_lib.rb b/test/load_graph/autoload_retry_class_lib.rb
+new file mode 100644
+index 000000000..c270ecc31
+--- /dev/null
++++ b/test/load_graph/autoload_retry_class_lib.rb
+@@ -0,0 +1,9 @@
++$retry_class_loads += 1
++module RetryOwner
++  class Item
++    def self.answer
++      7
++    end
++  end
++end
++raise ArgumentError, "class load failed" if $retry_class_loads == 1
+diff --git a/test/load_graph/autoload_retry_value_lib.rb b/test/load_graph/autoload_retry_value_lib.rb
+new file mode 100644
+index 000000000..f74d2792f
+--- /dev/null
++++ b/test/load_graph/autoload_retry_value_lib.rb
+@@ -0,0 +1,5 @@
++$retry_value_loads += 1
++module RetryOwner
++  Value = 11
++end
++raise ArgumentError, "value load failed" if $retry_value_loads == 1
+diff --git a/test/load_graph/compact_deferred_owner.rb b/test/load_graph/compact_deferred_owner.rb
+new file mode 100644
+index 000000000..3a40ae2a5
+--- /dev/null
++++ b/test/load_graph/compact_deferred_owner.rb
+@@ -0,0 +1,15 @@
++# A cached require used as a value makes the owner feature deferred in the
++# load record. Metadata discovery may see the child first, but it still
++# belongs to the literal owner; uncertain presence is not uncertain identity.
++if ARGV.length > 10
++  require_relative "compact_deferred_value_lib"
++end
++require_relative "compact_deferred_owner_lib"
++p DeferredLiteralOwner::Value.answer
++p DeferredLiteralOwner::Value.name
++begin
++  OtherLiteralOwner::Value
++rescue NameError
++  puts "wrong owner rejected"
++end
++p require_relative("compact_deferred_owner_lib")
+diff --git a/test/load_graph/compact_deferred_owner.rb.expected b/test/load_graph/compact_deferred_owner.rb.expected
+new file mode 100644
+index 000000000..fb50e524e
+--- /dev/null
++++ b/test/load_graph/compact_deferred_owner.rb.expected
+@@ -0,0 +1,4 @@
++42
++"DeferredLiteralOwner::Value"
++wrong owner rejected
++false
+diff --git a/test/load_graph/compact_deferred_owner_lib.rb b/test/load_graph/compact_deferred_owner_lib.rb
+new file mode 100644
+index 000000000..03db16356
+--- /dev/null
++++ b/test/load_graph/compact_deferred_owner_lib.rb
+@@ -0,0 +1,6 @@
++module DeferredLiteralOwner
++  OUTER = 41
++end
++DeferredLiteralOwner.autoload :Value, File.join(__dir__, "compact_deferred_value_lib.rb")
++module OtherLiteralOwner
++end
+diff --git a/test/load_graph/compact_deferred_value_lib.rb b/test/load_graph/compact_deferred_value_lib.rb
+new file mode 100644
+index 000000000..b3b58aae0
+--- /dev/null
++++ b/test/load_graph/compact_deferred_value_lib.rb
+@@ -0,0 +1,5 @@
++class DeferredLiteralOwner::Value
++  def self.answer
++    ::DeferredLiteralOwner::OUTER + 1
++  end
++end
+diff --git a/test/load_graph/member_class_own_protocol.rb b/test/load_graph/member_class_own_protocol.rb
+new file mode 100644
+index 000000000..7bb4f3a3c
+--- /dev/null
++++ b/test/load_graph/member_class_own_protocol.rb
+@@ -0,0 +1,8 @@
++# A real class-side response protocol stays outside the literal binding fold.
++class MemberOwnProtocol
++  def self.respond_to?(name, include_all = false)
++    name == :own_protocol
++  end
++end
++protocol_owner = MemberOwnProtocol
++p [protocol_owner.respond_to?(:own_protocol), protocol_owner.respond_to?(:new)]
+diff --git a/test/load_graph/member_class_own_protocol.rb.expected b/test/load_graph/member_class_own_protocol.rb.expected
+new file mode 100644
+index 000000000..094967631
+--- /dev/null
++++ b/test/load_graph/member_class_own_protocol.rb.expected
+@@ -0,0 +1 @@
++[true, false]
+diff --git a/test/load_graph/member_feature_identity.rb b/test/load_graph/member_feature_identity.rb
+new file mode 100644
+index 000000000..fdf56e4ea
+--- /dev/null
++++ b/test/load_graph/member_feature_identity.rb
+@@ -0,0 +1,42 @@
++require_relative 'member_feature_identity_helper'
++owner = SourceMemberFeature::Owner
++raise 'main API exposed in helper' if owner.respond_to?(:answer)
++raise 'private API exposed in helper' if owner.respond_to?(:hidden, true)
++raise 'builtin Class constructor absent' unless owner.respond_to?(:new)
++raise 'patch API exposed in helper' if owner.respond_to?(:patched)
++begin
++  SourceMemberFeature::Owner::Child.read
++  raise 'future constant exposed in helper'
++rescue NameError
++  $member_feature_events << :constant_absent
++end
++require_relative 'member_feature_identity_main'
++raise 'main value changed' unless SourceMemberFeature::Owner.answer == 42
++raise 'loaded main API absent through local' unless owner.respond_to?(:answer)
++raise 'private API public' if owner.respond_to?(:hidden)
++raise 'private API absent' unless owner.respond_to?(:hidden, true)
++raise 'patch hoisted into main' if SourceMemberFeature::Owner.respond_to?(:patched)
++require_relative 'member_feature_identity_patch'
++raise 'patch value changed' unless SourceMemberFeature::Owner.patched == 43
++raise 'class binding replaced' unless SourceMemberFeature::Owner.equal?(owner)
++require_relative 'member_feature_identity_patch'
++expected = [:helper, :constant_absent, [:added, :answer], [:added, :hidden], :main, [:added, :patched], :patch]
++raise 'source class callbacks/features reordered' unless $member_feature_events == expected
++p $member_feature_events
++puts 'source member feature identity compiler control PASS; NOT core support'
++
++# Captured/conditional writers are NOT a single source binding witness.
++class OtherMemberIdentity
++  def self.other
++    1
++  end
++end
++captured_owner = SourceMemberFeature::Owner
++1.times { captured_owner = OtherMemberIdentity }
++raise 'captured class write ignored' if captured_owner.respond_to?(:answer)
++raise 'captured class write lost' unless captured_owner.respond_to?(:other)
++conditional_owner = SourceMemberFeature::Owner
++conditional_owner = OtherMemberIdentity if ARGV.empty?
++raise 'conditional class write ignored' if conditional_owner.respond_to?(:answer)
++raise 'conditional class write lost' unless conditional_owner.respond_to?(:other)
++puts 'source class local writer controls PASS'
+diff --git a/test/load_graph/member_feature_identity.rb.expected b/test/load_graph/member_feature_identity.rb.expected
+new file mode 100644
+index 000000000..f938dfce8
+--- /dev/null
++++ b/test/load_graph/member_feature_identity.rb.expected
+@@ -0,0 +1,3 @@
++[:helper, :constant_absent, [:added, :answer], [:added, :hidden], :main, [:added, :patched], :patch]
++source member feature identity compiler control PASS; NOT core support
++source class local writer controls PASS
+diff --git a/test/load_graph/member_feature_identity_helper.rb b/test/load_graph/member_feature_identity_helper.rb
+new file mode 100644
+index 000000000..d49aa6e59
+--- /dev/null
++++ b/test/load_graph/member_feature_identity_helper.rb
+@@ -0,0 +1,15 @@
++# Source-labelled compiler design control; NOT a production provider.
++$member_feature_events = []
++module SourceMemberFeature
++  class Owner
++    def self.singleton_method_added(name)
++      $member_feature_events << [:added, name] unless name == :singleton_method_added
++    end
++    class Child
++      def self.read
++        DEFAULT
++      end
++    end
++  end
++end
++$member_feature_events << :helper
+diff --git a/test/load_graph/member_feature_identity_main.rb b/test/load_graph/member_feature_identity_main.rb
+new file mode 100644
+index 000000000..dfacacda9
+--- /dev/null
++++ b/test/load_graph/member_feature_identity_main.rb
+@@ -0,0 +1,14 @@
++require_relative 'member_feature_identity_helper'
++module SourceMemberFeature
++  class Owner
++    DEFAULT = 41
++    def self.answer
++      Child.read + 1
++    end
++    def self.hidden
++      7
++    end
++    private_class_method :hidden
++  end
++end
++$member_feature_events << :main
+diff --git a/test/load_graph/member_feature_identity_patch.rb b/test/load_graph/member_feature_identity_patch.rb
+new file mode 100644
+index 000000000..b30839d28
+--- /dev/null
++++ b/test/load_graph/member_feature_identity_patch.rb
+@@ -0,0 +1,8 @@
++module SourceMemberFeature
++  class Owner
++    def self.patched
++      answer + 1
++    end
++  end
++end
++$member_feature_events << :patch
+diff --git a/test/load_graph/namespace_presence.rb b/test/load_graph/namespace_presence.rb
+new file mode 100644
+index 000000000..57f688e06
+--- /dev/null
++++ b/test/load_graph/namespace_presence.rb
+@@ -0,0 +1,20 @@
++require_relative 'namespace_presence_helper'
++module NamespacePresence
++  class Owner
++    DEFAULT = 41
++    def self.answer
++      Child.read + 1
++    end
++    def self.hidden
++      7
++    end
++    private_class_method :hidden
++  end
++end
++raise 'qualified loaded method absent' unless NamespacePresence::Owner.respond_to?(:answer)
++raise 'absolute loaded method absent' unless ::NamespacePresence::Owner.respond_to?(:answer)
++raise 'aliased loaded method absent' unless NamespacePresence::Alias.respond_to?(:answer)
++raise 'qualified private visible' if NamespacePresence::Owner.respond_to?(:hidden)
++raise 'qualified private missing' unless NamespacePresence::Owner.respond_to?(:hidden, true)
++raise 'late lexical lookup changed' unless NamespacePresence::Owner.answer == 42
++puts 'namespace main after methods'
+diff --git a/test/load_graph/namespace_presence.rb.expected b/test/load_graph/namespace_presence.rb.expected
+new file mode 100644
+index 000000000..ceca5efa8
+--- /dev/null
++++ b/test/load_graph/namespace_presence.rb.expected
+@@ -0,0 +1,2 @@
++namespace helper before methods
++namespace main after methods
+diff --git a/test/load_graph/namespace_presence_helper.rb b/test/load_graph/namespace_presence_helper.rb
+new file mode 100644
+index 000000000..4b02bbe0d
+--- /dev/null
++++ b/test/load_graph/namespace_presence_helper.rb
+@@ -0,0 +1,19 @@
++# A helper opens the namespace before its parent's main feature defines
++# any class methods. A qualified receiver must use this load point too.
++module NamespacePresence
++  class Owner
++    class Child
++      def self.read
++        DEFAULT
++      end
++    end
++  end
++  Alias = Owner
++  raise 'bare future method' if Owner.respond_to?(:answer)
++  raise 'qualified future method' if NamespacePresence::Owner.respond_to?(:answer)
++  raise 'absolute future method' if ::NamespacePresence::Owner.respond_to?(:answer)
++  raise 'aliased future method' if NamespacePresence::Alias.respond_to?(:answer)
++  raise 'qualified future private method' if NamespacePresence::Owner.respond_to?(:hidden, true)
++  raise 'lost builtin Class surface' unless NamespacePresence::Owner.respond_to?(:new)
++end
++puts 'namespace helper before methods'
+diff --git a/test/ostruct_boxed_member_key.rb b/test/ostruct_boxed_member_key.rb
+new file mode 100644
+index 000000000..c9dc90b93
+--- /dev/null
++++ b/test/ostruct_boxed_member_key.rb
+@@ -0,0 +1,34 @@
++# A statically known OpenStruct with a boxed key (composition, not a subclass).
++require "ostruct"
++class MemberBag
++  def initialize
++    @data = OpenStruct.new(count: 3)
++  end
++  #: (untyped) -> untyped
++  def read(key)
++    @data[key]
++  end
++  #: (untyped, untyped) -> untyped
++  def write(key, value)
++    @data[key] = value
++  end
++end
++bag = MemberBag.new
++p bag.read(:count)
++p bag.read("count")
++p bag.read(:missing)
++p bag.write(:count, 5)
++p bag.read("count")
++p bag.write("count", false)
++p bag.read(:count)
++[:read, :write].each do |operation|
++  begin
++    if operation == :read
++      bag.read(7)
++    else
++      bag.write(7, "bad")
++    end
++  rescue NoMethodError => error
++    puts error.class
++  end
++end
+diff --git a/test/ostruct_boxed_member_key.rb.expected b/test/ostruct_boxed_member_key.rb.expected
+new file mode 100644
+index 000000000..c3552db21
+--- /dev/null
++++ b/test/ostruct_boxed_member_key.rb.expected
+@@ -0,0 +1,9 @@
++3
++3
++nil
++5
++5
++false
++false
++NoMethodError
++NoMethodError
+diff --git a/test/poly_slice_regexp_user_owner.rb b/test/poly_slice_regexp_user_owner.rb
+new file mode 100644
+index 000000000..eb9e82ba9
+--- /dev/null
++++ b/test/poly_slice_regexp_user_owner.rb
+@@ -0,0 +1,59 @@
++# A user-owned slice method opens polymorphic dispatch. Its builtin arm must
++# retain String's Regexp/capture overload, not coerce both args to Integer.
++class OtherSliceOwner
++  def slice(first, second)
++    [first, second]
++  end
++end
++
++def boxed(value)
++  [value, 17][0]
++end
++
++pattern = Regexp.union(/\A(?<host>\d+\.\d+\.\d+\.\d+)(?::\d+)?\z/, /\A(?<host>[a-f0-9:]+)\z/)
++s = boxed("127.0.0.1:3000")
++p s.slice(pattern, "host")
++p s.slice(pattern, :host)
++p s.slice(/(127)(\.0)/, 2)
++p s.slice(/(127)(\.0)/, -1)
++p s.slice(/(127)(\.0)/, -3)
++p boxed("abcdefghijkl").slice(/(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)(k)(l)/, 12)
++p s.slice(/never/, "missing")
++p s.slice(0, 3)
++p boxed([1, 2, 3]).slice(1, 2)
++p boxed({a: 1, b: 2, c: 3}).slice(:a, :c)
++p boxed(OtherSliceOwner.new).slice("first", "second")
++begin
++  s.slice(/(?<present>127)/, "missing")
++rescue IndexError => error
++  puts error.class
++end
++begin
++  boxed(nil).slice(pattern, "host")
++rescue NoMethodError => error
++  puts error.name
++end
++
++# Held arguments run once, left-to-right, before the builtin dispatch.
++class SliceArgumentOrder
++  def initialize
++    @events = []
++  end
++  def receiver
++    @events << "receiver"
++    boxed("abc")
++  end
++  def pattern
++    @events << "pattern"
++    /(?<part>b)/
++  end
++  def capture
++    @events << "capture"
++    "part"
++  end
++  def run
++    p receiver.slice(pattern, capture)
++    p @events
++  end
++end
++SliceArgumentOrder.new.run
+diff --git a/test/poly_slice_regexp_user_owner.rb.expected b/test/poly_slice_regexp_user_owner.rb.expected
+new file mode 100644
+index 000000000..66b59b9d2
+--- /dev/null
++++ b/test/poly_slice_regexp_user_owner.rb.expected
+@@ -0,0 +1,15 @@
++"127.0.0.1"
++"127.0.0.1"
++".0"
++".0"
++nil
++"l"
++nil
++"127"
++[2, 3]
++{a: 1, c: 3}
++["first", "second"]
++IndexError
++slice
++"b"
++["receiver", "pattern", "capture"]
 diff --git a/test/rbs-seed/memo_civ_instance_same_name.expected b/test/rbs-seed/memo_civ_instance_same_name.expected
 new file mode 100644
 index 000000000..f9a088e6f
@@ -1361,3 +3071,220 @@ index 000000000..c13371270
 +name = "@" + "field"
 +p read_unknown_class(PlainClassIvarReceiver, name)
 +p read_unknown_class(OwnClassIvarReceiver, name)
+diff --git a/test/reject/cvar_protocol_super.rb b/test/reject/cvar_protocol_super.rb
+new file mode 100644
+index 000000000..20ca63ebb
+--- /dev/null
++++ b/test/reject/cvar_protocol_super.rb
+@@ -0,0 +1,9 @@
++# A class/module object has Module's primitive, so this is a subset refusal,
++# not Ruby's NoMethodError claiming there is no superclass implementation.
++# spinel: reject-builtin-class: StorageProtocol.class_variable_set: super to an inherited builtin singleton method is not supported
++module StorageProtocol
++  def self.class_variable_set(name, value)
++    super
++  end
++end
++StorageProtocol.class_variable_set("@@value", 1)
+diff --git a/test/reject/cvar_reflection_changed_string_copy.rb b/test/reject/cvar_reflection_changed_string_copy.rb
+new file mode 100644
+index 000000000..20bf2f924
+--- /dev/null
++++ b/test/reject/cvar_reflection_changed_string_copy.rb
+@@ -0,0 +1,9 @@
++# A copied String's bytes are not proved when String#+@ is user-defined.
++# spinel: reject-builtin-class: unsupported call:
++class String
++  def +@ = "@@other"
++end
++module ChangedCvarNameCopy
++  class_variable_set(+"@@value", 17)
++  p class_variable_defined?("@@other")
++end
+diff --git a/test/setjmp_nullable_volatile_read.rb b/test/setjmp_nullable_volatile_read.rb
+new file mode 100644
+index 000000000..8498e106e
+--- /dev/null
++++ b/test/setjmp_nullable_volatile_read.rb
+@@ -0,0 +1,44 @@
++# Nullable numeric stack slots keep both members after setjmp/longjmp. A
++# by-value volatile struct read may otherwise reuse a pre-setjmp temporary in
++# Clang; scalar reads and the old-value capture of op-assignment must reload.
++def int_step(seed)
++  value = nil
++  value = seed if seed
++  begin
++    value += 2
++    raise "stop"
++  rescue
++    value = value.nil? ? -1 : value + 3
++  end
++  value
++end
++
++def float_rhs
++  GC.start
++  1.25
++end
++
++def float_step(seed)
++  value = nil
++  value = seed if seed
++  begin
++    value += float_rhs
++    raise "stop"
++  rescue
++    value = value.nil? ? -1.0 : (value += float_rhs)
++  end
++  value
++end
++
++p int_step(5), int_step(nil)
++p float_step(2.5), float_step(nil)
++step = lambda do |value|
++  begin
++    value += 2.0
++    raise "stop"
++  rescue
++    value += 3.0
++  end
++  value
++end
++p step.call(1.5)
+diff --git a/test/setjmp_nullable_volatile_read.rb.expected b/test/setjmp_nullable_volatile_read.rb.expected
+new file mode 100644
+index 000000000..77a953bf6
+--- /dev/null
++++ b/test/setjmp_nullable_volatile_read.rb.expected
+@@ -0,0 +1,5 @@
++10
++-1
++5.0
++-1.0
++6.5
+diff --git a/tools/load_graph_check.sh b/tools/load_graph_check.sh
+index 7ea34f80e..8df17da04 100755
+--- a/tools/load_graph_check.sh
++++ b/tools/load_graph_check.sh
+@@ -103,6 +103,20 @@ for e in test/load_graph/*.rb.expected; do
+   fi
+ done
+ 
++# Literal absolute require is the same physical feature as an autoload's
++# absolute target and require_relative. Do not send it through -I library
++# lookup (which treated a perfectly real literal filename as missing).
++mkdir "$tmp/absolute-literal"
++printf 'puts "absolute body"\nmodule AbsoluteFeature; VALUE = 17; end\n' > "$tmp/absolute-literal/lib.rb"
++printf 'autoload :AbsoluteFeature, File.join(__dir__, "lib.rb")\np AbsoluteFeature::VALUE\np require "%s/lib.rb"\np require_relative "lib"\n' "$tmp/absolute-literal" > "$tmp/absolute-literal/main.rb"
++printf 'absolute body\n17\nfalse\nfalse\n' > "$tmp/absolute-literal/expected"
++if "$SPINEL" --load-model=graph "$tmp/absolute-literal/main.rb" -o "$tmp/absolute-literal/probe" >"$tmp/absolute-literal/compile" 2>&1 &&
++   "$tmp/absolute-literal/probe" >"$tmp/absolute-literal/output" 2>&1; then
++  cmp -s "$tmp/absolute-literal/expected" "$tmp/absolute-literal/output" || fail "literal absolute require did not share autoload/relative cache identity"
++else
++  fail "literal absolute require did not compile/run"; sed -n 1,5p "$tmp/absolute-literal/compile"
++fi
++
+ # A require that names no file warns that it raises LoadError when it runs,
+ # unless the rescue clause its begin runs for it catches that LoadError
+ # (the fat-binary fallback, rescue_runs_main.rb)
+diff --git a/tools/test_hash_argument_pool.py b/tools/test_hash_argument_pool.py
+new file mode 100644
+index 000000000..6c5fc9a0d
+--- /dev/null
++++ b/tools/test_hash_argument_pool.py
+@@ -0,0 +1,95 @@
++#!/usr/bin/env python3
++"""Exercise the compiler's actual hash-argument memo at allocation boundaries.
++
++The small C carrier isolates the memo from the rest of inference; its fake node
++index supplies either no call or one call. The production memo code is extracted
++unchanged from analyze.c, compiled under ASan/UBSan, and invoked at a full pool.
++Run from any directory: python3 tools/test_hash_argument_pool.py
++"""
++import argparse
++from pathlib import Path
++import os
++import shlex
++import subprocess
++import tempfile
++
++ROOT = Path(__file__).resolve().parents[1]
++parser = argparse.ArgumentParser(description=__doc__)
++parser.add_argument("--source", type=Path, default=ROOT / "src/analyze.c",
++                    help="optional baseline analyze.c for a red/green check")
++source = parser.parse_args().source.read_text()
++start = source.index("typedef struct { char *name; int pidx, off; } HlaSlot;")
++end = source.index("static int hls_join(", start)
++memo = source[start:end]
++carrier = r'''
++#include <assert.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++typedef struct { int unused; } NodeTable;
++typedef struct { NodeTable *nt; } Compiler;
++#define NK_CallNode 1
++static int supplies_argument;
++static unsigned sp_strhash(const char *s) {
++  unsigned h = 2166136261u;
++  for (; *s; s++) h = (h ^ (unsigned char)*s) * 16777619u;
++  return h;
++}
++static int sp_streq(const char *a, const char *b) { return strcmp(a, b) == 0; }
++static const char *current_name;
++static int an_calls_named_first(Compiler *c, const char *name) {
++  (void)c; current_name = name; return supplies_argument ? 0 : -1;
++}
++static int an_calls_named_next(int id) { (void)id; return -1; }
++static int nt_kind(const NodeTable *nt, int id) { (void)nt; (void)id; return NK_CallNode; }
++static const char *nt_str(const NodeTable *nt, int id, const char *key) {
++  (void)nt; (void)id; (void)key; return current_name;
++}
++static int nt_ref(const NodeTable *nt, int id, const char *key) {
++  (void)nt; (void)id; (void)key; return 0;
++}
++static const int *nt_arr(const NodeTable *nt, int id, const char *key, int *count) {
++  static int argument = 91;
++  (void)nt; (void)id; (void)key; *count = 1; return &argument;
++}
++'''
++checks = r'''
++static void full_pool(void) {
++  hla_reset();
++  free(hla_pool);
++  hla_pcap = hla_pn = 1;
++  hla_pool = malloc(sizeof(int));
++  assert(hla_pool);
++  hla_pool[0] = 0;
++}
++int main(void) {
++  NodeTable nt = {0}; Compiler c = {&nt};
++  supplies_argument = 0;
++  full_pool();
++  int off = hla_args(&c, "empty", 0);
++  assert(off == 1 && hla_pool[off] == 0 && hla_pn <= hla_pcap);
++  assert(hla_args(&c, "empty", 0) == off);
++  supplies_argument = 1;
++  full_pool();
++  off = hla_args(&c, "one", 0);
++  assert(hla_pool[off] == 1 && hla_pool[off + 1] == 91 && hla_pn <= hla_pcap);
++  supplies_argument = 0;
++  full_pool();
++  for (int i = 0; i < 4097; i++) {
++    char name[40]; snprintf(name, sizeof name, "empty_%d", i);
++    off = hla_args(&c, name, 0);
++    assert(hla_pool[off] == 0 && hla_pn <= hla_pcap);
++  }
++  hla_reset(); free(hla_pool); free(hla_slot);
++  puts("hash-argument pool: empty/header, payload, memo and repeated growth PASS");
++  return 0;
++}
++'''
++with tempfile.TemporaryDirectory(prefix="spinel-hash-argument-pool-") as tmp:
++    path = Path(tmp)
++    (path / "test.c").write_text(carrier + memo + checks)
++    command = shlex.split(os.environ.get("CC", "cc"))
++    subprocess.run(command + ["-std=gnu11", "-g", "-O1", "-fsanitize=address,undefined",
++                   "-fno-omit-frame-pointer", str(path / "test.c"), "-o", str(path / "test")], check=True)
++    env = dict(os.environ, ASAN_OPTIONS="detect_leaks=0:halt_on_error=1", UBSAN_OPTIONS="halt_on_error=1")
++    subprocess.run([str(path / "test")], env=env, check=True)

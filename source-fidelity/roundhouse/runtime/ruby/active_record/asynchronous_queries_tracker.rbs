@@ -1,0 +1,26 @@
+module ActiveRecord
+  class AsynchronousQueriesTracker
+    class Session
+      @active: bool
+      @mutex: ::Mutex
+      @changed: ::ConditionVariable
+      @readers: Integer
+      @finalizing: bool
+      def initialize: () -> void
+      def active?: () -> bool
+      def synchronize: () { () -> untyped } -> untyped
+      def finalize: (?bool wait) -> nil
+    end
+    @stack: Array[::ActiveRecord::AsynchronousQueriesTracker::Session]
+    def self.run: () -> ::ActiveRecord::AsynchronousQueriesTracker
+    def self.complete: (::ActiveRecord::AsynchronousQueriesTracker tracker) -> ::ActiveRecord::AsynchronousQueriesTracker
+    def empty_sessions: () -> Array[::ActiveRecord::AsynchronousQueriesTracker::Session]
+    def initialize: () -> void
+    def current_session: () -> ::ActiveRecord::AsynchronousQueriesTracker::Session
+    def start_session: () -> Array[::ActiveRecord::AsynchronousQueriesTracker::Session]
+    def finalize_session: (?bool wait) -> ::ActiveRecord::AsynchronousQueriesTracker
+  end
+  class Base
+    def self.asynchronous_queries_tracker: () -> ::ActiveRecord::AsynchronousQueriesTracker
+  end
+end

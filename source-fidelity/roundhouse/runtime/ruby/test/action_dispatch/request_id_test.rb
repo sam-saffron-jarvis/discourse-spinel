@@ -13,6 +13,8 @@ class RequestIdTest < Minitest::Test
     b = ActionDispatch::RequestId.make("   ")
     assert_match UUID, a
     assert_match UUID, b
+    assert_match UUID, ActionDispatch::RequestId.make("\u00a0")
+    assert_match UUID, ActionDispatch::RequestId.make("\u3000")
     refute_equal a, b
   end
 

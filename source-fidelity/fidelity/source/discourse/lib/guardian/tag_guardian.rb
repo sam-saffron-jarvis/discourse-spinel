@@ -1,0 +1,55 @@
+# frozen_string_literal: true
+
+module TagGuardian
+  def can_see_tag?(tag)
+    return false if !SiteSetting.tagging_enabled
+    return false if !tag
+    return false if hidden_tag_names.include?(tag.name)
+    true
+  end
+
+  def can_create_tag?
+    SiteSetting.tagging_enabled && @user.in_any_groups?(SiteSetting.create_tag_allowed_groups_map)
+  end
+
+  def can_edit_tag_names?
+    SiteSetting.tagging_enabled && @user.in_any_groups?(SiteSetting.edit_tags_allowed_groups_map)
+  end
+
+  def can_edit_tag?(tag)
+    can_edit_tag_names? && can_see_tag?(tag)
+  end
+
+  def can_tag_topics?
+    SiteSetting.tagging_enabled && @user.in_any_groups?(SiteSetting.tag_topic_allowed_groups_map)
+  end
+
+  def can_tag_pms?
+    return false if !SiteSetting.tagging_enabled
+    return false if !authenticated?
+    return true if @user.is_system_user?
+
+    @user.in_any_groups?(SiteSetting.pm_tags_allowed_for_groups_map)
+  end
+
+  def can_admin_tags?
+    is_staff? && SiteSetting.tagging_enabled
+  end
+
+  def can_admin_tag_groups?
+    is_staff? && SiteSetting.tagging_enabled
+  end
+
+  def visible_tag_ids
+    @visible_tag_ids ||= DiscourseTagging.visible_tags(self).pluck(:id).to_set
+  end
+
+  def hidden_tag_names
+    @hidden_tag_names ||=
+      if SiteSetting.tagging_enabled && !is_admin?
+        DiscourseTagging.hidden_tag_names(self)
+      else
+        []
+      end
+  end
+end

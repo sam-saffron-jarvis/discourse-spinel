@@ -91,6 +91,7 @@ mod body_statements;
 mod error_site;
 mod external_include;
 mod hook_class_attribute;
+pub(crate) mod ordered_mattr;
 pub(crate) mod inherited_alias;
 mod class_macros;
 mod column_accessors;
@@ -130,7 +131,7 @@ pub mod view;
 pub mod vite;
 mod visibility;
 
-pub use app::{ingest_app, ingest_app_from_tree, ingest_app_with_vfs};
+pub use app::{ingest_app, ingest_app_for_target, ingest_app_from_tree, ingest_app_with_vfs};
 
 /// The construct an ActiveRecord class outside app/models is reported
 /// under (`app::report_unmodelled_records`): the CLI keys its per-target

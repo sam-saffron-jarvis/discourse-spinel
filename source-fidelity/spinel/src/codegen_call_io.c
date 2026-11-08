@@ -573,8 +573,12 @@ static int socket_send_call(const NodeTable *nt, const char *name, int argc, con
 }
 
 /* The socket calls emit_io_socket_opt_call answers, at the arities it does */
-static int boxed_socket_opt(const char *name, int argc) {
-  return (sp_streq(name, "connect_nonblock") && argc >= 1 && argc <= 3) ||
+static int boxed_socket_opt(const NodeTable *nt, const char *name, int argc, const int *argv) {
+  int positional = nt_argv_kwh(nt, argv, argc) >= 0 ? argc - 1 : argc;
+  /* A user protocol (SSLSocket included) can take exception: alone. That
+     keyword hash is not the socket's required address operand; claiming it
+     here emitted an empty, void-valued fallback after the user-class arm. */
+  return (sp_streq(name, "connect_nonblock") && (positional == 1 || positional == 2)) ||
          (sp_streq(name, "setsockopt") && argc == 3) || (sp_streq(name, "getsockopt") && argc == 2);
 }
 
@@ -859,7 +863,7 @@ int emit_call_poly_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
        sp_streq(name, "readpartial") ||
        /* a socket read back out of a container: its non-blocking connect and
           its options, as the typed socket arms answer them */
-       (boxed_socket_opt(name, argc) && sp_feature_required("socket")) ||
+       (boxed_socket_opt(nt, name, argc, argv) && sp_feature_required("socket")) ||
        /* a socket's addresses: a connection passed into a Thread arrives
           boxed, and a server reads REMOTE_ADDR from it */
        ((is_socket_address(name)) && argc <= 1 && !nt_argv_has_splat(nt, argv, argc) &&
@@ -1074,7 +1078,7 @@ int emit_call_poly_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
         return 1;
       }
       int sockcall = socket_handle_call(nt, name, argc, argv);
-      if (boxed_socket_opt(name, argc) || sockcall) {
+      if (boxed_socket_opt(nt, name, argc, argv) || sockcall) {
         /* the receiver first, then the typed arm's call on the unboxed handle */
         int trv = ++g_tmp;
         buf_printf(b, "({ sp_RbVal _t%d = ", trv);
@@ -1203,6 +1207,14 @@ int emit_call_poly_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
       int qname = argc == 0 && (sp_streq(name, "close") || sp_streq(name, "closed?"));
       /* and a boxed Mutex answers owned? itself, where a stat answers its own */
       int mname = argc == 0 && sp_streq(name, "owned?");
+      /* LoadError#path and user readers can widen the same call to boxed.
+         IO/Dir still answer a String, boxed once into that shared slot. */
+      int boxed_path_result = is_path_reader(name) && repr_of(c, id).kind == RK_BOXED;
+      int boxed_sync_result = argc == 0 && sp_streq(name, "sync") && repr_of(c, id).kind == RK_BOXED;
+      int boxed_fileno_result = argc == 0 && sp_streq(name, "fileno") && repr_of(c, id).kind == RK_BOXED;
+      if (boxed_path_result) buf_puts(b, "sp_box_str(");
+      if (boxed_sync_result) buf_puts(b, "sp_box_bool(");
+      if (boxed_fileno_result) buf_puts(b, "sp_box_int(");
       int tdr = 0;
       if (dirfn || qname || mname) {
         tdr = ++g_tmp;
@@ -1584,6 +1596,7 @@ int emit_call_poly_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
                    sp_streq(name, "read_nonblock") ? "(const char *)NULL" : "(sp_int)0");
       else buf_printf(b, "sp_File_fileno(_t%d); })", tio2);
       if (tdr) buf_puts(b, "; })");
+      if (boxed_path_result || boxed_sync_result || boxed_fileno_result) buf_puts(b, ")");
       return 1;
     }
   }

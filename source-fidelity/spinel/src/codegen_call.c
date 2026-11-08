@@ -6535,11 +6535,14 @@ static int emit_poly_builtin_method(Compiler *c, int id, Buf *b) {
     }
     if (ps_pid_fn) {
       int tv = ++g_tmp;
+      int boxed_pid_result = repr_of(c, id).kind == RK_BOXED;
+      if (boxed_pid_result) buf_puts(b, "sp_box_int(");
       buf_printf(b, "({ sp_RbVal _t%d = ", tv); emit_expr(c, recv, b);
       buf_printf(b, "; _t%d.tag == SP_TAG_OBJ && _t%d.cls_id == SP_BUILTIN_PROCESS_STATUS"
                     " ? %s((sp_ProcessStatus *)_t%d.v.p)"
                     " : (sp_int)(sp_raise_nomethod(sp_nomethod_msg(\"%s\", _t%d)), 0); })",
                  tv, tv, ps_pid_fn, tv, name, tv);
+      if (boxed_pid_result) buf_puts(b, ")");
       return 1;
     }
     /* Process::Tms: the four Float fields the typed arm reads, behind a
@@ -6589,11 +6592,16 @@ static int emit_poly_builtin_method(Compiler *c, int id, Buf *b) {
   }
   if (tf) {
     int tv = ++g_tmp;
+    /* A user/Date accessor beside Time's may make the dispatch's builtin
+       answer itself boxed. Honor that slot, not just the raw Time result. */
+    int boxed_time_field = repr_of(c, id).kind == RK_BOXED;
+    if (boxed_time_field) buf_puts(b, "sp_box_int(");
     buf_printf(b, "({ sp_RbVal _t%d = ", tv); emit_expr(c, recv, b);
     buf_printf(b, "; _t%d.tag == SP_TAG_OBJ && _t%d.cls_id == SP_BUILTIN_TIME"
                   " ? sp_time_%s((sp_Time *)_t%d.v.p)"
                   " : (sp_int)(sp_raise_nomethod(sp_nomethod_msg(\"%s\", _t%d)), 0); })",
                tv, tv, tf, tv, name, tv);
+    if (boxed_time_field) buf_puts(b, ")");
     return 1;
   }
   /* The Time methods that answer a Time. The surface had the scalar reads and
@@ -19742,6 +19750,10 @@ void refl_builtin_singleton_methods(const char *cls, int all, ReflNames *r) {
 }
 
 int builtin_super_cmethod_known(const char *cls, const char *name) {
+  /* Every class/module object inherits Module's storage protocol, even a
+     program class with no builtin class-table id. Until that builtin super
+     dispatch is supported, reject it rather than emit a false NoMethodError. */
+  if (cls && is_cvar_reflection_name(name)) return 1;
   if (is_kernel_module_name(cls) && builtin_cmethod_known(cls, name)) return 1;
   int bid = builtin_class_id(cls);
   if (!bid) return 0;
@@ -32335,6 +32347,35 @@ int bool_side_responds(Compiler *c, const char *qm, int include_all, int foldabl
   *ta = ans[0]; *fa = ans[1];
   return 1;
 }
+/* A source-owned top-level local binding to one already-bound class. This
+   is intentionally narrower than class_var_static_ci: one plain direct
+   program statement in this file, before the read, and no other writes in
+   its scope. A factory, conditional binding, parameter, captured writer or
+   reassignable alias is not a load-point identity witness. */
+static int rto_bound_class_local(Compiler *c, int recv) {
+  const NodeTable *nt = c->nt;
+  if (nt_kind(nt, recv) != NK_LocalVariableReadNode) return -1;
+  const char *name = nt_str(nt, recv, "name");
+  Scope *sc = comp_scope_of(c, recv);
+  if (!name || !sc || sc->def_node >= 0) return -1;
+  int binding = -1;
+  for (int w = comp_lvw_first_sc(c, (int)(sc - c->scopes), name); w >= 0; w = comp_lvw_next_sc(c, w)) {
+    if (comp_scope_of(c, w) != sc) continue;
+    if (binding >= 0 || nt_kind(nt, w) != NK_LocalVariableWriteNode) return -1;
+    binding = w;
+  }
+  if (binding < 0 || nt_int(nt, binding, "node_file", -1) != nt_int(nt, recv, "node_file", -2) ||
+      nt_int(nt, binding, "node_line", 0) <= 0 ||
+      nt_int(nt, binding, "node_line", 0) >= nt_int(nt, recv, "node_line", 0)) return -1;
+  int direct = 0;
+  NT_FOREACH_KIND(nt, NK_ProgramNode, p) {
+    int n = 0; const int *body = nt_arr(nt, nt_ref(nt, p, "statements"), "body", &n);
+    for (int j = 0; j < n; j++) if (body[j] == binding) direct = 1;
+  }
+  if (!direct) return -1;
+  return cplan_const_recv_class(c, binding, nt_ref(nt, binding, "value"));
+}
+
 int respond_to_static_answer(Compiler *c, int id, int recv, TyKind rt, const char *qm,
                                     int argc, const int *argv) {
   const NodeTable *nt = c->nt;
@@ -32504,9 +32545,18 @@ int respond_to_static_answer(Compiler *c, int id, int recv, TyKind rt, const cha
     int cobj = rk == NK_ConstantReadNode && ty_is_object(rt) &&
                nt_str(nt, recv, "name") && const_node_class_index(c, recv) < 0 &&
                builtin_class_id(nt_str(nt, recv, "name")) == 0;
-    if (rk == NK_ConstantReadNode && !cobj) {
-      const char *rcn = nt_str(nt, recv, "name");
-      int ci = comp_class_index(c, rcn);
+    /* A qualified constant that names a class has the same load-point
+       method history as a bare class constant. Falling through to the
+       type probe/runtime Class table used the program-end surface instead,
+       exposing a later reopen's methods from an earlier namespace prelude. */
+    int path_ci = rk == NK_ConstantPathNode && rt == TY_CLASS ? const_node_class_index(c, recv) : -1;
+    int bound_ci = rt == TY_CLASS && foldable ? rto_bound_class_local(c, recv) : -1;
+    if (bound_ci >= 0 && (comp_cmethod_in_chain(c, bound_ci, "respond_to?", NULL) >= 0 ||
+                          comp_cmethod_in_chain(c, bound_ci, "respond_to_missing?", NULL) >= 0)) return -1;
+    if (path_ci < 0) path_ci = bound_ci;
+    if ((rk == NK_ConstantReadNode && !cobj) || path_ci >= 0) {
+      const char *rcn = path_ci >= 0 ? c->classes[path_ci].name : nt_str(nt, recv, "name");
+      int ci = path_ci >= 0 ? path_ci : comp_class_index(c, rcn);
       /* `Struct` and `Data` are core class objects with no user entry, and
          the synthesized probe cannot type a bare `Struct.new` (it is the
          class-building call, not a value), so both answered false for the

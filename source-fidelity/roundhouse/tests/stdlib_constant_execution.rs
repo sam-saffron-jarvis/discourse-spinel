@@ -468,3 +468,63 @@ fn float_domain_error_constant_executes_after_emission() {
     stdlib_app().write("app/services/float_domain_probe.rb", FLOAT_DOMAIN_SOURCE)
         .run_ruby(FLOAT_DOMAIN_SCRIPT).assert_passes();
 }
+
+// A real provided stdlib class, not an application-specific replacement.
+// The source deliberately has no require: project demand imports must supply it.
+const OPEN_STRUCT_SOURCE: &str = r#"class RecordHolder
+  def initialize(table = nil)
+    @data = OpenStruct.new(table)
+  end
+  def [](name)
+    @data[name.to_sym]
+  end
+  def []=(name, value)
+    @data[name.to_sym] = value
+  end
+  def to_h
+    @data.to_h
+  end
+end
+"#;
+
+const OPEN_STRUCT_SCRIPT: &str = r#"
+empty = RecordHolder.new
+raise "missing field" unless empty[:missing].nil?
+record = RecordHolder.new({ "name" => "Alice", count: 3 })
+raise "initialization" unless record[:name] == "Alice" && record["count"] == 3
+record[:name] = "Bob"
+raise "mutation" unless record.to_h == { name: "Bob", count: 3 }
+copy = record.to_h
+copy[:count] = 7
+raise "table escaped" unless record[:count] == 3
+puts "OpenStruct composition execution passed"
+"#;
+
+#[test]
+fn open_struct_composition_executes_after_emission() {
+    stdlib_app().write("app/services/record_holder.rb", OPEN_STRUCT_SOURCE)
+        .run_ruby(OPEN_STRUCT_SCRIPT).assert_passes();
+}
+
+#[test]
+#[ignore = "requires the native Spinel compiler; set SPINEL"]
+fn open_struct_composition_executes_in_native_spinel() {
+    // Run this emitted library, not the unrelated whole framework boot.
+    // The latter currently activates a Date path through JSON without its
+    // date formatter; that is not an OpenStruct availability claim.
+    let (tree, errors) = stdlib_app()
+        .write("app/services/record_holder.rb", OPEN_STRUCT_SOURCE)
+        .emit(roundhouse::project::BuildTarget::Spinel);
+    assert!(errors.is_empty(), "{errors:?}");
+    let library = std::fs::read_to_string(tree.join("app/models/record_holder.rb")).unwrap();
+    assert!(library.contains("require \"ostruct\""), "demand import missing: {library}");
+    std::fs::write(tree.join("contract.rb"), format!("{library}\n{OPEN_STRUCT_SCRIPT}")).unwrap();
+    let compiler = std::env::var("SPINEL").unwrap_or_else(|_| "spinel".into());
+    let output = std::process::Command::new(compiler)
+        .args(["--load-model=graph", "--no-inline-hot", "--cc=clang", "--jobs=4", "contract.rb", "-o", "contract"])
+        .current_dir(&tree).output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let output = std::process::Command::new(tree.join("contract")).current_dir(&tree).output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("OpenStruct composition execution passed"));
+}

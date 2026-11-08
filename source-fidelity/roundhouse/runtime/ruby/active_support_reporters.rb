@@ -21,8 +21,6 @@
 #   errors handled is the same.
 # - The reported-error flag (`@__rails_error_reported`) is kept beside the
 #   error, in REPORTED, by object_id.
-# - ExecutionContext has no `current_attributes_instances`: nothing here
-#   defines CurrentAttributes, which is what registers them.
 # - A report to an ErrorReporter with no subscribers is logged through
 #   Rails.logger, where Rails drops it (see ErrorReporter#report).
 # - ensure_backtrace trims this file's frames from `backtrace` by their
@@ -144,31 +142,59 @@ module ActiveSupport
     end
   end
 
+  # The registry half of active_support/current_attributes.rb. Attribute
+  # declarations/accessors remain statically expanded by ingest/current_attributes;
+  # the registry holds real instances, not class names or synthetic reset flags.
+  # Concrete classes supply reset (including their supported reset behavior).
+  class CurrentAttributes
+    def self.clear_all
+      ExecutionContext.current_attributes_instances.values.each { |instance| instance.reset }
+      ExecutionContext.current_attributes_instances.clear
+    end
+
+    def reset
+      raise NotImplementedError, "CurrentAttributes subclass must implement reset"
+    end
+  end
+
   # active_support/execution_context.rb: the per-thread context hash an
   # error report merges under its own `context:`.
   module ExecutionContext
     class Record
-      attr_reader :store
+      attr_reader :store, :current_attributes_instances
 
       def initialize
         @store = {}
+        @current_attributes_instances = {}
         @stack = []
+        @instances_stack = []
       end
 
       def push
         @stack << @store
+        @instances_stack << @current_attributes_instances
         @store = {}
+        @current_attributes_instances = {}
         self
       end
 
       def pop
+        @current_attributes_instances = @instances_stack.pop || {}
         @store = @stack.pop || {}
         self
       end
 
+      # Give the empty registry its actual public type at construction, including
+      # inside map's block (an uncontextualized {} otherwise infers String keys).
+      def empty_instances
+        {}
+      end
+
       def flush
         @stack = @stack.map { |_| {} }
+        @instances_stack = @instances_stack.map { |_| empty_instances }
         @store = {}
+        @current_attributes_instances = {}
         self
       end
     end
@@ -221,26 +247,25 @@ module ActiveSupport
 
     def self.push
       nestable ? record.push : clear
-      changed
       self
     end
 
     def self.pop
       nestable ? record.pop : clear
-      changed
       self
     end
 
     def self.clear
       Thread.current[:active_support_execution_context] = nil
-      changed
       nil
     end
 
     def self.flush
-      result = record.flush
-      changed
-      result
+      record.flush
+    end
+
+    def self.current_attributes_instances
+      record.current_attributes_instances
     end
 
     def self.record

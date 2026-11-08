@@ -4,6 +4,45 @@ Sam approved this strategy on November2: original Discourse application bodies
 remain unchanged except individually evidenced unsupported-Ruby transformations.
 The parked `minimal/` implementation is a demo/reference, NOT this query engine.
 
+## Recovery9 complete-query measurement — still NOT ACCEPTED
+
+`make probe-original-query` measures **complete byte-identical original
+TopicQuery, TopicList and PrivateMessageLists files**, with explicitly audited
+supporting projections. It is a failing dependency probe, not a new acceptance
+alias. Its generated real entry calls `TopicQuery.new(nil, ...).list_latest`;
+strict lower failures prevent full-query compilation/execution. Diagnostic order
+is recorded with source byte spans and is **not** labelled runtime reachability.
+No error/survey output is executed.
+
+An independently labelled initializer projection copies WHOLE original
+`initialize`, `public_valid_options`, `valid_options`, Guardian initializer and
+anonymous predicate methods. The first native/CRuby runtime failure was original
+TopicQuery146 `Hash#assert_valid_keys`. Shared framework support now retains live
+keys, hash identity, exact invalid-key order/text and Symbol/String distinction.
+Original `default_results`822's unconditional `reverse_merge!` also has a verified
+shared implementation preserving zero/false/nil, aliases, defaults, frozen errors
+and operand evaluation. Cross-shape mutations remain unproved; helper bodies have
+no unresolved or gradual types. Native `defined?(@@...)` retains its real runtime
+assigned flag rather than a load-time constant fold, unblocking the original
+cattr seed without erasing inherited values or callbacks.
+
+The same ELF accepts page0/page1 inputs supplied AFTER compilation and proves the
+original options copy/identity and anonymous fallback. The actual fully booted
+Rails values match. **The expanded invalid-option comparison intentionally
+fails:** original plugins append additional valid keys to TopicQuery, whereas the
+isolated native prefix has not executed their activation. Their live callback
+source locations are recorded, never used to seed native state or trim the error
+message. Complete producer sources are pinned, including assign/events/solved
+plugin files and Solved RegisterFilters. The actual original add/remove/apply
+registry API separately works on original/lowered/native Ruby with a synthetic
+TEST callback and live capture; that is **not production activation coverage**.
+
+Next is source-faithful activation/registration (including original callbacks,
+configuration, ordering and effects), not hard-coded observed option names or a
+replay of the unrelated cold-admin getter diagnostic. Full-query missing model,
+mixin, settings/provider and callback dependencies remain explicit. Existing
+anonymous and broader019 targets retain their separate scope and gates.
+
 ## Labelled anonymous security milestone (not ticket019 acceptance)
 
 `make verify-anonymous-security` is a **separate positive target** for the
@@ -472,3 +511,188 @@ Acquisition/type progress is NOT runtime boot, registered YAML settings, plugin
 startup, original getter/security/direct-PG or019 acceptance. Current/theme/plugin
 values and YAML-yield closure remain unproved. All previous failed proof history
 is retained under build; strict019 remains nonzero and unchanged in its contract.
+
+## Actual plugin activation producer probe (Recovery10; not019 acceptance)
+
+`make probe-plugin-activation` retains the failing original-query/constructor
+comparison and adds an observation-only TracePoint wrapper around the **normal
+existing guarded Rails oracle**. It does not use the consumed private-PG HTML
+experiment, call activation twice, replace callbacks/configuration, or replay
+observed state into native execution. The trace records original activation,
+configuration declarations, initializer storage/notification, implicit reloadable
+patch blocks, registration order, callable source locations and captured callable
+locations. Arbitrary captured values are never serialized. Every observed loaded
+plugin Ruby source must be pinned by `SOURCE_LOCK.json`.
+
+Complete selected original producer methods and a separately labelled original935
+first-statement prefix are byte-audited. The native memo-reader declaration prefix
+runs under original Ruby, same-lowered Ruby and native ELF, with per-instance
+storage/identity and no native child/network proof. This is **not activation**.
+The full producer retains its missing dependencies; the evaluation-only prefix
+still exposes the canonical native compiler's explicit string `instance_eval`
+refusal. Refused output is never executed. Complete original scripts and observed
+loaded-plugin dependency files remain separate source resources, not model files
+that would silently skip/reorder their top-level DSL. Their acquisition is not
+proof of all dynamic provider/settings/model dependencies or source-eval support.
+
+The actual solved filter captures its two original callbacks with the
+`DiscourseSolved::RegisterFilters` Class as owner, unlike the assign/events
+plugin-instance-owned closures. A literal-block or hoisting transformation must
+prove filenames, lexical constants/locals, return frames, captures, ordering and
+all effects before admission. Do not seed the observed option names, trim the
+constructor error, or omit the remaining activation/initializer bodies to pass.
+Post-execution source/lowered/resource hashes and fixture cleanup are checked even
+when constructor parity fails. Broader019/F2/list_latest/page remain unaccepted.
+
+### Original metadata construction prefix
+
+`make verify-plugin-metadata` executes the complete original `Plugin::Metadata`
+class and whole original `Plugin::Instance.parse_from_source`/constructor, reading
+all three pinned plugin scripts as live data. It compares native ELF, identical
+lowered CRuby, original-source CRuby and separate fully booted guarded Rails.
+The original official-plugin JSON file is copied byte-for-byte as a resource,
+not serialized into an Array/Set snapshot. A post-compile owned TEST input change
+must change native metadata and fail comparison; original source stays unchanged.
+This proof never evaluates a script or activates a plugin natively.
+
+The measured prerequisite is one-argument `JSON.load_file(String)`, lowered in
+shared IR to `JSON.parse(::File.read(path, encoding: "UTF-8"))`, as Ruby's actual
+stdlib implementation does. Native/original/lowered controls cover UTF-8 despite
+a different ambient read encoding, once-only path effects, read/parse failures
+and lexical File shadowing. Options, blocks, unknown paths and overridden core
+worlds remain unclaimed. The real `parse_from_source` producer also provides
+the types required by the existing String truncation lowering: do not replace it
+with seeded metadata or expand unrelated string helpers to hide a missing caller.
+Metadata success is NOT native activation, provider/settings boot, full-query or
+019/F2/page acceptance. The original source-eval and callback/effect obligations
+above remain binding.
+
+## Recovery11 staging semantics and concrete registry dependency
+
+Read [SOURCE_STAGING.md](SOURCE_STAGING.md). `tools/probe_source_staging.py --trace
+<actual-producer-evidence>` analyzes complete original scripts and runs reduced
+counterexamples. Its successful result **rejects** unproved block/hoisting/Proc
+shortcuts; it never evaluates a plugin or accepts native activation. Caller
+locals, constant lookup, filenames/relative requires, return/arity/capture frames
+and declaration-effect order remain obligations, not string-eval waivers.
+
+`make verify-archetype-dependency` closes a measured dependency of complete original
+DiscoursePluginRegistry205 using the **whole original Archetype** and the **whole
+genuine ActiveModel8.1.4 serialization source**, not an empty include/header.
+Framework code and its MIT license are pinned against the verified cached gem's
+exact package members and runtime lock in `SOURCE_LOCK.json`; all provenance
+checks reject changed source/package bytes. Default registrations, lifecycle,
+replacement/deregistration, live options aliases and default serialization match
+native ELF, same-lowered CRuby, original-source CRuby and guarded real Rails.
+A native original-registration omission negative must be detected. This is not
+all serialization options, full-registry/native activation/settings/query proof.
+
+That actual lifecycle exposed a compiler defect: single-index assignment syntax was
+indistinguishable from explicit `[]=` calls in IR, producing a nil return signature
+for original Archetype.register. Shared Assign/Index IR now retains the RHS return,
+identity, once-only receiver/key/value order and errors, while explicit overridden
+setter calls retain their own return. No original method body was replaced.
+The full original query input now includes the complete Archetype and original
+serialization mixin instead of partial availability. Full registry measurement
+continues to retain genuine remaining source dependencies; especially, indifferent
+hashes are not manufactured runtime Classes.
+
+`make probe-remaining-activation` reruns original activation/full query and the
+untrimmed constructor error matrix without repeating the already-completed reader
+control. It remains deliberately failing until actual source activation/dependency
+proof succeeds. Prior completed metadata/memo/JSON targets are not a replacement
+for those remaining checks. All previous gates and failure evidence are retained.
+
+### Original VendoredAssets path-value prerequisite
+
+`python3 tools/probe_vendored_assets.py --relative-path moment/moment.js` runs the
+complete pinned original `lib/vendored_assets.rb`, not a replacement application
+body. The argument is a live input from the real registry's core asset map; the
+second observed map value is `moment-timezone/moment-timezone-with-data.js`.
+Native ELF, byte-identical lowered CRuby and fully booted original Rails must
+match **raw root/path strings**, with the same actual application-root cwd and
+input. No relative-path normalization or fake Rails root is allowed. A native
+post-compile input-change control must change the actual output path. Trace,
+source/lowered/ELF hashes, original method ownership and real oracle containment
+and cleanup are checked. This is not complete registry/activation/019 acceptance.
+
+The initial measured failure was real: native/compat returned root `.` and
+`./vendor/...`, while Rails returned its absolute application root and path.
+The shared runtime now captures the default emitted application's absolute boot
+cwd at framework load, preserving it after chdir (even before the first root
+read), root object identity and fresh mutable strings from `to_s`/`to_path`.
+Native execution in two different boot directories checks against compiler-path
+baking. Public paths derive from the same root. Custom application-root config,
+unrestricted Pathname APIs and all possible path-join forms are not admitted by
+this prerequisite proof; existing unsupported profiles remain outside it.
+
+Complete VendoredAssets is now included in full original query/registry input
+measurements with byte/span provenance. The measured full-registry source debt
+falls6→5; full-query debt remains69 because its separately labelled registry
+projection did not previously contain this asset method. Neither count implies
+executable full-registry or original script activation support. HIA's first-class
+class values, actual SeedFu/GlobalSetting initialization and complete activation
+resource/provider/callback effects remain obligations.
+
+### SeedFu candidate closure versus actual cold producer observation
+
+`python3 tools/probe_seedfu_closure.py` is **measurement only**, never native
+admission or parity. It verifies cached discourse-seed-fu2.3.12 and exact installed
+package members, retains all8complete require/autoload candidate files in a
+private source input, and records strict refusal without compiling/executing any
+error output. An observation-only TracePoint around normal guarded original
+Rails boot records the real declaration/accessor/Railtie/fixture registration
+order, shared live storage, pending autoloads and actual loaded files. All actual
+Discourse caller bytes are checked against the pinned Git source. No method,
+initializer or callback is wrapped/replaced; `SeedFu.seed` is never invoked.
+
+The observed final storage has **13runtime paths**, not the package's default
+`['db/fixtures']` or merely its two Railtie paths. Keep the real environment/root
+and every original plugin/config append producer; these observations are NEVER
+native inputs. Only3SeedFu files actually load cold (entry, Railtie, ActiveRecord
+extension); Runner/Seeder/Writer/etc remain autoload candidates, not evidence of
+cold execution. The candidate whole-source input retains mattr/@@ source-order
+and GzipReader diagnostics. The required Railtie initializer is also unported;
+a warning/drop is NOT available initialization. Do not admit a fake Railtie,
+freeze the observed array, waive ordering, or port an unreachable gzip API merely
+to quiet an overbroad input. Default native eager autoload is documented subset
+behavior, not a Spinel defect; the existing graph loader passes a separate
+reduced lazy-effect control, not whole SeedFu/plugin activation acceptance.
+
+### Loader-prefix order and original Vips worker identity
+
+The real SeedFu entry's leading literal autoloads also exposed a shared
+file-program ordering bug: the carried module body previously ran before its
+registrations. A reduced emitted-Ruby control was clean to analyze but observed
+no registration from the body. The shared ProgramItem sequence now opens a simple
+module, emits its initial literal registrations exactly once, then runs its
+carried declaration. It does not hoist past an earlier statement, complex/class
+header, nested declaration, unknown receiver/block or nonliteral directive. This
+is a source-IR ordering correction, NOT native SeedFu/whole script admission or
+an excuse to waive the separate mattr/@@ ordering guard. Native graph/bootstrap
+coverage remains a distinct obligation.
+
+A subsequent original boot failed closed because the pinned read-only Vips
+worker calls `Process.setproctitle("discourse vips worker")`: its original script
+argument disappears from `/proc/PID/cmdline`. The guard now observes the **pinned
+original WorkerProcess#start return**, without wrapping/replacing/invoking it
+twice. It verifies original source hashes, exact worker class/original methods,
+core spawn, parent PID, executable, stable kernel process start time and the
+original private socket inode/owner/directory. Each version-only connection must
+match that same attested object/process/socket. A matching title alone, copied
+worker record, changed PID/start/executable/socket, or changed source is rejected.
+Neither shared Unix services nor other Vips operations become authorized.
+
+`probe_seedfu_closure.py --vips-retitle-control` adds an observation-only delay
+after the original start and requires its actual changed process title before
+the original version call. It must still prove ownership, original effects and
+owned-child exit; no application callback or worker command is replaced. PG and
+Valkey guards/negative controls remain unchanged. The original ownership failure
+is retained as evidence, not retried by blindly accepting a name or weakening
+isolation.
+
+The next source-order design and executable original-macro controls are in
+[`SEEDFU_SOURCE_ORDER.md`](SEEDFU_SOURCE_ORDER.md). They also record the separate
+native graph-bootstrap refusal; shared leading-autoload order alone does not
+make the CRuby file-program helper native-capable. The original ordering guard
+remains intact, including storage protocol overrides and all required producers.

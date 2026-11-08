@@ -103,6 +103,20 @@ for e in test/load_graph/*.rb.expected; do
   fi
 done
 
+# Literal absolute require is the same physical feature as an autoload's
+# absolute target and require_relative. Do not send it through -I library
+# lookup (which treated a perfectly real literal filename as missing).
+mkdir "$tmp/absolute-literal"
+printf 'puts "absolute body"\nmodule AbsoluteFeature; VALUE = 17; end\n' > "$tmp/absolute-literal/lib.rb"
+printf 'autoload :AbsoluteFeature, File.join(__dir__, "lib.rb")\np AbsoluteFeature::VALUE\np require "%s/lib.rb"\np require_relative "lib"\n' "$tmp/absolute-literal" > "$tmp/absolute-literal/main.rb"
+printf 'absolute body\n17\nfalse\nfalse\n' > "$tmp/absolute-literal/expected"
+if "$SPINEL" --load-model=graph "$tmp/absolute-literal/main.rb" -o "$tmp/absolute-literal/probe" >"$tmp/absolute-literal/compile" 2>&1 &&
+   "$tmp/absolute-literal/probe" >"$tmp/absolute-literal/output" 2>&1; then
+  cmp -s "$tmp/absolute-literal/expected" "$tmp/absolute-literal/output" || fail "literal absolute require did not share autoload/relative cache identity"
+else
+  fail "literal absolute require did not compile/run"; sed -n 1,5p "$tmp/absolute-literal/compile"
+fi
+
 # A require that names no file warns that it raises LoadError when it runs,
 # unless the rescue clause its begin runs for it catches that LoadError
 # (the fat-binary fallback, rescue_runs_main.rb)

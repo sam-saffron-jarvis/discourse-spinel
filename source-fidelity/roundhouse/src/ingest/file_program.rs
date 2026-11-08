@@ -99,14 +99,31 @@ fn program_items(
                     opened.push(chain);
                 }
             }
+            let leading_autoloads = leading_module_autoloads(stmt, span_of);
+            if !leading_autoloads.is_empty() {
+                // The source opens the module, registers these autoloads,
+                // THEN runs the carried declaration's constants/state/defs.
+                // Loading the complete declaration first loses observations
+                // of the registration from its own body (SeedFu's shape).
+                let module = stmt.as_module_node().expect("module prefix");
+                let path = module_name_path(&module).expect("simple module");
+                let chain = vec![(path[0].clone(), false)];
+                if !opened.contains(&chain) {
+                    opened.insert(0, chain);
+                }
+            }
             if !opened.is_empty() {
                 items.push(ProgramItem::Opened(opened));
             }
+            items.extend(leading_autoloads.iter().cloned());
             if !names.is_empty() {
                 items.push(ProgramItem::Declared(names));
             }
-            // What the bodies require and autoload as they load, after them.
-            body_requires(&stmt, &[], &span_of, &mut items);
+            // Other bodies' loads keep their existing policy. Prefix
+            // registrations were carried above, never register them twice.
+            let mut body_loads = Vec::new();
+            body_requires(&stmt, &[], &span_of, &mut body_loads);
+            items.extend(body_loads.into_iter().filter(|item| !leading_autoloads.contains(item)));
             continue;
         }
         // A constant rides with the file's classes (`carry_file_constants`).
@@ -193,7 +210,7 @@ fn file_branch(
     list_dir: &dyn Fn(&std::path::Path) -> Vec<(String, bool)>,
     span_of: &dyn Fn(&ruby_prism::Node<'_>) -> Span,
 ) -> Option<ProgramItem> {
-    if !declares_inside(stmt) || super::visibility::console_only_node(stmt) {
+    if (!declares_inside(stmt) && !loads_inside(stmt)) || super::visibility::console_only_node(stmt) {
         return None;
     }
     let items = |stmts: &[ruby_prism::Node<'_>]| program_items(stmts, file, carried, list_dir, span_of);
@@ -363,6 +380,28 @@ fn dir_relative_pattern(node: &ruby_prism::Node<'_>) -> Option<String> {
     }
     let tail = String::from_utf8_lossy(tail.as_string_node()?.unescaped()).into_owned();
     tail.strip_prefix('/').map(str::to_string)
+}
+
+/// A simple top-level module's initial literal registrations. No earlier
+/// statement is crossed, and no nested declaration is opened ahead of them.
+/// Class/superclass headers, compact namespace paths, nonliteral directives
+/// and registrations after another body statement retain their prior policy.
+fn leading_module_autoloads(
+    decl: &ruby_prism::Node<'_>,
+    span_of: &dyn Fn(&ruby_prism::Node<'_>) -> Span,
+) -> Vec<ProgramItem> {
+    let Some(module) = decl.as_module_node() else { return Vec::new() };
+    let Some(path) = module_name_path(&module).filter(|path| path.len() == 1) else { return Vec::new() };
+    let Some(body) = module.body().and_then(|body| body.as_statements_node()) else { return Vec::new() };
+    let statements: Vec<_> = body.body().iter().collect();
+    if statements.iter().any(|stmt| stmt.as_def_node().is_none() && declares_inside(stmt)) {
+        return Vec::new();
+    }
+    statements.iter().map_while(|stmt| {
+        literal_autoload(stmt).map(|(name, feature)| ProgramItem::Autoload {
+            span: span_of(stmt), owner: path[0].clone(), name, feature,
+        })
+    }).collect()
 }
 
 /// The requires a declaration's bodies run as they load, in source
@@ -658,6 +697,23 @@ fn is_file_return(stmt: &ruby_prism::Node<'_>) -> bool {
     finds.0
 }
 
+/// Literal load calls inside a file-level branch must stay in that branch,
+/// rather than becoming a general expression or an unconditional dependency.
+fn loads_inside(stmt: &ruby_prism::Node<'_>) -> bool {
+    use ruby_prism::Visit;
+    struct Loads(bool);
+    impl<'pr> Visit<'pr> for Loads {
+        fn visit_def_node(&mut self, _: &ruby_prism::DefNode<'pr>) {}
+        fn visit_call_node(&mut self, call: &ruby_prism::CallNode<'pr>) {
+            if call.receiver().is_none() && matches!(call.name().as_slice(), b"require" | b"require_relative" | b"autoload") { self.0 = true; }
+            ruby_prism::visit_call_node(self, call);
+        }
+    }
+    let mut loads = Loads(false);
+    loads.visit(stmt);
+    loads.0
+}
+
 /// Whether a statement other than a declaration holds a `class`,
 /// `module` or `def` (one inside an `if`, a block, a `begin`): the
 /// expression ingest would read it as nil, and the library-class walk
@@ -709,4 +765,54 @@ pub(super) fn literal_requires(source: &[u8], file: &str) -> Vec<String> {
     let mut out = Vec::new();
     walk(&statements, &mut out);
     out
+}
+
+#[cfg(test)]
+mod prefix_autoload_tests {
+    use super::*;
+
+    fn items(source: &str, names: &[&str]) -> Vec<ProgramItem> {
+        let carried = names.iter().map(|name| name.to_string()).collect();
+        file_program(source.as_bytes(), "prefix.rb", &carried, &|_| Vec::new()).unwrap().items
+    }
+
+    #[test]
+    fn source_prefix_is_before_declaration_and_not_duplicated() {
+        let program = items("module SeedLike\n  autoload :One, 'one'\n  autoload :Two, 'two'\n  mattr_accessor :paths\n  @@paths = ['db/fixtures']\nend\n", &["SeedLike"]);
+        assert!(matches!(&program[0], ProgramItem::Opened(chains) if chains == &vec![vec![("SeedLike".into(), false)]]));
+        assert!(matches!(&program[1], ProgramItem::Autoload { name, .. } if name == "One"));
+        assert!(matches!(&program[2], ProgramItem::Autoload { name, .. } if name == "Two"));
+        assert!(matches!(&program[3], ProgramItem::Declared(_)));
+        assert_eq!(program.iter().filter(|item| matches!(item, ProgramItem::Autoload { .. })).count(), 2);
+    }
+
+    #[test]
+    fn no_registration_moves_across_an_earlier_statement_or_complex_header() {
+        for (source, name) in [
+            ("module Config\n  SEEN = 1\n  autoload :One, 'one'\n  def self.value = SEEN\nend", "Config"),
+            ("class Config < Base\n  autoload :One, 'one'\nend", "Config"),
+            ("module Outer::Config\n  autoload :One, 'one'\n  def self.value = 1\nend", "Outer::Config"),
+            ("module Config\n  autoload :One, 'one'\n  module Nested; end\nend", "Config"),
+            ("module Config\n  autoload :One, 'one'\n  if true; module Nested; end; end\nend", "Config"),
+        ] {
+            let program = items(source, &[name]);
+            let declaration = program.iter().position(|item| matches!(item, ProgramItem::Declared(_))).unwrap();
+            let autoload = program.iter().position(|item| matches!(item, ProgramItem::Autoload { .. })).unwrap();
+            assert!(declaration < autoload, "must not hoist across unsupported ordering/header: {source}");
+        }
+    }
+
+    #[test]
+    fn unknown_receiver_block_and_nonliteral_forms_are_not_newly_lifted() {
+        for source in [
+            "module Config\n  autoload :One, feature\nend",
+            "module Config\n  self.autoload :One, 'one'\nend",
+            "module Config\n  autoload(:One, 'one') {}\nend",
+        ] {
+            let parsed = super::super::prism::parse(source.as_bytes(), "prefix.rb");
+            let root = parsed.node();
+            let decl = root.as_program_node().unwrap().statements().body().iter().next().unwrap();
+            assert!(leading_module_autoloads(&decl, &|_| Span::synthetic()).is_empty(), "{source}");
+        }
+    }
 }

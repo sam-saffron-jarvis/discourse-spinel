@@ -353,7 +353,7 @@ fn assigned_literal(mut value: Expr, file: &str) -> Expr {
 }
 
 /// Does the source's leading comment block say `frozen_string_literal: true`?
-fn freezes_literals(text: &str) -> bool {
+pub(crate) fn freezes_literals(text: &str) -> bool {
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -372,7 +372,7 @@ fn freezes_literals(text: &str) -> bool {
     false
 }
 
-fn fresh_reserved_local(loc: &ruby_prism::Location<'_>, stem: &str) -> Symbol {
+pub(super) fn fresh_reserved_local(loc: &ruby_prism::Location<'_>, stem: &str) -> Symbol {
     let mut name = stem.to_string();
     let mut suffix = 0;
     while super::sources::generated_local_is_reserved(loc, &name) {
@@ -1197,6 +1197,33 @@ fn ingest_expr_node(node: &Node<'_>, file: &str) -> IngestResult<Expr> {
                 Some(block_node) => ingest_call_block(&block_node, file, &method)?,
                 None => None,
             };
+            // Prism represents `table[key] = value` as a CallNode named
+            // `[]=`, but Ruby assignment answers the RHS, independently of
+            // what an overridden setter returns. A plain Send lost that
+            // distinction and gave tail stores a nil method signature.
+            // Keep explicit `table.[]=(key, value)` as a real method call.
+            if c.is_attribute_write() && method == "[]=" {
+                if c.is_safe_navigation()
+                    || args.len() != 2
+                    || block.is_some()
+                    || recv.is_none()
+                    || args.iter().any(|arg| matches!(&*arg.node,
+                        ExprNode::Splat { .. } | ExprNode::KeywordSplat { .. }
+                        | ExprNode::ForwardArgs | ExprNode::ForwardKeywords
+                        | ExprNode::ForwardKeywordsWithPairs { .. }))
+                {
+                    return Err(IngestError::Unsupported {
+                        file: file.into(),
+                        message: "indexed assignment requires one non-variadic index and an RHS".into(),
+                    });
+                }
+                return Ok(Expr::new(span, ExprNode::Assign {
+                    target: crate::expr::LValue::Index {
+                        recv: recv.expect("checked receiver"), index: args[0].clone(),
+                    },
+                    value: args[1].clone(),
+                }));
+            }
             // Two shapes a paren-less call can't hold once lowered, both
             // of which the emitter can only fix here — by the time it
             // has a rendered `base` string it can't tell where the

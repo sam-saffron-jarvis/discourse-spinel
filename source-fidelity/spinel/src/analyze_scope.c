@@ -1460,14 +1460,37 @@ void header_parent_encloses(Compiler *c, int par, int child, const char *leaf, i
     c->classes[child].enclosing_class = pc;
     return;
   }
-  char head[64];
-  snprintf(head, sizeof head, "%.*s", (int)strcspn(path, ":"), path);
-  if (!has_path || named || !leaf || !(is_builtin_class_name(head) || is_builtin_module_name(head))) return;
+  /* The namespace may be a required file whose header the graph walk has
+     not visited yet. Its absence from the class table is not evidence that
+     this compact header belongs to the top level (or the surrounding cref).
+     Retain the explicit Ruby path without making that namespace present. */
+  if (!has_path) return;
+  c->classes[child].enclosing_class = -1;
+  if (named || !leaf) return;
   char rn[320];
   snprintf(rn, sizeof rn, "%s::%s", path, leaf);
   c->classes[child].ruby_name_cache = strdup(rn);
 }
 
+
+/* Resolve only deferred explicit namespace links after all graph-file
+   headers have been registered. This changes metadata ownership, never a
+   load point or a runtime presence flag. */
+int settle_header_namespaces(Compiler *c) {
+  if (!prog_has_files(c)) return 0;
+  int changed = 0;
+  for (int ci = 0; ci < c->nclasses; ci++) {
+    ClassInfo *cls = &c->classes[ci];
+    if (cls->enclosing_class >= 0 || !cls->ruby_name_cache) continue;
+    int cp = class_def_path(c->nt, cls->def_node);
+    if (cp < 0 || nt_kind(c->nt, cp) != NK_ConstantPathNode) continue;
+    int par = nt_ref(c->nt, cp, "parent");
+    if (par < 0 || !nt_kind_is_constant(nt_kind(c->nt, par))) continue;
+    header_parent_encloses(c, par, ci, nt_str(c->nt, cp, "name"), 1);
+    if (cls->enclosing_class >= 0) { comp_touch_class(cls->idx); changed = 1; }
+  }
+  return changed;
+}
 
 /* `class C < S` (or `C = Class.new(S) do ... end`) where the constant S
    names nothing where the header stands (elab_const_ref_at): CRuby raises
@@ -9738,9 +9761,7 @@ int infer_cvar_types(Compiler *c, int nil_only) {
     int cci = recv >= 0 && nt_kind(nt, recv) == NK_ConstantReadNode ? const_node_class_index(c, recv) : -1;
     int args = nt_ref(nt, id, "arguments");
     int an = 0; const int *av = args >= 0 ? nt_arr(nt, args, "arguments", &an) : NULL;
-    NodeKind ak = an == 2 && av ? nt_kind(nt, av[0]) : NK_NilNode;
-    const char *cvn = (ak == NK_SymbolNode) ? nt_str(nt, av[0], "value")
-                    : (ak == NK_StringNode) ? nt_str(nt, av[0], "content") : NULL;
+    const char *cvn = an == 2 && av ? comp_cvar_literal_name(c, av[0]) : NULL;
     /* a name written out that is no class variable name raises when the
        call runs (cvar_name_ok): it declares nothing */
     if (cvn && !cvar_name_ok(cvn)) continue;
@@ -9754,6 +9775,10 @@ int infer_cvar_types(Compiler *c, int nil_only) {
     if (nil_only && scl->cvar_types[idx] != TY_BOOL &&
         scl->cvar_types[idx] != TY_SYMBOL) continue;
     TyKind vt = infer_type(c, av[1]);
+    /* A real Module protocol store has the same nil semantics as @@x = nil.
+       Bool/Symbol have no nil inhabitant; the late nil-only pass must widen
+       them too, rather than collapsing a nil seed into false/:empty. */
+    if (vt == TY_NIL) vt = nil_write_type(scl->cvar_types[idx]);
     if (vt == TY_NIL || vt == TY_UNKNOWN) continue;
     TyKind merged = ty_unify(scl->cvar_types[idx], vt);
     if (merged != scl->cvar_types[idx]) { cvar_set_type(scl, idx, merged); changed = 1; }

@@ -2,11 +2,12 @@
 //!
 //! Ingest expands `mattr_accessor :x` into `def self.x; @@x; end`, its
 //! writer, and the seed `@@x = nil unless defined?(@@x)`
-//! (`ingest::library_class::mattr_nil_seed`), as Rails stores it. Spinel
-//! has no class variables, and refuses the reads, the writes and the
-//! seed's `defined?` (`project::report_native_ruby_syntax`). Campfire's
-//! script-source memo (`InlineScriptHashes.last_script_sources`,
-//! once-campfire#370) is one.
+//! (`ingest::library_class::mattr_nil_seed`), as Rails stores it. Targets
+//! without class-variable storage need the equivalent module-local form.
+//! Spinel now preserves native lexical/shared class variables and their
+//! runtime assigned flags; class cattr storage stays native there.
+//! Campfire's module script-source memo (`InlineScriptHashes.last_script_sources`,
+//! once-campfire#370) is one safely movable case.
 //!
 //! In a MODULE, and when nothing outside the module names `@@x`, the class
 //! variable and the module's own instance variable behave alike: the

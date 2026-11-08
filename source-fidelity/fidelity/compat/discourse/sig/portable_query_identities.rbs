@@ -1,0 +1,10 @@
+# Supported query identity contract: actual User records or anonymous nil.
+# No identity, admin bit or permission result is supplied by these annotations.
+class TopicQuery
+  @user: User?
+  @guardian: Guardian
+end
+
+class TopicList
+  @current_user: User?
+end

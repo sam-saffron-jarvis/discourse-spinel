@@ -18722,8 +18722,8 @@ int emit_poly_call(Compiler *c, int id, Buf *b) {
           buf_printf(b, "sp_poly_index_poly(_t%d, ", tsv); emit_boxed(c, argv[0], b); buf_puts(b, ")");
         }
         else {
-          buf_printf(b, "sp_poly_slice(_t%d, sp_poly_arg_int_chk(", tsv); emit_boxed(c, argv[0], b);
-          buf_puts(b, "), sp_poly_arg_int_chk("); emit_boxed(c, argv[1], b); buf_puts(b, "))");
+          buf_printf(b, "sp_poly_slice_or_call(_t%d, ", tsv); emit_boxed(c, argv[0], b);
+          buf_puts(b, ", "); emit_boxed(c, argv[1], b); buf_puts(b, ")");
         }
       }
       else {

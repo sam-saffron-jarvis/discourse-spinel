@@ -1201,8 +1201,7 @@ fn renders_open_ended(e: &Expr) -> bool {
         ExprNode::Send { recv, method, args, parenthesized, .. } => {
             let m = method.as_str();
             let r = recv.is_some();
-            let assigns =
-                r && ((m == "[]=" && args.len() == 2) || (is_setter_method(m) && args.len() == 1));
+            let assigns = r && is_setter_method(m) && args.len() == 1;
             // The shapes `emit_send_base` renders with no trailing
             // argument list: an index read (`h[k]`), a binary operator
             // with its one operand (`a == b`; `p.=== 1, 2` is a command),
@@ -1456,11 +1455,10 @@ pub(super) fn emit_send_base(
             }
         }
     }
-    // Index-read (`recv[idx]`) and index-write (`recv[idx] = value`)
-    // Sends round-trip to bracket-syntax regardless of receiver shape
-    // — handled before the SelfRef-implicit shortcut, which would
-    // emit `[](idx)` / `[]=(idx, value)` (bare method-call to `[]` /
-    // `[]=`, not valid Ruby in those positions).
+    // Index reads keep bracket syntax. Assignment syntax is an Assign/Index
+    // in IR; a Send named []= is an explicit method call and must keep the
+    // setter's own return value (which need not be the assignment RHS).
+    // Handle self before implicit-self spelling, which cannot print `[](...)`.
     if m == "[]" && !args_s.is_empty() {
         if let Some(r) = recv {
             return format!("{}[{}]", emit_postfix_recv(r), args_s.join(", "));
@@ -1468,7 +1466,7 @@ pub(super) fn emit_send_base(
     }
     if m == "[]=" && args_s.len() == 2 {
         if let Some(r) = recv {
-            return format!("{}[{}] = {}", emit_postfix_recv(r), args_s[0], args_s[1]);
+            return format!("{}.[]=({})", emit_postfix_recv(r), args_s.join(", "));
         }
     }
     // Unary `!` Send (`Send { recv: cond, method: "!", args: [] }`)
@@ -2278,15 +2276,11 @@ mod tests {
     }
 
     #[test]
-    fn self_index_write_emits_bracket_assign() {
-        // `Send { recv: SelfRef, method: "[]=", args: [:k, "v"] }`
-        // must emit as `self[:k] = "v"`, not `[]=(:k, "v")`. Surfaces
-        // when copy-pasting parsed Ruby method bodies (e.g. per-
-        // subclass specialization) — the SelfRef-implicit-receiver
-        // shortcut would otherwise render `[]=` as a bare method
-        // call which Ruby parses as a name, not an index assign.
+    fn self_index_setter_send_preserves_explicit_method_call() {
+        // Source assignment now uses Assign/Index. This Send must neither
+        // become bare []=(...) nor turn the setter return into its RHS.
         let expr = send(Some(self_ref()), "[]=", vec![lit_sym("k"), lit_str("v")]);
-        assert_eq!(emit_expr(&expr), r#"self[:k] = "v""#);
+        assert_eq!(emit_expr(&expr), r#"self.[]=(:k, "v")"#);
     }
 
     #[test]

@@ -35,6 +35,7 @@ use crate::ingest::ingest_app;
 pub use crate::build_target::{BuildTarget, ParamBindCapability};
 
 mod rack_mounts;
+mod file_programs;
 
 /// Quick-start README for a transpile target. Injected into every
 /// file set by `target_files` (so both `--target` output and the
@@ -1794,7 +1795,7 @@ fn report_native_ruby_syntax(app: &App, target: BuildTarget) {
     if matches!(target, BuildTarget::Blog | BuildTarget::Ruby | BuildTarget::Jruby) {
         return;
     }
-    fn visit(expr: &crate::expr::Expr, target: BuildTarget, load_time: bool) {
+    fn visit(expr: &crate::expr::Expr, target: BuildTarget, load_time: bool, finite_defined: &std::collections::BTreeSet<(u32, u32, u32)>) {
         use crate::expr::{ExprNode, LValue};
         let construct = match &*expr.node {
             ExprNode::ForwardKeywords if target == BuildTarget::Spinel => None,
@@ -1808,9 +1809,12 @@ fn report_native_ruby_syntax(app: &App, target: BuildTarget) {
             // program ("constant" or nil; lexical, inherited, nested and
             // missing paths included). While the program loads, CRuby
             // answers nil for a constant whose file has not run yet and
-            // Spinel does not, so that position stays refused.
+            // Spinel does not, so that position stays refused unless the
+            // finite file-program lowering proves this exact autoload binding
+            // and the generated build selects native graph loading.
             ExprNode::Defined { operand }
-                if target == BuildTarget::Spinel && !load_time
+                if target == BuildTarget::Spinel
+                    && (!load_time || finite_defined.contains(&(expr.span.file.0, expr.span.start, expr.span.end)))
                     && matches!(&*operand.node, ExprNode::Const { .. }) => None,
             // Native @@ cells carry a separate runtime "has been assigned"
             // flag. Unlike a whole-program constant lookup, this also answers
@@ -1846,11 +1850,17 @@ fn report_native_ruby_syntax(app: &App, target: BuildTarget) {
                 "native Ruby semantics have no verified implementation on this target",
             );
         }
-        expr.node.for_each_child(&mut |child| visit(child, target, load_time));
+        expr.node.for_each_child(&mut |child| visit(child, target, load_time, finite_defined));
     }
+    // A resolved finite feature graph uses native graph loading, whose
+    // pending/loaded constant queries have executable owner/resource proof.
+    // All other load-time queries retain the refusal above.
+    let finite_defined = if target == BuildTarget::Spinel {
+        crate::lower::file_programs::lower(app).ok().flatten().map(|plan| plan.defined_sites).unwrap_or_default()
+    } else { Default::default() };
     let load_time = crate::lower::defined_const_fold::load_time_roots(app);
     crate::lower::for_each_emit_body_ref(app, &mut |expr| {
-        visit(expr, target, load_time.contains(&(expr as *const crate::expr::Expr as usize)))
+        visit(expr, target, load_time.contains(&(expr as *const crate::expr::Expr as usize)), &finite_defined)
     });
 }
 
@@ -2634,12 +2644,24 @@ pub fn target_files(
     fixture: &Path,
     target: BuildTarget,
 ) -> Result<Vec<(String, String)>, String> {
+    if app.source_gem_ruby_family_inventory && target != BuildTarget::Spinel {
+        let diagnostic = crate::diagnostic::Diagnostic::unsupported(
+            crate::span::Span::synthetic(), Some(crate::Symbol::from(target.as_str())),
+            "source-gem runtime profile",
+            "this source inventory needs the guarded Spinel finite feature graph (also executed under CRuby); re-ingest without that profile for another target",
+        );
+        let message = diagnostic.message.clone();
+        emit::diagnostics::push(diagnostic);
+        return Err(message);
+    }
     // Stage 0 of the specializer: the identity. Nothing is specialized
     // yet, so none of the trimming or refusals below apply — every construct is
     // residue, and the residue runs on Rails.
     if target == BuildTarget::Futamura {
         return futamura_target_files(app, fixture, None);
     }
+    let constant_features = crate::lower::literal_constant_features::lower(app);
+    let app = constant_features.as_ref().unwrap_or(app);
     rack_mounts::check_target(app, target)?;
     let refusals = crate::gems::extension_gem_refusals(app, Some(target.as_str()));
     if !refusals.is_empty() {
@@ -2995,12 +3017,20 @@ fn target_files_inner(
             if declarations.iter().all(|lc| !lc.has_source_ivar_initializers()) {
                 continue;
             }
+            let identical_module_accessors = declarations.len() == 1 && declarations[0].is_module
+                && declarations[0].class_ivar_initializers.iter().any(|expr| expr.declaration_step().is_some()
+                    && matches!(&*expr.node, crate::expr::ExprNode::If { else_branch, .. }
+                        if matches!(&*else_branch.node, crate::expr::ExprNode::Send { method, .. } if method.as_str() == "class_variable_set")))
+                && crate::ingest::ordered_mattr::closed_world(app);
             let all: Vec<_> = declarations.iter().flat_map(|lc| &lc.methods).collect();
             let mut methods = crate::det::HashMap::default();
             for &method in &all {
                 let key = (method.receiver, &method.name);
                 if let Some(previous) = methods.insert(key, method)
                     && !crate::dialect::staged_alias_redefinition(previous, method, all.iter().copied())
+                    && !(identical_module_accessors && crate::dialect::staged_identical_accessor(previous, method)
+                        && crate::ingest::ordered_mattr::source_accessor_event(app, declarations[0], previous)
+                        && crate::ingest::ordered_mattr::source_accessor_event(app, declarations[0], method))
                 {
                     return Err(format!(
                         "class-instance-variable initialization with method redefinition is not supported (spinel): {}.{}",
@@ -3022,6 +3052,9 @@ fn target_files_inner(
                 spinel_relation_model_handle(&mut files)?;
                 widen_spinel_hash_config_arrays(&mut files);
                 let mut files = spin_shape(files)?;
+                if crate::lower::file_programs::lower(app)?.is_some() {
+                    file_programs::graph_build(&mut files);
+                }
                 if dialect == crate::emit::shared::schema_sql::Dialect::Postgres {
                     let manifest = files.iter_mut().find(|(p, _)| p == "spin.toml").ok_or("PostgreSQL tree: spin.toml not found")?;
                     if !manifest.1.lines().any(|line| line.trim() == "[dependencies]") {
@@ -3930,21 +3963,7 @@ end
 /// Rails refuses it (three of campfire's 24 guard tests). `hton` is the
 /// masked address in network order, which is what the port's `@octets`
 /// holds too.
-const IPADDR_STDLIB: &str = r##"# Ruby's own ipaddr — see `project::IPADDR_STDLIB`.
-# The port at runtime/ruby/ipaddr.rb exists for the targets
-# that have no stdlib to reach for; this tree has one, and
-# defining a second IPAddr beside it is a superclass mismatch
-# at require time.
-require "ipaddr"
-
-class IPAddr
-  # The port's representation, answered by the stdlib's: 4 octets for
-  # IPv4, 16 for IPv6, masked to the prefix.
-  def octets
-    hton.bytes
-  end unless method_defined?(:octets)
-end
-"##;
+const IPADDR_STDLIB: &str = include_str!("../runtime/spinel/ipaddr_stdlib.rb");
 
 const RESOLV_STUB_REOPEN: &str = r##"require "resolv"
 
@@ -8658,9 +8677,23 @@ fn spinel_files_with_source_markers(
     fixture: &Path,
     param_binds: bool,
 ) -> Result<(Vec<(String, String)>, Vec<String>), String> {
+    let finite = crate::lower::file_programs::lower(app).map_err(file_programs::refusal)?;
+    let prepared = finite.as_ref().map(|plan| plan.prepare(app));
+    let app = prepared.as_ref().unwrap_or(app);
     let (mut files, stems) =
         emit::ruby::expr::with_spinel_requires(|| {
-            emit::ruby::source_markers::with_source_markers(app, || spinel_files(app, fixture, param_binds))
+            emit::ruby::source_markers::with_source_markers(app, || {
+                let emitted = || {
+                    let (mut files, stems) = spinel_files(app, fixture, param_binds)?;
+                    if let Some(plan) = &finite {
+                        file_programs::apply(&mut files, app, plan).map_err(file_programs::refusal)?;
+                    }
+                    Ok::<_, String>((files, stems))
+                };
+                if let Some(plan) = &finite {
+                    emit::ruby::with_file_program_headers(&plan.compact_headers, &plan.declarations, emitted)
+                } else { emitted() }
+            })
         })?;
     apply_gem_packages(&mut files, app)?;
     for (path, content) in files.iter_mut() {
@@ -9154,6 +9187,7 @@ fn spinel_files(app: &App, fixture: &Path, param_binds: bool) -> Result<(Vec<(St
         // `Rails.event` / `Rails.error`: the reporters, ParameterFilter and
         // ExecutionContext. rails.rb requires it, so it ships beside rails.
         "active_support_reporters",
+        "active_support_interlock",
         "active_support_isolated_execution_state",
         "active_support_notifications",
         "active_support_configuration_file",
@@ -9298,6 +9332,13 @@ fn spinel_files(app: &App, fixture: &Path, param_binds: bool) -> Result<(Vec<(St
                 .to_string();
         }
     }
+
+    // Optional full stdlib/bundled provider. The octet port remains the
+    // default for applications compiled with machine-word integers. A
+    // profile requiring String case equality/IPv6 bignums can explicitly
+    // select this provider (and omit the port's layout signatures) on BOTH
+    // Ruby and Spinel, using --int-overflow=promote on the native lane.
+    files.push(("runtime/ipaddr_stdlib.rb".to_string(), IPADDR_STDLIB.to_string()));
 
     let app_files = emit::ruby::emit_spinel_with_param_binds(app, param_binds);
     let test_stems = app_test_stems(&app_files);
@@ -11337,7 +11378,7 @@ fn drop_facades_the_program_defines(files: &mut [(String, String)]) {
 /// Constant → bundled library that provides it. One table, read by
 /// both the pass that writes the requires and the gate that checks a
 /// tree for missing ones — a second copy is how the rule drifts.
-const BUNDLED: [(&str, &str); 30] = [
+const BUNDLED: [(&str, &str); 31] = [
     // INERT in our trees, and deliberately: `runtime/spinel/base64.rb`
     // defines `Base64` without requiring the library, which the second
     // condition below reads as "the program defines it" and drops the
@@ -11405,6 +11446,8 @@ const BUNDLED: [(&str, &str); 30] = [
     // require below and hide stdlib `String#shellescape`. CRuby/JRuby
     // boot requires the stdlib feature by hand.
     ("Shellwords", "shellwords"),
+    // OpenStruct is the actual ostruct default gem / Spinel native class.
+    ("OpenStruct", "ostruct"),
     // `PTY.spawn`: the app writes `require "pty"` (Rails does not load
     // it), but an app file reaches the tree without its requires.
     // Spinel takes `packages/pty`.

@@ -1,0 +1,7 @@
+# The pure graph dependency takes live JSON data, not captured generated paths.
+class PortableEmberAssetGraph
+  def self.script_chunks: (Hash[String, untyped] manifest) -> Hash[String, Array[String]]
+  def self.import_map: (Hash[String, untyped] manifest) -> Hash[String, String]
+  def self.logical_name: (String filename) -> String
+  def self.deep_imports_for: (chunk_filename: String, chunks: Hash[String, untyped], ?seen: Set[String]) -> Array[String]
+end

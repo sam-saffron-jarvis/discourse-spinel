@@ -1,21 +1,25 @@
-# Status at publication — November 4, 2026
+# Migration status — source checkpoint, not a release
 
-## Verified, within explicit scopes
+The supported anonymous/no-plugin native JSON request has executed differential
+checks. Subsequent scoped work has executed the topic-list body/head, genuine
+import-map and asset acquisition, locale/MessageFormat handling, theme caches,
+script/module preloads, captured-head flow, client setup, the settings collection
+consumed by SVG generation, icon producers and Ruby-free SVG XML symbol handling.
+These are declared-scope comparisons against shared-compatible CRuby and original
+methods, not a complete unchanged Rails application or generic all-profile support.
 
-- Refreshed task Spinel source is `1c7339c66`, with nine local compiler commits on the recorded upstream pin. Both pristine and patched compiler gates were green during the maintenance run. This is compiler health, not application completion.
-- Original scope/Active Record/PostgreSQL foundation passed native, same-lowered CRuby and actual Rails comparisons.
-- A separately labelled original anonymous category-security projection passed direct native ELF-to-read-only-PostgreSQL, values/types/NULLs, category-leak/type negative controls, source integrity and fixture cleanup. The broad authenticated/admin/settings ticket was **not** accepted by this narrower proof.
-- A reduced JSON-versus-HTML dispatch mechanism passed CRuby and native execution. Its test helper is explicitly not Discourse's actual serializer implementation.
-- The original Rails oracle produced JSON page0 with20topics, empty page1, and HTML200 with the actual preload methods observed. Real CSS-cache effects occurred only in an approved disposable PostgreSQL copy, which was removed. This is **Rails reference execution**, not native or browser proof. No private data/captures are published.
+The complete native layout/HTML200/browser page remains unaccepted at the start of
+continuous publication. Later snapshots publish committed code, NOT an automatic
+promotion of that acceptance. Consult the timestamped `fidelity/RECOVERY*.md` source
+checkpoint reports and their test targets for the exact scope and remaining
+boundary of each commit. A commit subject or successful source export is not proof
+that a runtime gate passed. Raw private runtime evidence is deliberately excluded.
 
-## Active WIP and present blockers
+Current work is still closing SVG bundle/digest/path and remaining layout/preload
+behavior before complete response and browser validation. Authentication, writes,
+all plugins, all settings profiles and production readiness are not claimed.
+Existing original-Rails HTML observations are reference-only, not native parity.
 
-- The original query initializer can execute natively; hash option validation/default merging and class-variable presence support have been developed with focused checks. Some of this work is uncommitted in the source snapshot and is not a complete-query pass.
-- Actual plugins register additional valid query options/callbacks. The native prefix has not yet reproduced the complete original registration/activation path; its invalid-option error differs from fully booted Rails. The fix must execute or correctly expand original registration behavior, not hard-code observed names or weaken error parity.
-- The complete original `default_results`/`latest_results`/`create_list`/`list_latest` and TopicList model/dependency closure are not accepted.
-- The original controller serialization bridge depends on pinned AMS0.8.4 and MultiJson/Oj behavior that does not yet have a passing native bridge. Source projections and real-gem reference fixtures are not native support claims.
-- Original controller dynamic configuration/generated actions, document/preloads and actual frontend integration remain unfinished natively.
-
-## What this publication is NOT
-
-No claim of a working unchanged native Discourse `/latest`, a standalone production port, an accepted full serializer/controller/browser gate, performance superiority, or a new deployment. Later dirty source is included for inspection without falsely inheriting older test results. The root-level backend is the older manual/adapted experiment, not the implementation of this source-fidelity goal.
+Shared-database writes and reusing consumed one-off private-database experiments
+are not authorised by publishing this source. Guards must not be bypassed to run
+it against production. No deployment or performance superiority is implied.

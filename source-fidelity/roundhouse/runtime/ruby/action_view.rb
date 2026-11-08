@@ -1,5 +1,8 @@
 # frozen_string_literal: true
 require_relative "action_view/slots"
+require_relative "action_view/html_fragment"
+require_relative "action_view/source_asset_paths"
+require_relative "action_view/source_asset_response"
 require_relative "action_view/missing_template"
 require_relative "action_view/base"
 require_relative "action_view/view_helpers"

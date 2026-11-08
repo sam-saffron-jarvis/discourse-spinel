@@ -1088,6 +1088,40 @@ pub(crate) fn staged_alias_redefinition<'a>(
             && before.ordinal < step.ordinal && step.ordinal < after.ordinal))
 }
 
+/// Reinstalling the same generated primitive accessor changes definition
+/// events, not its executable body. Only a closed module declaration profile
+/// (validated before emit, with no method-object/surface observation) may use
+/// this proof. All events remain; no repeated definition is deduplicated.
+pub(crate) fn staged_identical_accessor(previous: &MethodDef, next: &MethodDef) -> bool {
+    if previous.name != next.name || previous.receiver != next.receiver
+        || previous.enclosing_class != next.enclosing_class
+        || previous.visibility != MethodVisibility::Public || next.visibility != MethodVisibility::Public
+        || previous.body.method_alias_source().is_some() || next.body.method_alias_source().is_some()
+        || previous.block_param.is_some() || next.block_param.is_some()
+        || previous.has_anonymous_block || next.has_anonymous_block
+        || previous.unsupported_formals.is_some() || next.unsupported_formals.is_some() { return false; }
+    let (Some(before), Some(after)) = (previous.body.declaration_step(), next.body.declaration_step()) else { return false };
+    if before.call.is_synthetic() || after.call.is_synthetic() || before.call.file != after.call.file
+        || (before.call.start, before.ordinal) >= (after.call.start, after.ordinal) { return false; }
+    staged_identical_accessor_shape(previous, next)
+}
+
+/// Shape comparison shared with source-declaration provenance validation.
+pub(crate) fn staged_identical_accessor_shape(previous: &MethodDef, next: &MethodDef) -> bool {
+    fn cell(method: &MethodDef) -> Option<&Symbol> {
+        match (&method.kind, &*method.body.node) {
+            (AccessorKind::AttributeReader, ExprNode::Var { name, .. })
+                if method.params.is_empty() && name.as_str().starts_with("@@") => Some(name),
+            (AccessorKind::AttributeWriter, ExprNode::Assign { target: LValue::Var { name, .. }, value })
+                if name.as_str().starts_with("@@") && method.params.len() == 1
+                    && method.params[0].default.is_none() && !method.params[0].keyword && !method.params[0].rest && !method.params[0].forwarding
+                    && matches!(&*value.node, ExprNode::Var { name, .. } if name == &method.params[0].name) => Some(name),
+            _ => None,
+        }
+    }
+    previous.kind == next.kind && cell(previous).is_some() && cell(previous) == cell(next)
+}
+
 // Library classes -------------------------------------------------------
 
 /// A non-model class living under `app/models/`. Surfaced by lowerings
@@ -1212,6 +1246,9 @@ impl LibraryClass {
     /// Synthetic mattr/cattr seeds retain the framework seed policy.
     pub fn is_source_class_initializer(expr: &Expr) -> bool {
         if expr.span.is_synthetic() { return false; }
+        // Positioned declaration statements include real protocol calls and
+        // checks, not only direct source variable assignments.
+        if expr.declaration_step().is_some() { return true; }
         match &*expr.node {
             ExprNode::Assign { target: LValue::Ivar { .. }, .. }
                 | ExprNode::OpAssign { target: LValue::Ivar { .. }, .. } => true,

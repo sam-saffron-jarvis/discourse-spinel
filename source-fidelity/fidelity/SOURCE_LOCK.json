@@ -189,6 +189,1363 @@
     {
       "path": "plugins/discourse-solved/lib/discourse_solved/register_filters.rb",
       "sha256": "7e8b44407967c57ebe44f5e88dbe88324414ff3145cc8ae1655b91ba62dc72a1"
+    },
+    {
+      "path": "plugins/discourse-assign/app/models/assign_mailer_site_settings.rb",
+      "sha256": "bb7a374abe54de1a5b10d454652c64a75b9b5734895f4815ed4bac754569a59f"
+    },
+    {
+      "path": "plugins/discourse-assign/app/models/assignment.rb",
+      "sha256": "9b47f8e5ca077aae3d79e3cc0915ee962427749d8e3118c6b3dcb7ca314fb490"
+    },
+    {
+      "path": "plugins/discourse-assign/app/models/remind_assigns_frequency_site_settings.rb",
+      "sha256": "5e5992bfd5a8dc6b45e26b5ff95517ae784988c59efb24664291dbad9bb6a846"
+    },
+    {
+      "path": "plugins/discourse-assign/lib/discourse_assign/assignee_resolver.rb",
+      "sha256": "7882e9d033b74f5e6b5e413f4c0145c48d707797aa448a65d0c6806d6b39722c"
+    },
+    {
+      "path": "plugins/discourse-assign/lib/discourse_assign/assignment_permissions.rb",
+      "sha256": "4f7a8560f5927314b5738c6e579fd3ae3fb4f2cb5e9fdf621a7534b5a993775d"
+    },
+    {
+      "path": "plugins/discourse-assign/lib/discourse_assign/engine.rb",
+      "sha256": "4e1d8a26f5266092503fd72dac8010bec06832713bb8413177fcfcb8c658f017"
+    },
+    {
+      "path": "plugins/discourse-assign/lib/discourse_assign/group_extension.rb",
+      "sha256": "974119d3c6d8780de8678ecfe2cbbc0ea4def3bd1301e8e764b200644b0ec866"
+    },
+    {
+      "path": "plugins/discourse-assign/lib/discourse_assign/guardian_extensions.rb",
+      "sha256": "14035f907a33a9f231e5d17f45af17802e9352fe3204075f4a12d3ef60818439"
+    },
+    {
+      "path": "plugins/discourse-assign/lib/discourse_assign/list_controller_extension.rb",
+      "sha256": "1506e14741a4458d42c461f235714b82b9231410ebaf7dbf6e8b1c97498c08a9"
+    },
+    {
+      "path": "plugins/discourse-assign/lib/discourse_assign/notification_extension.rb",
+      "sha256": "b4a5a87ef7a771b266d34abefecb44ada7fd731749b7c4ba19c2492a960a34bd"
+    },
+    {
+      "path": "plugins/discourse-assign/lib/discourse_assign/post_extension.rb",
+      "sha256": "79b49875288e0166dbc0fb652713d3156ed763e0b0e9ef5dbd8fbc7d54c2343e"
+    },
+    {
+      "path": "plugins/discourse-assign/lib/discourse_assign/topic_extension.rb",
+      "sha256": "d850266bff33dd7739af51b0f5b60185cc5ff862ffccab3f94d87fbbfeea5171"
+    },
+    {
+      "path": "plugins/discourse-assign/lib/discourse_assign/user_option_extension.rb",
+      "sha256": "24baf300b13efd4ff6170e0fe2fc6acdfe079dd15f326882453424950fe26298"
+    },
+    {
+      "path": "plugins/discourse-assign/lib/discourse_assign/web_hook_extension.rb",
+      "sha256": "278e684021d4e85c4efe03c21c1a3fceeb3f1e8de9cfa1efc18c370ab3ba0e1e"
+    },
+    {
+      "path": "plugins/discourse-assign/lib/discourse_assign/workflows/assignment_trigger.rb",
+      "sha256": "7445967701a2a49e0e5d91cbdd1f21c6112df1d840e9545d3c73ce2dd501b8b2"
+    },
+    {
+      "path": "plugins/discourse-assign/lib/discourse_assign/workflows/schema.rb",
+      "sha256": "74d19fcb74f876fe1261288dda1739be381f46ffe4d84e4aa499f495e84f6cad"
+    },
+    {
+      "path": "plugins/discourse-assign/lib/discourse_workflows/nodes/assign_topic/v1.rb",
+      "sha256": "34d3a63a1d3d969230b6600215de3758b6f0ad875257bff5b3dfeefdf976c337"
+    },
+    {
+      "path": "plugins/discourse-assign/lib/discourse_workflows/nodes/assigned/v1.rb",
+      "sha256": "699a63328f68f4fc224c5ccfde78f0428566faf4b28bcd89f699b44905640f0d"
+    },
+    {
+      "path": "plugins/discourse-assign/lib/discourse_workflows/nodes/assigned/v2.rb",
+      "sha256": "1b0b3c048ca29414122e506958c421ae8e4515696eabd344db6e56557b0fb005"
+    },
+    {
+      "path": "plugins/discourse-assign/lib/discourse_workflows/nodes/check_assignment/v1.rb",
+      "sha256": "6b62ba664af06b39504e2e4c576a5f7d362bf1a02b1ddb926ed347ccbd58b4fb"
+    },
+    {
+      "path": "plugins/discourse-assign/lib/discourse_workflows/nodes/unassigned/v1.rb",
+      "sha256": "30120ae5991770f40f9bc0a5abf9ea8e39fda666182a0a5c0ac8ca8b364e04e7"
+    },
+    {
+      "path": "plugins/discourse-assign/lib/discourse_workflows/nodes/unassigned/v2.rb",
+      "sha256": "629e01b6b6094128eb0fbd5659c4431f04eb2f7df054ccd43f5437897727f431"
+    },
+    {
+      "path": "plugins/discourse-assign/lib/pending_assigns_reminder.rb",
+      "sha256": "43306313f4ad6c269297c9e8f100bb147ecadddfd076873ad733a38129471001"
+    },
+    {
+      "path": "plugins/discourse-assign/lib/validators/assign_statuses_validator.rb",
+      "sha256": "09b6b3fbaa661b0c0ea3a6f50ea3e196352b0a4a12e46554550329930aec9a87"
+    },
+    {
+      "path": "plugins/discourse-events/app/jobs/regular/discourse_post_event_bulk_invite.rb",
+      "sha256": "9c29b4a703d7440573a14d2a428c2e80681016478ecc6be10dc9ea1b923f4941"
+    },
+    {
+      "path": "plugins/discourse-events/app/models/discourse_events/events/event.rb",
+      "sha256": "e20cebd688bd6879f99b6a853aa0599eec5d3ce5a35e24ad9cb96141e79caae6"
+    },
+    {
+      "path": "plugins/discourse-events/app/services/discourse_events/categories/types/events.rb",
+      "sha256": "fca36d2aeaeda460c2acbe7b00865ea464876f1505b752be34d00bfc93c1f157"
+    },
+    {
+      "path": "plugins/discourse-events/jobs/regular/discourse_post_event/bump_topic.rb",
+      "sha256": "8e99836cd39280a0a3ef122321ff5064a3ebf0805760019eb0d8b5d5b329e1f0"
+    },
+    {
+      "path": "plugins/discourse-events/jobs/regular/discourse_post_event/publish_livestream_chat_transcript.rb",
+      "sha256": "e26977df7445cb3719ebbe86dfaf08e4643c6bbaf1bde23437de48103bb52adf"
+    },
+    {
+      "path": "plugins/discourse-events/jobs/regular/discourse_post_event/send_reminder.rb",
+      "sha256": "afc53e88b454885c496ae772655509f52d32a07a16d121ee654f81aa61c4475d"
+    },
+    {
+      "path": "plugins/discourse-events/jobs/regular/discourse_post_event/warm_event_onebox.rb",
+      "sha256": "2c48e691fff130b18fdc68eb04d6f8a98f40cfd4f1197183bff28cb4ac02ffc7"
+    },
+    {
+      "path": "plugins/discourse-events/jobs/regular/discourse_post_event/warm_livestream_onebox.rb",
+      "sha256": "23e5aabf5135154cc87ff95b04b0f233c034f03299b7adbdde49de05bab9bbbd"
+    },
+    {
+      "path": "plugins/discourse-events/jobs/regular/discourse_post_event/warm_recording_onebox.rb",
+      "sha256": "b9d880ed8410c4e70ecb06cbf8eb3d0e72448f73ab4f6abc32dc0fd787bfc262"
+    },
+    {
+      "path": "plugins/discourse-events/jobs/scheduled/create_holiday_events.rb",
+      "sha256": "05c7da0120a570c2e175e6e9cdaa726a587b4286c995d2a03259344c9d45bbcc"
+    },
+    {
+      "path": "plugins/discourse-events/jobs/scheduled/delete_expired_event_posts.rb",
+      "sha256": "baccc567679e0259be1d5f82a4492fd7b3d28881e1ae42e0a38b29a43ae44079"
+    },
+    {
+      "path": "plugins/discourse-events/jobs/scheduled/monitor_event_dates.rb",
+      "sha256": "ca5ec7c209abcbaea221265d824c4f3e292cd1d66630809172539216c536dad7"
+    },
+    {
+      "path": "plugins/discourse-events/jobs/scheduled/update_holiday_usernames.rb",
+      "sha256": "da077ce0fead6eea01effe875eaf748ba5f5998035df332e9b5d0466ff40b4dc"
+    },
+    {
+      "path": "plugins/discourse-events/lib/discourse_events/configuration/event_custom_fields_validator.rb",
+      "sha256": "e642304168c6901082db41a7b6be6cd02bb0517429548f98f61a678db8d3ae41"
+    },
+    {
+      "path": "plugins/discourse-events/lib/discourse_events/configuration/first_day_of_week.rb",
+      "sha256": "eb59a47e109f48c80b1cdeb3f5a54963d0aef187dca09788a42397220739baf7"
+    },
+    {
+      "path": "plugins/discourse-events/lib/discourse_events/configuration/map_event_tag_colors_json_schema.rb",
+      "sha256": "07da3e36e36544e237bc506666d8289f90259d4d7540b2cd94c477678b011404"
+    },
+    {
+      "path": "plugins/discourse-events/lib/discourse_events/configuration/map_events_title_json_schema.rb",
+      "sha256": "1c7d712a866aea1777050b26f4f2c0a9fad9ad7a3e9b9397d8b7465699f63d1d"
+    },
+    {
+      "path": "plugins/discourse-events/lib/discourse_events/configuration/time_of_day_validator.rb",
+      "sha256": "e960017624299c9fafdb5c53d6851916be9b4e739a3cbd610b4b5454827f23e4"
+    },
+    {
+      "path": "plugins/discourse-events/lib/discourse_events/configuration/upcoming_events_default_view.rb",
+      "sha256": "7490a4580c3d02e623d6fd42f809e6fcbb80c8937163d253e91333a17fd483a7"
+    },
+    {
+      "path": "plugins/discourse-events/lib/discourse_events/engine.rb",
+      "sha256": "1999ab5a75be658588c375cf5b9b6fa94e645630e9611ca7a74ab91cb5debd17"
+    },
+    {
+      "path": "plugins/discourse-events/lib/discourse_events/events/chat_channel_sync.rb",
+      "sha256": "37ebcb9cac94fa308d8e5c1737f3c17b5db41481337134735fc85e3e1bffcdf7"
+    },
+    {
+      "path": "plugins/discourse-events/lib/discourse_events/events/email_renderer.rb",
+      "sha256": "c9a9ea04eed87658e28ec4c5d1cdea2dd7d582194905e7ab4bb865271d93560c"
+    },
+    {
+      "path": "plugins/discourse-events/lib/discourse_events/events/excerpt.rb",
+      "sha256": "ad9624f159c101f834659455a956686be833b788d9adefc916f6f34a14913201"
+    },
+    {
+      "path": "plugins/discourse-events/lib/discourse_events/events/export_csv_controller_extension.rb",
+      "sha256": "2431526360403caceda5f47a4e71f1d28b7e73dd264c8c47fea2ee85d7cc7026"
+    },
+    {
+      "path": "plugins/discourse-events/lib/discourse_events/events/export_csv_report_extension.rb",
+      "sha256": "7cbe129815700b579eb83feb0191547b91faf969b48dff3a3ffc6b6e1e55a47c"
+    },
+    {
+      "path": "plugins/discourse-events/lib/discourse_events/events/finder.rb",
+      "sha256": "cd50857ac8ff4eb40d16cd9b470c186676120c7e5e7e3d353f194a00823a9c95"
+    },
+    {
+      "path": "plugins/discourse-events/lib/discourse_events/events/guardian_extensions.rb",
+      "sha256": "b27925ad33c8a5068fbc021529812d22ac1dea621394dc9511d811247cd0b3fd"
+    },
+    {
+      "path": "plugins/discourse-events/lib/discourse_events/events/onebox_data.rb",
+      "sha256": "e49105a791f340e0b69a674f7b3bc87ca27acd02ff1ce0b7d4d8ea83be3645e0"
+    },
+    {
+      "path": "plugins/discourse-events/lib/discourse_events/events/onebox_occurrence.rb",
+      "sha256": "801bd1d0b34c5fd32a3d892747a3ead7a9e5aadaa70aa83ef531358cba1d4a49"
+    },
+    {
+      "path": "plugins/discourse-events/lib/discourse_events/events/parser.rb",
+      "sha256": "af4d8d88a7ff363a4aa73bedafb9d883bb9927bc6b2fee8b35306c719085b666"
+    },
+    {
+      "path": "plugins/discourse-events/lib/discourse_events/events/post_extension.rb",
+      "sha256": "d8f3f1299604d43621a97eb1c77bc70e46075379aab147890a2eab5f45021a16"
+    },
+    {
+      "path": "plugins/discourse-events/lib/discourse_events/events/rrule_configurator.rb",
+      "sha256": "b532a010017a6c2c9291d4b93d709a8571b0d208584e0d6667a9cb4c3da467fc"
+    },
+    {
+      "path": "plugins/discourse-events/lib/discourse_events/events/rrule_generator.rb",
+      "sha256": "0e16592411340b29646026d102ee858b5e64ac9e23ded4109741a9a0edd8372e"
+    },
+    {
+      "path": "plugins/discourse-events/lib/discourse_events/events/topic_extension.rb",
+      "sha256": "7fecc4415e1502f1e7f29f25374276d91880f81bb0105b2130100a0003bfe4ca"
+    },
+    {
+      "path": "plugins/discourse-events/lib/discourse_events/events/topics_filter.rb",
+      "sha256": "2bbfac643a9a110e4c7eec3c8efb8fa932e6e2310a80d2773fe2aebff0f83cfb"
+    },
+    {
+      "path": "plugins/discourse-events/lib/discourse_events/events/validator.rb",
+      "sha256": "77ecbd85c0d39d9e2f6c10fccc327582c78f7a6e061cfeeb44fad98b26f7fd65"
+    },
+    {
+      "path": "plugins/discourse-events/lib/discourse_events/events/web_hook_extension.rb",
+      "sha256": "d326be879d17eca808deea91eadd4dcddbea9ffc874a8a470fc3e364aca3d667"
+    },
+    {
+      "path": "plugins/discourse-events/lib/discourse_events/livestream/allowed_hosts.rb",
+      "sha256": "47b311e20b5a905956d8a0f8023a0d4ee2c08bbc18b1d17fdba5bd978686c729"
+    },
+    {
+      "path": "plugins/discourse-events/lib/discourse_events/livestream/allowed_hosts_validator.rb",
+      "sha256": "99205abddadb0c0ad2db80537e38009f3391bf470fdf90251d1f9ac992fc8e6b"
+    },
+    {
+      "path": "plugins/discourse-events/lib/discourse_events/livestream/chat_channel_extension.rb",
+      "sha256": "a5e2e3eda9814a94ca45c082b0cf5d0a33f56af8173825a5ff1415eebbb251a2"
+    },
+    {
+      "path": "plugins/discourse-events/lib/discourse_events/livestream/topic_extension.rb",
+      "sha256": "9b292593cd68bb0ff072f120d2d27679385de76b407f53e4eea99c7bd53a4641"
+    },
+    {
+      "path": "plugins/discourse-events/lib/discourse_events/livestream/zoom_url_parser.rb",
+      "sha256": "a46f68fc3afc7442734f41868340337510f2383183b60d31532ac5912a114234"
+    },
+    {
+      "path": "plugins/discourse-events/lib/discourse_events/mcp_tools.rb",
+      "sha256": "2d3161544d2d040b44dc493af99f82f565ee8580a175d9e25fbdd2b6c6d3609d"
+    },
+    {
+      "path": "plugins/discourse-events/lib/discourse_events/user_option_extension.rb",
+      "sha256": "aa6156bc6837033bb9b5ff7a22a43fcef583ca4a5c9d90dff71efdbd36255aa6"
+    },
+    {
+      "path": "plugins/discourse-events/lib/discourse_workflows/nodes/event_ended/v1.rb",
+      "sha256": "6f218c752e0102d6d1aaa559daa96c4d120bdfc04be5d14f395b8c21fbac825a"
+    },
+    {
+      "path": "plugins/discourse-events/lib/discourse_workflows/nodes/event_participation_changed/v1.rb",
+      "sha256": "bd4295e83ee168045306eb68a44237e316e361672ffe308643cccaf8dd419311"
+    },
+    {
+      "path": "plugins/discourse-events/lib/discourse_workflows/nodes/post_event_schema.rb",
+      "sha256": "515e773c2eff9ea26e89a84ab0916438d7c810c2417d627da91634593b1b3715"
+    },
+    {
+      "path": "plugins/discourse-events/lib/discourse_workflows/nodes/post_event_scoping.rb",
+      "sha256": "9b44c49ad8d614c5e0c71940054fdc0bd5de201f763ce3ee3db0cda9e3336be7"
+    },
+    {
+      "path": "plugins/discourse-solved/app/serializers/concerns/discourse_solved/topic_answer_mixin.rb",
+      "sha256": "d2cc45fbda40c5b34ee37929559f63033c2c29e834bb85a194c25c98265ae305"
+    },
+    {
+      "path": "plugins/discourse-solved/app/services/discourse_solved/categories/types/support.rb",
+      "sha256": "49f2006c15c06356cc69f0e590f4a8042289f79e28090c6efee3b30659a8287b"
+    },
+    {
+      "path": "plugins/discourse-solved/lib/discourse_automation/entry_point.rb",
+      "sha256": "3141e76e8350d93071070ec55ee7de4ad041877e953b1dc4a9c65259ee9329b0"
+    },
+    {
+      "path": "plugins/discourse-solved/lib/discourse_dev/discourse_solved.rb",
+      "sha256": "f83b1faa6ad295e44e8c9ee5c214da317645848fc88a84ddccfc723e8912de6b"
+    },
+    {
+      "path": "plugins/discourse-solved/lib/discourse_solved/admin_dashboard_support_categories_setting.rb",
+      "sha256": "59393cfdaf00b32c9b146fdd032f4245ace34a08256ad73587a2bb72087a3147"
+    },
+    {
+      "path": "plugins/discourse-solved/lib/discourse_solved/category_extension.rb",
+      "sha256": "641073c64896eab5732f4a1e00220aaaaa2d77a9a3520f9d5f114d18dc733ae3"
+    },
+    {
+      "path": "plugins/discourse-solved/lib/discourse_solved/engine.rb",
+      "sha256": "ea7a47be1b47be3d488bd9824933a36c4e5c67e456ac89b185cc52967e5ab9b1"
+    },
+    {
+      "path": "plugins/discourse-solved/lib/discourse_solved/guardian_extensions.rb",
+      "sha256": "2be552aeb8a90269d9d3935f4cdedb86db7a8708b2b22c17b5f8be431fd2d1f7"
+    },
+    {
+      "path": "plugins/discourse-solved/lib/discourse_solved/mcp_tools.rb",
+      "sha256": "5ee8b6b4ff6e40dfb65da3395a18208a68b047a5faff98da303b1354b1d8b9d2"
+    },
+    {
+      "path": "plugins/discourse-solved/lib/discourse_solved/post_mover_extension.rb",
+      "sha256": "e61bdcaf7f9f0a463634533b2d32af83632318b063725875707dea5672f83da7"
+    },
+    {
+      "path": "plugins/discourse-solved/lib/discourse_solved/post_serializer_extension.rb",
+      "sha256": "194750d98d0adc5be9ed6228d3559bdf4c59f6352a7121e68b599a98dd99ffda"
+    },
+    {
+      "path": "plugins/discourse-solved/lib/discourse_solved/topic_extension.rb",
+      "sha256": "48842b04ba748482f6b33841112772f9298946411298a834a39bd625fc41a73b"
+    },
+    {
+      "path": "plugins/discourse-solved/lib/discourse_solved/topic_posters_summary_extension.rb",
+      "sha256": "88d85f834e0b2017f62d2c32d0f70e72c05205dbb95b5f5e024c3f29a07ee6f0"
+    },
+    {
+      "path": "plugins/discourse-solved/lib/discourse_solved/topic_view_serializer_extension.rb",
+      "sha256": "cf9081a393d47abdb4fc9ddcadec0321739f378f1211d08ea8e0b5b4abfa288c"
+    },
+    {
+      "path": "plugins/discourse-solved/lib/discourse_solved/user_extension.rb",
+      "sha256": "e58d3d5c5fab25270771e259d0f660b3057718d89930b1ac917d0000b4f680f6"
+    },
+    {
+      "path": "plugins/discourse-solved/lib/discourse_solved/user_summary_extension.rb",
+      "sha256": "ac994a2b556498a130bbb63cd6cc1b989548099b6d92726ad6f81b14e156ae5a"
+    },
+    {
+      "path": "plugins/discourse-solved/lib/discourse_solved/web_hook_extension.rb",
+      "sha256": "3dfd061bd396533730e64c2717c5d5ba3e2076bec3521edd0fb9614b218536b4"
+    },
+    {
+      "path": "plugins/discourse-solved/lib/discourse_workflows/nodes/solution_changed/v1.rb",
+      "sha256": "6f03f95488fba605d07a4b1c67b8c5ef69e8a3e80a5501ca60c76845b13f60b8"
+    },
+    {
+      "path": "plugins/discourse-assign/config/settings.yml",
+      "sha256": "a4510eb20e665213e903e0224ec83b6f25c08ac06c5793e5b460b251192c7ff9"
+    },
+    {
+      "path": "plugins/discourse-events/config/settings.yml",
+      "sha256": "c05be464c3a453c433e7912ba33e1318da2b3550459078f88413e4ca600800cc"
+    },
+    {
+      "path": "plugins/discourse-solved/config/settings.yml",
+      "sha256": "3cb0eb5ffffeb44455b5c59d0596e66899999dc7b139026cc6beb4357b8535e2"
+    },
+    {
+      "path": "lib/vendored_assets.rb",
+      "sha256": "c19af1381a47ea6a4f5108ff55f404cf46f3a954406448666d0c9ad5b87d6642"
+    },
+    {
+      "path": "app/controllers/application_controller.rb",
+      "sha256": "793f89f85258089376c4e09da54030919afa29fc7b2cb3fad0109a3637ae012f"
+    },
+    {
+      "path": "app/controllers/list_controller.rb",
+      "sha256": "dbced8e36813d9d6221cb6316b48e1e3eb4ad70ecdec58f319f9569ba5f9edc0"
+    },
+    {
+      "path": "app/helpers/application_helper.rb",
+      "sha256": "657c2c838b498ba38ed7bb5d4a7f31c73ee5ee2bf98f629c192a1897ca862034"
+    },
+    {
+      "path": "app/models/color_scheme.rb",
+      "sha256": "8b056000b62c817a6884c5fd863f70862fe4630718e4d4d3460cf3ef19c186aa"
+    },
+    {
+      "path": "app/models/concerns/has_cooked_tag_description.rb",
+      "sha256": "7ccee4f1bda30e30250d8cb996023251df4a289be5db91a2b339ddbdfdf0f525"
+    },
+    {
+      "path": "app/models/concerns/has_custom_fields.rb",
+      "sha256": "f8971a2d398a3f079a0a1c3418035381c35ffe4ec5982cf5f36de176bbee0347"
+    },
+    {
+      "path": "app/models/concerns/has_destroyed_web_hook.rb",
+      "sha256": "0b77e50d0dd24691243e7f42a233463f83edf79c9df643edee144bfe70ec2600"
+    },
+    {
+      "path": "app/models/concerns/has_nested_reply_stats.rb",
+      "sha256": "3d3661d4d7c08ea62e9773f473b8e2f943fe1e7ac655eec30e4fd192d56f740d"
+    },
+    {
+      "path": "app/models/concerns/localizable.rb",
+      "sha256": "c999f97ce255bb902ccbb032a598e37e6fece3b6a96144d99bb64651d3da0314"
+    },
+    {
+      "path": "app/models/concerns/searchable.rb",
+      "sha256": "e251f8fcceedccbaaea227c3782e48aaee87b4ff2c46bdfae541ad4dfb46f827"
+    },
+    {
+      "path": "app/models/emoji.rb",
+      "sha256": "2b6e655755e8791642a56689448b8645213253fd039226f2882cc5463eddcc71"
+    },
+    {
+      "path": "app/models/locale_site_setting.rb",
+      "sha256": "ac2b5f9b96056e1232f55a504f248429271eab39feaf2066062a36d01aabbcc7"
+    },
+    {
+      "path": "app/models/post.rb",
+      "sha256": "83ddbfe431d831eb6e05b00d87a3ebed1be91560544d17159c8835119db9912f"
+    },
+    {
+      "path": "app/models/tag.rb",
+      "sha256": "7a9fbea8e5c4fd398ce88b77069a8b98321964d44f367669976f57b462f23871"
+    },
+    {
+      "path": "app/models/tag_group_permission.rb",
+      "sha256": "317588ad512e33f5d8776b2fd606e60b8bcce6ae9d641be15b6d0a986ba4b831"
+    },
+    {
+      "path": "app/models/theme_field.rb",
+      "sha256": "e5b6eec0a5f8394d31668575c75e584b3d196221899e77891abb34fbe477e9b9"
+    },
+    {
+      "path": "app/models/theme_modifier_set.rb",
+      "sha256": "b04fb4f49b36945703d0fc83c08418bf1069f712a16a7084d444eb84fd5ff955"
+    },
+    {
+      "path": "app/models/top_menu_item.rb",
+      "sha256": "f6a9b57fce5de03add139593c6a217ca88f358b87eb8dd44dbe5d461b2d5c83b"
+    },
+    {
+      "path": "app/models/top_topic.rb",
+      "sha256": "e4cf822014910da4f23497f5d737af7338734b84e5ca15332f5b40487d7667b4"
+    },
+    {
+      "path": "app/models/topic_featured_users.rb",
+      "sha256": "59f26619198c8775cc8a8511b79ef0ff300eb4046628c859f7b74abae40c3956"
+    },
+    {
+      "path": "app/models/topic_participant_groups_summary.rb",
+      "sha256": "21bb4335d488df2a8690205ab139d0dcb39e8bae5a3d381dc21549cec6fe7757"
+    },
+    {
+      "path": "app/models/topic_participants_summary.rb",
+      "sha256": "9b9f4124ac82e94554f281f267df4537e5a67020c8bd67a43ecc7cfc0e0a4f5b"
+    },
+    {
+      "path": "app/models/topic_poster.rb",
+      "sha256": "c1d027245196c80f03fa36b4ce79bdbc2167826e1d50ee085174eafa304fec20"
+    },
+    {
+      "path": "app/models/topic_posters_summary.rb",
+      "sha256": "51a36d26c9a920b23979da1b200386d45fb506db375c93431d16c68da36ef152"
+    },
+    {
+      "path": "app/models/user_avatar.rb",
+      "sha256": "c6752e54850417b1e0dea38096eacda8df4c88b057e78cfa936abc4198575d76"
+    },
+    {
+      "path": "app/serializers/basic_user_serializer.rb",
+      "sha256": "e22b92f6de231ac3bd26ece1a3741cf002438e47554ebaa21757feda5b4ea3db"
+    },
+    {
+      "path": "app/serializers/concerns/localized_fancy_topic_title_mixin.rb",
+      "sha256": "8898a57e137bb4bf0622e6380161308d3d86ad7648cfaab01d25bfa3a9f643e5"
+    },
+    {
+      "path": "app/serializers/concerns/topic_tags_mixin.rb",
+      "sha256": "61990a216da86ad452a812f00eeb5bedecafef8255185d3abc4a6fbefeb07aa1"
+    },
+    {
+      "path": "app/serializers/concerns/user_flair_mixin.rb",
+      "sha256": "45044ae147145079456dfafb5902175174c952e0c70ef8f826c6658800604bdd"
+    },
+    {
+      "path": "app/serializers/concerns/user_primary_group_mixin.rb",
+      "sha256": "21d43084e6935559dbc57d6940027e6f1380ecda308cd93441ad174b444369fa"
+    },
+    {
+      "path": "app/serializers/concerns/user_status_mixin.rb",
+      "sha256": "bfdafeef213543c729a2c776cd80d792171506702066ca2a1ade272bae4e058d"
+    },
+    {
+      "path": "app/serializers/listable_topic_serializer.rb",
+      "sha256": "7768ea13a61e33f4164725b1ae717378a88dd1ddc10667a44eef260dfc47d66b"
+    },
+    {
+      "path": "app/serializers/topic_list_item_serializer.rb",
+      "sha256": "33a5cbc233e0f4c4b0457f7d99f288f12dd7a97719f457ea5a90623eb4795812"
+    },
+    {
+      "path": "app/serializers/topic_list_serializer.rb",
+      "sha256": "c3d062421d91095c0f378de047693de500192ca3dc4b3f94a4f8b6a764f4cbc4"
+    },
+    {
+      "path": "app/views/default/build_error.html.erb",
+      "sha256": "538696876f23e81dfb2ead3cc77a209c74ba223ea98220be89616129e5e741cf"
+    },
+    {
+      "path": "app/views/layouts/_head.html.erb",
+      "sha256": "8812af48e3a826a5b1e78a0aaf5e971990e2f783dfff184cdc4af3e27b619792"
+    },
+    {
+      "path": "app/views/layouts/_plugin_js.html.erb",
+      "sha256": "9938d4cf156c13ef6c94b8b39846c5bfd368b4f2d4ba9d08e44c36049ead5afb"
+    },
+    {
+      "path": "app/views/layouts/application.html.erb",
+      "sha256": "c9c62986b9c9f70ef776d6ba89a9b6a243b275a67df39ef62e2a959d599743d4"
+    },
+    {
+      "path": "app/views/list/list.erb",
+      "sha256": "6c09ddf9e3e16503a18d567d8d108184c486d269f11c86300ba6ba7892853201"
+    },
+    {
+      "path": "config/initializers/000-pg_connection_patch.rb",
+      "sha256": "14310137b6291aa547dfb7299971636b9d037f3ec365c46e136945492ee77c5b"
+    },
+    {
+      "path": "config/initializers/000-zeitwerk.rb",
+      "sha256": "d1f84a77c04d2d6513368e3f61b15b70b7502dccf9b9dcc7bf5285d5e33de6ce"
+    },
+    {
+      "path": "config/initializers/004-message_bus.rb",
+      "sha256": "477b0059d8addce2b37d13a28416a56be67f6f38046495548e5837228aeae2e9"
+    },
+    {
+      "path": "config/initializers/006-mini_profiler.rb",
+      "sha256": "4da8002bf0ed0855a8a6c2e03fc142db2c0eae7ed6adb79943eb5060d030e1d2"
+    },
+    {
+      "path": "config/initializers/008-rack-cors.rb",
+      "sha256": "a3658ce493733d64f4867cd09a1e1073cc498a046d771775f2438e566ec0d58f"
+    },
+    {
+      "path": "config/initializers/100-logster.rb",
+      "sha256": "7b3797baef07077b46f213abeacfb7a083affcc42f83ccc6b806a724ba729679"
+    },
+    {
+      "path": "config/initializers/100-quiet_logger.rb",
+      "sha256": "e50f040bb58306660561292e4fc707c304b58e367080b26a9da14011ecea5d7b"
+    },
+    {
+      "path": "config/initializers/100-silence_logger.rb",
+      "sha256": "fc44b4386dc375c9fb7ce60280a24c6bff8f0f3a4f24069df09089a72bce36e7"
+    },
+    {
+      "path": "config/routes.rb",
+      "sha256": "66ce2ecb978c2e5b8d084f242878ca9233761a25d984527d4f36ec6d5fa889c6"
+    },
+    {
+      "path": "lib/action_dispatch/session/discourse_cookie_store.rb",
+      "sha256": "8fccd243bedacddeda8d12950afcb3a44e40fb2fb98b10c075e969a95d084dad"
+    },
+    {
+      "path": "lib/admin_constraint.rb",
+      "sha256": "c10dbbc0f695dff70d00aafc45c7297da5354d12e7fa78a4e749cc7d146ddf53"
+    },
+    {
+      "path": "lib/application_layout_preloader.rb",
+      "sha256": "d1527e34b8ed09cbbe2b1e9fc5f2f472bf58d26e4036ff8611e531099c86335d"
+    },
+    {
+      "path": "lib/archived_site_mixin.rb",
+      "sha256": "dde4b70db26e396728d1741c04266f68c3762212eaa22a330e3c6e208ff8c67e"
+    },
+    {
+      "path": "lib/asset_processor.rb",
+      "sha256": "e1aad4ca7f55f9d91e83c93f32518dc8a73bde6af8cb1509b09dd25bd3d2b3e0"
+    },
+    {
+      "path": "lib/auth/default_current_user_provider.rb",
+      "sha256": "6a698b688a91aa2d02d204b16faf96fd9853f9c649bf0367cd485fbf2061b98e"
+    },
+    {
+      "path": "lib/canonical_url.rb",
+      "sha256": "8a6706347a468986476827f04fbc5d1e26dad7c0fa43d9d1cca08f338ac9f82c"
+    },
+    {
+      "path": "lib/content_localization.rb",
+      "sha256": "5103b856cb6b384bd53b3c75966eeeec928c38f72c122bd74a9aec6d3fdc08e1"
+    },
+    {
+      "path": "lib/content_security_policy.rb",
+      "sha256": "c74b5cb31482c96ac813059d812a50616764365be06a05fb85091a055890b635"
+    },
+    {
+      "path": "lib/content_security_policy/builder.rb",
+      "sha256": "db43ae4c1c1ae793ed8e4de53532c2c4cc62119fe0867bd3ff15ec7fa652b62f"
+    },
+    {
+      "path": "lib/content_security_policy/default.rb",
+      "sha256": "55609df6c201c35fb6b91d766c84b8099505061271b1bd027243d21a754bb268"
+    },
+    {
+      "path": "lib/content_security_policy/extension.rb",
+      "sha256": "02aada991a17572ef95ffd31d411c9d2defbd5e86afb8658b2bed691e0954229"
+    },
+    {
+      "path": "lib/content_security_policy/middleware.rb",
+      "sha256": "4deaeba117e52c4b362462383a1ac4937886d28bfaf39dbdb17e0dc3dd149c6a"
+    },
+    {
+      "path": "lib/crawler_detection.rb",
+      "sha256": "6de07eb4720e031c5835182a340e009120c884aba1b07d63399f8b25e51324c0"
+    },
+    {
+      "path": "lib/current_user.rb",
+      "sha256": "93c780941ae8f92387608c04ffadc929f6f1e1cfd8a026e44d0d67afa00e04de"
+    },
+    {
+      "path": "lib/dev_log_formatter.rb",
+      "sha256": "d15f00a3895f832c8aba6db20535d7293da35aae35266898694705d1e61ea930"
+    },
+    {
+      "path": "lib/discourse_tagging.rb",
+      "sha256": "2a5a833231d1817ff1b3ab14186d6c9429398bc1d775130016f90c2caafa31fc"
+    },
+    {
+      "path": "lib/distributed_cache.rb",
+      "sha256": "49c62ea506bd606dc494ec5618873e99b89519557e680f919aa4fba6560d6879"
+    },
+    {
+      "path": "lib/ember_assets.rb",
+      "sha256": "6435e5c5a84f109c3355c733ebf6bafa54ab3d349f107d7ba82d959d3bf6d741"
+    },
+    {
+      "path": "lib/file_store/local_store.rb",
+      "sha256": "6a66137dd1564f63a49677f2a8ba71178afac50efb7acba4c5980e0efa451018"
+    },
+    {
+      "path": "lib/final_destination/connector.rb",
+      "sha256": "13b1bfe151cfa6a278bdf47cb9e0d68366d28c79ef72fa97da8b07d890a190d8"
+    },
+    {
+      "path": "lib/freedom_patches/active_record_attribute_methods.rb",
+      "sha256": "f639557c64c4aea29ae48f185d23ceb66b2f902d3bb91416f9f094fd59308370"
+    },
+    {
+      "path": "lib/freedom_patches/ams_include_without_root.rb",
+      "sha256": "ec170969a7cd62ef4c2a0666fb6bbd22cfb545f8c2c29381b14c2d2365c4db69"
+    },
+    {
+      "path": "lib/freedom_patches/erb_util.rb",
+      "sha256": "3614713fcc5773f0c0c816498eeacc135a1556b4ede90f2358c38d2ca2cfb1f0"
+    },
+    {
+      "path": "lib/freedom_patches/final_destination_connect.rb",
+      "sha256": "a93586fd8bb43e83ec8c553be93cf4057c714556709293077d5236b743865676"
+    },
+    {
+      "path": "lib/freedom_patches/inflector_backport.rb",
+      "sha256": "50c8068bfd8d6ef4f36694fb3531c7c649867ccc6d88da033128bd8af5d221e2"
+    },
+    {
+      "path": "lib/freedom_patches/safe_buffer.rb",
+      "sha256": "7e560562f3592c7cb68a475905a4888a5d6b473206d478b5f879b321d83730ad"
+    },
+    {
+      "path": "lib/freedom_patches/translate_accelerator.rb",
+      "sha256": "fd96706f4ff1c6d3e06c3432445c3bd1de273f508e6a406907d9f9fa5c1783e8"
+    },
+    {
+      "path": "lib/group_lookup.rb",
+      "sha256": "fa5acf927ea5164747e7171560865a29509d421ddb6c43c06062baae1362eea6"
+    },
+    {
+      "path": "lib/homepage_constraint.rb",
+      "sha256": "120a6d2ca967604fc729b625d938615e0419ed4eb0cdfd547291f2efe92fcb67"
+    },
+    {
+      "path": "lib/homepage_helper.rb",
+      "sha256": "f1edc0948b2f32943a1414855a3e136d4f2cd53521445f1425c949bf07553a75"
+    },
+    {
+      "path": "lib/http_language_parser.rb",
+      "sha256": "2a6220a9affe8600cecc8b83dcc00b14bf16f2325ac31ac1cd52a5a2adfc0aed"
+    },
+    {
+      "path": "lib/i18n/backend/discourse_i18n.rb",
+      "sha256": "ec957af8c52e988109302a341fa163987355b0ca8d697734345d19f7a975f6fd"
+    },
+    {
+      "path": "lib/i18n/backend/fallback_locale_list.rb",
+      "sha256": "e9fb2d91e95676f299790abc9138a81e1d02e91825af875b0b047d9c8a2433d8"
+    },
+    {
+      "path": "lib/markdown_endpoint/accept_header.rb",
+      "sha256": "5ba952bd227f3d581bf3324c0e7c38bd278df47995d240bf8d1d5257bf05380e"
+    },
+    {
+      "path": "lib/markdown_endpoint/controller_support.rb",
+      "sha256": "fb062ada8d830ce2972ff1697ed7a3ca1114c59bc1ba1ea22037c8a2defeedce"
+    },
+    {
+      "path": "lib/markdown_endpoint/request_constraint.rb",
+      "sha256": "3321a6a72d7f9922b06171c8758d88bb0c554f7ada56d263dd6cddeecc9a2634"
+    },
+    {
+      "path": "lib/markdown_endpoint/vary_middleware.rb",
+      "sha256": "3103c9d187d5fa560da97ea4b392c1e94b8ed929ce3c7bb894074c18c0600ae9"
+    },
+    {
+      "path": "lib/middleware/anonymous_cache.rb",
+      "sha256": "78ab777f46d81d26515004972943ada9c91a0b785b1430bd4a916feae59ae539"
+    },
+    {
+      "path": "lib/middleware/crawler_hooks.rb",
+      "sha256": "e4a72324fb869343ba520c308e81ce68ecde445a7957ceba73161c2a5efa86a7"
+    },
+    {
+      "path": "lib/middleware/csp_script_nonce_injector.rb",
+      "sha256": "e90d39dbca90cb9398a9e9346f17925cc7b38d986de9a531e5460662bac50409"
+    },
+    {
+      "path": "lib/middleware/default_headers.rb",
+      "sha256": "1ee14a5a33a40376b8f22be96633a21bf0addae86c98484bf2252a314825b5d4"
+    },
+    {
+      "path": "lib/middleware/missing_avatars.rb",
+      "sha256": "709ddd595851a13e15cb735bc46516ac36f76c44f1220eb0252259a67f5ff169"
+    },
+    {
+      "path": "lib/middleware/omniauth_bypass_middleware.rb",
+      "sha256": "0648b2776aef085563925211cf57962d98e2b90feb81244e89ec40abfb6107c5"
+    },
+    {
+      "path": "lib/middleware/overload_protections.rb",
+      "sha256": "ff648f739f9797a0731383a5158e318d2a350125669eba7fe26cd58ffd10d620"
+    },
+    {
+      "path": "lib/middleware/processing_request.rb",
+      "sha256": "541129bbdddc0017c89ea2e94d699787bc17e83de19bdd16955927441e1134db"
+    },
+    {
+      "path": "lib/middleware/track_view_session_id_injector.rb",
+      "sha256": "afb9af3785f6e6092674d31b1f08d48acc4336372c2e42c2c66004b686eaab4b"
+    },
+    {
+      "path": "lib/mini_sql_multisite_connection.rb",
+      "sha256": "a34dc0a6e5db5ce244c325dce157241dc27d6c770969d3630a7562b0064c79f3"
+    },
+    {
+      "path": "lib/mobile_detection.rb",
+      "sha256": "3fe460ff9f600326e2d704540afbc404786bf3bf93441d8edefdc74456e3baa9"
+    },
+    {
+      "path": "lib/pinned_check.rb",
+      "sha256": "e8fb1c0e3e37a792fa0d1aa9b082a7f08766b3b69bb16de28731c1b44e8906c7"
+    },
+    {
+      "path": "lib/precompiled_bundle.rb",
+      "sha256": "03d6855aa83043bbc96cabee3fbc2a58345a025791a86c6e9804085569796b7b"
+    },
+    {
+      "path": "lib/rate_limiter/on_create_record.rb",
+      "sha256": "a60b3b46dbde1e25827b1f52eb089271c28f6e5ae189b3bb75ba1d8ee174b48f"
+    },
+    {
+      "path": "lib/read_only_mixin.rb",
+      "sha256": "403e40baa6b2e61242c0874fbeacd67f0932d2a4c3c5f6c7d5138683ec8a1f0c"
+    },
+    {
+      "path": "lib/route_format.rb",
+      "sha256": "0a733259ebbc59c3b9877f13b8a2970d29bbd29569ec82ebc4425eb001449c35"
+    },
+    {
+      "path": "lib/route_matcher.rb",
+      "sha256": "ee2e41a2ec3db033a235275f9df9c2eca9593d40e40dce7cb77ad1cc133551e8"
+    },
+    {
+      "path": "lib/scheduler/defer.rb",
+      "sha256": "01e88b7c6ceb02d2ec7cc72aa74f8bbfa84af924fabcf3fb40dd4602ae9a6f22"
+    },
+    {
+      "path": "lib/site_icon_manager.rb",
+      "sha256": "ba17ad2583f3566cdfc6e9cf736d76e2541147d0e4748a6ec32c06ebbab2593c"
+    },
+    {
+      "path": "lib/theme_modifier_helper.rb",
+      "sha256": "0f949a8476e38435fa2c0e91a906714fd6769ff122573e204d84261b8aa3d713"
+    },
+    {
+      "path": "lib/theme_resolver.rb",
+      "sha256": "4e70b3cfa8a25ab5fe63a1d9382644cd4fd83b74be5cb44eec57fbf5f6b79e0c"
+    },
+    {
+      "path": "lib/topic_list_responder.rb",
+      "sha256": "aa029946c01a1cd803504af21e9960f2d259482f67656b4a6d151da3e985704b"
+    },
+    {
+      "path": "lib/topic_query_params.rb",
+      "sha256": "930fdf22110573de49155ffcc53f944d7615edb4cc4b8165702e6e8f0cc2ebdd"
+    },
+    {
+      "path": "lib/topic_subtype.rb",
+      "sha256": "555cb5a20243f3f20ca9dc6132a51bde5911456b71923701d7afebcff6e41f1c"
+    },
+    {
+      "path": "lib/trust_level.rb",
+      "sha256": "b2cae9d0a789fed04c50eea7b68669056b248d92d6a5e4a7230722054fdca657"
+    },
+    {
+      "path": "lib/url_helper.rb",
+      "sha256": "56c7128ade9b1bc796f542f75738c8f78fb305f0745c8c74df781b935c8d40fe"
+    },
+    {
+      "path": "lib/user_lookup.rb",
+      "sha256": "1d0c9648d7b48a05576e7114d315c903417173e25e1e96bea35e22a26dd5db19"
+    },
+    {
+      "path": "lib/vary_header.rb",
+      "sha256": "304d143208d9629c9a5e5ed2aed4314a52ad8979ea0f11c48389494edde41e54"
+    },
+    {
+      "path": "lib/work_queue.rb",
+      "sha256": "82814fcf8b98f43a9e972422f7a5ccd03ab31e83602771531fd2e1f41dd92d12"
+    },
+    {
+      "path": "lib/site_settings/validations.rb",
+      "sha256": "a70b4e2c9b98679557214eeff3a24e1b252a0cdc6a4763ef5956ab858bd7d9d5"
+    },
+    {
+      "path": "config/initializers/000-mini_sql.rb",
+      "sha256": "fc74fc60c34d120fdebc01a6a92451bc5a5968aad28e3427818eb616e1a22280"
+    },
+    {
+      "path": "lib/freedom_patches/rails_multisite.rb",
+      "sha256": "4939ddcedc15fe76e26a655c7ca6820162ed8a6e269fa290bd58e7ff3d15f14a"
+    },
+    {
+      "path": "config/initializers/002-freedom_patches.rb",
+      "sha256": "239a979ec2a07e5073937b23249f51d4e29caa3c75ebc479665241204a51f392"
+    },
+    {
+      "path": "lib/notification_levels.rb",
+      "sha256": "840a12cdc9922fc33f84a5931ff374ca70a8ae061bc531adce8f427e92c17a77"
+    },
+    {
+      "path": "app/models/topic_tag.rb",
+      "sha256": "34efee4eef567e9c6019926a91b906ddd92fa3b68d67f52f3f42710aa9bbe642"
+    },
+    {
+      "path": "app/models/shared_draft.rb",
+      "sha256": "b6be22773216c0367b3fd719040948fdd52be8fef0eb79e7f39decd281bcc9e1"
+    },
+    {
+      "path": "app/models/topic_user.rb",
+      "sha256": "71b73ec5c9b2a82cd06c8b52e191e8fed0a305c9ec28aa4146128c9b4e9512be"
+    },
+    {
+      "path": "app/models/category_user.rb",
+      "sha256": "04da18c18c042c439f23a9a8e8f057b967cf034de6873f31a0b0f57b2a82c59b"
+    },
+    {
+      "path": "app/models/tag_user.rb",
+      "sha256": "91d77b4a0f8ab81cdfd07dec1d020bbb120e84f36f04e75d156943b0214d242e"
+    },
+    {
+      "path": "app/models/dismissed_topic_user.rb",
+      "sha256": "7a83f5d3638d78bc88eaa041a8d24873d538b9d5721009f93b6d4b8a60ef7001"
+    },
+    {
+      "path": "app/models/post_action.rb",
+      "sha256": "feb352bae1b021fabe1e97fc059ce9a0f3e583de2251054700a068bb6f62fa7b"
+    },
+    {
+      "path": "app/models/post_action_type.rb",
+      "sha256": "d1640ebe0f6e5f3aa42f40b37eee615db0a852914048d808df0368b34a32368b"
+    },
+    {
+      "path": "lib/post_action_type_view.rb",
+      "sha256": "00663ea1c3558cd616c0d9e105ce0659cf72bae1e915298dfae06939c432a137"
+    },
+    {
+      "path": "lib/flag_settings.rb",
+      "sha256": "dda40f87b128d2201f5112bc0ba97f89fa6bdedb1fa92590950f83a4bbfcf2e3"
+    },
+    {
+      "path": "lib/topics_filter.rb",
+      "sha256": "a5947103d6b9755e3c3796d43620c1eb9b7693ce494d76d9f9d1fd660dc2351e"
+    },
+    {
+      "path": "lib/search.rb",
+      "sha256": "1812071535a4542156454ad53650d6a429b66e15a3475754cef8a7b12062e8c7"
+    },
+    {
+      "path": "app/models/flag.rb",
+      "sha256": "f1459070df7967016fc299f031b6803aa6658c13e84b5fc597e5588ef2bdfb52"
+    },
+    {
+      "path": "app/models/tag_group.rb",
+      "sha256": "e0f92b49351b31fe9805ff6f265394cb5b7b49e720d155fc74194a27748ec758"
+    },
+    {
+      "path": "app/models/tag_group_membership.rb",
+      "sha256": "7e45033c77dc5eb4f915ed9969b326fd2a41ec38af2c3534026edf8f32e430a7"
+    },
+    {
+      "path": "app/models/base_timer.rb",
+      "sha256": "1bfba93fb3c91a0e72f9d4e59d8109bf4cd9b6cfbf5a980c9ce6ea60be13c1b6"
+    },
+    {
+      "path": "app/models/topic_timer.rb",
+      "sha256": "ca26cd3aa8a2c06c81e288f2f96123eabe9095e37cf36d863b40e23542da3d67"
+    },
+    {
+      "path": "app/models/topic_custom_field.rb",
+      "sha256": "7fb71982f49ceef16de78aaf067beea5adc3f915e41a9b8bda607800d04cb1b3"
+    },
+    {
+      "path": "app/models/upload.rb",
+      "sha256": "62b354ba06b7c740f2f80ba8f2b09dd1af5a8e2d4d58426bc7afbe64c04cefe5"
+    },
+    {
+      "path": "app/models/topic_thumbnail.rb",
+      "sha256": "ca1cae048c5a1a6ce86173c30b6bfcd7bf4d90ed2d35e47581d5c53fa64ceeca"
+    },
+    {
+      "path": "app/models/optimized_image.rb",
+      "sha256": "19595717f19aa679357117b3a63c0e52bc6e9b88c8dd3c5e2b663fc2e92f6c55"
+    },
+    {
+      "path": "config/locales/server.en.yml",
+      "sha256": "13fdf75fb404c3da601f7605d7f8e307f87676774e30c6bb199ecbcd62d46af9"
+    },
+    {
+      "path": "config/locales/client.en.yml",
+      "sha256": "64dd75303aad1c507d49cedc0d3c4ea72b73a27685b3b8f3e3208a6b4ae0db55"
+    },
+    {
+      "path": "app/serializers/application_serializer.rb",
+      "sha256": "3229c8ff0e74557095907bf959a555238d0284263ad2b5b1cb491898159f593a"
+    },
+    {
+      "path": "app/serializers/basic_topic_serializer.rb",
+      "sha256": "42e4a354cf6c5c9da17aedeb45895170e0f55cca9e40190a29d4d13703b59f85"
+    },
+    {
+      "path": "app/serializers/topic_poster_serializer.rb",
+      "sha256": "398602fab0f12109f0aa075a1f4a257f33696cc797b97c2f06a2a6ca8df88761"
+    },
+    {
+      "path": "app/serializers/poster_serializer.rb",
+      "sha256": "2aec379a95411f8bd2503d8bba17adf72260dbe196945876c18ef74cf3005cde"
+    },
+    {
+      "path": "app/serializers/primary_group_serializer.rb",
+      "sha256": "e1b2cc430e51ac33a0d9e81c3f82742c6f53bd38d87a35a678d1236e90417748"
+    },
+    {
+      "path": "app/serializers/flair_group_serializer.rb",
+      "sha256": "6285a64f23f812df15d885576927de726b4250960bf7f79dcb91d4e6c7a4bef4"
+    },
+    {
+      "path": "app/serializers/tag_serializer.rb",
+      "sha256": "22124371c2b0a013bd8149d4a73bb2de9280f228764767a6a18bc247b6a6068f"
+    },
+    {
+      "path": "app/serializers/tag_localization_serializer.rb",
+      "sha256": "65eff629d7036838703c92d5a30511d8c7430d337fa366a040f770e99712ff87"
+    },
+    {
+      "path": "app/serializers/category_badge_serializer.rb",
+      "sha256": "4cdde74352d0ba874c8ce91e79a48b74954def41462a8c18fff95c0a47fe15d9"
+    },
+    {
+      "path": "app/models/child_theme.rb",
+      "sha256": "7c57cbb7d4dbdd26ccbbf2186d1abc904d36a6498a404710a6786dab604e18b8"
+    },
+    {
+      "path": "app/models/remote_theme.rb",
+      "sha256": "5e27599e6d622ea8f6fc0a0938338fbf4875b4d501c5ab86cd2eb50075ac2414"
+    },
+    {
+      "path": "db/structure.sql",
+      "sha256": "b67895df3d6508bd7537c7066d85ef4c1240c036d9df6611b385e99fd1523e63"
+    },
+    {
+      "path": "lib/guardian/tag_guardian.rb",
+      "sha256": "17f20e05e0d86ef1efb1b9ed3236bdac7f1de62894151de4aa3de3f412cb4131"
+    },
+    {
+      "path": "lib/letter_avatar.rb",
+      "sha256": "67bc3333274faf89988b49133e4c1d15aa71e1458bd81ba8b87e050f7ef19df8"
+    },
+    {
+      "path": "config/database.yml",
+      "sha256": "a21991bbf63539e8b372aa0521e0e7660362bfcebe76330b397f18559cdf0600"
+    },
+    {
+      "path": "lib/auth.rb",
+      "sha256": "197d81a48ec0cab3539743ccc88b09a879ce07936a8e18878a1880df2bc73e84"
+    },
+    {
+      "path": "lib/json_error.rb",
+      "sha256": "70a66221b15a9b548a347cf9eaae35ffa5fa2f3ec3a5e92dd756b8bbacd8bd71"
+    },
+    {
+      "path": "config/initializers/markdown_endpoints.rb",
+      "sha256": "18057a2c8b2eec326403bfa79ccf7357a8416bf963b0e655425eaf437a3e4f4b"
+    },
+    {
+      "path": "lib/git_utils.rb",
+      "sha256": "9b39f2b22e2aa376af6525cb96429ad7521f0b31476eaa0bd1873c62d3886a6b"
+    },
+    {
+      "path": "config/locales/server.fr.yml",
+      "sha256": "4bf761084ece61969f3f86ed945a0114bdc64201f4e7bab3882d2ada27b1f0c0"
+    },
+    {
+      "path": "config/locales/client.fr.yml",
+      "sha256": "9ff678dac528021b565cc286123e4860aeabed497cee5c65f00dc1e7eba97acd"
+    }
+  ],
+  "framework_sources": [
+    {
+      "gem": "activemodel",
+      "version": "8.1.4",
+      "package": "run/bundle/ruby/4.0.0/cache/activemodel-8.1.4.gem",
+      "package_sha256": "9a0906c127bd118aa5f06157db12b8f750da83dccee72db2f658547a0ae7a0e8",
+      "runtime_lock": "discourse/Gemfile.lock",
+      "runtime_lock_sha256": "ada2da879a32de7000c2bd43954514dc900e4b71c463d86533b105017bdeaba8",
+      "verification": "Gem::Package.verify plus exact package data.tar.gz member equality; complete original code and MIT license; no fake module/header",
+      "files": [
+        {
+          "path": "source/framework/activemodel-8.1.4/lib/active_model/serialization.rb",
+          "package_member": "lib/active_model/serialization.rb",
+          "sha256": "5b08d8ed89ed3918802de5534425bd4c7b03865d9d4369009ec10c90ce797e86"
+        },
+        {
+          "path": "source/framework/activemodel-8.1.4/MIT-LICENSE",
+          "package_member": "MIT-LICENSE",
+          "sha256": "1abcf1f3e09902d5357287d17d7d83e72376916771ec48a812e34ae4ff2ba041"
+        }
+      ]
+    },
+    {
+      "gem": "mini_sql",
+      "version": "1.6.0",
+      "package": "run/bundle/ruby/4.0.0/cache/mini_sql-1.6.0.gem",
+      "package_sha256": "5296637f6a4af5bb43e06788037e9a2968ff9c8eb65928befcba8cb41f42d6ee",
+      "runtime_lock": "discourse/Gemfile.lock",
+      "runtime_lock_sha256": "ada2da879a32de7000c2bd43954514dc900e4b71c463d86533b105017bdeaba8",
+      "verification": "Gem::Package.verify and complete lib/*.rb package-member/installed/copied equality; original license",
+      "files": [
+        {
+          "path": "source/framework/mini_sql-1.6.0/LICENSE.txt",
+          "package_member": "LICENSE.txt",
+          "sha256": "18840685875743c55b13e6b7772cb7980b11215a0e63b391fcb11a049abdfe97"
+        },
+        {
+          "path": "source/framework/mini_sql-1.6.0/lib/mini_sql.rb",
+          "package_member": "lib/mini_sql.rb",
+          "sha256": "40d88753c620534cb6e5546cab6b688470db55e35206f950ebd53916867d3305"
+        },
+        {
+          "path": "source/framework/mini_sql-1.6.0/lib/mini_sql/abstract/prepared_binds.rb",
+          "package_member": "lib/mini_sql/abstract/prepared_binds.rb",
+          "sha256": "565a9d81672a86c62c87584292fef30c345f1e9a4a257d376d31e45c892ae5ca"
+        },
+        {
+          "path": "source/framework/mini_sql-1.6.0/lib/mini_sql/abstract/prepared_cache.rb",
+          "package_member": "lib/mini_sql/abstract/prepared_cache.rb",
+          "sha256": "d894be93cdc2a839c97fe3bd88f9f7f91fb3e44366712a1fb26e4e34ec81c60d"
+        },
+        {
+          "path": "source/framework/mini_sql-1.6.0/lib/mini_sql/active_record_postgres/connection.rb",
+          "package_member": "lib/mini_sql/active_record_postgres/connection.rb",
+          "sha256": "b9a378f743089adf0f2380c3418d751da50acf882f93eb2d0ae19fadf9a57af3"
+        },
+        {
+          "path": "source/framework/mini_sql-1.6.0/lib/mini_sql/builder.rb",
+          "package_member": "lib/mini_sql/builder.rb",
+          "sha256": "a8d50f90ed3971ef0639ba2a43673ae1e45d66dd6ea053fdae04510a18cc9cfe"
+        },
+        {
+          "path": "source/framework/mini_sql-1.6.0/lib/mini_sql/connection.rb",
+          "package_member": "lib/mini_sql/connection.rb",
+          "sha256": "bbc6e3246b1aad771dc9f19de9f520b04d6d0161b6348186a9e46f8a367b82ec"
+        },
+        {
+          "path": "source/framework/mini_sql-1.6.0/lib/mini_sql/decoratable.rb",
+          "package_member": "lib/mini_sql/decoratable.rb",
+          "sha256": "2a3bdf3e85e24e7a36b76d19c6248666d25118d79bfd52b1f1f49bf4626ce32f"
+        },
+        {
+          "path": "source/framework/mini_sql-1.6.0/lib/mini_sql/deserializer_cache.rb",
+          "package_member": "lib/mini_sql/deserializer_cache.rb",
+          "sha256": "fe67a12c1a245a2fac22fe069221d3306c634a8a6534466b3f8a5ae746335416"
+        },
+        {
+          "path": "source/framework/mini_sql-1.6.0/lib/mini_sql/inline_param_encoder.rb",
+          "package_member": "lib/mini_sql/inline_param_encoder.rb",
+          "sha256": "640ac8d85c41e52d09914a7a86971568c26d957d7f76672d56b6d53f9d18c8dc"
+        },
+        {
+          "path": "source/framework/mini_sql-1.6.0/lib/mini_sql/mysql/connection.rb",
+          "package_member": "lib/mini_sql/mysql/connection.rb",
+          "sha256": "a6d1ba1c3dee79da4ff7fd62e5bc3933c027db05b54ab2a7791e39e4050dcc53"
+        },
+        {
+          "path": "source/framework/mini_sql-1.6.0/lib/mini_sql/mysql/deserializer_cache.rb",
+          "package_member": "lib/mini_sql/mysql/deserializer_cache.rb",
+          "sha256": "ad98f6d3df9267a713dd4c5f3e6bd412fec7861d3c148ea2d9605e208c3e17b1"
+        },
+        {
+          "path": "source/framework/mini_sql-1.6.0/lib/mini_sql/mysql/prepared_binds.rb",
+          "package_member": "lib/mini_sql/mysql/prepared_binds.rb",
+          "sha256": "90467bd7bed52fd3734bdc792b92054376f6655b645a4d09261889cb28a1d6f1"
+        },
+        {
+          "path": "source/framework/mini_sql-1.6.0/lib/mini_sql/mysql/prepared_cache.rb",
+          "package_member": "lib/mini_sql/mysql/prepared_cache.rb",
+          "sha256": "848f756c80e11de09a58515834c82727fb350e40ab47b3096016cdcc91a5e20c"
+        },
+        {
+          "path": "source/framework/mini_sql-1.6.0/lib/mini_sql/mysql/prepared_connection.rb",
+          "package_member": "lib/mini_sql/mysql/prepared_connection.rb",
+          "sha256": "14d17d18ea07c2468428f7cc6292051e2f731eab4942f7127231764092505c26"
+        },
+        {
+          "path": "source/framework/mini_sql-1.6.0/lib/mini_sql/postgres/coders.rb",
+          "package_member": "lib/mini_sql/postgres/coders.rb",
+          "sha256": "31e6caac64930cc94bea0381efca6c0375a7e7f73f3779e9e074bd92a04fc5a8"
+        },
+        {
+          "path": "source/framework/mini_sql-1.6.0/lib/mini_sql/postgres/connection.rb",
+          "package_member": "lib/mini_sql/postgres/connection.rb",
+          "sha256": "dec87e35cb7af8c6422575510856cba7b69e477b4bab5554761c3573e49e785f"
+        },
+        {
+          "path": "source/framework/mini_sql-1.6.0/lib/mini_sql/postgres/deserializer_cache.rb",
+          "package_member": "lib/mini_sql/postgres/deserializer_cache.rb",
+          "sha256": "1897db0d1d1a390cb2fb3dafcac0398d0a47082245f110b24a3161844fdf098c"
+        },
+        {
+          "path": "source/framework/mini_sql-1.6.0/lib/mini_sql/postgres/prepared_binds.rb",
+          "package_member": "lib/mini_sql/postgres/prepared_binds.rb",
+          "sha256": "6a3601a25d246302ae1f775fd449b82bca11e986580db0b471e2e14191dc4206"
+        },
+        {
+          "path": "source/framework/mini_sql-1.6.0/lib/mini_sql/postgres/prepared_cache.rb",
+          "package_member": "lib/mini_sql/postgres/prepared_cache.rb",
+          "sha256": "a7e4107ee86d83b9a8518ba1f6845da2f2fbea319dadf2a12d3a00082d238b6a"
+        },
+        {
+          "path": "source/framework/mini_sql-1.6.0/lib/mini_sql/postgres/prepared_connection.rb",
+          "package_member": "lib/mini_sql/postgres/prepared_connection.rb",
+          "sha256": "f807ae644c52653c45079d1f878590ffd268fcaf1afe14582c259c137a7fbaef"
+        },
+        {
+          "path": "source/framework/mini_sql-1.6.0/lib/mini_sql/postgres_jdbc/connection.rb",
+          "package_member": "lib/mini_sql/postgres_jdbc/connection.rb",
+          "sha256": "a54014e2db01cfb4f107b0890107f6c8464a2a0c126c481a522f4b1689dfde12"
+        },
+        {
+          "path": "source/framework/mini_sql-1.6.0/lib/mini_sql/postgres_jdbc/deserializer_cache.rb",
+          "package_member": "lib/mini_sql/postgres_jdbc/deserializer_cache.rb",
+          "sha256": "00d8fb4518a1c1c8836e7287033b74cc6bcf63c42357fb0b84ca363e8da505db"
+        },
+        {
+          "path": "source/framework/mini_sql-1.6.0/lib/mini_sql/result.rb",
+          "package_member": "lib/mini_sql/result.rb",
+          "sha256": "21590e92c8d50bb2ca5c7454f89059c79bc596a90a779aa9ea46d327df8962d2"
+        },
+        {
+          "path": "source/framework/mini_sql-1.6.0/lib/mini_sql/serializer.rb",
+          "package_member": "lib/mini_sql/serializer.rb",
+          "sha256": "9b3f69d37e342d8ac174c103c3f3d45d169abd1dd0881906b3e56189de135c4a"
+        },
+        {
+          "path": "source/framework/mini_sql-1.6.0/lib/mini_sql/sqlite/connection.rb",
+          "package_member": "lib/mini_sql/sqlite/connection.rb",
+          "sha256": "b95ebc239c5f7f6cb14143ba2f4a739e25b0d2dbca581799c5de27a9b4669207"
+        },
+        {
+          "path": "source/framework/mini_sql-1.6.0/lib/mini_sql/sqlite/deserializer_cache.rb",
+          "package_member": "lib/mini_sql/sqlite/deserializer_cache.rb",
+          "sha256": "9f1f3dea5399be713bff68ab95e5ce0da1a16c07be41b297dda3bce4e6963735"
+        },
+        {
+          "path": "source/framework/mini_sql-1.6.0/lib/mini_sql/sqlite/prepared_binds.rb",
+          "package_member": "lib/mini_sql/sqlite/prepared_binds.rb",
+          "sha256": "b067b23b9e79837c9563818d673ed35be00a12bfb84ff8262dc845ddf62d7f44"
+        },
+        {
+          "path": "source/framework/mini_sql-1.6.0/lib/mini_sql/sqlite/prepared_cache.rb",
+          "package_member": "lib/mini_sql/sqlite/prepared_cache.rb",
+          "sha256": "f6c75c7fd3540e462ca3be728bce23e130963d45e78aa4ed300346a9a4ec547a"
+        },
+        {
+          "path": "source/framework/mini_sql-1.6.0/lib/mini_sql/sqlite/prepared_connection.rb",
+          "package_member": "lib/mini_sql/sqlite/prepared_connection.rb",
+          "sha256": "75d4ec9a3d98f415d9d7f05963a60bf4f586662f58a4752e8556d2f14d0ac75a"
+        },
+        {
+          "path": "source/framework/mini_sql-1.6.0/lib/mini_sql/version.rb",
+          "package_member": "lib/mini_sql/version.rb",
+          "sha256": "b43667ac76b95faa7a417f393bdc14fda2d74c3c1a0ca5436e4a30075abe2a36"
+        }
+      ]
+    },
+    {
+      "gem": "rails_multisite",
+      "version": "9.0.0",
+      "package": "run/bundle/ruby/4.0.0/cache/rails_multisite-9.0.0.gem",
+      "package_sha256": "2bc88f0405cb88d1055712095a11c4eb8ce1d4a36599d1226c6779946be495e6",
+      "runtime_lock": "discourse/Gemfile.lock",
+      "runtime_lock_sha256": "ada2da879a32de7000c2bd43954514dc900e4b71c463d86533b105017bdeaba8",
+      "verification": "Gem::Package.verify and complete lib/*.rb package-member/installed/copied equality; original license",
+      "files": [
+        {
+          "path": "source/framework/rails_multisite-9.0.0/LICENSE",
+          "package_member": "LICENSE",
+          "sha256": "aec9ac9a8d022aa456a769f4c9424606fb4b16f2887f45d7eb438f2551ff1a73"
+        },
+        {
+          "path": "source/framework/rails_multisite-9.0.0/lib/rails_multisite.rb",
+          "package_member": "lib/rails_multisite.rb",
+          "sha256": "e21d62f059413bb6c24d590aa0368bda980c43fe456ba4fbc324370351d6ddc2"
+        },
+        {
+          "path": "source/framework/rails_multisite-9.0.0/lib/rails_multisite/connection_management.rb",
+          "package_member": "lib/rails_multisite/connection_management.rb",
+          "sha256": "cd53093af8e75ccb28bb6781935b2168db8c1fecfb577cbe165c6439d2fee5a5"
+        },
+        {
+          "path": "source/framework/rails_multisite-9.0.0/lib/rails_multisite/connection_management/connection_specification.rb",
+          "package_member": "lib/rails_multisite/connection_management/connection_specification.rb",
+          "sha256": "16345d74417a47e887ad4ed7a6f9ac44c62a820a20e7d7440a4adc59a08f7764"
+        },
+        {
+          "path": "source/framework/rails_multisite-9.0.0/lib/rails_multisite/connection_management/null_instance.rb",
+          "package_member": "lib/rails_multisite/connection_management/null_instance.rb",
+          "sha256": "d38fc376b5f6705d678061c7ee5ee4e72505213055ce6584e6ef6ad7f5462e06"
+        },
+        {
+          "path": "source/framework/rails_multisite-9.0.0/lib/rails_multisite/cookie_salt.rb",
+          "package_member": "lib/rails_multisite/cookie_salt.rb",
+          "sha256": "d92f91d4104202811db7d3bd594d23fe7c1a1e7e721ad940f4a333ee45e54283"
+        },
+        {
+          "path": "source/framework/rails_multisite-9.0.0/lib/rails_multisite/formatter.rb",
+          "package_member": "lib/rails_multisite/formatter.rb",
+          "sha256": "1566fb0f8b47460c0493afe55f1237c715c3ab5477aef2ad6dbd8cbb26b6c463"
+        },
+        {
+          "path": "source/framework/rails_multisite-9.0.0/lib/rails_multisite/middleware.rb",
+          "package_member": "lib/rails_multisite/middleware.rb",
+          "sha256": "d0881e32a2d75289cf59abd1f5fc7e1266d1747915c83e574fcaa38a824f659c"
+        },
+        {
+          "path": "source/framework/rails_multisite-9.0.0/lib/rails_multisite/railtie.rb",
+          "package_member": "lib/rails_multisite/railtie.rb",
+          "sha256": "c000b5cbef1c67c05f5e604d5100e3134e8b9b3c7a21026f2767e5cc00fb4aaa"
+        },
+        {
+          "path": "source/framework/rails_multisite-9.0.0/lib/rails_multisite/version.rb",
+          "package_member": "lib/rails_multisite/version.rb",
+          "sha256": "715d4839e2208a3308fa750b6a856f44ecdec69818480677986ff1b731bc3f83"
+        }
+      ]
+    },
+    {
+      "gem": "active_model_serializers",
+      "version": "0.8.4",
+      "package": "run/bundle/ruby/4.0.0/cache/active_model_serializers-0.8.4.gem",
+      "package_sha256": "7350e3d3b6a5946bbec033241d908013cc85ff4d584230e6aa074225547c754c",
+      "runtime_lock": "discourse/Gemfile.lock",
+      "runtime_lock_sha256": "ada2da879a32de7000c2bd43954514dc900e4b71c463d86533b105017bdeaba8",
+      "files": [
+        {
+          "path": "source/framework/active_model_serializers-0.8.4/lib/active_model/serializer.rb",
+          "package_member": "lib/active_model/serializer.rb",
+          "sha256": "f4a8fa7aa6584b19cc0ad6e43cbf9d1be56db82ba7f89c8387fbe93f8a6af437"
+        },
+        {
+          "path": "source/framework/active_model_serializers-0.8.4/lib/active_model/serializer/associations.rb",
+          "package_member": "lib/active_model/serializer/associations.rb",
+          "sha256": "a36792fd5c2f7c7172ece726ca89e6dd6c6d507edcd2c5636f3b3ef00bfe35d4"
+        }
+      ]
+    },
+    {
+      "gem": "discourse-emojis",
+      "version": "1.0.47",
+      "package": "run/bundle/ruby/4.0.0/cache/discourse-emojis-1.0.47.gem",
+      "package_sha256": "83430f5c6705a2b19540790fdde5ee87921d69918f88885e9bafdfd4c43c5adc",
+      "runtime_lock": "discourse/Gemfile.lock",
+      "runtime_lock_sha256": "ada2da879a32de7000c2bd43954514dc900e4b71c463d86533b105017bdeaba8",
+      "files": [
+        {
+          "path": "source/framework/discourse-emojis-1.0.47/dist/emojis.json",
+          "package_member": "dist/emojis.json",
+          "sha256": "760785d628114cfdf4ad8d3dd746f58b46ecaa5b6057adb3262aee10a0c73a64"
+        },
+        {
+          "path": "source/framework/discourse-emojis-1.0.47/dist/tonable_emojis.json",
+          "package_member": "dist/tonable_emojis.json",
+          "sha256": "a5562b7c98d6b43d70dbd6a8c6e2154d435135b09f5a4ab649fd18a7e2bb9734"
+        },
+        {
+          "path": "source/framework/discourse-emojis-1.0.47/dist/aliases.json",
+          "package_member": "dist/aliases.json",
+          "sha256": "da6fee5934923cb79212811b6529ac36205244cd064d34aafaf1fdb121b8eba8"
+        }
+      ]
+    },
+    {
+      "gem": "discourse-fonts",
+      "version": "0.0.19",
+      "package": "run/bundle/ruby/4.0.0/cache/discourse-fonts-0.0.19.gem",
+      "package_sha256": "78d4ddd671615908303a675427039d8d787c935e6deae184c6e143c18c6e0033",
+      "runtime_lock": "discourse/Gemfile.lock",
+      "runtime_lock_sha256": "ada2da879a32de7000c2bd43954514dc900e4b71c463d86533b105017bdeaba8",
+      "files": [
+        {
+          "path": "source/framework/discourse-fonts-0.0.19/vendor/assets/fonts/NotoSans-Regular.woff2",
+          "package_member": "vendor/assets/fonts/NotoSans-Regular.woff2",
+          "sha256": "0d352d8a993d3f79d860e44d74ee3e132649253f2af24caad088c3aed6ec08c8"
+        }
+      ]
+    },
+    {
+      "gem": "addressable",
+      "version": "2.9.0",
+      "package": "run/bundle/ruby/4.0.0/cache/addressable-2.9.0.gem",
+      "package_sha256": "7fdf6ac3660f7f4e867a0838be3f6cf722ace541dd97767fa42bc6cfa980c7af",
+      "runtime_lock": "discourse/Gemfile.lock",
+      "runtime_lock_sha256": "ada2da879a32de7000c2bd43954514dc900e4b71c463d86533b105017bdeaba8",
+      "files": [
+        {
+          "path": "source/framework/addressable-2.9.0/lib/addressable/uri.rb",
+          "package_member": "lib/addressable/uri.rb",
+          "sha256": "091242d2582f1cfd50ca021e15b12170c2c278af52d4c9d7c0efa25269354384"
+        }
+      ]
     }
   ]
 }

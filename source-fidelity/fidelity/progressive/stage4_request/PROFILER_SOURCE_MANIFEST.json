@@ -1,0 +1,1092 @@
+{
+  "profile": "original5 profiler records/config/owned injected Redis core; NOT full middleware acceptance",
+  "source_sha256": {
+    "rack-mini-profiler-5.0.0/lib/mini_profiler.rb": "628c9e1252562ead239bb9ac21057e708571094c71ce2e1819270c27a5b49a34",
+    "rack-mini-profiler-5.0.0/lib/mini_profiler/timer_struct/base.rb": "919a19d0bd4b6117191a1d68249652ec916c46a9eb13490dd3ebff501f52098d",
+    "rack-mini-profiler-5.0.0/lib/mini_profiler/timer_struct/page.rb": "89048fbd94e4b85dc9b43a4071befc474fb6de9771a45f18e2418a783acde0d0",
+    "rack-mini-profiler-5.0.0/lib/mini_profiler/timer_struct/request.rb": "fec027bea7b2bd46682c312ee506993f345e8e76415b1c1b9cab33b84d086c3a",
+    "rack-mini-profiler-5.0.0/lib/mini_profiler/timer_struct/sql.rb": "6fcfdcbf80577058f6393e00129459e245d3fd807430fdc9b4a6d57f564b7ba4",
+    "rack-mini-profiler-5.0.0/lib/mini_profiler/timer_struct/custom.rb": "31aaef4c9517881a4ce2908ffa1131be8d069761f1e693f7bc8934d7075b110e",
+    "rack-mini-profiler-5.0.0/lib/mini_profiler/context.rb": "0047272973bd8118294a9850b3227b7d4d167ab70f524b2376551d2a2f3beb14",
+    "rack-mini-profiler-5.0.0/lib/mini_profiler/config.rb": "697ff206e89c31ab75fcb0b8b7eda578e0148ab86ed1d96c7d6b211d62d50971",
+    "rack-mini-profiler-5.0.0/lib/mini_profiler/profiling_methods.rb": "bd87b69a73e04d043b7ff09c07c84a976ec03c49e1472f229b21bd0f75018b8a",
+    "rack-mini-profiler-5.0.0/lib/mini_profiler/storage/abstract_store.rb": "4c977865875fc96a5f303d59c434b815c8e3c4e1622cf32c1379d4d8fb79fe04",
+    "rack-mini-profiler-5.0.0/lib/mini_profiler/storage/redis_store.rb": "fc5ba14a4a6d2d830d86b3ad1ff011741288982074f8da0541b716ab6a6c1c6e",
+    "rack-2.2.24/lib/rack.rb": "88e5d0fb971650b550ef27b10114448c181ad9ee4d7bca95582b00f925b0f51b",
+    "rack-2.2.24/lib/rack/utils.rb": "20a66a4007602f9e84e75e1a5425c1b62148804a0abe2051e82940b3fde63dfb",
+    "rack-mini-profiler-5.0.0/lib/mini_profiler/client_settings.rb": "8a834a0e61b71e07d029c5cf2bc9994aaf312c26261d5ec9fd211c5e839bd8b5",
+    "rack-2.2.24/lib/rack/head.rb": "3963238648c2a4acfb899584dec4e2af7b78f756e4becd6749af2d378437916b",
+    "rack-2.2.24/lib/rack/method_override.rb": "437e563b6faebca79375ea0ac0133943e3c16010a933657cc9568099b8e03f67",
+    "railties-8.1.4/lib/rails/application/configuration.rb": "75649b1f8df9152a5e9d44199a6b6b8507117eeabbdda1954c1a74d6abb21871",
+    "actionpack-8.1.4/lib/action_dispatch/middleware/remote_ip.rb": "2441e33160728a8811a05df6f5234e06bf5b10ed78ee1926246e6ef26278d6fc",
+    "actionpack-8.1.4/lib/action_dispatch/middleware/host_authorization.rb": "07a32f5fa2c5877e752c97838c999b8ec9e610d78f0e8f897d11d51b80f34b9e",
+    "actionpack-8.1.4/lib/action_dispatch/http/url.rb": "9aa62a38e75ea5aa0611de933e54d7fd276dbcbb70bdf244010b52f3167f76f1",
+    "rack-2.2.24/lib/rack/request.rb": "dd838c7a8bcf2fc83fcdb3b4bf9cdc069d8631bc6eddb2a5eb0434fe02c6d680",
+    "fast_blank-1.0.1/ext/fast_blank/fast_blank.c": "a53e252432e0d2db0ddbc938cd343710e81b38f5375da887ad5db85ac9168b27",
+    "actionpack-8.1.4/lib/action_dispatch/middleware/request_id.rb": "2dca413452f89789e2fe07d98f35443f96ef34edfee499c2bea49bff54371941",
+    "actionpack-8.1.4/lib/action_dispatch/http/request.rb": "c0d20583a279b6c95aa011e0dab84125c498fe9b57b2745dffc9bf622f9c672c",
+    "activerecord-8.1.4/lib/active_record/query_cache.rb": "0c665f3d10ff587fcbc33e71bb7cd0669c053fcfcca2bfd33714bd5838aaa8d8",
+    "activerecord-8.1.4/lib/active_record/connection_adapters/abstract/connection_pool.rb": "825edc0dd09cd3804515924d4cc3a6e87f424fce9c1998b6888b350bdff667e6",
+    "activesupport-8.1.4/lib/active_support/dependencies/interlock.rb": "e988d82671e7a25443bb4fb2bf9f1365d2b6d813c430de8ea0e07c2e151339f5",
+    "activesupport-8.1.4/lib/active_support/concurrency/share_lock.rb": "d95411406f1f75c3244b206850699feb9b1d527c14c34aee7b62965559a38195",
+    "railties-8.1.4/lib/rails/application/finisher.rb": "d41f9d808d520e94c9ca1340d942ff0efb23e1f3a788fb4922cd81255aa5624a",
+    "activesupport-8.1.4/lib/active_support/execution_context.rb": "eaf412ca1df3dc266c12da859eb9ac82fa3c1afe15ff9769ae4a07b3ad41c112",
+    "activesupport-8.1.4/lib/active_support/current_attributes.rb": "3e89d4cf25a4a2fe031192ba4f987de211f6473eba3dc38111026e81c240f90d",
+    "activesupport-8.1.4/lib/active_support/railtie.rb": "29dd746c50e712524a1bd240fae3361b7ecf302cfbc434bd49a1ac6cd5e65ad3",
+    "activesupport-8.1.4/lib/active_support/event_reporter.rb": "12847d07b8cf71b9462e9753b9467a0af961b09da78c6e4c79f34689d4f40f35",
+    "activerecord-8.1.4/lib/active_record/asynchronous_queries_tracker.rb": "d4906d5db0e0ef57571ab936c2a01f7bdaff743126d08b1a8b826a6173e44e80"
+  },
+  "application_source_sha256": {
+    "config/initializers/006-mini_profiler.rb": "4da8002bf0ed0855a8a6c2e03fc142db2c0eae7ed6adb79943eb5060d030e1d2",
+    "config/discourse_defaults.conf": "ffc088046d70a1a0fa7bea1b6f1458ea7a45e689614faadb5ad508cf50a002c6",
+    "lib/middleware/processing_request.rb": "541129bbdddc0017c89ea2e94d699787bc17e83de19bdd16955927441e1134db"
+  },
+  "selected_spans": [
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler/timer_struct/base.rb",
+      "start_byte": 172,
+      "end_byte": 240,
+      "text_sha256": "5977de18a225ac6357278cc7cd8f9330923c10fac254a796d65a262970c25e22"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler/timer_struct/base.rb",
+      "start_byte": 250,
+      "end_byte": 305,
+      "text_sha256": "1c6f24c8413988174f5f1f6372589a07a771ed6ff404ab517b82e4833135b081"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler/timer_struct/base.rb",
+      "start_byte": 315,
+      "end_byte": 366,
+      "text_sha256": "b2c1701df5cbb9aa40359227bd27bfe591052e2d41ca646e7709094465576772"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler/timer_struct/base.rb",
+      "start_byte": 376,
+      "end_byte": 439,
+      "text_sha256": "2e6d68f0bcb0808be26917785025381af9804147ca4745c08e9707c643f8900f"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler/timer_struct/base.rb",
+      "start_byte": 449,
+      "end_byte": 690,
+      "text_sha256": "5eecd6bf6177c937dc9df29ff22dd31dab3141122d91a093c8cd3d22f9b88570"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler/timer_struct/page.rb",
+      "start_byte": 1624,
+      "end_byte": 3171,
+      "text_sha256": "7be2e57194ad5d15cdea18c1063721a195a9a88c5e62e0012de4fbd9878d316a"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler/timer_struct/page.rb",
+      "start_byte": 3240,
+      "end_byte": 3447,
+      "text_sha256": "e95710a057e6bf47378d5c7a715dedee9636b9f59e425413720c20fe97ca48fa"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler/timer_struct/page.rb",
+      "start_byte": 3644,
+      "end_byte": 3693,
+      "text_sha256": "aac6bc7eff27a15143c78506ca13eb847e0f146f68d852177fe481e0312a2446"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler/timer_struct/page.rb",
+      "start_byte": 3457,
+      "end_byte": 3537,
+      "text_sha256": "8e05424063f3f68971dd5a943202f71d94f7a9ccc04530a95f19360a2a1cf88e"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler/timer_struct/page.rb",
+      "start_byte": 3703,
+      "end_byte": 3785,
+      "text_sha256": "5057efc3deb65ced5da76c8cca5b1913f042a6d85a7f8b1564d5889968a1fcd4"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler/timer_struct/page.rb",
+      "start_byte": 3795,
+      "end_byte": 3911,
+      "text_sha256": "3f67d61cbde80625ec3588da028bf52b3948a3c2d271c1be5a8defdcde64ceef"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler/timer_struct/page.rb",
+      "start_byte": 4057,
+      "end_byte": 4335,
+      "text_sha256": "45f10125dc07893e8b0b209efad78d4ceee52d87e2c57e463aa4dafaea100033"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler/timer_struct/request.rb",
+      "start_byte": 136,
+      "end_byte": 295,
+      "text_sha256": "894f1c067f790280873249f916445be81837e2f47dcba86f9bbd4a5d83dd945e"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler/timer_struct/request.rb",
+      "start_byte": 364,
+      "end_byte": 1585,
+      "text_sha256": "900ae2b202a374b717d401e456780907359db53396aea6f8bdf4967369e37938"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler/timer_struct/request.rb",
+      "start_byte": 1897,
+      "end_byte": 1941,
+      "text_sha256": "1007b708753da4bb0e36245879fb0ad1382e5c4493f05fac86a8f56fe70f149a"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler/timer_struct/request.rb",
+      "start_byte": 6122,
+      "end_byte": 6569,
+      "text_sha256": "60e261d8c68689f950500ce72ad473e57dedaafd2245dba3bbba9004bedf9120"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler/timer_struct/request.rb",
+      "start_byte": 1654,
+      "end_byte": 1720,
+      "text_sha256": "80f0bd901290d22f4e9f172cec4b5681c663376dc2973d4b964cbd79c2740e18"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler/timer_struct/request.rb",
+      "start_byte": 2149,
+      "end_byte": 2452,
+      "text_sha256": "8723ce8caabf7a5074bc51d12aa2f2c4986c050c5933b0c1f295e68e4c52a208"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler/timer_struct/request.rb",
+      "start_byte": 2904,
+      "end_byte": 3524,
+      "text_sha256": "da1a22efa8efc46e8ae70dccdbcfab92da317d5dacc4b5dfdda291b38139c94c"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler/timer_struct/request.rb",
+      "start_byte": 4408,
+      "end_byte": 5118,
+      "text_sha256": "e5df4a8c8a1b4f5eafeb7735791b92e4418742174e0e59e556c073f23eede840"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler/timer_struct/sql.rb",
+      "start_byte": 214,
+      "end_byte": 2163,
+      "text_sha256": "e53959f625aa569f42410e015de7f07375e144f43f7e0030a96c470ab15d8122"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler/timer_struct/sql.rb",
+      "start_byte": 2660,
+      "end_byte": 3439,
+      "text_sha256": "2fd5cbfad5ac033ad6f850328aab1e9c9803460051dfea7a8c140e2ea24f46f9"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler/timer_struct/sql.rb",
+      "start_byte": 2173,
+      "end_byte": 2650,
+      "text_sha256": "f27fdd45fb1854ab1570d8dceb23abbd6e47959d6295551cbdf784ac2bf91faa"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler/timer_struct/custom.rb",
+      "start_byte": 266,
+      "end_byte": 718,
+      "text_sha256": "8f0ca8302022ee246cdf5a77614ff9828ff4e7e4d0869c4e9db984a7f77eb14c"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler/config.rb",
+      "start_byte": 326,
+      "end_byte": 350,
+      "text_sha256": "1f16f70e9e97296688f865880cb6295945e0a55cccc03dc8d19d99175cfb8480"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler/config.rb",
+      "start_byte": 465,
+      "end_byte": 492,
+      "text_sha256": "3185f461a8a85cc4edd2381fa7b18382f45e737908c7a62f0424677150831d67"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler/config.rb",
+      "start_byte": 503,
+      "end_byte": 527,
+      "text_sha256": "64970e103efae240fc598fbaaef8a25ee9a41adfb4f197e897ccdd045f49aa3a"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler/config.rb",
+      "start_byte": 1319,
+      "end_byte": 1334,
+      "text_sha256": "15f5c9ec17f53f0f24001ab317593a9d70b41f6821bc666bbf773cbf66138c29"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler/config.rb",
+      "start_byte": 932,
+      "end_byte": 968,
+      "text_sha256": "b90dc3bb4be68f107b2f46f0d6287127f684948a9587096a3f1b042ea98c40a0"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler/config.rb",
+      "start_byte": 1799,
+      "end_byte": 1825,
+      "text_sha256": "4122e8b784abfdb1c0bece62ab3feb9f6f79f995533689abb0c7a8df8d032d5e"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler/config.rb",
+      "start_byte": 1345,
+      "end_byte": 1370,
+      "text_sha256": "e8db954ed9a4ee07f2a09a62cc618dfcdcf919f773ef3cd973d1e02162287fb7"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler/config.rb",
+      "start_byte": 979,
+      "end_byte": 1006,
+      "text_sha256": "ae8d7bf63a7c7e465ac27fc9d312bdcbcf85bb794aa3de5b2ce8b0d7618015bc"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler/config.rb",
+      "start_byte": 2210,
+      "end_byte": 2252,
+      "text_sha256": "fc0288e1dafe52ec3a3502d07694f987fd6fd52b662c501dffbcaa44be203c86"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler/config.rb",
+      "start_byte": 2263,
+      "end_byte": 2298,
+      "text_sha256": "2d9898df0cf4f94b61af92538ec3b3c8b31e19da8c761da238c98e36a2529749"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler/config.rb",
+      "start_byte": 2464,
+      "end_byte": 2489,
+      "text_sha256": "66b8cb7ee58b9ba6dc8108374ff6a9c6d472f1269e8fd001de41dad30df532af"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler/config.rb",
+      "start_byte": 403,
+      "end_byte": 454,
+      "text_sha256": "92ce10358d0c17b1ecb00e502cc77a99a1032f4721a0290cc55b01edba6394d3"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler/config.rb",
+      "start_byte": 1132,
+      "end_byte": 1308,
+      "text_sha256": "a38ffc298c4baf428b866f0f9858d0f992d0b714196cb77c28ce361986980d00"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler/config.rb",
+      "start_byte": 614,
+      "end_byte": 655,
+      "text_sha256": "998c420c6f96e3f43a8b7e5f94eb3e784c41e87556eff0a07940e7fdcf705851"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler/config.rb",
+      "start_byte": 851,
+      "end_byte": 921,
+      "text_sha256": "3346befb1d0a28ba99bd0f95aed106e5d4458af44489472fbee14711094e85de"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler/config.rb",
+      "start_byte": 1576,
+      "end_byte": 1607,
+      "text_sha256": "b094ad2a708edb5e29fb3740a2c81818af6884c8e2a2411c722efa3f8642bd31"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler/config.rb",
+      "start_byte": 2119,
+      "end_byte": 2153,
+      "text_sha256": "514ee8597cd9471aa37e2d621a84f7e28c922737102296222bf6eb43dcaa002b"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler/config.rb",
+      "start_byte": 2309,
+      "end_byte": 2345,
+      "text_sha256": "cf913d632d05d5b706ec03cb121ab8d023a6038a1c462dfb84d6cdd1c0d37d87"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler.rb",
+      "start_byte": 910,
+      "end_byte": 965,
+      "text_sha256": "3c343fae6a2c0982043c87cd1b4badfa37df86e2e7ab77746704bae19344f7f9"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler.rb",
+      "start_byte": 973,
+      "end_byte": 1041,
+      "text_sha256": "17f721ec4a105abba7d7695c2c31d2e42b7b40d9b0e154290c701ba69afbd557"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler.rb",
+      "start_byte": 1049,
+      "end_byte": 1353,
+      "text_sha256": "66f246e6ba3b0b567ece3bed4a592be77d129c5e30912580000cb2238c9e460e"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler.rb",
+      "start_byte": 1834,
+      "end_byte": 2228,
+      "text_sha256": "db83ff4b83e2f0e4fa0ceaeaf768b825945e7c7467b537d9a77db3d9030d1c9d"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler.rb",
+      "start_byte": 2236,
+      "end_byte": 2313,
+      "text_sha256": "4b0ac7fc8323de773a009e40b1d82f83c090de5051967fc39da0cda1874953c3"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler.rb",
+      "start_byte": 2321,
+      "end_byte": 2399,
+      "text_sha256": "f7f7f73b0322c3fb26a2f2bb4d8044e04a279621868ac79bcc9724c2c94aec40"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler.rb",
+      "start_byte": 2407,
+      "end_byte": 2479,
+      "text_sha256": "08d33e4639d2713ed37fe7d0d9f65d7544b00409e26a3526228a5c125600a7c9"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler.rb",
+      "start_byte": 1361,
+      "end_byte": 1573,
+      "text_sha256": "98fba1b786ace0f98b3eb924bf51739aff0a9fd934bff68ccf1bdff035c336b8"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler.rb",
+      "start_byte": 1581,
+      "end_byte": 1683,
+      "text_sha256": "f7d5763e8c14e30ae106b0a5dee21b3226aec56df6d51207dabff8164e6d40b5"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler.rb",
+      "start_byte": 3278,
+      "end_byte": 3416,
+      "text_sha256": "1f6c0d336e84dd364e0d4ada7e569b28a67f4c8a5af3ed308a705d22c398d67c"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler.rb",
+      "start_byte": 3424,
+      "end_byte": 3576,
+      "text_sha256": "38dc85e8542e47a61ef6c2d0cef3e332363c61e09bd88265faec483961d7b755"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler/profiling_methods.rb",
+      "start_byte": 99,
+      "end_byte": 499,
+      "text_sha256": "c81d1d5cecb2a451a9de662dd116736652fd71b0484673968abd879b9a7114f2"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler/profiling_methods.rb",
+      "start_byte": 688,
+      "end_byte": 926,
+      "text_sha256": "8f8373dcc383328daa4f90acecb12aa6da2725d9336f43949a55999fbbadbc93"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler/profiling_methods.rb",
+      "start_byte": 934,
+      "end_byte": 1122,
+      "text_sha256": "33826d3984599d26acd589d99922b7932050c7f1e2d4d8fc13773c9750a09aff"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler.rb",
+      "start_byte": 4158,
+      "end_byte": 4204,
+      "text_sha256": "6f13b6f55f22d4c0c6fc56892b9176314f12a91b5c7f1c8effc65663fff062f2"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler.rb",
+      "start_byte": 4210,
+      "end_byte": 4264,
+      "text_sha256": "28e908eb7b8784e2804d05e4c80e414ec08509d1c638a52ea1ff8bf5e2e023e7"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler.rb",
+      "start_byte": 4270,
+      "end_byte": 4302,
+      "text_sha256": "1d9126b2f638ff8c699c4211c09120c7bbac41c15a768d4d3e32eadf8f2bda30"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler.rb",
+      "start_byte": 4093,
+      "end_byte": 4152,
+      "text_sha256": "36620fa3e3ef677b64815c8b80970956c9a7b236e35e5a936586745296bb95c9"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler.rb",
+      "start_byte": 19520,
+      "end_byte": 19800,
+      "text_sha256": "4a27d54b5422187fc4a81ba94221083172a1694bc28d5763ae619405c11cefd2"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler.rb",
+      "start_byte": 19806,
+      "end_byte": 19867,
+      "text_sha256": "a06ff6641827f82487da2623b2b9b26c0fb58a1953ce51b74c6c654b3ea1a3ce"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler.rb",
+      "start_byte": 19873,
+      "end_byte": 19979,
+      "text_sha256": "b659862597870b28dbf1ab780d6c4175efd0206ee97ad62ec9e73dc0c952ba91"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler.rb",
+      "start_byte": 14113,
+      "end_byte": 15423,
+      "text_sha256": "449b14e0184dec3eda0b9a9319fcf2e778c44ae95298f5383c23125803d38d50"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler/storage/redis_store.rb",
+      "start_byte": 217,
+      "end_byte": 498,
+      "text_sha256": "fc4183f230bb7b75c0138055548b880dcf41793b40f5421f23a7a81317d98d92"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler/storage/redis_store.rb",
+      "start_byte": 506,
+      "end_byte": 636,
+      "text_sha256": "31f1a607a4edebd23761323fe167d2e671f381167e921bcfa667efe783071422"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler/storage/redis_store.rb",
+      "start_byte": 644,
+      "end_byte": 973,
+      "text_sha256": "0e05e7e2634b949be1f11a127966d3904b1ea3949d19ab12598bac2ca46dd102"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler/storage/redis_store.rb",
+      "start_byte": 981,
+      "end_byte": 1305,
+      "text_sha256": "45f7efab842791d83086e849c4427e531dd53da345b921659ad965da7860538a"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler/storage/redis_store.rb",
+      "start_byte": 1884,
+      "end_byte": 2099,
+      "text_sha256": "7393a89da5355b8a8546c325e8e2c1b0875c9aede06272425750f57ff175aff6"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler/storage/redis_store.rb",
+      "start_byte": 1313,
+      "end_byte": 1710,
+      "text_sha256": "db18196f18a0e8ba5d5d6369b2f0163ec0389dbe869321b8a0a55035a3bc3a32"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler/storage/redis_store.rb",
+      "start_byte": 2571,
+      "end_byte": 3412,
+      "text_sha256": "d0b891527f033e1ae17b5e0d37c2bae4c83a5e68903b3a9f15bf7b76c63c6339"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler/storage/redis_store.rb",
+      "start_byte": 8755,
+      "end_byte": 8810,
+      "text_sha256": "88b8019698ca3a64bc7e56c1a751be6884063ead3aae6756f6160b7dafd761f3"
+    },
+    {
+      "source": "rack-mini-profiler-5.0.0/lib/mini_profiler/storage/redis_store.rb",
+      "start_byte": 8687,
+      "end_byte": 8747,
+      "text_sha256": "b59cc00ef018bc9c83af1de4c3e9ea9a1aea17a9811e6e0d9d9845b928c08513"
+    },
+    {
+      "source": "rack-2.2.24/lib/rack.rb",
+      "start_byte": 1074,
+      "end_byte": 1108,
+      "text_sha256": "0087002215c451ce9cc3f3c6eb4afcbf6d7709309ec9e97225aa225198b123cb"
+    },
+    {
+      "source": "rack-2.2.24/lib/rack.rb",
+      "start_byte": 965,
+      "end_byte": 1000,
+      "text_sha256": "b978331ef87e934e19ceda476d315e602fb74465df2283b2f9e86a16f31c7540"
+    },
+    {
+      "source": "rack-2.2.24/lib/rack.rb",
+      "start_byte": 1224,
+      "end_byte": 1250,
+      "text_sha256": "b7ac8623299507ae4b8d462c1a18b6a4a8df727a9c0c7901c2adc9083822cef5"
+    },
+    {
+      "source": "rack-2.2.24/lib/rack.rb",
+      "start_byte": 1111,
+      "end_byte": 1143,
+      "text_sha256": "48d05ac7a01e6471d81b93d48556e8f91dbc744a678e12439cdbb388508e9492"
+    },
+    {
+      "source": "rack-2.2.24/lib/rack/utils.rb",
+      "start_byte": 1313,
+      "end_byte": 1373,
+      "text_sha256": "2974d1d12a2a5e43a139a11528868b32068b00a9a9265e5b014b28d51ce64513"
+    },
+    {
+      "source": "rack-2.2.24/lib/rack/utils.rb",
+      "start_byte": 8444,
+      "end_byte": 9913,
+      "text_sha256": "59ff4bf24293bd3cb738676e8a9ec5ff9640ffd44b042766b156d0608e39d28e"
+    },
+    {
+      "source": "rack-2.2.24/lib/rack/utils.rb",
+      "start_byte": 9919,
+      "end_byte": 10059,
+      "text_sha256": "989e0a2459ded6c4e10f72a3960bf6f5dafd76cb7d80933173c75b669816b65c"
+    },
+    {
+      "source": "railties-8.1.4/lib/rails/application/configuration.rb",
+      "start_byte": 12792,
+      "end_byte": 13080,
+      "text_sha256": "ff7df53c468993a722074e7558efa7f27116ef8c99cde8b1b12bb7c8fbae547d"
+    },
+    {
+      "source": "rack-2.2.24/lib/rack/head.rb",
+      "start_byte": 164,
+      "end_byte": 208,
+      "text_sha256": "c365a8b7c9ad703043c327371f9b660f0b46d50dca06e7a838f59c0f751a5737"
+    },
+    {
+      "source": "rack-2.2.24/lib/rack/head.rb",
+      "start_byte": 214,
+      "end_byte": 509,
+      "text_sha256": "0a261cda75ffd11e1e3440466e060df922ccc269128f8dbbd14a748bb6b8a455"
+    },
+    {
+      "source": "rack-2.2.24/lib/rack/method_override.rb",
+      "start_byte": 283,
+      "end_byte": 327,
+      "text_sha256": "c365a8b7c9ad703043c327371f9b660f0b46d50dca06e7a838f59c0f751a5737"
+    },
+    {
+      "source": "rack-2.2.24/lib/rack/method_override.rb",
+      "start_byte": 333,
+      "end_byte": 644,
+      "text_sha256": "26cdfb5b1aa4122fa6f6b7f91d0786a978022703f376907fe425036fbc2322b4"
+    },
+    {
+      "source": "rack-2.2.24/lib/rack/method_override.rb",
+      "start_byte": 950,
+      "end_byte": 999,
+      "text_sha256": "1990f56520bd79297886766bc3e1f0f10fe12df085366ff667751975448bc4b4"
+    },
+    {
+      "source": "rack-2.2.24/lib/rack/method_override.rb",
+      "start_byte": 251,
+      "end_byte": 277,
+      "text_sha256": "3d81794423e80d36b4bb6bce3a691c85f376c155c5da1ee7fd974086a3208538"
+    },
+    {
+      "source": "actionpack-8.1.4/lib/action_dispatch/middleware/remote_ip.rb",
+      "start_byte": 0,
+      "end_byte": 9413,
+      "text_sha256": "2441e33160728a8811a05df6f5234e06bf5b10ed78ee1926246e6ef26278d6fc"
+    },
+    {
+      "source": "actionpack-8.1.4/lib/action_dispatch/middleware/host_authorization.rb",
+      "start_byte": 922,
+      "end_byte": 1021,
+      "text_sha256": "b3d0386a4829734ef7472d6b4f695af6c49384221bd9c11b59f5f7c0a68766ca"
+    },
+    {
+      "source": "actionpack-8.1.4/lib/action_dispatch/middleware/host_authorization.rb",
+      "start_byte": 1026,
+      "end_byte": 1049,
+      "text_sha256": "d0008945bb6e025e5cdc320552fbd6f4eb5e383ff73e9978a75c2323509c4202"
+    },
+    {
+      "source": "actionpack-8.1.4/lib/action_dispatch/middleware/host_authorization.rb",
+      "start_byte": 1064,
+      "end_byte": 1101,
+      "text_sha256": "99e903a77aa3d75655a439342b70092708fd4e858ea946502373393c50b421c7"
+    },
+    {
+      "source": "actionpack-8.1.4/lib/action_dispatch/middleware/host_authorization.rb",
+      "start_byte": 1116,
+      "end_byte": 1175,
+      "text_sha256": "26b45a26b3e519ae80f6836c35beb9ffa6cf8fb60c7314caea44e4411ecc5eb3"
+    },
+    {
+      "source": "actionpack-8.1.4/lib/action_dispatch/middleware/host_authorization.rb",
+      "start_byte": 1190,
+      "end_byte": 1239,
+      "text_sha256": "e50bd6fb61fcb504b26619d23b850366c077b6daa4e5a24da46a8f803b0b8fc0"
+    },
+    {
+      "source": "actionpack-8.1.4/lib/action_dispatch/middleware/host_authorization.rb",
+      "start_byte": 1254,
+      "end_byte": 1316,
+      "text_sha256": "af94e2821cdf31858c84c63a729099f0ce3661410c50f7dfb6756617ac5d2e2b"
+    },
+    {
+      "source": "actionpack-8.1.4/lib/action_dispatch/middleware/host_authorization.rb",
+      "start_byte": 1331,
+      "end_byte": 1480,
+      "text_sha256": "b7299fe262a934c0405f115d2ecc63dbe880f52e96e673d8ed34ade06a2e2d3e"
+    },
+    {
+      "source": "actionpack-8.1.4/lib/action_dispatch/middleware/host_authorization.rb",
+      "start_byte": 1486,
+      "end_byte": 2843,
+      "text_sha256": "18af408eaa1bbeaabe33626b0f7da4da0e9192a3fd24d4355e924757d3868069"
+    },
+    {
+      "source": "actionpack-8.1.4/lib/action_dispatch/middleware/host_authorization.rb",
+      "start_byte": 4039,
+      "end_byte": 4254,
+      "text_sha256": "38c165e98c9270306caf9cb6c6aab39bbcdc9dc2835c59f8011139b62050bd22"
+    },
+    {
+      "source": "actionpack-8.1.4/lib/action_dispatch/middleware/host_authorization.rb",
+      "start_byte": 4260,
+      "end_byte": 4613,
+      "text_sha256": "77be0cbfa785b6f1b09515ff9eb03f347a7acc66746f14840ecab7e0539ae073"
+    },
+    {
+      "source": "actionpack-8.1.4/lib/action_dispatch/middleware/host_authorization.rb",
+      "start_byte": 4633,
+      "end_byte": 5001,
+      "text_sha256": "3440b5b65ab3804d2350f7f8eed3c889fafe370683ca124595fe057603c2da14"
+    },
+    {
+      "source": "actionpack-8.1.4/lib/action_dispatch/middleware/host_authorization.rb",
+      "start_byte": 5009,
+      "end_byte": 5084,
+      "text_sha256": "970a66506913ece30693af312045ac2ac444f99c514c0d8df0d000c940e4608c"
+    },
+    {
+      "source": "actionpack-8.1.4/lib/action_dispatch/middleware/host_authorization.rb",
+      "start_byte": 5092,
+      "end_byte": 5209,
+      "text_sha256": "3304143505b7844d23719b69c48837468e5dee60af3da60949951739e72fbbd8"
+    },
+    {
+      "source": "railties-8.1.4/lib/rails/application/configuration.rb",
+      "start_byte": 2077,
+      "end_byte": 2214,
+      "text_sha256": "2b53c634c0368b8871b85695c62e989cf3b285e016da2ac8c9d033aa78795f55"
+    },
+    {
+      "source": "actionpack-8.1.4/lib/action_dispatch/http/url.rb",
+      "start_byte": 10829,
+      "end_byte": 11057,
+      "text_sha256": "dd7448de090f19859e0648bd9906a42fc8e91581d7175f3d7b1339af777fb49c"
+    },
+    {
+      "source": "actionpack-8.1.4/lib/action_dispatch/http/url.rb",
+      "start_byte": 11259,
+      "end_byte": 11321,
+      "text_sha256": "2df6094f4c2570dd8a53bd79c10408d8f095f0c71a5df3eec667064d0811e8b4"
+    },
+    {
+      "source": "rack-2.2.24/lib/rack/request.rb",
+      "start_byte": 1450,
+      "end_byte": 1499,
+      "text_sha256": "ce7e4ee5901dce785837394d28ecfe3fbdaa35e3182518a8120ec58d37430c14"
+    },
+    {
+      "source": "rack-2.2.24/lib/rack/request.rb",
+      "start_byte": 1889,
+      "end_byte": 1945,
+      "text_sha256": "7748c6cffcd2afc94936749a5cfd7b60fb0e0bf81f3cee534d602ecae6844800"
+    },
+    {
+      "source": "actionpack-8.1.4/lib/action_dispatch/middleware/request_id.rb",
+      "start_byte": 1010,
+      "end_byte": 1143,
+      "text_sha256": "0ceab4ba0c131da208f2f4b12cc8a738bcd4a45a76d3c15346e8d853a0b2e17a"
+    },
+    {
+      "source": "actionpack-8.1.4/lib/action_dispatch/middleware/request_id.rb",
+      "start_byte": 1149,
+      "end_byte": 1371,
+      "text_sha256": "49c6ca2e79afa0b6ea716a89bae9d76c02e13657890effcd26050a8fbfdf2f36"
+    },
+    {
+      "source": "actionpack-8.1.4/lib/action_dispatch/middleware/request_id.rb",
+      "start_byte": 1391,
+      "end_byte": 1571,
+      "text_sha256": "38cbb740a79fd1fe698a96dfc0935d960b300547ea68541b86be40a0c33d774e"
+    },
+    {
+      "source": "actionpack-8.1.4/lib/action_dispatch/middleware/request_id.rb",
+      "start_byte": 1579,
+      "end_byte": 1638,
+      "text_sha256": "8d8e596a08f613deb4d29916d9e3748f1d59d7eb18b1ca1a6118bf5dd9f6e4eb"
+    },
+    {
+      "source": "actionpack-8.1.4/lib/action_dispatch/http/request.rb",
+      "start_byte": 10810,
+      "end_byte": 10867,
+      "text_sha256": "f87bb4ece9791136b4014051ce268a774cbf3fb852f280efc20d3ee527ec6c37"
+    },
+    {
+      "source": "activerecord-8.1.4/lib/active_record/query_cache.rb",
+      "start_byte": 1411,
+      "end_byte": 1647,
+      "text_sha256": "381c828ff4a89b71525616e61c4631e82ab4daae188016c8ebe952e7d99a5268"
+    },
+    {
+      "source": "activerecord-8.1.4/lib/active_record/query_cache.rb",
+      "start_byte": 1655,
+      "end_byte": 1799,
+      "text_sha256": "af28dd2e11dfc5e1f5e2dff9fbbfcd64c39d9b68e4a2dab9c2a470398002467f"
+    }
+  ],
+  "response_middleware": {
+    "baseline_revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+    "source_sha256": {
+      "lib/markdown_endpoint/request_constraint.rb": "3321a6a72d7f9922b06171c8758d88bb0c554f7ada56d263dd6cddeecc9a2634",
+      "lib/middleware/request_tracker.rb": "f98bf46666513461457f1a68a2f26b9754254cb75c16ea1578ed9a7a377f7a04",
+      "lib/markdown_endpoint/vary_middleware.rb": "3103c9d187d5fa560da97ea4b392c1e94b8ed929ce3c7bb894074c18c0600ae9",
+      "lib/middleware/track_view_session_id_injector.rb": "afb9af3785f6e6092674d31b1f08d48acc4336372c2e42c2c66004b686eaab4b",
+      "lib/middleware/csp_script_nonce_injector.rb": "e90d39dbca90cb9398a9e9346f17925cc7b38d986de9a531e5460662bac50409",
+      "config/initializers/008-rack-cors.rb": "a3658ce493733d64f4867cd09a1e1073cc498a046d771775f2438e566ec0d58f"
+    },
+    "selected_spans": [
+      {
+        "source": "lib/markdown_endpoint/request_constraint.rb",
+        "start_byte": 85,
+        "end_byte": 148,
+        "text_sha256": "fe4db06d8d5dcd3afa58407fad99c07edba5d1b2992bd32bb213d42793910274"
+      },
+      {
+        "source": "lib/middleware/request_tracker.rb",
+        "start_byte": 823,
+        "end_byte": 849,
+        "text_sha256": "72a14606c970ecfbb59b5f71c1fdc8c8bad98ccb87d766d2e402dc43ba4e833b"
+      },
+      {
+        "source": "lib/markdown_endpoint/vary_middleware.rb",
+        "start_byte": 0,
+        "end_byte": 635,
+        "text_sha256": "3103c9d187d5fa560da97ea4b392c1e94b8ed929ce3c7bb894074c18c0600ae9"
+      },
+      {
+        "source": "lib/middleware/track_view_session_id_injector.rb",
+        "start_byte": 0,
+        "end_byte": 653,
+        "text_sha256": "afb9af3785f6e6092674d31b1f08d48acc4336372c2e42c2c66004b686eaab4b"
+      },
+      {
+        "source": "lib/middleware/csp_script_nonce_injector.rb",
+        "start_byte": 0,
+        "end_byte": 946,
+        "text_sha256": "e90d39dbca90cb9398a9e9346f17925cc7b38d986de9a531e5460662bac50409"
+      },
+      {
+        "source": "config/initializers/008-rack-cors.rb",
+        "start_byte": 31,
+        "end_byte": 1788,
+        "text_sha256": "f52b94dd72e11eeed4c812610795468136e543b30d634992b7b17bfcdf965117"
+      }
+    ],
+    "cors_candidate": "compat/framework/portable_cors_middleware.rb",
+    "cors_candidate_sha256": "4877f928db16ae40290e704d721f525fb4fce2729c5f1849d09018061cab4d99",
+    "framework_source_sha256": {
+      "fast_blank-1.0.1/ext/fast_blank/fast_blank.c": "a53e252432e0d2db0ddbc938cd343710e81b38f5375da887ad5db85ac9168b27"
+    },
+    "request_id_candidate": "compat/framework/portable_discourse_request_id_middleware.rb",
+    "request_id_candidate_sha256": "809943fed9035bf0af5b82b1d8c27fb60e0ffda62aa7bad876a413c67822bd9d",
+    "candidate": "compat/framework/portable_json_response_middleware.rb",
+    "candidate_sha256": "dc71bdedf42e79a14ae1531efc3e9d9032a8f4254f86c1b6dc7018225d88167a",
+    "implemented_classes": [
+      "MarkdownEndpoint::VaryMiddleware",
+      "Discourse::Cors",
+      "Middleware::TrackViewSessionIdInjector",
+      "Middleware::CspScriptNonceInjector"
+    ],
+    "transformations": [
+      "Two original constant declarations have explicit source-owned namespace bindings; no configuration values",
+      "Discourse's actual fast_blank1.0.1 String/nil predicate (rb_isspace or NUL) replaces Ruby blank? dispatch; non-String headers refuse",
+      "RequestId method retains original presence-before-sanitization in actual fast_blank context; Ruby first(255) becomes standard String[0,255]",
+      "CORS uses real shared global configuration and SiteSetting store, source blank semantics, Array empty?/include? equivalents; no forced settings or captured origins"
+    ],
+    "full_stack_accepted": false,
+    "observed_payloads_as_inputs": false
+  },
+  "host_authorization": {
+    "candidate": "compat/framework/portable_host_authorization.rb",
+    "candidate_sha256": "7ff200f3b86e0197bdb166a5a666c21c4cb8c7c24f66f0bfeeb704be2a6093d9",
+    "application_source_sha256": {
+      "config/environments/development.rb": "a1a3996bfbc85d1157d0e9b20ed06814ea51b889fdfc516b4bcc6da1322540b5"
+    },
+    "application_selected_spans": [
+      {
+        "source": "config/environments/development.rb",
+        "start_byte": 3781,
+        "end_byte": 3821,
+        "text_sha256": "9f999640bc05536396083626a9b1ddfbfd02afab069d5d5d3c528adcda558319"
+      }
+    ],
+    "auxiliary_source_sha256": {
+      "spinel/packages/ipaddr/ipaddr.rb": "983829aa6cd740efc188f8f4e5515fc34454d070319a82cdda1537e404d235a7"
+    },
+    "original_class": "ActionDispatch::HostAuthorization",
+    "actual_class": "ActionDispatch::HostAuthorization",
+    "native_integer_profile": "--int-overflow=promote (actual IPAddr IPv6 masks require 128-bit integers)",
+    "transformations": [
+      "Request env adapter retains original header access/host normalization and shared env writes",
+      "Actual permissions/constants and development host declarations retained; RAILS_DEVELOPMENT_HOSTS stays live",
+      "Default blocked-host debug HTML and custom response applications are unsupported profiles, never anonymous success",
+      "Deprecated DISCOURSE_DEV_HOSTS deprecation side effect is unsupported, explicitly refused"
+    ],
+    "full_stack_accepted": false,
+    "captured_permissions_or_runtime_hosts": false
+  },
+  "remote_ip": {
+    "candidate": "compat/framework/portable_remote_ip.rb",
+    "candidate_sha256": "67a4ed9d5d45b820b94a54cb8e61ab963c00ec29663e88991a51c0ba2418afd5",
+    "source": "actionpack-8.1.4/lib/action_dispatch/middleware/remote_ip.rb",
+    "transformations": [
+      "Request env adapter writes the identical lazy action_dispatch.remote_ip GetIp slot; controller hydration reads that real object's to_s",
+      "Default-proxy constructor only: nonnil custom proxies explicitly refuse, never silently replaced",
+      "IPAddr singleton to_range begin==end is equivalent to prefix==address-family bit width, avoiding Spinel's unsupported Range of objects",
+      "Proxy and server ingress excluded before effects by portable_json_ingress.rb, not by forcing original live settings"
+    ],
+    "source_replacement": {
+      "before": "range = IPAddr.new(ip).to_range; range.begin == range.end",
+      "after": "address = IPAddr.new(ip); address.prefix == (address.ipv4? ? 32 : 128)"
+    },
+    "equivalence_test": "test_remote_ip_ingress.py original/shared/native and singleton-mask controls",
+    "full_stack_accepted": false,
+    "forwarded_profile_accepted": false,
+    "observed_ip_values_as_inputs": false
+  },
+  "json_profile_middleware": {
+    "candidate": "compat/framework/portable_json_profile_middleware.rb",
+    "candidate_sha256": "85e9c3685476668ace00b25656e6a7962780baed46e343251f6592ecdf2c71d3",
+    "application_source_sha256": {
+      "lib/middleware/omniauth_bypass_middleware.rb": "0648b2776aef085563925211cf57962d98e2b90feb81244e89ec40abfb6107c5",
+      "lib/middleware/missing_avatars.rb": "709ddd595851a13e15cb735bc46516ac36f76c44f1220eb0252259a67f5ff169",
+      "lib/content_security_policy/middleware.rb": "4deaeba117e52c4b362462383a1ac4937886d28bfaf39dbdb17e0dc3dd149c6a",
+      "lib/middleware/crawler_hooks.rb": "e4a72324fb869343ba520c308e81ce68ecde445a7957ceba73161c2a5efa86a7",
+      "config/application.rb": "789086c01435a0fc91651bf3ad098e10e5f8bea96fd84569e91e2b7f38db1d58",
+      "lib/middleware/default_headers.rb": "1ee14a5a33a40376b8f22be96633a21bf0addae86c98484bf2252a314825b5d4"
+    },
+    "selected_spans": [
+      {
+        "source": "lib/middleware/omniauth_bypass_middleware.rb",
+        "start_byte": 1308,
+        "end_byte": 1362,
+        "text_sha256": "7266d3c22030d83515b51938a249895dd7486314ede0876f188d90ca941c8c8f"
+      },
+      {
+        "source": "lib/middleware/omniauth_bypass_middleware.rb",
+        "start_byte": 1366,
+        "end_byte": 2033,
+        "text_sha256": "17ffc23b9364b3eea666984bb7fe74f4473705f513040cd4ffe3ec7bfde02b9b"
+      },
+      {
+        "source": "lib/middleware/missing_avatars.rb",
+        "start_byte": 406,
+        "end_byte": 465,
+        "text_sha256": "417a1a636379819e3e67b071da018065f2d562af5f5383dbfb71f866878181fa"
+      },
+      {
+        "source": "lib/middleware/missing_avatars.rb",
+        "start_byte": 471,
+        "end_byte": 936,
+        "text_sha256": "db2334259b22b864fdee96045981f270117f20d5e2bd670bbc02111b8f02ef23"
+      },
+      {
+        "source": "lib/content_security_policy/middleware.rb",
+        "start_byte": 116,
+        "end_byte": 160,
+        "text_sha256": "c365a8b7c9ad703043c327371f9b660f0b46d50dca06e7a838f59c0f751a5737"
+      },
+      {
+        "source": "lib/content_security_policy/middleware.rb",
+        "start_byte": 166,
+        "end_byte": 1357,
+        "text_sha256": "d30c39d54d06723541600e3fae6b570af66152f0aeb86a33ec3c537c82194544"
+      },
+      {
+        "source": "lib/content_security_policy/middleware.rb",
+        "start_byte": 1683,
+        "end_byte": 1785,
+        "text_sha256": "7a30c87cce59f8e85cdc6815a61b683240fa88f6c6353e92714c348e28774e82"
+      },
+      {
+        "source": "lib/middleware/crawler_hooks.rb",
+        "start_byte": 329,
+        "end_byte": 373,
+        "text_sha256": "c365a8b7c9ad703043c327371f9b660f0b46d50dca06e7a838f59c0f751a5737"
+      },
+      {
+        "source": "lib/middleware/crawler_hooks.rb",
+        "start_byte": 379,
+        "end_byte": 858,
+        "text_sha256": "c9dc1f2535b615bd454a95293bf5f445e229e94e94485f587f54101879578898"
+      },
+      {
+        "source": "rack-2.2.24/lib/rack/head.rb",
+        "start_byte": 164,
+        "end_byte": 208,
+        "text_sha256": "c365a8b7c9ad703043c327371f9b660f0b46d50dca06e7a838f59c0f751a5737"
+      },
+      {
+        "source": "rack-2.2.24/lib/rack/head.rb",
+        "start_byte": 214,
+        "end_byte": 509,
+        "text_sha256": "0a261cda75ffd11e1e3440466e060df922ccc269128f8dbbd14a748bb6b8a455"
+      },
+      {
+        "source": "rack-2.2.24/lib/rack/method_override.rb",
+        "start_byte": 283,
+        "end_byte": 327,
+        "text_sha256": "c365a8b7c9ad703043c327371f9b660f0b46d50dca06e7a838f59c0f751a5737"
+      },
+      {
+        "source": "rack-2.2.24/lib/rack/method_override.rb",
+        "start_byte": 333,
+        "end_byte": 644,
+        "text_sha256": "26cdfb5b1aa4122fa6f6b7f91d0786a978022703f376907fe425036fbc2322b4"
+      },
+      {
+        "source": "rack-2.2.24/lib/rack/method_override.rb",
+        "start_byte": 950,
+        "end_byte": 999,
+        "text_sha256": "1990f56520bd79297886766bc3e1f0f10fe12df085366ff667751975448bc4b4"
+      },
+      {
+        "source": "rack-2.2.24/lib/rack/method_override.rb",
+        "start_byte": 251,
+        "end_byte": 277,
+        "text_sha256": "3d81794423e80d36b4bb6bce3a691c85f376c155c5da1ee7fd974086a3208538"
+      },
+      {
+        "source": "lib/middleware/default_headers.rb",
+        "start_byte": 183,
+        "end_byte": 242,
+        "text_sha256": "417a1a636379819e3e67b071da018065f2d562af5f5383dbfb71f866878181fa"
+      },
+      {
+        "source": "lib/middleware/default_headers.rb",
+        "start_byte": 248,
+        "end_byte": 877,
+        "text_sha256": "ca6e04828edfd0a7b73a3204b9dac01b8dc90a7975ec44c7441790499028be3a"
+      },
+      {
+        "source": "lib/middleware/default_headers.rb",
+        "start_byte": 896,
+        "end_byte": 998,
+        "text_sha256": "7a30c87cce59f8e85cdc6815a61b683240fa88f6c6353e92714c348e28774e82"
+      },
+      {
+        "source": "lib/middleware/default_headers.rb",
+        "start_byte": 76,
+        "end_byte": 125,
+        "text_sha256": "ed0675a1c39a276434fb88e1709181db59d37c4b9d67b2e31bb3eb747f3b281a"
+      },
+      {
+        "source": "lib/middleware/default_headers.rb",
+        "start_byte": 130,
+        "end_byte": 177,
+        "text_sha256": "909db8eaf4153dbc6a9e6bdc847c24cafb30bdc043ae458dada2aaf58b6eb7d3"
+      }
+    ],
+    "supported_call_classes": [
+      "Middleware::OmniauthBypassMiddleware",
+      "Middleware::MissingAvatars",
+      "ContentSecurityPolicy::Middleware",
+      "Middleware::CrawlerHooks",
+      "Rack::Head",
+      "Rack::MethodOverride",
+      "Middleware::DefaultHeaders"
+    ],
+    "transformations": [
+      "Only source-proven early-return/short-circuit JSON paths projected; excluded route/method/HTML paths explicitly refuse",
+      "Rack env Request construction rebound to the same env-backed CoreRequest adapter",
+      "CSP presence uses actual Discourse fast_blank context, not a captured policy or a fake settings getter",
+      "Rack constant references expanded to their real header/method strings; HEAD BodyProxy and POST override paths refuse",
+      "DefaultHeaders uses actual Rails load_defaults8.1 source declaration, verified against live original configuration; no captured header map",
+      "HTML default-header/COOP setting path explicitly refuses; JSON merging and controller precedence retained"
+    ],
+    "full_optional_features_accepted": false,
+    "whole_stack_accepted": false,
+    "observed_payloads_as_inputs": false
+  },
+  "context_and_queries_lifecycle": {
+    "sources": [
+      "activerecord-8.1.4/lib/active_record/connection_adapters/abstract/connection_pool.rb",
+      "activesupport-8.1.4/lib/active_support/dependencies/interlock.rb",
+      "activesupport-8.1.4/lib/active_support/concurrency/share_lock.rb",
+      "railties-8.1.4/lib/rails/application/finisher.rb",
+      "activesupport-8.1.4/lib/active_support/execution_context.rb",
+      "activesupport-8.1.4/lib/active_support/current_attributes.rb",
+      "activesupport-8.1.4/lib/active_support/railtie.rb",
+      "activesupport-8.1.4/lib/active_support/event_reporter.rb",
+      "activerecord-8.1.4/lib/active_record/asynchronous_queries_tracker.rb"
+    ],
+    "runtime_sha256": {
+      "roundhouse/runtime/ruby/active_record/connection_pool_executor.rb": "a6da6f7dd5c1f93c6013e4d673589a3e47ad8fe469267de841064bcd5943e977",
+      "roundhouse/runtime/ruby/active_record/connection_pool_executor.rbs": "f5bae0f700c94c5c44ec3f5783bf67677ef061890985f90bf6700f3b50d43ec8",
+      "roundhouse/runtime/ruby/active_record/connection.rb": "21f728aed5ec212e14cdee91a1115a2e93152a2c0f71327cdc3f146b61837e78",
+      "roundhouse/runtime/ruby/active_record/connection.rbs": "eb6865860279df21a9f89ea85c8d3482043366d745381df1742a9510e493c1fb",
+      "roundhouse/runtime/spinel/active_record_db_config.rb": "96c4e21ec007e39f17178a45389502b48b5b7a1f0d931f303927cc59df762454",
+      "roundhouse/runtime/ruby/active_support_interlock.rb": "5ad94252c73cadec083f1fe1cb4996a569e2221b4f59e44c92d29bbbeeb45c19",
+      "roundhouse/runtime/ruby/active_support_interlock.rbs": "3e6936a0f64d693a911c680cb2cb513d70b39be5875f242003420f6df40cbf33",
+      "roundhouse/runtime/ruby/active_support_reporters.rb": "ea9d1a4df4fecd46dff06a6a0a577ae870af42a23bba4ff9eed304beb3d4af37",
+      "roundhouse/runtime/ruby/active_support_reporters.rbs": "71fe4ad992bd99e66ecf162a30a704d5e4ef836025a81dea4d42a119403deaad",
+      "roundhouse/runtime/ruby/active_record/asynchronous_queries_tracker.rb": "8e0f0173c208df19bdef110e819110cdba78ee602506b2f7a594b84e8febaab2",
+      "roundhouse/runtime/ruby/active_record/asynchronous_queries_tracker.rbs": "62ded66764d49ea0d79df9e1655b0f2a200e6ddf667c8d20340f778621ddd392",
+      "roundhouse/runtime/ruby/active_record/request_query_scope.rb": "4c9855055738167df105274de7cac58bc82947d7a214b12df1504e0fb416f920",
+      "roundhouse/runtime/ruby/active_record/request_query_scope.rbs": "541eba8d136a2c6ac949fb1b1f5a69d3881cdc4862f06b4d64a938841f7a6c20"
+    },
+    "transformations": [
+      "CurrentAttributes accessors remain statically lowered; registry holds actual typed instances per execution-context frame",
+      "Separate typed context/instance stacks preserve Rails push/pop/flush behavior",
+      "Session AtomicBoolean/read-write-lock replaced by mutex/condition-variable protected active state and real reader/finalizer exclusion",
+      "Original run order interlock/context/cache/queries and FIFO complete context/cache/queries/pool then interlock; reentrant inner scope does not own enclosing lifecycle",
+      "Single actual backend pool; real SQL notifications and Base.connection bind the stateless AR facade lease; source closed/nonjoinable completion releases that lease, never another owner's Db checkout or readonly transaction pin",
+      "Running interlock stores real strongly held thread/share records under a mutex/condition-variable; unloading waits for final reader release and readers wait behind writer; share upgrades/yield_shares/reloading profile explicitly unsupported"
+    ],
+    "supported_running_interlock_accepted": true,
+    "full_reloading_interlock_accepted": false,
+    "single_backend_facade_pool_completion_accepted": true,
+    "all_executor_hooks_accepted": false,
+    "observed_context_or_query_results_as_inputs": false
+  },
+  "query_cache_lifecycle": {
+    "source": "activerecord-8.1.4/lib/active_record/query_cache.rb",
+    "runtime_sha256": {
+      "roundhouse/runtime/ruby/active_record/query_cache_scope.rb": "6c08818cde7cbd3861914b2b0c68c1e5250d904e616fb5607174095ab46d0346",
+      "roundhouse/runtime/ruby/active_record/query_cache_scope.rbs": "14930660076bbcb15fb8c6e314f047eeaebdd61673f95370b87ae81992846c62"
+    },
+    "body_contract": "eager Array[String]; close-driven completion, not middleware return",
+    "supported_profile": "single active readonly database configuration; previously enabled cache ownership retained",
+    "all_executor_hooks_accepted": false,
+    "observed_cache_contents_as_inputs": false
+  },
+  "request_id_framework_binding": {
+    "implementations_sha256": {
+      "roundhouse/runtime/ruby/action_dispatch/request_id.rb": "ad0ec8faa88384021df6eecadaa9a503be1cfabf0c9fe8e9b3dcb70413c5c921",
+      "roundhouse/runtime/spinel/inprocess_controller.rb": "433c9c998e7f338d0e95e598057d94b9b5312cc9a2caad7d98cf38e26929e5fa"
+    },
+    "original_class": "ActionDispatch::RequestId",
+    "actual_class": "PortableDiscourseRequestIdMiddleware",
+    "transformations": [
+      "Request#get_header/set_header/request_id are direct reads/writes of the identical original env slot",
+      "Generic framework retains Rails Unicode blank; actual Discourse subclass uses original fast_blank context before sanitization"
+    ],
+    "full_stack_accepted": false
+  },
+  "shared_components_sha256": {
+    "compat/framework/portable_redis_connection.rb": "182c191079bc7f8472cc26c237922d67f607fc4f5aa558f0f115c1b7c8970f99",
+    "compat/framework/portable_profiler_request.rb": "2c0969d8b075e25b2d09fb216faca923f377c9175e5c8b89ff85e50896c077d6",
+    "compat/framework/portable_profiler_middleware.rb": "af0fe8c0e4d03d761dac4062fa5ac6ed2249468a63df9314604a39a5adfc967f",
+    "compat/framework/portable_profiler_bootstrap.rb": "d0b466c55b781fbfdf6bfefcc7a0845f857d78c03dba83b6a0a364e931c65fb8",
+    "compat/framework/portable_profiler_declarations.rb": "2fb38b6056a2a680e901773e43acddaee69f62c797e0a44925159ea08e02ba83",
+    "compat/framework/portable_request_processing.rb": "314e262b6b668873b1d3c815e45d86d6947a2d04034e35485a610c2ce1a0e6cf",
+    "compat/framework/portable_json_response_middleware.rb": "dc71bdedf42e79a14ae1531efc3e9d9032a8f4254f86c1b6dc7018225d88167a",
+    "compat/framework/portable_discourse_request_id_middleware.rb": "809943fed9035bf0af5b82b1d8c27fb60e0ffda62aa7bad876a413c67822bd9d",
+    "compat/framework/portable_cors_middleware.rb": "4877f928db16ae40290e704d721f525fb4fce2729c5f1849d09018061cab4d99",
+    "compat/framework/portable_host_authorization.rb": "7ff200f3b86e0197bdb166a5a666c21c4cb8c7c24f66f0bfeeb704be2a6093d9",
+    "compat/framework/portable_remote_ip.rb": "67a4ed9d5d45b820b94a54cb8e61ab963c00ec29663e88991a51c0ba2418afd5",
+    "compat/framework/portable_json_ingress.rb": "2b36e40778ca526b941867abc4aa8d625310620fa670ad3181a9c340b3294c0e",
+    "compat/framework/portable_json_profile_middleware.rb": "85e9c3685476668ace00b25656e6a7962780baed46e343251f6592ecdf2c71d3",
+    "compat/framework/portable_query_cache_boundary.rb": "71ba08a3f834f71c8aa7333c946ccc2e0d03bf6c62be2ea683e0b5f144afe9f9",
+    "compat/framework/portable_latest_request_stack.rb": "3ad76181ff6e94222caa13c450c76101d5c0d014910ca7f9a0f7e48857c7562d"
+  },
+  "candidate": "compat/framework/rack_mini_profiler_core.rb",
+  "candidate_sha256": "9a7fd1fb9aa1c6609200d847c54ff2af3c6b928fef5c3e9cdf20fdc6e9143ed8",
+  "transformations": [
+    "Explicit static Config/Context fields from actual defaults; no effective runtime values",
+    "Same-distribution base36 ID generation",
+    "ERB HTML escaping uses underlying CGI primitive",
+    "RedisStore implicit global connection refuses; actual injected-connection methods retained",
+    "Snapshot fields use literal original TLS key and actual first-field Hash initialization; no dummy entries or changed API"
+  ],
+  "native_request_accepted": false,
+  "page_accepted": false,
+  "captured_values_as_inputs": false
+}

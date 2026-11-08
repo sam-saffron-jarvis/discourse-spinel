@@ -1,0 +1,19 @@
+# Read-path parameter contracts from the original method callers. No User,
+# permission, row or runtime setting is manufactured by these signatures.
+class CategoryUser
+  def self.muted_category_ids_query: (User user, ?include_direct: bool) -> Relation[Category]
+  def self.indirectly_muted_category_ids: (User user) -> Array[Integer]
+  def self.lookup_for: (User? user, Array[Integer] category_ids) -> Hash[Integer, CategoryUser]
+end
+
+class TopicUser
+  def self.lookup_for: (User? user, Array[Topic] topics) -> Hash[Integer, TopicUser]
+end
+
+class DismissedTopicUser
+  def self.lookup_for: (User? user, Array[Topic] topics) -> Array[Integer]
+end
+
+class PostAction
+  def self.lookup_for: (User user, Array[Topic] topics, Integer post_action_type_id) -> Hash[Integer, Array[Integer]]?
+end

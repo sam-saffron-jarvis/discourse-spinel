@@ -1,0 +1,3 @@
+[:helper, :constant_absent, [:added, :answer], [:added, :hidden], :main, [:added, :patched], :patch]
+source member feature identity compiler control PASS; NOT core support
+source class local writer controls PASS

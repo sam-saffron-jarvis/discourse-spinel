@@ -49,6 +49,7 @@ module ActiveRecord
   end
 
   class Connection
+    def current_transaction: () -> ::ActiveRecord::Transaction
     self.@shared: Connection?
     def self.shared: () -> Connection
     def adapter_name: () -> String
@@ -68,6 +69,8 @@ module ActiveRecord
   end
 
   class Transaction
+    def closed?: () -> bool
+    def joinable?: () -> bool
     def after_commit: (^() -> nil work) -> nil
   end
 

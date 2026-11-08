@@ -293,6 +293,17 @@ pub fn helper_id_segments(app: &App) -> crate::det::HashMap<String, Vec<bool>> {
             .collect();
         out.entry(format!("{}_path", r.as_name)).or_insert(shape);
     }
+    // A monomorphized format helper has exactly the base route's segments.
+    // Retain that shape when splitting a runtime query hash from its args;
+    // otherwise x_path(params: opts, format: :json) becomes x_json_path(opts)
+    // against
+    // a zero-argument helper rather than x_json_path + query_suffix(opts).
+    let declared = out.keys().cloned().collect();
+    for (variant, (base, _)) in super::routes_to_library::format_variant_demand(app, &declared) {
+        if let Some(shape) = out.get(&format!("{base}_path")).cloned() {
+            out.entry(variant).or_insert(shape);
+        }
+    }
     out
 }
 

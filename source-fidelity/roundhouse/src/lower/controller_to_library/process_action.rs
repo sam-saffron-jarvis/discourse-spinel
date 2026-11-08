@@ -75,8 +75,18 @@ pub(super) struct RescueHandler {
 
 /// The around and after filters that fire for this controller, each
 /// already narrowed by any `skip_*` that names it.
+#[derive(Clone, Copy)]
+pub(super) enum FilterOrder {
+    Before(usize),
+    Around(usize),
+    After(usize),
+}
+
 #[derive(Default)]
 pub(super) struct WrapFilters {
+    /// Registration order across all three kinds. Indices address preamble
+    /// entries (excluding Lead), around entries, and after entries respectively.
+    pub order: Vec<FilterOrder>,
     /// Declaration order, inherited first — the first is OUTERMOST
     /// (ActiveSupport runs arounds in the order they were set).
     pub around: Vec<Filter>,
@@ -115,6 +125,43 @@ pub(super) fn dispatcher_bodies<'a>(
     out.extend(wraps.around.iter().flat_map(filter_guards));
     out.extend(rescues.iter().map(|h| &h.body));
     out
+}
+
+fn preamble_statement(p: &PreambleStmt, param: &str) -> (Expr, bool) {
+    match p {
+        PreambleStmt::Call { filter, halt_check } => {
+            (filter_dispatch_stmt(filter, param), *halt_check)
+        }
+        PreambleStmt::Block {
+            body,
+            only,
+            except,
+            if_cond,
+            unless_cond,
+            if_cond_expr,
+            unless_cond_expr,
+            halt_check,
+        } => {
+            let stmt = match cond_from_guards(
+                only,
+                except,
+                if_cond,
+                unless_cond,
+                if_cond_expr,
+                unless_cond_expr,
+                param,
+            ) {
+                Some(cond) => syn(ExprNode::If {
+                    cond,
+                    then_branch: body.clone(),
+                    else_branch: empty_seq(),
+                }),
+                None => body.clone(),
+            };
+            (stmt, *halt_check)
+        }
+        PreambleStmt::Lead { body } => (body.clone(), false),
+    }
 }
 
 pub(super) fn synthesize_process_action(
@@ -188,44 +235,17 @@ pub(super) fn synthesize_process_action(
         })
     });
 
+    let mut before_groups = Vec::new();
     for p in preamble {
-        let (stmt, halt_check) = match p {
-            PreambleStmt::Call { filter, halt_check } => {
-                (filter_dispatch_stmt(filter, param), *halt_check)
-            }
-            PreambleStmt::Block {
-                body,
-                only,
-                except,
-                if_cond,
-                unless_cond,
-                if_cond_expr,
-                unless_cond_expr,
-                halt_check,
-            } => {
-                let stmt = match cond_from_guards(
-                    only,
-                    except,
-                    if_cond,
-                    unless_cond,
-                    if_cond_expr,
-                    unless_cond_expr,
-                    param,
-                ) {
-                    Some(cond) => syn(ExprNode::If {
-                        cond,
-                        then_branch: body.clone(),
-                        else_branch: empty_seq(),
-                    }),
-                    None => body.clone(),
-                };
-                (stmt, *halt_check)
-            }
-            PreambleStmt::Lead { body } => (body.clone(), false),
-        };
-        stmts.push(stmt);
+        let (stmt, halt_check) = preamble_statement(p, param);
+        let mut group = vec![stmt];
         if halt_check {
-            stmts.push(halt_if_performed());
+            group.push(halt_if_performed());
+        }
+        if wraps.around.is_empty() || matches!(p, PreambleStmt::Lead { .. }) {
+            stmts.extend(group);
+        } else {
+            before_groups.push(group);
         }
     }
 
@@ -237,59 +257,48 @@ pub(super) fn synthesize_process_action(
         // `track_story_reads` loads the story and the read ribbon the
         // story page renders, then bumps the ribbon after it.
         let mut dispatch = case_dispatch(publics, inherited, deferred_tails, param);
-        for f in wraps.around.iter().rev() {
-            let wrapped = syn(ExprNode::Send {
-                recv: None,
-                method: f.target.clone(),
-                args: vec![],
-                block: Some(syn(ExprNode::Lambda { extra_params: Vec::new(),
-                    params: vec![],
-                    rest_param: None,
-                    block_param: None,
-                    body: dispatch.clone(),
-                    block_style: crate::expr::BlockStyle::Do,
-                })),
-                parenthesized: false,
-            });
-            dispatch = match filter_cond(f, param) {
-                Some(cond) => syn(ExprNode::If { cond, then_branch: wrapped, else_branch: dispatch }),
-                None => wrapped,
-            };
-        }
-        stmts.push(dispatch);
-        // `after_action :m` — after the action returns (a halted chain
-        // returned above; an action that raised is in the rescue).
-        for a in wraps.after.iter().rev() {
-            stmts.push(match a {
-                PreambleStmt::Call { filter, .. } => filter_dispatch_stmt(filter, param),
-                PreambleStmt::Block {
-                    body,
-                    only,
-                    except,
-                    if_cond,
-                    unless_cond,
-                    if_cond_expr,
-                    unless_cond_expr,
-                    ..
-                } => match cond_from_guards(
-                    only,
-                    except,
-                    if_cond,
-                    unless_cond,
-                    if_cond_expr,
-                    unless_cond_expr,
-                    param,
-                ) {
-                    Some(cond) => syn(ExprNode::If {
-                        cond,
-                        then_branch: body.clone(),
-                        else_branch: empty_seq(),
+        if wraps.around.is_empty() {
+            stmts.push(dispatch);
+            for after in wraps.after.iter().rev() {
+                stmts.push(preamble_statement(after, param).0);
+            }
+        } else {
+            // Compile the actual registration chain, not three kind-grouped
+            // lists: an around callback wraps only callbacks registered after
+            // it, including their after callbacks and before-filter halts.
+            for item in wraps.order.iter().rev() {
+                dispatch = match item {
+                    FilterOrder::Before(index) => {
+                        let mut body = before_groups[*index].clone();
+                        body.push(dispatch);
+                        syn(ExprNode::Seq { exprs: body })
+                    }
+                    FilterOrder::After(index) => syn(ExprNode::Seq {
+                        exprs: vec![dispatch, preamble_statement(&wraps.after[*index], param).0],
                     }),
-                    None => body.clone(),
-                },
-                // `Lead` is preamble-only; after filters never carry one.
-                PreambleStmt::Lead { body } => body.clone(),
-            });
+                    FilterOrder::Around(index) => {
+                        let filter = &wraps.around[*index];
+                        let wrapped = syn(ExprNode::Send {
+                            recv: None,
+                            method: filter.target.clone(),
+                            args: vec![],
+                            block: Some(syn(ExprNode::Lambda {
+                                extra_params: Vec::new(), params: vec![], rest_param: None,
+                                block_param: None, body: dispatch.clone(),
+                                block_style: crate::expr::BlockStyle::Do,
+                            })),
+                            parenthesized: false,
+                        });
+                        match filter_cond(filter, param) {
+                            Some(cond) => syn(ExprNode::If {
+                                cond, then_branch: wrapped, else_branch: dispatch,
+                            }),
+                            None => wrapped,
+                        }
+                    }
+                };
+            }
+            stmts.push(dispatch);
         }
         // Rails writes the CSP header in middleware, after the
         // controller — including an around_action that served a cached

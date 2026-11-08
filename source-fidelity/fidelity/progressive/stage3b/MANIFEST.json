@@ -1,0 +1,190 @@
+{
+  "profile": "supported anonymous list_latest + TopicList.topics hydration ONLY",
+  "baseline_revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+  "source_sha256": {
+    "lib/topic_query.rb": "9066840709436451bd392921f1dfaeed121ce0024e63916bb0e388145f8762dc",
+    "app/models/topic_list.rb": "5247ac80e9469741140f8d93e8cf2be750dc04b9af9907e6973780ab1c534e58"
+  },
+  "whole_query_methods": [
+    {
+      "start_byte": 8544,
+      "end_byte": 8610,
+      "text_sha256": "ef9ead7c640e38f5a65c672b006ae6cb868c35e3966215d1cdf51f8e92e9af8c"
+    },
+    {
+      "start_byte": 16842,
+      "end_byte": 18541,
+      "text_sha256": "4c042540322699c4c855de1fddad083ca950a753fd948428e4ebaa790225b803"
+    },
+    {
+      "start_byte": 15919,
+      "end_byte": 16838,
+      "text_sha256": "ab7905ade3a2d8370c0f8661fe8104eae71b8c3db5791b5355f388bfd4e33bad"
+    }
+  ],
+  "original_list_methods": [
+    {
+      "name": "on_preload",
+      "start_byte": 171,
+      "end_byte": 236,
+      "text_sha256": "5a4117b5891e5d32f2899656ad5a2c145f745d038d04c760c4acc0c3b609291c"
+    },
+    {
+      "name": "cancel_preload",
+      "start_byte": 240,
+      "end_byte": 370,
+      "text_sha256": "1c6ce34fdf7ac7dcd963191e3c1b96f584434bfd265079d3e094bfc9a57180d2"
+    },
+    {
+      "name": "preload",
+      "start_byte": 374,
+      "end_byte": 485,
+      "text_sha256": "881afd3ee596d2baeba89a03307b9cf2a569dddb74a7fe367fc9810be5f22556"
+    },
+    {
+      "name": "on_preload_user_ids",
+      "start_byte": 489,
+      "end_byte": 613,
+      "text_sha256": "4708b118fc9c6ff8f409e1d9a72276c01d14d79c14ef42817be2a039a045f7bc"
+    },
+    {
+      "name": "preload_user_ids",
+      "start_byte": 617,
+      "end_byte": 908,
+      "text_sha256": "c47fb3218cda74b4ec2e82cfe14a35dc64ce08aaf314be014b4ae6a7b3fd085c"
+    },
+    {
+      "name": "initialize",
+      "start_byte": 1165,
+      "end_byte": 1542,
+      "text_sha256": "8e382d4e0f8bc05ef827d1d676e681f0086f6ddbea30a33469a10366b1c3204c"
+    },
+    {
+      "name": "preload_key",
+      "start_byte": 1695,
+      "end_byte": 1733,
+      "text_sha256": "d6ac230574cc6411cd1489c26764b78f8e1f1aa54f712045b74a2c6c4289cb60"
+    },
+    {
+      "name": "topics",
+      "start_byte": 1761,
+      "end_byte": 1805,
+      "text_sha256": "a8cfd19087d2f67ecd16d599117fe028a96c3d20c10b0d7f1e305c01996cefa7"
+    },
+    {
+      "name": "categories",
+      "start_byte": 1809,
+      "end_byte": 1937,
+      "text_sha256": "b282cac029d9112a195159967425a85ec5193810e34ea329f0601f9e325e5c83"
+    },
+    {
+      "name": "load_topics",
+      "start_byte": 1941,
+      "end_byte": 4836,
+      "text_sha256": "9e9e80f6e78cea72f2037cf57644aa46400fa297e758330a3dff3422a381371c"
+    },
+    {
+      "name": "category_user_lookup",
+      "start_byte": 4909,
+      "end_byte": 5104,
+      "text_sha256": "228ecf6cf9bc81470ea798816acebb95ed69c691b9ab4548962953f844c3b0e5"
+    }
+  ],
+  "guarded_changes": [
+    {
+      "source": "lib/topic_query.rb",
+      "method": "create_list",
+      "start_byte": 18390,
+      "end_byte": 18526,
+      "text_sha256": "dc71e7a0f755076af1efdd9fddfffe36953c67418a0656e892e6be881223a1de",
+      "reason": "only :latest list dispatcher admitted; private-message/filter-info profiles explicitly refused"
+    },
+    {
+      "source": "lib/topic_query.rb",
+      "method": "create_list",
+      "start_byte": 17995,
+      "end_byte": 18237,
+      "text_sha256": "1f106193d1388fd885dc3794bb116bef98cc4557312afe03f1c02eedc7c65e00",
+      "reason": "only :latest list dispatcher admitted; private-message/filter-info profiles explicitly refused"
+    },
+    {
+      "source": "app/models/topic_list.rb",
+      "method": "load_topics",
+      "start_byte": 3303,
+      "end_byte": 3461,
+      "text_sha256": "8f88d3f0efcfcf187d5d19e194562f0413ff6273b7bb592d58ffcb96a4f0e5a8",
+      "reason": "authenticated post-action data branch unavailable under anonymous profile guard"
+    },
+    {
+      "source": "app/models/topic_list.rb",
+      "method": "load_topics",
+      "start_byte": 2446,
+      "end_byte": 2556,
+      "text_sha256": "da590182faf7016a2122e552505ece6283e7b005a07bc15728dc981520ae1b59",
+      "reason": "no authenticated post-action query in guarded anonymous profile"
+    },
+    {
+      "source": "app/models/topic_list.rb",
+      "method": "load_topics",
+      "start_byte": 2241,
+      "end_byte": 2406,
+      "text_sha256": "b6dad17b99456bbd1cdbefb87c5ade4a2a56acdb1f29a84a658ec7fd271a890e",
+      "reason": "original conditional is nil for the guarded anonymous identity"
+    },
+    {
+      "source": "app/models/topic_list.rb",
+      "method": "load_topics",
+      "start_byte": 2127,
+      "end_byte": 2235,
+      "text_sha256": "4b37b392a488b2f9275dcb90f33c00de6890226cb377a5e5622bc535b43fde98",
+      "reason": "anonymous constructor/profile guard excludes per-user notification/dismissed lookup"
+    },
+    {
+      "source": "app/models/topic_list.rb",
+      "method": "load_topics",
+      "start_byte": 2045,
+      "end_byte": 2122,
+      "text_sha256": "d1b3194b9835938fe3aba2115ac4a39627dabf44c140e3ade73bdd35356404ff",
+      "reason": "anonymous constructor/profile guard excludes per-user notification/dismissed lookup"
+    },
+    {
+      "source": "app/models/topic_list.rb",
+      "method": "load_topics custom field guard",
+      "start_byte": 4671,
+      "end_byte": 4703,
+      "text_sha256": "9a47b437846ea1e3f72aefce82aec9bbb44bb6996c287dee03db01661d7528a5",
+      "reason": "explicit nil/empty collection check: native Object#blank? does not dispatch Set#empty?"
+    },
+    {
+      "source": "app/models/topic_list.rb",
+      "method": "category_user_lookup",
+      "start_byte": 4909,
+      "end_byte": 5104,
+      "text_sha256": "228ecf6cf9bc81470ea798816acebb95ed69c691b9ab4548962953f844c3b0e5",
+      "reason": "preserve original memoized anonymous [] branch; nonnil current_user explicitly refuses"
+    },
+    {
+      "source": "app/models/topic_list.rb",
+      "method": "preloaded_custom_fields accessors",
+      "start_byte": 87,
+      "end_byte": 126,
+      "text_sha256": "883223de9e2f61fd3b158a8f94b40bd8797aace1ba8f2184ccc727584bf00ee9",
+      "reason": "explicit instance forwarding to actual class accessor; common native cattr lowering supplies class API only"
+    }
+  ],
+  "live_values_used_as_inputs": false,
+  "candidate_sha256": {
+    "topic_query_list_latest.rb": "a08400c797911e4b3dea30762a071d53f1ab718dc53cd02621b831805e2429ab",
+    "topic_list.rb": "2a5245b7ab425144d4dff2610180d9d53559d55300016504ecda10be360fdb90"
+  },
+  "unsupported_profiles": [
+    "authenticated",
+    "nonlatest",
+    "unlimited",
+    "non_en_locale",
+    "serialization_request"
+  ],
+  "full_query_accepted": false,
+  "json_request_accepted": false,
+  "page_accepted": false
+}

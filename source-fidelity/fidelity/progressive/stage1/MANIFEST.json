@@ -1,0 +1,106 @@
+{
+  "profile": "PARTIAL default_results visible paged relation ONLY",
+  "baseline_revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+  "source": "lib/topic_query.rb",
+  "source_sha256": "9066840709436451bd392921f1dfaeed121ce0024e63916bb0e388145f8762dc",
+  "selected_statements": [
+    {
+      "start_byte": 25162,
+      "end_byte": 25194,
+      "start_line": 822,
+      "end_line": 822,
+      "text_sha256": "6222074d3a45bc675b8adf37649098ae596d69ff67016e4e836360180cfc9f3c"
+    },
+    {
+      "start_byte": 25199,
+      "end_byte": 25281,
+      "start_line": 823,
+      "end_line": 823,
+      "text_sha256": "5d23d82f30feddbe4417066721e505a37f97a51d29ec149c0227b11beae90087"
+    },
+    {
+      "start_byte": 25346,
+      "end_byte": 25414,
+      "start_line": 826,
+      "end_line": 826,
+      "text_sha256": "e7223b744aae1182d2c01c368d0a7efbb83e7ee8ffd3c72ee2199451a80843eb"
+    },
+    {
+      "start_byte": 25420,
+      "end_byte": 25608,
+      "start_line": 828,
+      "end_line": 831,
+      "text_sha256": "344dff1c3e4183d34543e4056aa6a24182a58167499c843c0a434f2db6be717e"
+    },
+    {
+      "start_byte": 25652,
+      "end_byte": 25686,
+      "start_line": 834,
+      "end_line": 834,
+      "text_sha256": "d63f09240e0c893efe3697b1e0e77f176ecc13905fd452b2fa6332326e626220"
+    },
+    {
+      "start_byte": 27720,
+      "end_byte": 27877,
+      "start_line": 890,
+      "end_line": 894,
+      "text_sha256": "bd6d953c311ae320c9ca7c0886e2fc5928524d899fd6ab25c9b7531f35d8db7f"
+    },
+    {
+      "start_byte": 28226,
+      "end_byte": 28268,
+      "start_line": 905,
+      "end_line": 905,
+      "text_sha256": "05340e671657b31c9e0dfbed4d217cf0693786c0d1cf50716be4afdecb65eee4"
+    },
+    {
+      "start_byte": 28452,
+      "end_byte": 28531,
+      "start_line": 913,
+      "end_line": 913,
+      "text_sha256": "6618e51c38b59b87a9533eeefe3277e6c70a37b59bb3ecd1cc12e438cb93ab6c"
+    },
+    {
+      "start_byte": 28536,
+      "end_byte": 28580,
+      "start_line": 914,
+      "end_line": 914,
+      "text_sha256": "b97cf274bf5cf718c850683630542b134dcc5f627792ff5697e4705eaa9de94e"
+    },
+    {
+      "start_byte": 28728,
+      "end_byte": 28866,
+      "start_line": 920,
+      "end_line": 923,
+      "text_sha256": "d7ae076735031c2f921239d423c28f115a2a40d2d973c8bc0a4e837ce91da5fd"
+    }
+  ],
+  "whole_method_dependencies": [
+    {
+      "start_byte": 197,
+      "end_byte": 224,
+      "text_sha256": "80db81a85817b3d07ce0436d1a6438786dcab7617dc57fc0961baa52468ef5ef"
+    },
+    {
+      "start_byte": 21710,
+      "end_byte": 21763,
+      "text_sha256": "d652f789def4b6e2338198903aeca0d17060416c4a5aa7f962e4474605d0179b"
+    }
+  ],
+  "source_operation_order_preserved": true,
+  "live_values_used_as_inputs": false,
+  "candidate_sha256": "4d1c96a46c2f3d5b2a08a9f3f3a9eebef3bf061ad1a0d63258125cb0ca60a373",
+  "original_expression_sha256": "75deb82c17d156e54d5a6c3f1521c641659c3127d550bff80ff55f709338173b",
+  "omitted_profiles": [
+    "authenticated",
+    "category",
+    "tags",
+    "search",
+    "ordering",
+    "nested_replies",
+    "list_hydration"
+  ],
+  "complete_default_results_accepted": false,
+  "full_query_accepted": false,
+  "page_accepted": false
+}

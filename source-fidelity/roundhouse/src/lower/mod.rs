@@ -19,6 +19,10 @@
 
 pub mod arel;
 pub(crate) mod runtime_definition_family;
+pub(crate) mod file_programs;
+pub(crate) mod literal_constant_features;
+mod namespace_features;
+pub(crate) mod source_literal_policy;
 pub mod array_columns;
 pub mod projected_reads;
 pub mod associations;
@@ -166,6 +170,8 @@ pub mod route_helper_receiver;
 pub mod config_reader;
 pub mod symbolize_keys;
 pub mod hash_options;
+pub mod native_memo_readers;
+pub mod json_load_file;
 pub mod enum_mapping_keys;
 pub mod exists_conditions;
 pub mod destroy_by;
@@ -580,6 +586,8 @@ const POST_ANALYZE_PASS_ORDER: &[(&str, &[&str])] = &[
     // type. Folded last into that pass's hook+view walk.
     ("symbolize_keys", &["config_reader"]),
     ("hash_options", &[]),
+    ("native_memo_readers", &[]),
+    ("json_load_file", &[]),
     // No runs_after: it reads the ingested enum tables and rewrites only the key argument.
     ("enum_mapping_keys", &[]),
     // `-x` / `+x` on a typed Integer or Float → `x * -1` / `x`; local
@@ -1010,6 +1018,19 @@ pub(crate) fn apply_post_analyze_lowerings_for(
         hash_options::apply(app);
     }
     ran!("hash_options");
+    if target == crate::build_target::BuildTarget::Spinel {
+        native_memo_readers::apply(app);
+    }
+    ran!("native_memo_readers");
+    if matches!(
+        target,
+        crate::build_target::BuildTarget::Ruby
+            | crate::build_target::BuildTarget::Jruby
+            | crate::build_target::BuildTarget::Spinel
+    ) {
+        json_load_file::apply(app);
+    }
+    ran!("json_load_file");
     enum_mapping_keys::apply_enum_mapping_keys(app);
     ran!("enum_mapping_keys");
     numeric_unary::apply_numeric_unary_lowering(app);

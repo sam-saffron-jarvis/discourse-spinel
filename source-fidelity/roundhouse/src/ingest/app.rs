@@ -78,6 +78,16 @@ fn read_to_string_or_ledger<V: Vfs + ?Sized>(vfs: &V, path: &Path) -> IngestResu
 /// this guard covers every other caller (the LSP and MCP servers, the
 /// test suites against a fixture that has not been generated).
 pub fn ingest_app(dir: &Path) -> IngestResult<App> {
+    ingest_app_for_target_inner(dir, None)
+}
+
+/// Target-aware source inventory for an emitted program. Source consumers keep
+/// using `ingest_app`, which retains every conditional source-gem alternative.
+pub fn ingest_app_for_target(dir: &Path, target: crate::build_target::BuildTarget) -> IngestResult<App> {
+    ingest_app_for_target_inner(dir, Some(target))
+}
+
+fn ingest_app_for_target_inner(dir: &Path, target: Option<crate::build_target::BuildTarget>) -> IngestResult<App> {
     if !dir.is_dir() {
         return Err(IngestError::Io(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -87,7 +97,7 @@ pub fn ingest_app(dir: &Path) -> IngestResult<App> {
     // Absolute lockfile remotes must resolve identically whether the CLI
     // names this app by a relative path or an absolute one.
     let dir = dir.canonicalize()?;
-    ingest_app_with_vfs(&FsVfs::new(), &dir)
+    ingest_app_with_vfs_target(&FsVfs::new(), &dir, target)
 }
 
 /// Ingest a Rails app from an in-memory `path → bytes` tree. Path keys
@@ -569,6 +579,10 @@ fn owns_rack_call(source: &str, target: &str, start: u32) -> bool {
 }
 
 pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult<App> {
+    ingest_app_with_vfs_target(vfs, dir, None)
+}
+
+fn ingest_app_with_vfs_target<V: Vfs + ?Sized>(vfs: &V, dir: &Path, target: Option<crate::build_target::BuildTarget>) -> IngestResult<App> {
     // Front-end dispatch: a rack app with no config/routes.rb whose
     // app.rb subclasses Roda takes the Roda + Sequel walker (issue
     // #67); everything else is a Rails-convention tree.
@@ -580,7 +594,7 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
     let mut auto: Vec<String> = Vec::new();
     loop {
         let marks = (super::survey::mark(), super::prism::mark());
-        let mut app = ingest_rails_app(vfs, dir, &auto)?;
+        let mut app = ingest_rails_app(vfs, dir, &auto, target)?;
         let more: Vec<String> = super::auto_source_gems::candidates(&app, vfs, dir)
             .into_iter()
             .filter(|g| !auto.contains(g))
@@ -596,7 +610,7 @@ pub fn ingest_app_with_vfs<V: Vfs + ?Sized>(vfs: &V, dir: &Path) -> IngestResult
     }
 }
 
-fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[String]) -> IngestResult<App> {
+fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[String], target: Option<crate::build_target::BuildTarget>) -> IngestResult<App> {
     super::sources::reset();
     super::each_validator::reset();
     let _source_root = super::sources::set_root(dir);
@@ -628,6 +642,10 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
             auto_sourced.push(gem.clone());
         }
     }
+    let engine_partitioned = if matches!(target, Some(crate::build_target::BuildTarget::Spinel)) {
+        super::source_gems::specialize_ruby_family(vfs, dir, lock.as_ref(), &mut source_gems)
+            .map_err(|message| IngestError::Parse { file: dir.display().to_string(), message })?
+    } else { false };
     // One walk of an unchanging tree: remember what each path answered.
     let cached_vfs = crate::vfs::CachedVfs::new(vfs);
     let mount_vfs = super::source_gems::MountVfs { inner: &cached_vfs, gems: &source_gems };
@@ -665,6 +683,7 @@ fn ingest_rails_app<V: Vfs + ?Sized>(vfs: &V, dir: &Path, auto_source_gems: &[St
         )
     };
     let mut app = App::new();
+    app.source_gem_ruby_family_inventory = engine_partitioned;
     app.extensions = extensions;
     app.spinel_int_overflow = spinel_int_overflow;
     // `enum` columns declared inside a concern's `included do`, keyed by
@@ -3074,6 +3093,8 @@ end
     super::hook_class_attribute::expand(&mut app);
     super::app_extension_calls::mark(&mut app);
     super::body_statements::mark(&mut app);
+    crate::lower::literal_constant_features::position(&mut app);
+    super::ordered_mattr::validate(&app)?;
     report_unmodelled_records(&app);
     super::unreachable_views::mark(&mut app);
     // After every pass that changes a controller's methods, the concern

@@ -169,7 +169,7 @@ fn real_extension_callback_and_class_load_definitions_run_natively() {
     let source = SOURCE
         .replace("  #: (Symbol name, Integer delta) -> Symbol\n", "")
         .replace("  #: (singleton(ExtendedSettingOwner) base) -> nil\n", "");
-    let source = with_reader_storage(&source);
+    let source = with_per_site_reader_storage(&source);
     let (emitted, errors) = app(&source).emit(roundhouse::project::BuildTarget::Spinel);
     assert!(errors.is_empty(), "{errors:#?}");
     std::fs::write(
@@ -310,7 +310,7 @@ fn producer_arguments_are_inferred_from_actual_owner_calls() {
 fn actual_original_extension_retains_its_owner_and_factory_diagnostic() {
     let input =
         std::env::var("ROUNDHOUSE_ORIGINAL_SETTINGS_APP").expect("audited original input required");
-    let mut typed = roundhouse::ingest::ingest_app(std::path::Path::new(&input)).unwrap();
+    let mut typed = roundhouse::ingest::ingest_app_for_target(std::path::Path::new(&input), roundhouse::project::BuildTarget::Spinel).unwrap();
     let _diagnostics = roundhouse::session::analyze_and_lower_for(
         &mut typed,
         roundhouse::project::BuildTarget::Spinel,
@@ -416,5 +416,35 @@ fn unknown_and_other_receiver_reader_writes_do_not_close_owner_storage() {
                 .contains("runtime-defined method not supported")),
             "{label}: {errors:#?}"
         );
+    }
+}
+
+
+fn with_per_site_reader_storage(source: &str) -> String {
+    with_reader_storage(source).replace(
+        "    @themeable ||= {}",
+        "    @themeable ||= {}\n    @themeable[site_key] ||= {}",
+    ).replace("  def themeable", "  def select_site(site)\n    @site_reads = 0\n    @site = site\n  end\n  def site_reads\n    @site_reads\n  end\n  def site_key\n    @site_reads ||= 0\n    @site_reads += 1\n    @site || 'initial'\n  end\n  def themeable")
+    .replace("    ChildExtendedSettingOwner.setting(key, true)",
+        "    select_site('second')\n    setting(key, false)\n    raise 'index repeated on write' unless site_reads == 1\n    raise 'second site value frozen' unless themeable[key] == false\n    raise 'index repeated on read' unless site_reads == 2\n    select_site('initial')\n    raise 'original site storage lost' unless themeable[key]\n    raise 'index repeated on cached read' unless site_reads == 1\n    ChildExtendedSettingOwner.setting(key, true)")
+}
+
+#[test]
+fn per_site_memoized_reader_index_writes_keep_nested_storage_types() {
+    assert_original_and_lowered(&with_per_site_reader_storage(SOURCE));
+}
+
+#[test]
+fn per_site_reader_keeps_unknown_and_nonmemoized_storage_debt() {
+    let source = with_per_site_reader_storage(SOURCE);
+    for source in [
+        source.replace("@site || 'initial'", "unknown_site_key"),
+        source.replace("enabled ? true : false", "unknown_value_producer"),
+        source.replace("@themeable[site_key] ||= {}", "@themeable[site_key].dup"),
+        source.replace("@themeable[site_key] ||= {}", "@other[site_key] ||= {}"),
+    ] {
+        let (_, typed, errors) = app(&source).emit_with_app(roundhouse::project::BuildTarget::Spinel);
+        assert!(typed.runtime_definition_families.is_empty(), "unproved nested storage admitted");
+        assert!(errors.iter().any(|error| error.message.contains("runtime-defined method not supported")), "{errors:#?}");
     }
 }

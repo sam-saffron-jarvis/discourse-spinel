@@ -1,0 +1,84 @@
+{
+  "profile": "WIP shared AMS0.8 source declaration expansion; NOT request acceptance",
+  "framework_source": "fidelity/source/framework/active_model_serializers-0.8.4/lib/active_model/serializer.rb",
+  "framework_sha256": "f4a8fa7aa6584b19cc0ad6e43cbf9d1be56db82ba7f89c8387fbe93f8a6af437",
+  "copied_read_methods": [
+    {
+      "name": "root_name",
+      "start_byte": 9820,
+      "end_byte": 10104,
+      "text_sha256": "562a1c8c988c1af4cd2b91a5466ae27589e8013184a04bd921366626a2467fee"
+    },
+    {
+      "name": "url_options",
+      "start_byte": 10110,
+      "end_byte": 10168,
+      "text_sha256": "2159219f1546552b2e6e8157bda48f17023b964e8768ec8446f05eec7d569631"
+    },
+    {
+      "name": "meta_key",
+      "start_byte": 10174,
+      "end_byte": 10242,
+      "text_sha256": "e945515f52007b5af96bc257560f6c6498c7a8b7fb1d464b48c7bfc08a87eda7"
+    },
+    {
+      "name": "include_meta",
+      "start_byte": 10248,
+      "end_byte": 10345,
+      "text_sha256": "9fd358c2354e689986d4dc16af252d737bf7c2afcf37ffeffba4ac376f61be1a"
+    },
+    {
+      "name": "as_json",
+      "start_byte": 10653,
+      "end_byte": 10984,
+      "text_sha256": "c568f4a3668629afc382a4244f314b6dbc950c2f19f699ccb1fd9a8c5fee91e7"
+    },
+    {
+      "name": "serializable_hash",
+      "start_byte": 11077,
+      "end_byte": 11402,
+      "text_sha256": "0ec56bfdc24a54fdc3767b3ce579bb1cecb301bfda18d5643fd485d07aa3d06f"
+    },
+    {
+      "name": "merge_association",
+      "start_byte": 14093,
+      "end_byte": 14515,
+      "text_sha256": "39c86275c3a4d64b79f36b748cfe0ffdca6011b5e4d23d71a12d99fa2e70d3e0"
+    },
+    {
+      "name": "scope",
+      "start_byte": 15040,
+      "end_byte": 15080,
+      "text_sha256": "fe86883d043ed453acb59c0f4aae26e95588d90638928d01f8b12299d24b5dab"
+    },
+    {
+      "name": "_serializable_hash",
+      "start_byte": 15137,
+      "end_byte": 15217,
+      "text_sha256": "47920fb46aa648ea30697431dc728cbdb87e9771ff27d1301d3dd992cb7b496d"
+    },
+    {
+      "name": "perform_caching?",
+      "start_byte": 15223,
+      "end_byte": 15309,
+      "text_sha256": "9726ddd64988c3539e40c942ec70c85252384e8b7ea795e75e598dda909492ba"
+    }
+  ],
+  "declared_defaults_not_effective_values": true,
+  "captured_payload_as_input": false,
+  "constructor_change": "Preserve object/options initialization; nonnil scope_name explicitly refuses unsupported singleton alias generation",
+  "guarded_cache_change": "serializable_hash preserves the actual uncached algorithm; activated caching explicitly refuses instead of importing unrelated cache machinery",
+  "unsupported": [
+    "dynamic_serializer_mutation",
+    "caching",
+    "scope_name_alias",
+    "unknown_serializer_classes"
+  ],
+  "candidate_source_sha256": {
+    "lib/portable_serializer_read.rb": "6a9cb99a6f5ea76d81f9490ce890e00efb97d97ce7ae144511fa06f80e9facbd"
+  },
+  "native_query_executed": false,
+  "json_request_accepted": false,
+  "full_query_accepted": false,
+  "page_accepted": false
+}

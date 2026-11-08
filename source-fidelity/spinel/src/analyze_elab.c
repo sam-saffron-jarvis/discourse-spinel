@@ -2454,6 +2454,11 @@ void elab_program(Compiler *c, struct HostStep *h) {
   lr_later_settle(c);
   lr_record_unplaced(c);
   r->recorded = 1;
+  /* A compact header may precede its namespace in the order deferred
+     files are discovered, although the namespace is loaded first at run
+     time. Rebuild binding ownership once those literal links are known;
+     do not move their load/presence events or relax unknown-owner guards. */
+  if (settle_header_namespaces(c)) lr_record_again(&x);
   if (r->check) {   /* the same record made after the walk, as a check */
     char *walked = lr_dump_text(c);
     lr_record_again(&x);
@@ -7054,7 +7059,20 @@ int elab_autoload_read(Compiler *c, int id) {
   LoadPoint p = elab_point_from(c, id), at = elab_point_of(c, id);
   int par = k == NK_ConstantPathNode ? nt_ref(nt, id, "parent") : -1;
   int lexical = k == NK_ConstantReadNode && !lr_root_read(nt, id), owner = LR_MAIN, found;
-  if (!lexical && par >= 0 && (owner = lr_class_ref_at(c, par, NULL)) < LR_MAIN) return 0;
+  if (!lexical && par >= 0) {
+    owner = lr_class_ref_at(c, par, NULL);
+    /* A deferred file makes presence uncertain, not necessarily identity.
+       The existing closed candidate proof can establish one literal owner
+       while the emitted parent read still checks its runtime presence.
+       Never guess an owner from a leaf name or a mixed/opaque world. */
+    if (owner < LR_MAIN && c->lrec->recorded && !c->lrec->walk) {
+      int *possible = NULL;
+      int n = elab_class_candidates(c, par, &possible);
+      if (n == 1) owner = possible[0];
+      free(possible);
+    }
+    if (owner < LR_MAIN) return 0;
+  }
   /* a constant of the name proves no file is left to run, unless a
      registration comes first on the lookup's way (an inner scope's, or the
      scope's own ahead of an ancestor's constant) */

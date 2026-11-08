@@ -118,13 +118,17 @@ static int class_may_have_const(Compiler *c, int k, const char *nm, int *sub, in
       *sub = j;
       return 1;
     }
-  /* a class declared under a qualified name (native_struct "M::Leaf") is
-     keyed by its leaf, with no enclosing link to check */
+  /* A compact/native header can carry its full Ruby path before its
+     namespace's deferred header is registered. Match the owner too: a
+     matching leaf alone must not expose A::Value through B::Value. */
   size_t nl = strlen(nm);
+  const char *owner = class_ruby_name(c, k);
+  size_t ol = owner ? strlen(owner) : 0;
   for (int j = 0; j < c->nclasses; j++) {
     const char *rn = c->classes[j].enclosing_class < 0 ? c->classes[j].ruby_name_cache : NULL;
     size_t rl = rn ? strlen(rn) : 0;
-    if (rl > nl + 2 && sp_streq(rn + rl - nl, nm) && !strncmp(rn + rl - nl - 2, "::", 2)) { *sub = j; return 1; }
+    if (owner && rl == ol + nl + 2 && !strncmp(rn, owner, ol) &&
+        !strncmp(rn + ol, "::", 2) && sp_streq(rn + ol + 2, nm)) { *sub = j; return 1; }
   }
   const char *kl = class_leaf_name(ki->name);
   if (program_writes_const_in(c, ki->name, nm) || (kl != ki->name && program_writes_const_in(c, kl, nm))) {
@@ -242,19 +246,15 @@ int const_path_misses_member(Compiler *c, int id) {
    class whose parent, a class or module of the program, holds no member of
    that name: an explicit scope does not fall back to Object's constants
    (Holder::Target with Target defined at the top level names nothing,
-   #10577). Only a top-level class is checked: a nested one a path reaches
-   through a constant write or a compact class header (AS::CoreExt::Err =
-   ..., `class Invoice::Line` in a subclass) is a member the walk does not
-   list, and so is one a constant holding a module reaches. Any other node
-   is its name's. */
+   #10577). Deferred compact headers retain their explicit namespace too,
+   so a nested class is not evidence for the same leaf under another owner.
+   Constant-held aliases and native-class namespaces keep the conservative
+   exceptions below. Any other node is its name's. */
 int const_node_class_index(Compiler *c, int id) {
   const NodeTable *nt = c->nt;
   int k = comp_class_index(c, nt_str(nt, id, "name"));
-  /* (a class named under another by a compact header carries that name,
-     ruby_name_cache, P::Foo for `class AliasP::Foo`: no top-level one; nor
-     is a native struct, whose module the walk does not list it in) */
-  if (k < 0 || c->classes[k].enclosing_class >= 0 || c->classes[k].ruby_name_cache ||
-      c->classes[k].is_native_class || nt_kind(nt, id) != NK_ConstantPathNode) return k;
+  /* Native-class namespaces are not exhaustively listed by the walk. */
+  if (k < 0 || c->classes[k].is_native_class || nt_kind(nt, id) != NK_ConstantPathNode) return k;
   /* (nor a path whose leaf the qualifying pass found a member for and
      renamed, qc_orig_name: module M; A = Foo; end makes M::A Foo, renamed
      to the alias's class afterwards) */
@@ -585,6 +585,21 @@ static int builtin_scope_lacks_member(Compiler *c, int seg) {
      mixins are recorded, so it cannot tell yet) */
   int k = comp_class_index(c, nt_str(nt, seg, "name"));
   if (!is_constless_builtin_name(pn)) return 0;
+  /* Compact headers under a reopened builtin deliberately keep a full Ruby
+     path rather than an enclosing link. Use the same owner-aware member
+     proof as program namespaces; a cache alone is not a blanket exemption. */
+  int owner = comp_class_index(c, pn), member = -1;
+  if (owner >= 0 && class_may_have_const(c, owner, nm, &member, 0)) return 0;
+  /* A compact header need not reopen its builtin owner, so there may be
+     no owner class entry to walk. Its resolved Ruby path is still exact
+     membership evidence, not permission to use the same leaf under any
+     other builtin. Keep literal `__` in the written leaf intact. */
+  if (k >= 0) {
+    const char *rn = c->classes[k].ruby_name_cache;
+    const char *leaf = wn ? wn : nt_str(nt, seg, "name");
+    size_t pl = strlen(pn);
+    if (rn && leaf && !strncmp(rn, pn, pl) && !strncmp(rn + pl, "::", 2) && sp_streq(rn + pl + 2, leaf)) return 0;
+  }
   /* a top-level builtin class or module (Array::String) is no member
      either, unless the program reopens it or gives it its own entry */
   int top_builtin = k < 0 && !strchr(nm, ':') && builtin_class_id(nm) != 0 &&

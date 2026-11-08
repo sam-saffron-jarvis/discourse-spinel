@@ -183,6 +183,9 @@ typedef struct {
                        shared-object semantics. Implies is_cell (body reads and
                        writes go through *_cell_<name>), but the cell is the
                        caller's slot -- no heap cell is allocated on entry. */
+  int stack_volatile; /* codegen: this frame's C stack slot is volatile across
+                         setjmp; read nullable aggregates memberwise so Clang
+                         cannot reuse a pre-setjmp by-value temporary */
   int borrowed_volatile; /* codegen: this String slot, or a slot borrowed here,
                            is live across setjmp; propagate through lending */
   int inline_alias; /* (params of a yielding method, codegen only) how many
@@ -2159,6 +2162,7 @@ int        comp_cvar_index(ClassInfo *ci, const char *name);  /* class var; -1 i
 int        comp_cvar_intern(ClassInfo *ci, const char *name); /* find or add; returns index */
 int        comp_cvar_owner(const Compiler *c, int cid, const char *name); /* the class whose slot holds @@name */
 int        cvar_name_ok(const char *n);   /* `@@` and an identifier: a reflection call's literal name that is not one raises NameError */
+const char *comp_cvar_literal_name(Compiler *c, int node); /* literal String/Symbol, including a fresh builtin +String literal */
 /* 1 iff method m's param idx is a byref string out-param (LocalVar.byref_out):
    passed as const char** so callee mutation lands in the caller's variable. */
 int        comp_byref_param(Compiler *c, Scope *m, int idx);

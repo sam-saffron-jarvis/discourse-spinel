@@ -173,6 +173,10 @@ pub struct App {
     /// the gem files an app support file requires, as it loads at boot.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub boot_gem_entries: Vec<String>,
+    /// Source-gem dependencies selected only when engine predicates agree on
+    /// Ruby and Spinel. This inventory must not be emitted for another runtime.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub source_gem_ruby_family_inventory: bool,
     pub controllers: Vec<Controller>,
     pub routes: RouteTable,
     /// Explicit request-slice roots and reachability, absent for whole-app builds.
@@ -1242,6 +1246,7 @@ impl App {
             native_library_keywords: false,
             file_programs: Vec::new(),
             boot_gem_entries: Vec::new(),
+            source_gem_ruby_family_inventory: false,
             controllers: Vec::new(),
             routes: RouteTable::default(),
             entry_slice: None,

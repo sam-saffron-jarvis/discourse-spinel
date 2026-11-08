@@ -444,3 +444,204 @@ fn two_runtime_families_run_natively_with_helper_name_collision() {
         );
     }
 }
+
+// The first original core /latest reader uses |scoped_to = nil| and returns
+// inside the installed method. This bounded language-core control proves only
+// its zero-invocation-argument ABI/frame prerequisite, never SiteSetting values
+// or provider/bootstrap behavior. The real core candidate must be reapplied.
+fn optional_nil_source() -> String {
+    SOURCE.replace(
+        "{ @frame_names = [__method__, __callee__]; @values[key] + delta }",
+        "{ |scoped_to = nil| @frame_names = [__method__, __callee__]; return @values[key] + delta if scoped_to.nil?; @values[key] + delta }",
+    ).replace("    delta = 0", "    scoped_to = 91\n    define_singleton_method(:factory_scope) { scoped_to }\n    delta = 0")
+        .replace("    delta = 5", "    delta = 5\n    scoped_to = 93")
+        .replace("before_events + [key", "before_events + [:factory_scope, key")
+        .replace("raw.arity == 0", "raw.arity == -1")
+        .replace("    raise \"root method frame\"", "    raise \"optional default captured/mutated factory local\" unless factory_scope == 93\n    raise \"root method frame\"")
+}
+
+fn check_nil_optional_method_frame(native: bool) {
+    let source = optional_nil_source();
+    let probe = "RuntimeValueFamily.exercise(false)\n";
+    let original = emit_and_run::ruby().args(["--enable-frozen-string-literal", "-e"])
+        .arg(format!("{source}\n{probe}")).output().unwrap();
+    assert!(original.status.success(), "{}", String::from_utf8_lossy(&original.stderr));
+    let (emitted, typed, errors) = emit_and_run::empty_app()
+        .write("config/routes.rb", "Rails.application.routes.draw do\nend\n")
+        .write("lib/runtime_value_family.rb", &source)
+        .emit_with_app(roundhouse::project::BuildTarget::Spinel);
+    assert!(errors.is_empty(), "{errors:#?}");
+    assert_eq!(typed.runtime_definition_families.len(), 1);
+    fn closed(expr: &roundhouse::expr::Expr) -> bool {
+        let mut valid = expr.ty.as_ref().is_some_and(|ty| !ty.mentions_unknown());
+        expr.node.for_each_child(&mut |child| valid &= closed(child));
+        valid
+    }
+    for class in typed.library_classes.iter().filter(|class| class.name.0.as_str().starts_with("RoundhouseRuntimeFamily")) {
+        for method in &class.methods {
+            assert!(closed(&method.body), "untyped optional/frame helper {}#{}", class.name.0, method.name);
+        }
+    }
+    let consumer = format!("{}{probe}", all_model_requires(&emitted));
+    std::fs::write(emitted.join("nil_optional.rb"), consumer).unwrap();
+    let lowered = emit_and_run::ruby().args(["--enable-frozen-string-literal", "nil_optional.rb"])
+        .current_dir(&*emitted).output().unwrap();
+    assert!(lowered.status.success(), "{}", String::from_utf8_lossy(&lowered.stderr));
+    assert_eq!(original.stdout, lowered.stdout);
+    if native {
+        let compiled = std::process::Command::new(std::env::var("SPINEL").unwrap_or_else(|_| "spinel".into()))
+            .args(["--rbs", ".", "nil_optional.rb", "-o", "nil_optional"])
+            .current_dir(&*emitted).output().unwrap();
+        assert!(compiled.status.success(), "{}", String::from_utf8_lossy(&compiled.stderr));
+        let output = std::process::Command::new(emitted.join("nil_optional")).current_dir(&*emitted).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(output.stdout, lowered.stdout);
+    }
+}
+
+#[test]
+fn nil_optional_definition_preserves_method_return_capture_and_original_arity() {
+    check_nil_optional_method_frame(false);
+}
+
+#[test]
+#[ignore = "requires Spinel; no external service"]
+fn nil_optional_definition_method_frame_runs_natively() {
+    check_nil_optional_method_frame(true);
+}
+
+
+#[test]
+fn nil_optional_definition_does_not_admit_explicit_arguments_or_other_formals() {
+    for source in [
+        optional_nil_source().replace("|scoped_to = nil|", "|scoped_to = 1|"),
+        optional_nil_source().replace("|scoped_to = nil|", "|__rh_method_receiver = nil|").replace("if scoped_to.nil?", "if true"),
+        optional_nil_source().replace("|scoped_to = nil|", "|scoped_to: nil|"),
+        optional_nil_source().replace("|scoped_to = nil|", "|*scoped_to|"),
+        optional_nil_source().replace("unless public_send(key) ==", "unless public_send(key, nil) =="),
+    ] {
+        let (_, typed, errors) = emit_and_run::empty_app()
+            .write("config/routes.rb", "Rails.application.routes.draw do\nend\n")
+            .write("lib/runtime_value_family.rb", &source)
+            .emit_with_app(roundhouse::project::BuildTarget::Spinel);
+        assert!(typed.runtime_definition_families.is_empty(), "unproved optional ABI admitted");
+        assert!(errors.iter().any(|error| error.message.contains("runtime-defined method")), "{errors:#?}");
+    }
+}
+
+const MODEL_SOURCE: &str = r#"class ModelClassRuntimeSettings < ActiveRecord::Base
+  @values = {}
+  @events = []
+  def self.singleton_method_added(name)
+    return if name == :singleton_method_added
+    @events << name
+  end
+  def self.events
+    @events
+  end
+  def self.seed(values)
+    @values = values
+  end
+  def self.install(alternative)
+    key = alternative ? :alternative : :answer
+    scoped_to = ['factory']
+    delta = 0
+    define_singleton_method(:snapshot) { scoped_to.first }
+    define_singleton_method(key) do |scoped_to = nil|
+      return @values[key] + delta if scoped_to.nil?
+      @values[key] + delta
+    end
+    delta = 5
+    scoped_to[0] = 'late'
+    key
+  end
+  def self.exercise(alternative)
+    raise 'model identity/table changed' unless table_name == 'model_class_runtime_settings'
+    raise 'model native table presence' unless respond_to?(:table_name)
+    raise 'model native query presence' unless respond_to?(:find_by)
+    key = alternative ? :alternative : :answer
+    raise 'model method visible early' if respond_to?(key)
+    seed({answer: 17, alternative: 19})
+    before = events.dup
+    raise 'source installation result' unless install(alternative) == key
+    raise 'model definition callbacks changed' unless events == before + [:snapshot, key]
+    expected = alternative ? 24 : 22
+    raise 'model class storage/capture' unless public_send(key) == expected
+    raise 'optional formal did not shadow' unless snapshot == 'late'
+    bound = method(key)
+    raise 'model Method receiver identity' unless bound.receiver.equal?(self)
+    raise 'model source arity' unless bound.arity == -1
+    raise 'bound model value' unless bound.call == expected
+    puts 'model-owned runtime class setting PASS'
+  end
+end
+"#;
+
+#[test]
+fn source_model_class_owned_definition_keeps_real_model_and_storage() {
+    check_model_class_definition(false);
+}
+
+#[test]
+#[ignore = "requires Spinel; no external services or DB writes"]
+fn source_model_class_owned_definition_runs_natively() {
+    check_model_class_definition(true);
+}
+
+fn check_model_class_definition(native: bool) {
+    let probe = "ModelClassRuntimeSettings.exercise(ARGV.length > 0)\n";
+    let (emitted, typed, errors) = emit_and_run::empty_app()
+        .write("config/routes.rb", "Rails.application.routes.draw do\nend\n")
+        .write("db/schema.rb", "ActiveRecord::Schema.define do\n create_table :model_class_runtime_settings do |t|\n t.string :value\n end\nend\n")
+        .write("app/models/model_class_runtime_settings.rb", MODEL_SOURCE)
+        .emit_with_app(roundhouse::project::BuildTarget::Spinel);
+    assert!(errors.is_empty(), "{errors:#?}");
+    assert!(typed.models.iter().any(|model| model.name.0.as_str() == "ModelClassRuntimeSettings"));
+    assert!(!typed.library_classes.iter().any(|class| class.name.0.as_str() == "ModelClassRuntimeSettings"));
+    assert_eq!(typed.runtime_definition_families.len(), 1, "source model family was not admitted");
+    let consumer = format!("require_relative 'runtime/active_support_ext'\nrequire_relative 'runtime/active_record'\n{}{probe}", all_model_requires(&emitted));
+    std::fs::write(emitted.join("model_class_setting.rb"), consumer).unwrap();
+    if native {
+        let compiled = std::process::Command::new(std::env::var("SPINEL").unwrap_or_else(|_| "spinel".into()))
+            .args(["--rbs", ".", "model_class_setting.rb", "-o", "model_class_setting"])
+            .current_dir(&*emitted).output().unwrap();
+        assert!(compiled.status.success(), "{}", String::from_utf8_lossy(&compiled.stderr));
+    }
+    for arguments in [Vec::<&str>::new(), vec!["alternative"]] {
+        // The original framework model class is genuine ActiveRecord. No row
+        // is constructed, fetched, saved or seeded by this pure class control.
+        let original = emit_and_run::ruby().args(["-ractive_record", "-e"])
+            .arg(format!("{MODEL_SOURCE}\n{probe}")).args(&arguments).output().unwrap();
+        assert!(original.status.success(), "{}", String::from_utf8_lossy(&original.stderr));
+        let lowered = emit_and_run::ruby().arg("model_class_setting.rb").args(&arguments)
+            .current_dir(&*emitted).output().unwrap();
+        assert!(lowered.status.success(), "{}", String::from_utf8_lossy(&lowered.stderr));
+        assert_eq!(original.stdout, lowered.stdout);
+        if native {
+            let output = std::process::Command::new(emitted.join("model_class_setting")).args(&arguments)
+                .current_dir(&*emitted).output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            assert_eq!(output.stdout, lowered.stdout);
+        }
+    }
+}
+
+#[test]
+fn model_runtime_family_refuses_unproved_owners_and_effects() {
+    for source in [
+        format!("{MODEL_SOURCE}\nclass ModelClassRuntimeSettings\n def self.later; 1; end\nend\n"),
+        format!("{MODEL_SOURCE}\nclass ChildSettings < ModelClassRuntimeSettings\nend\n"),
+        MODEL_SOURCE.replace("< ActiveRecord::Base", "< ApplicationRecord"),
+        MODEL_SOURCE.replace("  @values = {}", "  opaque_class_effect\n  @values = {}"),
+        MODEL_SOURCE.replace("  @values = {}", "  include UnprovedModelConcern\n  @values = {}"),
+        MODEL_SOURCE.replace(":snapshot", ":table_name"),
+    ] {
+        let (_, typed, errors) = emit_and_run::empty_app()
+            .write("config/routes.rb", "Rails.application.routes.draw do\nend\n")
+            .write("db/schema.rb", "ActiveRecord::Schema.define do\n create_table :model_class_runtime_settings do |t|\n t.string :value\n end\nend\n")
+            .write("app/models/model_class_runtime_settings.rb", &source)
+            .emit_with_app(roundhouse::project::BuildTarget::Spinel);
+        assert!(typed.runtime_definition_families.is_empty(), "unproved model world admitted: {source}");
+        assert!(errors.iter().any(|error| error.message.contains("runtime-defined method")), "{errors:#?}");
+    }
+}

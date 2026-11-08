@@ -1,0 +1,798 @@
+{
+  "profile": "WIP static AMS0.8 app declaration expansion ONLY",
+  "baseline_revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+  "source_sha256": {
+    "app/serializers/topic_list_serializer.rb": "c3d062421d91095c0f378de047693de500192ca3dc4b3f94a4f8b6a764f4cbc4",
+    "app/serializers/application_serializer.rb": "3229c8ff0e74557095907bf959a555238d0284263ad2b5b1cb491898159f593a",
+    "app/serializers/topic_list_item_serializer.rb": "33a5cbc233e0f4c4b0457f7d99f288f12dd7a97719f457ea5a90623eb4795812",
+    "app/serializers/listable_topic_serializer.rb": "7768ea13a61e33f4164725b1ae717378a88dd1ddc10667a44eef260dfc47d66b",
+    "app/serializers/basic_topic_serializer.rb": "42e4a354cf6c5c9da17aedeb45895170e0f55cca9e40190a29d4d13703b59f85",
+    "app/serializers/concerns/localized_fancy_topic_title_mixin.rb": "8898a57e137bb4bf0622e6380161308d3d86ad7648cfaab01d25bfa3a9f643e5",
+    "app/serializers/basic_user_serializer.rb": "e22b92f6de231ac3bd26ece1a3741cf002438e47554ebaa21757feda5b4ea3db",
+    "app/serializers/concerns/user_status_mixin.rb": "bfdafeef213543c729a2c776cd80d792171506702066ca2a1ade272bae4e058d",
+    "app/serializers/concerns/topic_tags_mixin.rb": "61990a216da86ad452a812f00eeb5bedecafef8255185d3abc4a6fbefeb07aa1",
+    "app/serializers/topic_poster_serializer.rb": "398602fab0f12109f0aa075a1f4a257f33696cc797b97c2f06a2a6ca8df88761",
+    "app/serializers/poster_serializer.rb": "2aec379a95411f8bd2503d8bba17adf72260dbe196945876c18ef74cf3005cde",
+    "app/serializers/concerns/user_primary_group_mixin.rb": "21d43084e6935559dbc57d6940027e6f1380ecda308cd93441ad174b444369fa",
+    "app/serializers/concerns/user_flair_mixin.rb": "45044ae147145079456dfafb5902175174c952e0c70ef8f826c6658800604bdd",
+    "app/serializers/primary_group_serializer.rb": "e1b2cc430e51ac33a0d9e81c3f82742c6f53bd38d87a35a678d1236e90417748",
+    "app/serializers/flair_group_serializer.rb": "6285a64f23f812df15d885576927de726b4250960bf7f79dcb91d4e6c7a4bef4",
+    "app/serializers/tag_serializer.rb": "22124371c2b0a013bd8149d4a73bb2de9280f228764767a6a18bc247b6a6068f",
+    "app/serializers/tag_localization_serializer.rb": "65eff629d7036838703c92d5a30511d8c7430d337fa366a040f770e99712ff87",
+    "app/serializers/category_badge_serializer.rb": "4cdde74352d0ba874c8ce91e79a48b74954def41462a8c18fff95c0a47fe15d9"
+  },
+  "captured_payload_as_input": false,
+  "live_settings_as_inputs": false,
+  "classes": {
+    "TopicListSerializer": {
+      "kind": "class",
+      "parent": "ApplicationSerializer",
+      "includes": [],
+      "attributes": {
+        "can_create_topic": "can_create_topic",
+        "filter": "filter",
+        "more_topics_url": "more_topics_url",
+        "for_period": "for_period",
+        "per_page": "per_page",
+        "top_tags": "top_tags",
+        "tags": "tags",
+        "shared_drafts": "shared_drafts",
+        "filter_option_info": "filter_option_info",
+        "filter_new_topic_ids": "filter_new_topic_ids"
+      },
+      "associations": {
+        "topics": {
+          "many": true,
+          "options": {
+            "serializer": "TopicListItemSerializer",
+            "embed": ":objects"
+          }
+        },
+        "shared_drafts": {
+          "many": true,
+          "options": {
+            "serializer": "TopicListItemSerializer",
+            "embed": ":objects"
+          }
+        },
+        "tags": {
+          "many": true,
+          "options": {
+            "serializer": "TagSerializer",
+            "embed": ":objects"
+          }
+        },
+        "categories": {
+          "many": true,
+          "options": {
+            "serializer": "CategoryBadgeSerializer",
+            "embed": ":objects"
+          }
+        }
+      }
+    },
+    "ApplicationSerializer": {
+      "kind": "class",
+      "parent": null,
+      "includes": [],
+      "attributes": {},
+      "associations": {}
+    },
+    "TopicListItemSerializer": {
+      "kind": "class",
+      "parent": "ListableTopicSerializer",
+      "includes": [
+        "TopicTagsMixin"
+      ],
+      "attributes": {
+        "fancy_title": "fancy_title",
+        "fancy_title_localized": "fancy_title_localized",
+        "locale": "locale",
+        "id": "id",
+        "title": "title",
+        "slug": "slug",
+        "posts_count": "posts_count",
+        "reply_count": "reply_count",
+        "highest_post_number": "highest_post_number",
+        "image_url": "image_url",
+        "created_at": "created_at",
+        "last_posted_at": "last_posted_at",
+        "bumped": "bumped",
+        "bumped_at": "bumped_at",
+        "archetype": "archetype",
+        "unseen": "unseen",
+        "last_read_post_number": "last_read_post_number",
+        "unread": "unread",
+        "new_posts": "new_posts",
+        "unread_posts": "unread_posts",
+        "pinned": "pinned",
+        "unpinned": "unpinned",
+        "excerpt": "excerpt",
+        "visible": "visible",
+        "closed": "closed",
+        "archived": "archived",
+        "is_warning": "is_warning",
+        "notification_level": "notification_level",
+        "bookmarked": "bookmarked",
+        "liked": "liked",
+        "unicode_title": "unicode_title",
+        "unread_by_group_member": "unread_by_group_member",
+        "thumbnails": "thumbnails",
+        "visibility_reason_id": "visibility_reason_id",
+        "tags": "tags",
+        "tags_descriptions": "tags_descriptions",
+        "views": "views",
+        "like_count": "like_count",
+        "has_summary": "has_summary",
+        "last_poster_username": "last_poster_username",
+        "category_id": "category_id",
+        "op_like_count": "op_like_count",
+        "op_can_like": "op_can_like",
+        "op_liked": "op_liked",
+        "first_post_id": "first_post_id",
+        "pinned_globally": "pinned_globally",
+        "liked_post_numbers": "liked_post_numbers",
+        "featured_link": "featured_link",
+        "featured_link_root_domain": "featured_link_root_domain",
+        "allowed_user_count": "allowed_user_count",
+        "participant_groups": "participant_groups",
+        "is_hot": "is_hot",
+        "is_nested_view": "is_nested_view",
+        "has_new_replies": "has_new_replies"
+      },
+      "associations": {
+        "last_poster": {
+          "many": false,
+          "options": {
+            "serializer": "BasicUserSerializer",
+            "embed": ":objects"
+          }
+        },
+        "posters": {
+          "many": true,
+          "options": {
+            "serializer": "TopicPosterSerializer",
+            "embed": ":objects"
+          }
+        },
+        "participants": {
+          "many": true,
+          "options": {
+            "serializer": "TopicPosterSerializer",
+            "embed": ":objects"
+          }
+        }
+      }
+    },
+    "ListableTopicSerializer": {
+      "kind": "class",
+      "parent": "BasicTopicSerializer",
+      "includes": [],
+      "attributes": {
+        "fancy_title": "fancy_title",
+        "fancy_title_localized": "fancy_title_localized",
+        "locale": "locale",
+        "id": "id",
+        "title": "title",
+        "slug": "slug",
+        "posts_count": "posts_count",
+        "reply_count": "reply_count",
+        "highest_post_number": "highest_post_number",
+        "image_url": "image_url",
+        "created_at": "created_at",
+        "last_posted_at": "last_posted_at",
+        "bumped": "bumped",
+        "bumped_at": "bumped_at",
+        "archetype": "archetype",
+        "unseen": "unseen",
+        "last_read_post_number": "last_read_post_number",
+        "unread": "unread",
+        "new_posts": "new_posts",
+        "unread_posts": "unread_posts",
+        "pinned": "pinned",
+        "unpinned": "unpinned",
+        "excerpt": "excerpt",
+        "visible": "visible",
+        "closed": "closed",
+        "archived": "archived",
+        "is_warning": "is_warning",
+        "notification_level": "notification_level",
+        "bookmarked": "bookmarked",
+        "liked": "liked",
+        "unicode_title": "unicode_title",
+        "unread_by_group_member": "unread_by_group_member",
+        "thumbnails": "thumbnails",
+        "visibility_reason_id": "visibility_reason_id"
+      },
+      "associations": {
+        "last_poster": {
+          "many": false,
+          "options": {
+            "serializer": "BasicUserSerializer",
+            "embed": ":objects"
+          }
+        }
+      }
+    },
+    "BasicTopicSerializer": {
+      "kind": "class",
+      "parent": "ApplicationSerializer",
+      "includes": [
+        "LocalizedFancyTopicTitleMixin"
+      ],
+      "attributes": {
+        "fancy_title": "fancy_title",
+        "fancy_title_localized": "fancy_title_localized",
+        "locale": "locale",
+        "id": "id",
+        "title": "title",
+        "slug": "slug",
+        "posts_count": "posts_count"
+      },
+      "associations": {}
+    },
+    "LocalizedFancyTopicTitleMixin": {
+      "kind": "module",
+      "parent": null,
+      "includes": [],
+      "attributes": {
+        "fancy_title": "fancy_title",
+        "fancy_title_localized": "fancy_title_localized",
+        "locale": "locale"
+      },
+      "associations": {}
+    },
+    "BasicUserSerializer": {
+      "kind": "class",
+      "parent": "ApplicationSerializer",
+      "includes": [
+        "UserStatusMixin"
+      ],
+      "attributes": {
+        "status": "status",
+        "id": "id",
+        "username": "username",
+        "name": "name",
+        "avatar_template": "avatar_template"
+      },
+      "associations": {}
+    },
+    "UserStatusMixin": {
+      "kind": "module",
+      "parent": null,
+      "includes": [],
+      "attributes": {
+        "status": "status"
+      },
+      "associations": {}
+    },
+    "TopicTagsMixin": {
+      "kind": "module",
+      "parent": null,
+      "includes": [],
+      "attributes": {
+        "tags": "tags",
+        "tags_descriptions": "tags_descriptions"
+      },
+      "associations": {}
+    },
+    "TopicPosterSerializer": {
+      "kind": "class",
+      "parent": "ApplicationSerializer",
+      "includes": [],
+      "attributes": {
+        "extras": "extras",
+        "description": "description"
+      },
+      "associations": {
+        "user": {
+          "many": false,
+          "options": {
+            "serializer": "PosterSerializer"
+          }
+        },
+        "primary_group": {
+          "many": false,
+          "options": {
+            "serializer": "PrimaryGroupSerializer"
+          }
+        },
+        "flair_group": {
+          "many": false,
+          "options": {
+            "serializer": "FlairGroupSerializer"
+          }
+        }
+      }
+    },
+    "PosterSerializer": {
+      "kind": "class",
+      "parent": "BasicUserSerializer",
+      "includes": [
+        "UserPrimaryGroupMixin"
+      ],
+      "attributes": {
+        "status": "status",
+        "id": "id",
+        "username": "username",
+        "name": "name",
+        "avatar_template": "avatar_template",
+        "flair_name": "flair_name",
+        "flair_url": "flair_url",
+        "flair_bg_color": "flair_bg_color",
+        "flair_color": "flair_color",
+        "flair_group_id": "flair_group_id",
+        "primary_group_name": "primary_group_name",
+        "admin": "admin",
+        "moderator": "moderator",
+        "trust_level": "trust_level"
+      },
+      "associations": {}
+    },
+    "UserPrimaryGroupMixin": {
+      "kind": "module",
+      "parent": null,
+      "includes": [
+        "UserFlairMixin"
+      ],
+      "attributes": {
+        "flair_name": "flair_name",
+        "flair_url": "flair_url",
+        "flair_bg_color": "flair_bg_color",
+        "flair_color": "flair_color",
+        "flair_group_id": "flair_group_id",
+        "primary_group_name": "primary_group_name",
+        "admin": "admin",
+        "moderator": "moderator",
+        "trust_level": "trust_level"
+      },
+      "associations": {}
+    },
+    "UserFlairMixin": {
+      "kind": "module",
+      "parent": null,
+      "includes": [],
+      "attributes": {
+        "flair_name": "flair_name",
+        "flair_url": "flair_url",
+        "flair_bg_color": "flair_bg_color",
+        "flair_color": "flair_color",
+        "flair_group_id": "flair_group_id"
+      },
+      "associations": {}
+    },
+    "PrimaryGroupSerializer": {
+      "kind": "class",
+      "parent": "ApplicationSerializer",
+      "includes": [],
+      "attributes": {
+        "id": "id",
+        "name": "name"
+      },
+      "associations": {}
+    },
+    "FlairGroupSerializer": {
+      "kind": "class",
+      "parent": "ApplicationSerializer",
+      "includes": [],
+      "attributes": {
+        "id": "id",
+        "name": "name",
+        "flair_url": "flair_url",
+        "flair_bg_color": "flair_bg_color",
+        "flair_color": "flair_color"
+      },
+      "associations": {}
+    },
+    "TagSerializer": {
+      "kind": "class",
+      "parent": "ApplicationSerializer",
+      "includes": [],
+      "attributes": {
+        "id": "id",
+        "name": "name",
+        "slug": "slug",
+        "topic_count": "topic_count",
+        "staff": "staff",
+        "description": "description",
+        "description_cooked": "description_cooked"
+      },
+      "associations": {
+        "localizations": {
+          "many": true,
+          "options": {
+            "serializer": "TagLocalizationSerializer",
+            "embed": ":objects"
+          }
+        }
+      }
+    },
+    "TagLocalizationSerializer": {
+      "kind": "class",
+      "parent": "ApplicationSerializer",
+      "includes": [],
+      "attributes": {
+        "id": "id",
+        "tag_id": "tag_id",
+        "locale": "locale",
+        "name": "name",
+        "description": "description",
+        "description_cooked": "description_cooked"
+      },
+      "associations": {}
+    },
+    "CategoryBadgeSerializer": {
+      "kind": "class",
+      "parent": "ApplicationSerializer",
+      "includes": [],
+      "attributes": {
+        "id": "id",
+        "name": "name",
+        "slug": "slug",
+        "color": "color",
+        "text_color": "text_color",
+        "style_type": "style_type",
+        "icon": "icon",
+        "emoji": "emoji",
+        "read_restricted": "read_restricted",
+        "parent_category_id": "parent_category_id"
+      },
+      "associations": {}
+    }
+  },
+  "candidates": {
+    "app/serializers/topic_list_serializer.rb": "8bca64c6a569d0f404e58f573dbabaf6d2381d72d18c376c485e616fae059d07",
+    "app/serializers/application_serializer.rb": "d73ef8f998e654e0f975f143952b951fc09139ff14ceacec716384bf8c8c1d8f",
+    "app/serializers/topic_list_item_serializer.rb": "75675cf76fa4614f353f0a8310d70bab1f21419abae67a467aefa25ec60dae23",
+    "app/serializers/listable_topic_serializer.rb": "6ad87b2080fe7fe08319b6a5ee55c54b7c41415b17dd0d185afc533f35d84c83",
+    "app/serializers/basic_topic_serializer.rb": "0b356d751945c75696ca835808bf4ac41fd045f0c54a774dbc3d0a0600393a81",
+    "app/serializers/concerns/localized_fancy_topic_title_mixin.rb": "5f4d1b32812de883cb49450c80b4afe8c6c2cc188ca835792b9e9d845e9f71b2",
+    "app/serializers/basic_user_serializer.rb": "9504fc92eedb6cc6235137e53fe5610958b857abcb11e01f233f664e32874143",
+    "app/serializers/concerns/user_status_mixin.rb": "3cda1866cb8f58cd2a548b729d70409040bdc5426bab240695819a44f8c8101d",
+    "app/serializers/concerns/topic_tags_mixin.rb": "74176466d339bc420403c67c301e564fbc7edcf8f7cf986677a06350b4b4bf37",
+    "app/serializers/topic_poster_serializer.rb": "204108b1f954c4a6f4ae4e1dcde1f2981437274074e938694a60a9a74986440b",
+    "app/serializers/poster_serializer.rb": "0426cbb489686d8944efca9855e85f97f5d81894d7d262cc150d293674f9ddb3",
+    "app/serializers/concerns/user_primary_group_mixin.rb": "a155203b3e9889a73fe7dbe10cd4781b6d4c9f25649f06009cb3d16f09d49010",
+    "app/serializers/concerns/user_flair_mixin.rb": "ca1ea0bab7f83804da4b91ec471f3d4ff6ecbb71932e9ac942c351c60f7886e3",
+    "app/serializers/primary_group_serializer.rb": "47c6a76d0e995d3c87314a04cc91969ac8b6490dbb7782f478ce9f6423fd476b",
+    "app/serializers/flair_group_serializer.rb": "24144a18bb71819bae15755b5405a66a281ffacc5997f51a191c85081419a1dd",
+    "app/serializers/tag_serializer.rb": "6851f80db872b0d3080e0975bb81992f6c5836f04721fe436f622b6e4cf93f05",
+    "app/serializers/tag_localization_serializer.rb": "68a57fa84a15a70cde935c88c300471974878ad139d100a0cc37425463e50818",
+    "app/serializers/category_badge_serializer.rb": "f9444b32362c601877e37ed293e17e3a1ccdd82b285c7f310e9864fcf56d8492"
+  },
+  "guarded_changes": [
+    {
+      "source": "app/serializers/topic_list_serializer.rb",
+      "start_byte": 575,
+      "end_byte": 649,
+      "text_sha256": "b3956a90885a0f3165962a3a0ec6517994c408ffad346e9f909392583b6d73ec",
+      "reason": "Fixed actual declaration/hook expanded to ordinary shared methods; no observed values or empty callback installed"
+    },
+    {
+      "source": "app/serializers/topic_list_serializer.rb",
+      "start_byte": 514,
+      "end_byte": 572,
+      "text_sha256": "932b4e8624ac357b64036037424e6575873e05cf18877d60c91da0add19fae00",
+      "reason": "Fixed actual declaration/hook expanded to ordinary shared methods; no observed values or empty callback installed"
+    },
+    {
+      "source": "app/serializers/topic_list_serializer.rb",
+      "start_byte": 434,
+      "end_byte": 511,
+      "text_sha256": "9900f6032eca2e256d8bc4ac16ae35f0759554c9a460a24644de3c7e117c422c",
+      "reason": "Fixed actual declaration/hook expanded to ordinary shared methods; no observed values or empty callback installed"
+    },
+    {
+      "source": "app/serializers/topic_list_serializer.rb",
+      "start_byte": 361,
+      "end_byte": 431,
+      "text_sha256": "e386f0a8c7b778d9d4cd3c6b0b87fc490fea65de7108525fb453b5fcee81567a",
+      "reason": "Fixed actual declaration/hook expanded to ordinary shared methods; no observed values or empty callback installed"
+    },
+    {
+      "source": "app/serializers/topic_list_serializer.rb",
+      "start_byte": 83,
+      "end_byte": 357,
+      "text_sha256": "42966778755b0c1bfe9ccb92e39b0c41d2957b8fce25f2109fe1fbe646673ec6",
+      "reason": "Fixed actual declaration/hook expanded to ordinary shared methods; no observed values or empty callback installed"
+    },
+    {
+      "source": "app/serializers/application_serializer.rb",
+      "start_byte": 116,
+      "end_byte": 141,
+      "text_sha256": "7f61666f137d98b2ddf7643e4c0cf126a6d28d468198381b368f0e90c44bfee2",
+      "reason": "Fixed actual declaration/hook expanded to ordinary shared methods; no observed values or empty callback installed"
+    },
+    {
+      "source": "app/serializers/topic_list_item_serializer.rb",
+      "start_byte": 4062,
+      "end_byte": 4367,
+      "text_sha256": "42be799aff665e9caa49d4e4c306ec61b1b8fb34fe49ccb52d12f13aeee05b0c",
+      "reason": "Explicit supported Topic/anonymous/no-status guard; non-supported branch refuses rather than importing unrelated family"
+    },
+    {
+      "source": "app/serializers/topic_list_item_serializer.rb",
+      "start_byte": 3480,
+      "end_byte": 3699,
+      "text_sha256": "c7236c5543d1f227edc701278da2633f5fd7b664e4ccb7338a0472126835a9ad",
+      "reason": "Explicit supported Topic/anonymous/no-status guard; non-supported branch refuses rather than importing unrelated family"
+    },
+    {
+      "source": "app/serializers/topic_list_item_serializer.rb",
+      "start_byte": 3404,
+      "end_byte": 3476,
+      "text_sha256": "667b24209904f0997cb78990b1591c5a9f34d31645fef3257fe07a0d4849d9da",
+      "reason": "Explicit supported Topic/anonymous/no-status guard; non-supported branch refuses rather than importing unrelated family"
+    },
+    {
+      "source": "app/serializers/topic_list_item_serializer.rb",
+      "start_byte": 2853,
+      "end_byte": 2948,
+      "text_sha256": "df453b8a2a4e5a4f935f31e3b303e694e2734becaf07ce5a4f43cd45550a9e5a",
+      "reason": "Explicit supported Topic/anonymous/no-status guard; non-supported branch refuses rather than importing unrelated family"
+    },
+    {
+      "source": "app/serializers/topic_list_item_serializer.rb",
+      "start_byte": 2675,
+      "end_byte": 2849,
+      "text_sha256": "0574f2d59010e398af147ad92d5b1e6d04b5c8b675a84399104e65d28136816f",
+      "reason": "Explicit supported Topic/anonymous/no-status guard; non-supported branch refuses rather than importing unrelated family"
+    },
+    {
+      "source": "app/serializers/topic_list_item_serializer.rb",
+      "start_byte": 1690,
+      "end_byte": 1922,
+      "text_sha256": "4e812268a161ba2b578c863b9d1ad15be9aac023ea220d117ac3d30531f16e8e",
+      "reason": "Explicit supported Topic/anonymous/no-status guard; non-supported branch refuses rather than importing unrelated family"
+    },
+    {
+      "source": "app/serializers/topic_list_item_serializer.rb",
+      "start_byte": 1121,
+      "end_byte": 1612,
+      "text_sha256": "1c758c2db7630c0ddc75d4aab786ca73059109788c12ce51c850321f55d44363",
+      "reason": "Explicit supported Topic/anonymous/no-status guard; non-supported branch refuses rather than importing unrelated family"
+    },
+    {
+      "source": "app/serializers/topic_list_item_serializer.rb",
+      "start_byte": 744,
+      "end_byte": 818,
+      "text_sha256": "986f15672e1bd1617c6ec0e55e54f2ab64ff59ce08f6eac47c23884868e5d8fc",
+      "reason": "Fixed actual declaration/hook expanded to ordinary shared methods; no observed values or empty callback installed"
+    },
+    {
+      "source": "app/serializers/topic_list_item_serializer.rb",
+      "start_byte": 672,
+      "end_byte": 741,
+      "text_sha256": "980237162d81134f79f93e99d41030d8f3327b6e082c32aac240e0ce8a773952",
+      "reason": "Fixed actual declaration/hook expanded to ordinary shared methods; no observed values or empty callback installed"
+    },
+    {
+      "source": "app/serializers/topic_list_item_serializer.rb",
+      "start_byte": 115,
+      "end_byte": 668,
+      "text_sha256": "7bf2c056f3c0f6a45f9026fb62cdfef40ed9ca1bbfb6e7d301e6eaf23b080270",
+      "reason": "Fixed actual declaration/hook expanded to ordinary shared methods; no observed values or empty callback installed"
+    },
+    {
+      "source": "app/serializers/listable_topic_serializer.rb",
+      "start_byte": 4037,
+      "end_byte": 4127,
+      "text_sha256": "fad59b3f2becfb93bf406e3214c7a30ccce36412044de57bc5c79fb585399e36",
+      "reason": "Explicit supported Topic/anonymous/no-status guard; non-supported branch refuses rather than importing unrelated family"
+    },
+    {
+      "source": "app/serializers/listable_topic_serializer.rb",
+      "start_byte": 3156,
+      "end_byte": 3209,
+      "text_sha256": "3533f42c76a7f9825e5a7aeb139308115129d0ed9ffafa18d4539aed9939855a",
+      "reason": "Explicit supported Topic/anonymous/no-status guard; non-supported branch refuses rather than importing unrelated family"
+    },
+    {
+      "source": "app/serializers/listable_topic_serializer.rb",
+      "start_byte": 3061,
+      "end_byte": 3111,
+      "text_sha256": "d750e6910367af14f5b0eeb287866c30a9b9051ff70db41e9f2d918112521a19",
+      "reason": "Explicit supported Topic/anonymous/no-status guard; non-supported branch refuses rather than importing unrelated family"
+    },
+    {
+      "source": "app/serializers/listable_topic_serializer.rb",
+      "start_byte": 809,
+      "end_byte": 879,
+      "text_sha256": "af4829c0650599093c272ea50ace96bb2a84cafafb52f1a27c65ae03a5a219ba",
+      "reason": "Fixed actual declaration/hook expanded to ordinary shared methods; no observed values or empty callback installed"
+    },
+    {
+      "source": "app/serializers/listable_topic_serializer.rb",
+      "start_byte": 86,
+      "end_byte": 805,
+      "text_sha256": "d77f5f8734d786e1af5e32e6a1d2a558d44e5ba16a35e852367fa027ae6cf5a7",
+      "reason": "Fixed actual declaration/hook expanded to ordinary shared methods; no observed values or empty callback installed"
+    },
+    {
+      "source": "app/serializers/basic_topic_serializer.rb",
+      "start_byte": 202,
+      "end_byte": 259,
+      "text_sha256": "6d8a0d7e6bc210bd1be10972d8df1e7d06aad2ff5c0a7f425e080b85b863732c",
+      "reason": "Fixed actual declaration/hook expanded to ordinary shared methods; no observed values or empty callback installed"
+    },
+    {
+      "source": "app/serializers/concerns/localized_fancy_topic_title_mixin.rb",
+      "start_byte": 685,
+      "end_byte": 926,
+      "text_sha256": "83a221a51b166fe381f9f40244ee3a19b66217e7033782ae3b6da0e879c8d220",
+      "reason": "Explicit supported Topic/anonymous/no-status guard; non-supported branch refuses rather than importing unrelated family"
+    },
+    {
+      "source": "app/serializers/concerns/localized_fancy_topic_title_mixin.rb",
+      "start_byte": 279,
+      "end_byte": 361,
+      "text_sha256": "e65f67294a9915d53cf1d63d37651ada9693bcc2656e74ce8f1f5ce4cd7c9891",
+      "reason": "Explicit supported Topic/anonymous/no-status guard; non-supported branch refuses rather than importing unrelated family"
+    },
+    {
+      "source": "app/serializers/concerns/localized_fancy_topic_title_mixin.rb",
+      "start_byte": 70,
+      "end_byte": 207,
+      "text_sha256": "6cdf79feb9f84b2594a1ada4a42a9874df0879bcda664aa481bb29c886d73f81",
+      "reason": "Fixed actual declaration/hook expanded to ordinary shared methods; no observed values or empty callback installed"
+    },
+    {
+      "source": "app/serializers/basic_user_serializer.rb",
+      "start_byte": 457,
+      "end_byte": 520,
+      "text_sha256": "825254b2642b4fc2f2b59df70c7918eaf9bfd903ebf874a441f8f7b4bfd85cf1",
+      "reason": "Explicit supported Topic/anonymous/no-status guard; non-supported branch refuses rather than importing unrelated family"
+    },
+    {
+      "source": "app/serializers/basic_user_serializer.rb",
+      "start_byte": 110,
+      "end_byte": 160,
+      "text_sha256": "429f2f1273406b577bb8c4265b724d30b0686682cbec783fc3d3e383b376afc5",
+      "reason": "Fixed actual declaration/hook expanded to ordinary shared methods; no observed values or empty callback installed"
+    },
+    {
+      "source": "app/serializers/concerns/user_status_mixin.rb",
+      "start_byte": 339,
+      "end_byte": 425,
+      "text_sha256": "4a77eb4f3a673f0b12c5c8c8fb5511153f16af209e9590ad724df8df47a02e06",
+      "reason": "Explicit supported Topic/anonymous/no-status guard; non-supported branch refuses rather than importing unrelated family"
+    },
+    {
+      "source": "app/serializers/concerns/user_status_mixin.rb",
+      "start_byte": 119,
+      "end_byte": 335,
+      "text_sha256": "2d5ee0e5fb17386543775506ac32ba625aa83e3e466034a882c946508bdb98e2",
+      "reason": "Explicit supported Topic/anonymous/no-status guard; non-supported branch refuses rather than importing unrelated family"
+    },
+    {
+      "source": "app/serializers/concerns/user_status_mixin.rb",
+      "start_byte": 56,
+      "end_byte": 115,
+      "text_sha256": "ea573551522e5f9b4839f771f9d8296696ed5174736f6243ddfadc7270311bff",
+      "reason": "Fixed actual declaration/hook expanded to ordinary shared methods; no observed values or empty callback installed"
+    },
+    {
+      "source": "app/serializers/concerns/topic_tags_mixin.rb",
+      "start_byte": 1084,
+      "end_byte": 1546,
+      "text_sha256": "d506fe75efe0b16f6b8a845f92402da57898551ad3a4e576486606e5148a9477",
+      "reason": "Explicit supported Topic/anonymous/no-status guard; non-supported branch refuses rather than importing unrelated family"
+    },
+    {
+      "source": "app/serializers/concerns/topic_tags_mixin.rb",
+      "start_byte": 413,
+      "end_byte": 626,
+      "text_sha256": "e58633ad975b5c0d9d6c271b0e7b9b76ae322e16ee9e48a5f1dafec91d77a679",
+      "reason": "Explicit supported Topic/anonymous/no-status guard; non-supported branch refuses rather than importing unrelated family"
+    },
+    {
+      "source": "app/serializers/concerns/topic_tags_mixin.rb",
+      "start_byte": 81,
+      "end_byte": 178,
+      "text_sha256": "dbcdef526c3551f870aa56d868bf30d1fda13eb9ae11e1ca749a4fb730ddf5e8",
+      "reason": "Fixed actual declaration/hook expanded to ordinary shared methods; no observed values or empty callback installed"
+    },
+    {
+      "source": "app/serializers/topic_poster_serializer.rb",
+      "start_byte": 228,
+      "end_byte": 282,
+      "text_sha256": "733d00df4fb25d7f8aab407a335a0ae22eee151733bb9dc60ee457dc7b675b9b",
+      "reason": "Fixed actual declaration/hook expanded to ordinary shared methods; no observed values or empty callback installed"
+    },
+    {
+      "source": "app/serializers/topic_poster_serializer.rb",
+      "start_byte": 167,
+      "end_byte": 225,
+      "text_sha256": "4bb84786da9c5404fbb9ff57091533316ff7b362758b510a2c1de65c025ffa4f",
+      "reason": "Fixed actual declaration/hook expanded to ordinary shared methods; no observed values or empty callback installed"
+    },
+    {
+      "source": "app/serializers/topic_poster_serializer.rb",
+      "start_byte": 121,
+      "end_byte": 164,
+      "text_sha256": "8b46979c101bf620d75fa93813cbf7d38578f494c679c72cd0aca3ed1741a313",
+      "reason": "Fixed actual declaration/hook expanded to ordinary shared methods; no observed values or empty callback installed"
+    },
+    {
+      "source": "app/serializers/topic_poster_serializer.rb",
+      "start_byte": 85,
+      "end_byte": 117,
+      "text_sha256": "089b9a1a6aca16ba18cfdea2e7cb0d655a655db3d5f9aa300d7a7d6fc9637feb",
+      "reason": "Fixed actual declaration/hook expanded to ordinary shared methods; no observed values or empty callback installed"
+    },
+    {
+      "source": "app/serializers/concerns/user_primary_group_mixin.rb",
+      "start_byte": 62,
+      "end_byte": 200,
+      "text_sha256": "2da14898b0e63074c4ff578d31020f4d74d6d565c1660e28329096241e501749",
+      "reason": "Fixed actual declaration/hook expanded to ordinary shared methods; no observed values or empty callback installed"
+    },
+    {
+      "source": "app/serializers/concerns/user_flair_mixin.rb",
+      "start_byte": 55,
+      "end_byte": 178,
+      "text_sha256": "3053a2a04f09602de0395ebe30e5401dd3ed39aae1e0877288e89e5a692d0f6c",
+      "reason": "Fixed actual declaration/hook expanded to ordinary shared methods; no observed values or empty callback installed"
+    },
+    {
+      "source": "app/serializers/primary_group_serializer.rb",
+      "start_byte": 86,
+      "end_byte": 107,
+      "text_sha256": "422271cff899df3edc8c2aa5c86f1f6562e8d57c0f79bfdeda5fc871a94127b5",
+      "reason": "Fixed actual declaration/hook expanded to ordinary shared methods; no observed values or empty callback installed"
+    },
+    {
+      "source": "app/serializers/flair_group_serializer.rb",
+      "start_byte": 84,
+      "end_byte": 148,
+      "text_sha256": "4ab49ca694d79c688ed8d55ad9d78f1463fe114a3823f3d2cdd345ccd645c5e3",
+      "reason": "Fixed actual declaration/hook expanded to ordinary shared methods; no observed values or empty callback installed"
+    },
+    {
+      "source": "app/serializers/tag_serializer.rb",
+      "start_byte": 951,
+      "end_byte": 1025,
+      "text_sha256": "7d194d3f8bd08b7c516415caab93fa3f8b6abc682957e259f2783b0222ca9f6f",
+      "reason": "Explicit supported Topic/anonymous/no-status guard; non-supported branch refuses rather than importing unrelated family"
+    },
+    {
+      "source": "app/serializers/tag_serializer.rb",
+      "start_byte": 872,
+      "end_byte": 947,
+      "text_sha256": "d1097e224286509ce781cf988d1a329285236e22e8c17c1b5036049c37b67e31",
+      "reason": "Explicit supported Topic/anonymous/no-status guard; non-supported branch refuses rather than importing unrelated family"
+    },
+    {
+      "source": "app/serializers/tag_serializer.rb",
+      "start_byte": 166,
+      "end_byte": 245,
+      "text_sha256": "6716e3813eec4c97ad702c69b298030ad4a896ff0c868d5be8f3f779e0b42e6a",
+      "reason": "Fixed actual declaration/hook expanded to ordinary shared methods; no observed values or empty callback installed"
+    },
+    {
+      "source": "app/serializers/tag_serializer.rb",
+      "start_byte": 77,
+      "end_byte": 162,
+      "text_sha256": "b804b929e9ceee3d5f9a7a7d38bef78c667c270b4f9e499c3e09a6e57f56195e",
+      "reason": "Fixed actual declaration/hook expanded to ordinary shared methods; no observed values or empty callback installed"
+    },
+    {
+      "source": "app/serializers/tag_localization_serializer.rb",
+      "start_byte": 89,
+      "end_byte": 163,
+      "text_sha256": "3e58a1fe13435b368470f2e9df1da04a302ec51c78973582ef2971af9bf5f16b",
+      "reason": "Fixed actual declaration/hook expanded to ordinary shared methods; no observed values or empty callback installed"
+    },
+    {
+      "source": "app/serializers/category_badge_serializer.rb",
+      "start_byte": 87,
+      "end_byte": 320,
+      "text_sha256": "e420cd1294c5bd0c392ae02c129046acf92d2254109525c4d2e60f2a088f08a4",
+      "reason": "Fixed actual declaration/hook expanded to ordinary shared methods; no observed values or empty callback installed"
+    }
+  ],
+  "native_query_executed": false,
+  "json_request_accepted": false,
+  "full_query_accepted": false,
+  "page_accepted": false
+}

@@ -75,6 +75,32 @@ impl ThroughJoins {
     }
 }
 
+/// Read-only two-hop collection through a monomorphic belongs_to, followed by
+/// a direct has_many. Keep the actual intermediate reader (including missing
+/// parents/default scopes), rather than inventing an owner FK on the target.
+pub(crate) fn belongs_to_through_collection(
+    model: &Model,
+    models: &[Model],
+    name: &Symbol,
+) -> Option<(Symbol, Symbol, Symbol)> {
+    let (target, through, source) = model.associations().find_map(|assoc| match assoc {
+        Association::HasMany { name: n, target, through: Some(through), source, scope: None, .. }
+            if n == name => Some((target, through, source.as_ref().unwrap_or(name))),
+        _ => None,
+    })?;
+    let intermediate = model.associations().find_map(|assoc| match assoc {
+        Association::BelongsTo { name, target, polymorphic: false, .. }
+            if name == through => Some(target),
+        _ => None,
+    })?;
+    let intermediate = models.iter().find(|candidate| &candidate.name == intermediate)?;
+    intermediate.associations().find_map(|assoc| match assoc {
+        Association::HasMany { name, target: actual, foreign_key, through: None, scope: None, as_interface: None, .. }
+            if name == source && actual == target => Some((through.clone(), foreign_key.clone(), assoc.owner_key())),
+        _ => None,
+    })
+}
+
 /// Resolve one through association's join. `through_name` is that
 /// association (`:labels`), not the sibling it names (`:labelings`).
 pub(crate) fn through_writer_join(
@@ -260,6 +286,25 @@ pub(super) fn push_association_methods(
                     keeps_nil,
                     model.methods().any(|m| m.name.as_str() == format!("__hold_{name}")),
                 );
+                if keeps_nil {
+                    if let Some((intermediate, foreign_key, parent_key)) = belongs_to_through_collection(model, models, name) {
+                        let text = format!(
+                            r#"def {name}
+  parent = {intermediate}
+  relation = if parent.nil? || parent.{parent_key}.nil?
+    ActiveRecord::Relation.new({target}).none
+  else
+    ActiveRecord::Relation.new({target}).where({foreign_key}: parent.{parent_key})
+  end
+  relation = relation.preloaded(__{name}_cache, true) if @{name}_loaded
+  relation
+end"#,
+                            target = target.0.as_str(),
+                        );
+                        reader.body = crate::runtime_src::parse_methods(&text)
+                            .expect("belongs_to through reader").remove(0).body;
+                    }
+                }
                 if crate::lower::default_scope::reader_replaces_scope(models, assoc) {
                     reroot_unscoping(&mut reader.body, target, foreign_key);
                 }

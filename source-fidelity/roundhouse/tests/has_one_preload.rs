@@ -1,7 +1,8 @@
 //! Unscoped `has_one` participates in Relation `preload` / `includes`
 //! batching through the load-once cache.
 //!
-//! Unclaimed: scoped `has_one` batch scope application; polymorphic
+//! Scoped singular reads preload with their real reader (N+1 allowed).
+//! Unclaimed: scoped `has_one` optimized batching; polymorphic
 //! `as:` preload batch; separate `eager_load` emit_and_run pin.
 
 #[path = "support/emit_and_run.rs"]
@@ -100,4 +101,70 @@ puts "has_one preload class_name/foreign_key passed"
 "#,
         )
         .assert_passes();
+}
+
+/// Scoped singular associations use their actual reader rather than an FK-only
+/// batch that would erase the scope. Cache nil too; query counts may be N+1.
+#[test]
+fn scoped_has_one_preload_preserves_scope_and_memoizes_missing() {
+    let (path, from, to) = profile_schema_edit();
+    emit_and_run::real_blog()
+        .edit(path, from, to)
+        .write("app/models/profile.rb", "class Profile < ApplicationRecord\n  belongs_to :article\nend\n")
+        .edit("app/models/article.rb", "  has_many :comments, dependent: :destroy",
+              "  has_many :comments, dependent: :destroy\n  has_one :selected_profile, -> { where(bio: 'selected') }, class_name: 'Profile'\n  scope :with_selected_profile, -> { includes(:selected_profile) }")
+        .run_ruby(r#"
+a = Article.create!(title: 'Alpha', body: 'abcdefghij')
+b = Article.create!(title: 'Beta', body: 'abcdefghij')
+Profile.create!(article_id: a.id, bio: 'wrong')
+p = Profile.create!(article_id: a.id, bio: 'selected')
+Profile.create!(article_id: b.id, bio: 'wrong')
+rows = Article.with_selected_profile.order(:id).to_a
+repeated = Db.capture_sql do
+  raise 'scope erased' unless rows[0].selected_profile.id == p.id
+  raise 'missing scope result' unless rows[1].selected_profile.nil?
+  raise 'missing memoization' unless rows.all?(&:selected_profile_loaded?)
+  rows.each { |row| row.selected_profile }
+end
+raise 'repeat queried' unless repeated.empty?
+puts 'scoped has_one read preloading passed'
+"#).assert_passes();
+}
+
+/// A collection through a belongs_to is keyed from the real intermediate
+/// record, not the owner's id. Preloaded readers remain Relations (including
+/// a missing parent), with constraints intact when forked with where.
+#[test]
+fn belongs_to_through_collection_preserves_parent_key_and_relation_cache() {
+    let (path, from, to) = profile_schema_edit();
+    emit_and_run::real_blog()
+        .edit(path, from, to)
+        .edit("db/schema.rb", "  create_table \"articles\", force: :cascade do |t|",
+              "  create_table \"articles\", force: :cascade do |t|\n    t.integer \"profile_id\"")
+        .write("app/models/profile.rb", "class Profile < ApplicationRecord\n  belongs_to :article\n  has_many :notes, class_name: 'Comment', foreign_key: :article_id, primary_key: :article_id\nend\n")
+        .edit("app/models/article.rb", "  has_many :comments, dependent: :destroy",
+              "  has_many :comments, dependent: :destroy\n  belongs_to :profile, optional: true\n  has_many :related_comments, through: :profile, source: :notes\n  scope :with_related_comments, -> { includes(:related_comments) }")
+        .run_ruby(r#"
+a = Article.create!(title: 'Alpha', body: 'abcdefghij')
+b = Article.create!(title: 'Beta', body: 'abcdefghij')
+c = Article.create!(title: 'Gamma', body: 'abcdefghij')
+p = Profile.create!(article_id: b.id, bio: 'parent')
+a.profile_id = p.id
+a.save!
+x = Comment.create!(article_id: a.id, commenter: 'wrong', body: 'wrong owner')
+y = Comment.create!(article_id: b.id, commenter: 'right', body: 'actual parent')
+raise 'lazy parent FK' unless a.related_comments.to_a.map(&:id) == [y.id]
+rows = Article.with_related_comments.order(:id).to_a
+repeated = Db.capture_sql do
+  raise 'cached relation' unless rows[0].related_comments.is_a?(ActiveRecord::Relation)
+  raise 'parent key' unless rows[0].related_comments.to_a.map(&:id) == [y.id]
+  raise 'nil parent' unless rows[1].related_comments.to_a.empty?
+  raise 'missing memoization' unless rows.all?(&:related_comments_loaded?)
+end
+raise 'repeat queried' unless repeated.empty?
+raise 'fork dropped parent constraint' unless rows[0].related_comments.where(id: x.id).to_a.empty?
+raise 'fork lost actual row' unless rows[0].related_comments.where(id: y.id).to_a.map(&:id) == [y.id]
+raise 'nil parent fork' unless rows[2].related_comments.where(id: y.id).to_a.empty?
+puts 'belongs_to through read preloading passed'
+"#).assert_passes();
 }

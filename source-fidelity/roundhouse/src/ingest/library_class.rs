@@ -1763,7 +1763,7 @@ pub(super) fn library_class_from_module_node_with_scope(
         mut unknown_calls,
         mut class_initializers,
         class_attributes: _, conditional_definitions,
-    } = walk_decl_body_with_visibility(module.body(), &owner, file, DeclBodyMode::Instance, &visibility)?;
+    } = walk_decl_body_with_visibility(module.body(), &owner, file, DeclBodyMode::ModuleInstance, &visibility)?;
     class_initializers.extend(take_class_ivar_initializers(&mut unknown_calls));
     Ok(LibraryClass {
         name: owner,
@@ -1802,6 +1802,7 @@ fn take_class_ivar_initializers(calls: &mut Vec<Expr>) -> Vec<Expr> {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum DeclBodyMode {
     Instance,
+    ModuleInstance,
     ClassMethods,
     /// `class << self`. `included_hook` is set only for a module's own
     /// singleton, where `def included(base)` is the same `Module#included`
@@ -1813,7 +1814,7 @@ pub(super) enum DeclBodyMode {
 
 impl DeclBodyMode {
     fn is_class_side(self) -> bool {
-        !matches!(self, Self::Instance)
+        !matches!(self, Self::Instance | Self::ModuleInstance)
     }
 }
 #[derive(Default)]
@@ -2634,7 +2635,7 @@ fn walk_decl_body_with_visibility<'pr>(
     // A model also gets them as its own methods (the concern splice).
     // ponytail: a non-model includer's `def x` written ABOVE its `include`
     // loses to the block in Ruby but wins over the hoisted copy; unchecked.
-    let concern_direct_defs: Option<HashSet<String>> = (mode == DeclBodyMode::Instance
+    let concern_direct_defs: Option<HashSet<String>> = (!mode.is_class_side()
         && statements.iter().any(|stmt| {
             stmt.as_call_node().is_some_and(|call| {
                 call.receiver().is_none()
@@ -2927,10 +2928,10 @@ fn walk_decl_body_with_visibility<'pr>(
         // `class << self ... end` — singleton class block. Body
         // defines class-level methods on the enclosing scope.
         if let Some(sc) = stmt.as_singleton_class_node() {
-            let own = mode == DeclBodyMode::Instance && sc.expression().as_self_node().is_some();
+            let own = !mode.is_class_side() && sc.expression().as_self_node().is_some();
             let mode = DeclBodyMode::SingletonClass {
-                included_hook: mode == DeclBodyMode::Instance,
-                has_class_methods: mode == DeclBodyMode::Instance && has_class_methods,
+                included_hook: !mode.is_class_side(),
+                has_class_methods: !mode.is_class_side() && has_class_methods,
             };
             let captured = super::inherited_alias::captured();
             let mut inner = walk_decl_body_with_visibility(sc.body(), owner, file, mode, visibility)?;
@@ -3027,7 +3028,7 @@ fn walk_decl_body_with_visibility<'pr>(
                 // it as the call it is, and `inherited_alias::settle`
                 // looks the original up once every file is walked.
                 if super::inherited_alias::is_capturing()
-                    && matches!(mode, DeclBodyMode::Instance | DeclBodyMode::SingletonClass { included_hook: true, .. })
+                    && matches!(mode, DeclBodyMode::Instance | DeclBodyMode::ModuleInstance | DeclBodyMode::SingletonClass { included_hook: true, .. })
                 {
                     let span = Span {
                         file: super::sources::file_id(file),
@@ -3239,6 +3240,17 @@ fn walk_decl_body_with_visibility<'pr>(
                         // copies; models synthesize those separately).
                         let is_class_attr =
                             kw.starts_with("cattr_") || kw.starts_with("mattr_");
+                        if is_class_attr && mode == DeclBodyMode::ModuleInstance {
+                            if call.block().is_some() {
+                                return Err(IngestError::Unsupported { file: file.into(),
+                                    message: "ordered module mattr block defaults require a preserved block frame and method-surface timing proof".into() });
+                            }
+                            if let Some(expansion) = super::ordered_mattr::expand(&call, owner, file) {
+                                out.class_initializers.extend(expansion.initializers);
+                                out.methods.extend(expansion.methods);
+                                continue;
+                            }
+                        }
                         let mut names: Vec<Symbol> = Vec::new();
                         if is_class_attr {
                             // Preserve the existing cattr/mattr contract. Their

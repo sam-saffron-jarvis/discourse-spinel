@@ -98,18 +98,15 @@ pub(super) fn shape(app: &App, family: &Family) -> bool {
     for class in app
         .library_classes
         .iter()
+        .chain(family.model_surface.iter())
         .filter(|class| family.descendants.contains(&class.name.0))
     {
         if class.is_module
             || !class.includes.is_empty()
             || class.origin.is_some()
             || !class.conditional_definitions.is_empty()
-            || app
-                .library_classes
-                .iter()
-                .filter(|other| other.name == class.name)
-                .count()
-                != 1
+            || (app.library_classes.iter().filter(|other| other.name == class.name).count()
+                + usize::from(family.model_surface.as_ref().is_some_and(|model| model.name == class.name))) != 1
             || class.methods.iter().any(|method| {
                 method.receiver == MethodReceiver::Class
                     && OVERRIDES.contains(&method.name.as_str())
@@ -521,8 +518,7 @@ pub(super) fn template(body: &Expr) -> bool {
         }
         valid &= !matches!(
             &*expr.node,
-            ExprNode::Return { .. }
-                | ExprNode::Super { .. }
+            ExprNode::Super { .. }
                 | ExprNode::Yield { .. }
                 | ExprNode::Break { .. }
                 | ExprNode::Next { .. }

@@ -105,6 +105,15 @@ impl<'a> BodyTyper<'a> {
             "[]=" | "write_attribute" if args.len() == 2 => &args[0],
             _ => return None,
         };
+        // A raw column read bypasses a user-defined accessor. Its return can
+        // have a completely different type (e.g. stored String[] dimensions
+        // exposed as Integer[][]); consulting instance_methods recursed into
+        // that accessor's inferred result and rejected valid storage reads.
+        if matches!(method.as_str(), "[]" | "read_attribute") {
+            if let Some(ty) = self.attribute_by_name(model, std::slice::from_ref(key_arg)) {
+                return Some(ty);
+            }
+        }
         let methods = &self.classes().get(model)?.instance_methods;
         let entry = match &*key_arg.node {
             ExprNode::Lit { value: crate::expr::Literal::Sym { value } } => methods.get(value),

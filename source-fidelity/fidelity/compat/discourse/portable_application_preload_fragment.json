@@ -1,0 +1,27 @@
+{
+  "pin": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+  "source": "app/views/layouts/application.html.erb",
+  "source_sha256": "c9c62986b9c9f70ef776d6ba89a9b6a243b275a67df39ef62e2a959d599743d4",
+  "selected_span": {
+    "start_byte": 4004,
+    "end_byte": 4161,
+    "text_sha256": "61eb099f2bd2b5c776f6f989f544e823a2a8bb35d7d753f5894af5d1279f93a0"
+  },
+  "raw_helper": {
+    "source": "actionview-8.1.4/lib/action_view/helpers/output_safety_helper.rb",
+    "start_byte": 583,
+    "end_byte": 644,
+    "text_sha256": "92e5499adcd197a5fc9547e6457f477f537319727a19c3cae59ef38f07e0d7bd"
+  },
+  "candidate_sha256": "8295d11b6ec369349fc3f64cc12913b43e6d810ff0ce9ac89388e0ef9a4fc623",
+  "original_compiled_sha256": "5a93760954fcc6e108a1924377a6b0cf07957ae5c9e4a864c42759b79f554b8d",
+  "transformations": [
+    "Original HTML Erubi/OutputBuffer reference; exact literal span retained",
+    "raw(preloaded_json) String-to-trusted boundary inlined; helper acquisition/escape logic unchanged"
+  ],
+  "context": "Unit preloader strings/nil in actual minimal ActionView JSON context (standalone JSON gem), NOT Site/settings data or full Rails/Oj encoding",
+  "original_html_accepted": false,
+  "native_html_accepted": false,
+  "browser_accepted": false,
+  "page_accepted": false
+}

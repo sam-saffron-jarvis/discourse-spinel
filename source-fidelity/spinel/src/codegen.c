@@ -3447,6 +3447,7 @@ void declare_local(Compiler *c, Buf *b, LocalVar *lv, int vol) {
    method-scope locals under per-frame unique names so a same-named caller
    local in an argument expression is not captured by the declaration. */
 void declare_local_named(Compiler *c, Buf *b, LocalVar *lv, const char *name, int vol) {
+  lv->stack_volatile = vol;
   TyKind t = lv->type;
   Buf cty; memset(&cty, 0, sizeof cty);
   const char *init = "0";
@@ -3960,6 +3961,7 @@ void emit_scope_decls_ends(Compiler *c, Scope *s, Buf *b, size_t *ends) {
       /* a parameter the body reassigns inside a begin and reads after the
          rescue or a retry's longjmp: a volatile local copy of the incoming
          value (the signature names it lv_<name>__in) (#6552) */
+      lv->stack_volatile = 1;
       LocalVar cp = *lv; cp.is_param = 0;
       Buf d; memset(&d, 0, sizeof d);
       declare_local(c, &d, &cp, 1);
@@ -9512,7 +9514,8 @@ void emit_local_ctype(Compiler *c, TyKind ty, int vol, Buf *b) {
 
 /* emit_local_ctype for a local's own slot: an Integer or Float slot that
    holds its nil beside the value (slot_is_oint) is its oint type */
-static void emit_local_slot_ctype(Compiler *c, const LocalVar *lv, TyKind ty, int vol, Buf *b) {
+static void emit_local_slot_ctype(Compiler *c, LocalVar *lv, TyKind ty, int vol, Buf *b) {
+  if (lv) lv->stack_volatile = vol;
   if (!lv || !slot_is_oint(lv)) { emit_local_ctype(c, ty, vol, b); return; }
   if (vol) buf_puts(b, "volatile ");
   emit_slot_ctype(c, lv, b);

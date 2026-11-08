@@ -41,8 +41,10 @@ module ActionController
 
     # `request_method` is the request's own verb (Rack::ConditionalGet
     # reads REQUEST_METHOD); `if_none_match` is the request's
-    # If-None-Match header, "" when it has none.
-    def commit_conditional_get!(request_method, if_none_match)
+    # If-None-Match header, "" when it has none. Applications that delete
+    # Rack::ETag retain ConditionalGet but must not synthesize body validators
+    # or Rack::ETag's default Cache-Control.
+    def commit_conditional_get!(request_method, if_none_match, etag_middleware: true)
       etag = @headers["ETag"]
       last_modified = @headers["Last-Modified"]
 
@@ -61,12 +63,12 @@ module ActionController
       # body, an error status) gets `Cache-Control: no-cache` instead
       # of the default, unless it already has one.
       digested = false
-      if (@status == 200 || @status == 201) && etag.nil? && last_modified.nil? && !@body.empty?
+      if etag_middleware && (@status == 200 || @status == 201) && etag.nil? && last_modified.nil? && !@body.empty?
         etag = "W/\"" + ActionController::Base.body_sha256_hex(@body)[0, 32].to_s + "\""
         @headers["ETag"] = etag
         digested = true
       end
-      if @headers["Cache-Control"].nil?
+      if etag_middleware && @headers["Cache-Control"].nil?
         @headers["Cache-Control"] = digested ? ActionController::DEFAULT_CACHE_CONTROL : "no-cache"
       end
 

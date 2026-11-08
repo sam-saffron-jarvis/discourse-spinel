@@ -1,0 +1,130 @@
+{
+  "profile": "supported anonymous core default_results behavior ONLY",
+  "baseline_revision": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+  "source": "lib/topic_query.rb",
+  "source_sha256": "9066840709436451bd392921f1dfaeed121ce0024e63916bb0e388145f8762dc",
+  "original_method": {
+    "start_byte": 25124,
+    "end_byte": 31624,
+    "text_sha256": "0040700356b405b2bfa9bff3ef955d04df80fd32e0417678d9206365d14a5bb2"
+  },
+  "guarded_branches": [
+    {
+      "start_byte": 25774,
+      "end_byte": 25964,
+      "text_sha256": "9cf5aee28ccf8fa42d5e987d41b0d136a0db2474e9608c6010b99de23bc13f28",
+      "replacement_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "reason": "supported component constructs only original anonymous identity"
+    },
+    {
+      "start_byte": 27883,
+      "end_byte": 28276,
+      "text_sha256": "00a2316c1ef346425943c744ab9f5493ce09f253142e13d991d5cdf7aec66180",
+      "replacement_sha256": "05340e671657b31c9e0dfbed4d217cf0693786c0d1cf50716be4afdecb65eee4",
+      "reason": "include_pms/include_all_pms request keys explicitly refused"
+    },
+    {
+      "start_byte": 28997,
+      "end_byte": 29259,
+      "text_sha256": "5a776dcfd85997d5124bd45fd90e023e3a9f36a7c351e77c0a5e3d2899572485",
+      "replacement_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "reason": "request profile keys explicitly refused; anonymous component has no authenticated branch"
+    },
+    {
+      "start_byte": 29265,
+      "end_byte": 29981,
+      "text_sha256": "7e3f9fe750e639e9b20467daffc7c20c25bc45b667a9544557b63ae0ca9282e3",
+      "replacement_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "reason": "request profile keys explicitly refused; anonymous component has no authenticated branch"
+    },
+    {
+      "start_byte": 29987,
+      "end_byte": 30146,
+      "text_sha256": "6edb4478b9c330659e83f5b70dc9e090530711ea592c26cbff27bc7490cb36a5",
+      "replacement_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "reason": "request profile keys explicitly refused; anonymous component has no authenticated branch"
+    },
+    {
+      "start_byte": 30152,
+      "end_byte": 30345,
+      "text_sha256": "85b90d58e55c0a60a330fe29bc148f50d001e848cf72b29c098be28cf73b7807",
+      "replacement_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "reason": "request profile keys explicitly refused; anonymous component has no authenticated branch"
+    },
+    {
+      "start_byte": 30351,
+      "end_byte": 30567,
+      "text_sha256": "5aa2cb6bb8a845aa60a0fc39865db3b7ae376099077e0c9d7274d053f340f41d",
+      "replacement_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "reason": "request profile keys explicitly refused; anonymous component has no authenticated branch"
+    },
+    {
+      "start_byte": 30573,
+      "end_byte": 31309,
+      "text_sha256": "6c145f39695a45424d792a327b052e060b027a176a4f01f7992f8e221ccb6049",
+      "replacement_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "reason": "request profile keys explicitly refused; anonymous component has no authenticated branch"
+    }
+  ],
+  "dependencies": [
+    {
+      "start_byte": 197,
+      "end_byte": 224,
+      "text_sha256": "80db81a85817b3d07ce0436d1a6438786dcab7617dc57fc0961baa52468ef5ef"
+    },
+    {
+      "start_byte": 2633,
+      "end_byte": 2903,
+      "text_sha256": "258330c55b84bf8866a6e98b0ae62e384475d0f95b5c5bb8b842b7f4aca2f02b"
+    },
+    {
+      "start_byte": 21710,
+      "end_byte": 21763,
+      "text_sha256": "d652f789def4b6e2338198903aeca0d17060416c4a5aa7f962e4474605d0179b"
+    },
+    {
+      "start_byte": 22802,
+      "end_byte": 24780,
+      "text_sha256": "69323a44f54a373cea61378bfaae9ec8a63db562cc3645fb72ac5f925e8d910a"
+    },
+    {
+      "start_byte": 24784,
+      "end_byte": 25065,
+      "text_sha256": "98adba781fa02691610b0b5c796b5ec6b8b6c6d13c3d50d00d0ee6cb40a3d16a"
+    },
+    {
+      "start_byte": 43721,
+      "end_byte": 45920,
+      "text_sha256": "98e3116694188bda6c5050cbdbbce80c7f651faa0550b9f120abb34902d84a1d"
+    }
+  ],
+  "readonly_category_candidate_sha256": "741b7ce01f13c53b446f31fe2c1a48d32c77f21036aff64e3a964484bf8ea1b0",
+  "distributed_category_cache_equivalence_accepted": false,
+  "candidate_sha256": "5e7b5d094e5b943bb3fca4945732a3c20e8be52229985da5dd8c759994c31949",
+  "unsupported_request_keys": [
+    "search",
+    "state",
+    "before",
+    "bumped_before",
+    "status",
+    "filter",
+    "f",
+    "include_pms",
+    "include_all_pms",
+    "filtered_to_user",
+    "skip_ordering",
+    "tags",
+    "match_all_tags",
+    "exclude_tag",
+    "guardian"
+  ],
+  "unsupported_live_feature_profiles": [
+    "nested_replies_enabled",
+    "content_localization_enabled"
+  ],
+  "identity_api": "genuine anonymous Guardian; user/guardian read-only, nonanonymous identities not admitted",
+  "source_operation_order_preserved": true,
+  "live_values_used_as_inputs": false,
+  "full_query_accepted": false,
+  "page_accepted": false
+}

@@ -100,6 +100,18 @@ class Run:
         assert subprocess.check_output(["git", "-C", str(ROOT / "discourse"), "rev-parse", "HEAD"], text=True).strip() == PIN
         assert not subprocess.check_output(["git", "-C", str(ROOT / "discourse"), "status", "--porcelain", "--untracked-files=no"], text=True)
         self.evidence["source_hashes"] = sources
+        # Attest the actual read-only worker's original start, not its mutable
+        # process title. These bytes are checked against the immutable pin;
+        # they are not copied PG state or a new worker permission.
+        vips_sources = {}
+        for path in ("lib/discourse_vips.rb", "lib/discourse_vips/worker_process.rb", "script/discourse_vips_worker"):
+            upstream = subprocess.check_output(["git", "-C", str(ROOT / "discourse"), "show", f"{PIN}:{path}"])
+            assert (ROOT / "discourse" / path).read_bytes() == upstream
+            vips_sources[path] = digest(upstream)
+        self.env["FIDELITY_VIPS_ORIGINAL_SOURCE_HASHES"] = json.dumps(vips_sources)
+        self.evidence["original_vips_source_hashes"] = vips_sources
+        from framework_sources import verify_framework_sources
+        self.evidence["framework_sources"] = verify_framework_sources(lock, HERE, ROOT, digest)
         self.evidence["revisions"] = {repo: subprocess.check_output(["git", "-C", str(ROOT / repo), "rev-parse", "HEAD"], text=True).strip()
                                       for repo in ("roundhouse", "spinel", "fidelity")}
         compiler = ROOT / "spinel/spinel"
@@ -301,6 +313,12 @@ Db.close
     def oracle_equivalence(self):
         return "native/compat match actual full Rails oracle on nonempty live rows and source-labelled SELECT-only negative fixtures"
 
+    def oracle_application_root(self):
+        # Historical proof profiles always use the immutable reference checkout.
+        # Separately labelled patched profiles may override this location; the
+        # complete-original-file byte checks below remain mandatory.
+        return ROOT / "discourse"
+
     def oracle(self):
         authorization = (ROOT / "run/ORACLE_SANDBOX_AUTHORIZATION.json").read_bytes()
         policy = json.loads(authorization)
@@ -352,11 +370,10 @@ puts "private fixture writes real; shared and unknown endpoints rejected"
                 assert len(metadata) == 1
                 for path, sha in metadata[0]["complete_original_files"].items():
                     assert self.evidence["source_hashes"][path] == sha
-                assert metadata[0]["topic_slug_source"][0] == str(ROOT / "discourse/app/models/topic.rb")
+                assert metadata[0]["topic_slug_source"][0] == str(self.oracle_application_root() / "app/models/topic.rb")
                 assert "/rack-mini-profiler-" in metadata[0]["pg_exec_source"][0], "enabled profiling hook was lost"
                 self.evidence["actual_rails_oracle"] = metadata[0]
                 assert oracle, "actual Rails oracle produced no results"
-                self.evidence["rails_parity"] = self.compare_oracle(oracle)
                 pg_log = self.path / "oracle-pg-connections.jsonl"
                 assert pg_log.exists() and pg_log.stat().st_size, "no guarded PG pool evidence"
                 self.evidence["oracle_pg_connections"] = [json.loads(line) for line in pg_log.read_text().splitlines()]
@@ -383,6 +400,10 @@ raise "fixture preflight data disappeared" unless r.get("fidelity:preflight") ==
 puts JSON.generate({info: r.info("stats"), keys: r.dbsize})
 '''
                 self.command("fixture-effects", ["bundle", "exec", "ruby", "-e", stats, HERE / "tools/oracle_isolation.rb"], cwd=ROOT / "discourse", timeout=30)
+                # Preserve safety/effect evidence even when semantic parity
+                # subsequently fails (e.g. missing real plugin activation).
+                self.save()
+                self.evidence["rails_parity"] = self.compare_oracle(oracle)
                 for transform in self.evidence["transformations"]:
                     transform["equivalence"] = self.oracle_equivalence()
         finally:

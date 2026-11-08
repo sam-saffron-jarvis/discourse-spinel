@@ -1,0 +1,17 @@
+module ActiveRecord
+  class QueryCacheScope
+    @owned: bool
+    @completed: bool
+    def initialize: () -> void
+    def complete!: () -> nil
+  end
+  class QueryCacheScopeBody
+    @body: Array[String]
+    @scope: QueryCacheScope
+    @closed: bool
+    def initialize: (Array[String] body, QueryCacheScope scope) -> void
+    def join: (?String separator) -> String
+    def close: () -> nil
+    def closed?: () -> bool
+  end
+end

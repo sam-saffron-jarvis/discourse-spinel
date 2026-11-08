@@ -1,15 +1,16 @@
 # frozen_string_literal: true
 
-# Concrete runtime template for one zero-argument definition family.
+# Concrete runtime template for one zero-invocation-argument definition family.
 # The lowerer substitutes every __PLACEHOLDER__ before this source is
 # parsed or emitted. The body receives its receiver explicitly: calling a
 # stored closure never attempts to rebind Proc#self.
 module __REGISTRY__
   class __ENTRY__
-    def initialize(token, original_name, body)
+    def initialize(token, original_name, body, arity)
       @token = token
       @original_name = original_name
       @body = body
+      @arity = arity
       freeze
     end
 
@@ -23,6 +24,10 @@ module __REGISTRY__
 
     def body
       @body
+    end
+
+    def arity
+      @arity
     end
   end
 
@@ -71,7 +76,7 @@ module __REGISTRY__
     end
 
     def arity
-      0
+      @entry.arity
     end
 
     def ==(other)
@@ -141,11 +146,11 @@ module __REGISTRY__
     nil
   end
 
-  def self.install(owner, name, body, callback)
+  def self.install(owner, name, body, callback, arity)
     ensure_virtual_name(owner, name)
     token = __STATE_VALUE__.next_token
     __STATE_VALUE__.next_token = __STATE_VALUE__.next_token + 1
-    entry = __ENTRY__.new(token, name, body)
+    entry = __ENTRY__.new(token, name, body, arity)
     slot = __SLOT__.new(entry, 0)
     owner_entries = __STATE_VALUE__.entries[owner]
     if owner_entries.nil?

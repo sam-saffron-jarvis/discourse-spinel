@@ -68,6 +68,23 @@ pub(super) fn preserve_record_receiver_returns(lcs: &mut [LibraryClass], app: &A
     }
 }
 
+thread_local! {
+    static FILE_PROGRAM_HEADERS: std::cell::RefCell<BTreeSet<ClassId>> = const { std::cell::RefCell::new(BTreeSet::new()) };
+    static FILE_PROGRAM_DECLARATIONS: std::cell::RefCell<std::collections::BTreeMap<ClassId, usize>> = const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+}
+
+/// Consume resolved namespace-header IR. Lexical constant reads were preserved
+/// by the shared finite file-program lowering before this syntax is chosen.
+/// No namespace object is created or hoisted by this emission context.
+pub(crate) fn with_file_program_headers<T>(headers: &BTreeSet<ClassId>, declarations: &std::collections::BTreeMap<ClassId, usize>, f: impl FnOnce() -> T) -> T {
+    let previous = FILE_PROGRAM_HEADERS.with(|slot| slot.replace(headers.clone()));
+    let previous_declarations = FILE_PROGRAM_DECLARATIONS.with(|slot| slot.replace(declarations.clone()));
+    let result = f();
+    FILE_PROGRAM_HEADERS.with(|slot| { slot.replace(previous); });
+    FILE_PROGRAM_DECLARATIONS.with(|slot| { slot.replace(previous_declarations); });
+    result
+}
+
 /// Source overrides, including those on ApplicationRecord or a mixin,
 /// may return a different object. Do not interpose a self-returning wrapper.
 /// `lock!` calls `reload`, so an override of either one answers the source.
@@ -216,7 +233,7 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
         }
     }
 
-    lcs.iter()
+    let mut files = lcs.iter()
         .filter(|lc| !is_spliced_factory(lc))
         .filter(|lc| !matches!(lc.origin, Some(LibraryClassOrigin::DataFactory { .. })))
         .filter(|lc| owner_in_this_tree(lc).is_none())
@@ -248,7 +265,25 @@ pub(super) fn emit_library_class_decls(app: &App) -> Vec<EmittedFile> {
                 None => out.push(file),
             }
             out
-        })
+        });
+    let mut literal_policies = std::collections::BTreeMap::<PathBuf, crate::lower::source_literal_policy::Policy>::new();
+    for class in &lcs {
+        let owner = file_owner(class.name.0.as_str(), app, classes);
+        let path = PathBuf::from(format!("app/models/{}.rb", crate::naming::underscore(&owner)));
+        let policy = literal_policies.entry(path).or_default();
+        *policy = policy.join(crate::lower::source_literal_policy::declarations(app, std::iter::once(class)));
+    }
+    for file in &mut files {
+        if file.path.extension().is_none_or(|extension| extension != "rb") { continue; }
+        let policy = literal_policies.get(&file.path).copied().unwrap_or_default();
+        if policy == crate::lower::source_literal_policy::Policy::Mixed {
+            crate::emit::diagnostics::report_unsupported(crate::span::Span::synthetic(), "ruby",
+                "mixed source literal allocation", "merged declaration files have different source frozen-string policies; no common directive is proved");
+        } else if !policy.directive().is_empty() {
+            file.content.insert_str(0, policy.directive());
+        }
+    }
+    files
 }
 
 /// `Data.define(<symbols>)` — the factory `analyze::data` models.
@@ -8589,7 +8624,7 @@ fn emit_library_class_decl_inner(
     // above guarantees. That is also why this is not the default:
     // `Views::Articles` has no owner but the nesting itself, and a
     // compound header there would look up a `Views` nothing created.
-    if outer_runtime_anchor.is_some() {
+    if outer_runtime_anchor.is_some() || FILE_PROGRAM_HEADERS.with(|headers| headers.borrow().contains(&lc.name)) {
         segments = vec![name];
     }
     let segments = segments;
@@ -10000,7 +10035,16 @@ pub(super) fn file_owner(name: &str, app: &App, classes: &[LibraryClass]) -> Str
     let segments: Vec<&str> = name.split("::").collect();
     for i in 0..segments.len().saturating_sub(1) {
         let prefix = segments[..=i].join("::");
-        if owns_a_file(&prefix, app, classes) {
+        // Source-feature ownership precedes the ordinary body-end grouping
+        // heuristic: a helper's child must not travel into its parent's later
+        // main feature. It still emits its original nested lexical headers.
+        let same_feature = FILE_PROGRAM_DECLARATIONS.with(|slot| {
+            let declarations = slot.borrow();
+            declarations.get(&ClassId(Symbol::from(name))).is_none_or(|resource| {
+                declarations.get(&ClassId(Symbol::from(prefix.as_str()))) == Some(resource)
+            })
+        });
+        if same_feature && owns_a_file(&prefix, app, classes) {
             return prefix;
         }
     }
@@ -10976,7 +11020,9 @@ fn boolean_cast_body(col: &Symbol) -> Expr {
 // campfire's `Message.with_attachment_details` costs the room page two
 // queries where it cost eighty.
 //
-// Known gaps, deliberate: scoped / polymorphic has_one, direct has_many
+// Scoped non-polymorphic has_one and direct collections through belongs_to
+// preload via their real readers, preserving scopes/caches without claiming
+// batched query counts. Known gaps: polymorphic has_one, direct has_many
 // with a scope or polymorphic owner, and scope-carrying through-assocs
 // (other than a plain `order("...")`) get no batch arm — the dispatch
 // falls through and the lazy reader stays correct (just N+1, matching
@@ -11161,6 +11207,8 @@ enum PreloadKind {
     /// `has_one` — same FK-on-target batch as has_many, installing one
     /// record (or nil) per owner through the single-record preload setter.
     HasOne { fk: String, owner_key: String, target: String },
+    /// Preserve the declared reader/scope, installing its real result; N+1, not a batch-count claim.
+    Reader { target: String, singular: bool },
     /// Batched form of the through-reader join:
     /// `SELECT <t>.*, <thr>.<thr_fk> AS __src FROM <t> JOIN <thr> ON
     /// <thr>.<src_fk> = <t>.id WHERE <thr>.<thr_fk> IN (...)`.
@@ -11294,6 +11342,12 @@ fn preload_targets(model: &crate::dialect::Model, app: &App) -> Vec<(String, Pre
                     },
                 ));
             }
+            Association::HasOne { name, target, scope: Some(_), through: None, as_interface: None, .. }
+                if model_exists(target) && !crate::lower::model_to_library::model_defines_instance_method(model, name) => {
+                out.push((name.as_str().to_string(), PreloadKind::Reader {
+                    target: target.0.as_str().to_string(), singular: true,
+                }));
+            }
             // Through: same two-hop resolution as
             // `apply_through_assoc_lowering`; assoc scopes other than a
             // plain `order("...")` (or none) don't batch — the lazy
@@ -11302,6 +11356,12 @@ fn preload_targets(model: &crate::dialect::Model, app: &App) -> Vec<(String, Pre
                 name, target, through: Some(thr_name), scope, ..
             } => {
                 if !model_exists(target) {
+                    continue;
+                }
+                if crate::lower::model_to_library::belongs_to_through_collection(model, &app.models, name).is_some() {
+                    out.push((name.as_str().to_string(), PreloadKind::Reader {
+                        target: target.0.as_str().to_string(), singular: false,
+                    }));
                     continue;
                 }
                 let order = match scope {
@@ -11464,6 +11524,11 @@ def _preload_{name}(rec)
 end
 "#
                 );
+            }
+            PreloadKind::Reader { singular, .. } => {
+                let read = if *singular { format!("r.{name}") } else { format!("r.{name}.to_a") };
+                let append = if *singular { "loaded << value unless value.nil?" } else { "loaded.concat(value)" };
+                let _ = write!(src, "\ndef self._preload_batch_{name}(records)\n  loaded = []\n  records.each do |r|\n    value = {read}\n    r._preload_{name}(value)\n    {append}\n  end\n  loaded\nend\n");
             }
             PreloadKind::HasMany { fk, owner_key, target } => {
                 let collect_keys = collect_owner_keys(owner_key);
@@ -11699,6 +11764,7 @@ end
                 PreloadKind::HasMany { target, .. } => Some(target.as_str()),
                 PreloadKind::HasOne { target, .. } => Some(target.as_str()),
                 PreloadKind::Through { target, .. } => Some(target.as_str()),
+                PreloadKind::Reader { target, .. } => Some(target.as_str()),
                 PreloadKind::RichText { .. } => Some("ActionText::RichText"),
                 PreloadKind::PlainText { .. } => Some("ActionText::Markdown"),
                 // `includes(logo_attachment: :blob)`: the blob is already

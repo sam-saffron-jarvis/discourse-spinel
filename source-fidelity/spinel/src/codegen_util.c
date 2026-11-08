@@ -2089,11 +2089,11 @@ const char *nil_value(TyKind t) {
   return tr ? tr->nil : NULL;
 }
 
-/* Does the program ask whether class variable `nm` ("@@x") is set yet --
-   `defined?(@@x)`, `class_variable_defined?(:@@x)`, or
-   `class_variable_get(:@@x)`, which raises while it is not? Only such a
-   cvar carries a cvar_<C>_<x>__set flag, so every other program's writes
-   stay plain stores. */
+/* Does the program read class variable `nm` ("@@x") or ask whether it is
+   set yet -- a direct read, `defined?(@@x)`, class_variable_defined? or
+   class_variable_get? Declaring a slot is not assigning it: a writer may
+   never run and an overridden storage protocol may decline the write.
+   Such cvars carry cvar_<C>_<x>__set runtime flags. */
 int cvar_defined_probed(Compiler *c, const char *nm) {
   const NodeTable *nt = c->nt;
   if (!nm) return 0;
@@ -2101,6 +2101,7 @@ int cvar_defined_probed(Compiler *c, const char *nm) {
     const char *kt = nt_type(nt, k);
     NodeKind kk = nt_kind(nt, k);
     if (!kt) continue;
+    if (kk == NK_ClassVariableReadNode && sp_streq(nt_str(nt, k, "name"), nm)) return 1;
     if (kk == NK_DefinedNode) {
       int v = nt_ref(nt, k, "value");
       NodeKind vk = nt_kind(nt, v);
@@ -2112,10 +2113,7 @@ int cvar_defined_probed(Compiler *c, const char *nm) {
       int an = 0; int aa = nt_ref(nt, k, "arguments");
       const int *av = aa >= 0 ? nt_arr(nt, aa, "arguments", &an) : NULL;
       if (an < 1) continue;
-      const char *at = nt_type(nt, av[0]);
-      NodeKind ak = nt_kind(nt, av[0]);
-      const char *s = !at ? NULL : ak == NK_SymbolNode ? nt_str(nt, av[0], "value")
-                    : ak == NK_StringNode ? nt_str(nt, av[0], "content") : NULL;
+      const char *s = comp_cvar_literal_name(c, av[0]);
       if (s && sp_streq(s, nm)) return 1;
     }
   }
@@ -4751,6 +4749,18 @@ static void emit_const_recv_class(Compiler *c, int par, Buf *b) {
   if (repr_of(c, par).kind == RK_BOXED) { buf_puts(b, "sp_unbox_class("); emit_boxed(c, par, b); buf_puts(b, ")"); }
   else emit_expr(c, par, b);
 }
+/* A failed autoload rolls back only its own published binding. Ordinary
+   require must keep its partial constants/classes. Carry that binding's
+   runtime flag to the loader, rather than treating an early header/write
+   as proof that the feature completed. */
+static void emit_autoload_require(ConstReadEffect ce, Buf *b) {
+  buf_printf(b, "sp_autoload_require(sp_auto_%d_feature, sp_auto_%d_loaded, sp_auto_%d_top, ",
+             ce.autoload, ce.autoload, ce.autoload);
+  if (ce.class_presence) buf_printf(b, "&sp_class_present_%d", ce.class_presence - 1);
+  else if (ce.presence) buf_printf(b, "&cst_%s__set", ce.presence->name);
+  else buf_puts(b, "NULL");
+  buf_puts(b, ")");
+}
 static void emit_const_read_open_checked(Compiler *c, int id, ConstReadEffect ce, Buf *b) {
   const LocalVar *lv = ce.presence;
   if (ce.autoload) {
@@ -4758,9 +4768,9 @@ static void emit_const_read_open_checked(Compiler *c, int id, ConstReadEffect ce
     buf_puts(b, "((");
     if (ce.class_presence) buf_printf(b, "sp_class_present_%d ? (void)0 : ", ce.class_presence - 1);
     else if (ce.presence) buf_printf(b, "cst_%s__set ? (void)0 : ", ce.presence->name);
-    buf_printf(b, "sp_auto_%d_registered ? (void)sp_Kernel_require(sp_auto_%d_feature, sp_auto_%d_loaded, sp_auto_%d_top)"
-                  " : sp_raise_cls(\"NameError\", \"uninitialized constant %s\")), ",
-               ce.autoload, ce.autoload, ce.autoload, ce.autoload, nm);
+    buf_printf(b, "sp_auto_%d_registered ? (void)", ce.autoload);
+    emit_autoload_require(ce, b);
+    buf_printf(b, " : sp_raise_cls(\"NameError\", \"uninitialized constant %s\")), ", nm);
   }
   if (ce.class_presence) {
     char nm[256]; const_read_name(c, id, nm, sizeof nm);
@@ -4798,8 +4808,9 @@ int emit_const_autoload_run(Compiler *c, int id, Buf *b) {
   buf_puts(b, n ? "" : "(");
   if (ce.class_presence) buf_printf(b, "sp_class_present_%d ? (void)0 : ", ce.class_presence - 1);
   else if (ce.presence) buf_printf(b, "cst_%s__set ? (void)0 : ", ce.presence->name);
-  buf_printf(b, "sp_auto_%d_registered ? (void)sp_Kernel_require(sp_auto_%d_feature, sp_auto_%d_loaded, sp_auto_%d_top) : (void)0, ",
-             ce.autoload, ce.autoload, ce.autoload, ce.autoload);
+  buf_printf(b, "sp_auto_%d_registered ? (void)", ce.autoload);
+  emit_autoload_require(ce, b);
+  buf_puts(b, " : (void)0, ");
   return 1;
 }
 void emit_const_read_open(Compiler *c, int id, const LocalVar *lv, Buf *b) {

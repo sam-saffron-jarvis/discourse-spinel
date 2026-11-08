@@ -62,6 +62,141 @@ end
 require_relative "../tools/oracle_isolation"
 
 class OracleIsolationTest < Minitest::Test
+  def with_original_vips_hashes
+    before = ENV["FIDELITY_VIPS_ORIGINAL_SOURCE_HASHES"]
+    root = File.expand_path("../../discourse", __dir__)
+    ENV["FIDELITY_VIPS_ORIGINAL_SOURCE_HASHES"] = JSON.generate(%w[lib/discourse_vips.rb lib/discourse_vips/worker_process.rb script/discourse_vips_worker].to_h do |path|
+      [path, Digest::SHA256.file(File.join(root, path)).hexdigest]
+    end)
+    yield
+  ensure
+    ENV["FIDELITY_VIPS_ORIGINAL_SOURCE_HASHES"] = before
+  end
+
+  def test_a_process_label_or_copied_worker_record_cannot_replace_original_start_attestation
+    with_original_vips_hashes do
+      worker = Object.new
+      worker.define_singleton_method(:pid) { raise "unobserved PID must never be read" }
+      error = assert_raises(FidelityOracleIsolation::UnsafeEndpoint) { FidelityOracleIsolation.attested_vips_identity!(worker) }
+      assert_match "unobserved original vips worker start", error.message
+      before = FidelityOracleIsolation.instance_variable_get(:@vips_starts)
+      begin
+        FidelityOracleIsolation.instance_variable_set(:@vips_starts, { worker.object_id => [Object.new, {}] })
+        assert_raises(FidelityOracleIsolation::UnsafeEndpoint) { FidelityOracleIsolation.attested_vips_identity!(worker) }
+      ensure
+        FidelityOracleIsolation.instance_variable_set(:@vips_starts, before)
+      end
+    end
+  end
+
+  def test_observed_worker_identity_cannot_be_reused_for_changed_pid_start_socket_or_executable
+    with_original_vips_hashes do
+      worker = Object.new
+      original = { pid: 11, start: "101", executable: "/original/ruby", socket: "/owned/socket", socket_identity: [1, 2] }
+      before_starts = FidelityOracleIsolation.instance_variable_get(:@vips_starts)
+      method = FidelityOracleIsolation.method(:vips_process_identity!)
+      begin
+        FidelityOracleIsolation.instance_variable_set(:@vips_starts, { worker.object_id => [worker, original] })
+        [{ pid: 12 }, { start: "102" }, { executable: "/unowned/ruby" }, { socket: "/unowned/socket" }, { socket_identity: [1, 3] }].each do |change|
+          FidelityOracleIsolation.define_singleton_method(:vips_process_identity!) { |_| original.merge(change) }
+          error = assert_raises(FidelityOracleIsolation::UnsafeEndpoint) { FidelityOracleIsolation.attested_vips_identity!(worker) }
+          assert_match "original vips child identity changed", error.message
+        end
+      ensure
+        FidelityOracleIsolation.define_singleton_method(:vips_process_identity!, method)
+        FidelityOracleIsolation.instance_variable_set(:@vips_starts, before_starts)
+      end
+    end
+  end
+
+  def test_already_dead_attested_child_is_reaped_without_signalling_a_reusable_pid_group
+    with_original_vips_hashes do
+      worker = Object.new
+      worker.define_singleton_method(:discard) { @closed = true }
+      worker.define_singleton_method(:remove_socket) { @socket_removed = true }
+      worker.define_singleton_method(:shutdown) { raise "must not signal a reaped process group" }
+      identity = { pid: 11, start: "101" }
+      starts = FidelityOracleIsolation.instance_variable_get(:@vips_starts)
+      workers = FidelityOracleIsolation.instance_variable_get(:@vips_workers)
+      read = File.method(:read)
+      wait = Process.method(:waitpid)
+      kill = Process.method(:kill)
+      log = ENV.delete("FIDELITY_VIPS_LOG")
+      reaped = []
+      fields = Array.new(20, "0")
+      fields[0], fields[1], fields[19] = "Z", Process.pid.to_s, "101"
+      begin
+        FidelityOracleIsolation.instance_variable_set(:@vips_starts, { worker.object_id => [worker, identity] })
+        FidelityOracleIsolation.instance_variable_set(:@vips_workers, {})
+        File.define_singleton_method(:read) do |path, *args, **kwargs|
+          path == "/proc/11/stat" ? "11 (ruby) #{fields.join(' ')}" : read.call(path, *args, **kwargs)
+        end
+        Process.define_singleton_method(:waitpid) { |pid| reaped << pid; pid }
+        Process.define_singleton_method(:kill) do |signal, pid|
+          raise "unexpected signal" unless signal == 0 && pid == 11
+          raise Errno::ESRCH
+        end
+        FidelityOracleIsolation.cleanup_vips!
+        assert_equal [11], reaped
+        assert worker.instance_variable_get(:@closed)
+        assert worker.instance_variable_get(:@socket_removed)
+      ensure
+        File.define_singleton_method(:read, read)
+        Process.define_singleton_method(:waitpid, wait)
+        Process.define_singleton_method(:kill, kill)
+        ENV["FIDELITY_VIPS_LOG"] = log
+        FidelityOracleIsolation.instance_variable_set(:@vips_starts, starts)
+        FidelityOracleIsolation.instance_variable_set(:@vips_workers, workers)
+      end
+    end
+  end
+
+  def test_relocated_vips_source_is_owned_and_identical_to_both_reference_and_attestation
+    before_root = ENV["FIDELITY_VIPS_ORIGINAL_APPLICATION_ROOT"]
+    with_original_vips_hashes do
+      reference = File.expand_path("../../discourse", __dir__)
+      build = File.expand_path("../build", __dir__)
+      FileUtils.mkdir_p(build)
+      Dir.mktmpdir("vips-source-archive-", build) do |root|
+        JSON.parse(ENV.fetch("FIDELITY_VIPS_ORIGINAL_SOURCE_HASHES")).each_key do |path|
+          target = File.join(root, path)
+          FileUtils.mkdir_p(File.dirname(target))
+          FileUtils.cp(File.join(reference, path), target)
+        end
+        ENV["FIDELITY_VIPS_ORIGINAL_APPLICATION_ROOT"] = root
+        assert_equal root, FidelityOracleIsolation.original_vips_sources!
+        File.open(File.join(root, "script/discourse_vips_worker"), "a") { |file| file.puts "# changed archive" }
+        assert_raises(FidelityOracleIsolation::UnsafeEndpoint) { FidelityOracleIsolation.original_vips_sources! }
+      end
+      Dir.mktmpdir("unowned-vips-root-") do |outside|
+        ENV["FIDELITY_VIPS_ORIGINAL_APPLICATION_ROOT"] = outside
+        assert_raises(FidelityOracleIsolation::UnsafeEndpoint) { FidelityOracleIsolation.original_vips_sources! }
+        Dir.mktmpdir("vips-root-link-", build) do |inside|
+          link = File.join(inside, "outside")
+          File.symlink(outside, link)
+          ENV["FIDELITY_VIPS_ORIGINAL_APPLICATION_ROOT"] = link
+          assert_raises(FidelityOracleIsolation::UnsafeEndpoint) { FidelityOracleIsolation.original_vips_sources! }
+        end
+      end
+    end
+  ensure
+    ENV["FIDELITY_VIPS_ORIGINAL_APPLICATION_ROOT"] = before_root
+  end
+
+  def test_changed_vips_sources_and_unobserved_source_frames_fail_closed
+    with_original_vips_hashes do
+      expected = JSON.parse(ENV.fetch("FIDELITY_VIPS_ORIGINAL_SOURCE_HASHES"))
+      expected["script/discourse_vips_worker"] = "0" * 64
+      ENV["FIDELITY_VIPS_ORIGINAL_SOURCE_HASHES"] = JSON.generate(expected)
+      assert_raises(FidelityOracleIsolation::UnsafeEndpoint) { FidelityOracleIsolation.original_vips_sources! }
+    end
+    with_original_vips_hashes do
+      assert_raises(FidelityOracleIsolation::UnsafeEndpoint) do
+        FidelityOracleIsolation.attest_original_vips_start!(Object.new, "unowned_worker.rb")
+      end
+    end
+  end
+
   def test_alias_based_profiler_wraps_guard_without_recursion_or_hook_omission
     PG::Connection.class_eval do
       alias_method :fidelity_without_profiler, :exec
@@ -195,6 +330,30 @@ class OracleIsolationTest < Minitest::Test
     assert_equal "successful_reply", write.fetch("stage")
     assert_equal "Symbol", write.fetch("response_class")
     assert_equal 64, write.fetch("arguments_sha256").length
+  end
+
+  def test_binary_profiler_payload_is_recorded_without_changing_dispatch_or_reply
+    cfg = RedisClient::Config.new(host: @host, port: @port)
+    connection = Object.new
+    connection.instance_variable_set(:@config, cfg)
+    connection.extend(RedisClient::ConnectionMixin)
+    payload = Marshal.dump({profile: "real byte payload", bytes: "\xCE\xFF\x00".b})
+    command = ["SETEX", "MPRedisStore-unit", "60", payload]
+    reply = connection.call(command)
+    assert_same command, reply.last
+    assert_equal payload, reply.last.last
+    write = JSON.parse(File.readlines(ENV.fetch("FIDELITY_VALKEY_WRITE_LOG")).last)
+    assert_equal "setex", write.fetch("command")
+    assert_equal "successful_reply", write.fetch("stage")
+    encoded = FidelityOracleIsolation.evidence_value(command.drop(1))
+    assert_equal payload.b, [encoded.last.fetch(:binary_hex)].pack("H*")
+    assert_equal Digest::SHA256.hexdigest(JSON.generate(encoded)), write.fetch("arguments_sha256")
+    changed = command.dup
+    changed[-1] = payload + "\xFF".b
+    connection.call(changed)
+    second = JSON.parse(File.readlines(ENV.fetch("FIDELITY_VALKEY_WRITE_LOG")).last)
+    refute_equal write.fetch("arguments_sha256"), second.fetch("arguments_sha256")
+    assert_equal payload, command.last
   end
 
   def test_network_socket_guard_allows_only_pg_and_owned_fixture

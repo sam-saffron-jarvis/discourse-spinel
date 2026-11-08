@@ -73,3 +73,45 @@ fn a_bracket_read_of_a_nilable_column_is_still_nilable() {
     );
     assert_eq!(found.len(), 1, "{found:?}");
 }
+
+#[test]
+fn raw_reads_do_not_inherit_a_custom_accessors_return_type() {
+    let found = binops(r#"class Thing < ApplicationRecord
+  def position
+    (self[:position] || 0).to_s
+  end
+  def next_stored_position
+    (read_attribute(:position) || 0) + 1
+  end
+  def previous_stored_position
+    (self[:position] || 0) - 1
+  end
+end
+"#);
+    assert!(found.is_empty(), "{found:?}");
+}
+
+#[test]
+fn raw_string_array_read_bypasses_nested_integer_array_accessor() {
+    let tree: std::collections::HashMap<std::path::PathBuf, Vec<u8>> = [
+        ("db/schema.rb", "ActiveRecord::Schema.define do\n  create_table :shapes do |t|\n    t.string :dimensions, array: true\n  end\nend\n"),
+        ("app/models/shape.rb", r#"class Shape < ActiveRecord::Base
+  def dimensions
+    [[1, 2]]
+  end
+  def raw_widths
+    raw = read_attribute(:dimensions)
+    return [] if raw.nil?
+    raw.map { |dimension| dimension.split("x").first.to_i }
+  end
+end
+"#),
+    ].iter().map(|(path, source)| (std::path::PathBuf::from(path), source.as_bytes().to_vec())).collect();
+    let mut app = roundhouse::ingest::ingest_app_from_tree(tree).expect("ingest");
+    roundhouse::lower::array_columns::store_arrays(&mut app);
+    Analyzer::new(&app).analyze(&mut app);
+    let errors: Vec<_> = diagnose(&app).into_iter()
+        .filter(|diagnostic| diagnostic.severity == roundhouse::diagnostic::Severity::Error)
+        .collect();
+    assert!(errors.is_empty(), "{errors:?}");
+}

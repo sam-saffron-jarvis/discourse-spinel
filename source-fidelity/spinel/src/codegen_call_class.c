@@ -3736,9 +3736,7 @@ static int emit_class_value_singleton_methods(Compiler *c, int id, Buf *b, const
 static int emit_cvar_reflection(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name,
                                 int recv, int argc, const int *argv) {
   if (!is_cvar_reflection_name(name) || argc < 1) return 0;
-  NodeKind aty2_k = nt_kind(nt, argv[0]);
-  const char *cvn = (aty2_k == NK_SymbolNode) ? nt_str(nt, argv[0], "value")
-                  : (aty2_k == NK_StringNode) ? nt_str(nt, argv[0], "content") : NULL;
+  const char *cvn = comp_cvar_literal_name(c, argv[0]);
   NodeKind rty2_k = nt_kind(nt, recv);
   int ccid = (rty2_k == NK_ConstantReadNode) ? const_node_class_index(c, recv) : -1;
   if (cvn && cvn[0] == '@' && cvn[1] == '@' && ccid < 0)

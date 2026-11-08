@@ -1,0 +1,32 @@
+module ActiveRecord
+  module ConnectionLease
+    self.@installed: bool?
+    def self.checkout: () -> ::ActiveRecord::Connection
+    def self.current: () -> ::ActiveRecord::Connection?
+    def self.release: () -> nil
+    def self.install: () -> nil
+  end
+  module ConnectionAdapters
+    class DbPool
+      def active_connection?: () -> ::ActiveRecord::Connection?
+      def release_connection: () -> nil
+      def with_connection: () { (::ActiveRecord::Connection connection) -> untyped } -> untyped
+    end
+    class ConnectionPool
+      module ExecutorHooks
+        def self.run: () -> nil
+        def self.complete: (untyped state) -> nil
+      end
+    end
+  end
+  class ConnectionHandler
+    def connection_pool_list: () -> Array[::ActiveRecord::ConnectionAdapters::DbPool]
+    def each_connection_pool: () { (::ActiveRecord::ConnectionAdapters::DbPool pool) -> untyped } -> nil
+  end
+  CONNECTION_POOL: ::ActiveRecord::ConnectionAdapters::DbPool
+  CONNECTION_HANDLER: ::ActiveRecord::ConnectionHandler
+  class Base
+    def self.connection_pool: () -> ::ActiveRecord::ConnectionAdapters::DbPool
+    def self.connection_handler: () -> ::ActiveRecord::ConnectionHandler
+  end
+end

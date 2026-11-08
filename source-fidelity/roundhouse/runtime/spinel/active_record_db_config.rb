@@ -116,24 +116,6 @@ module ActiveRecord
   end
 
   module ConnectionAdapters
-    # The face of the Db shim's own pool: Rails' `with_connection` runs
-    # the block with the holder's connection, leasing one only when it
-    # holds none, which is what `ActiveRecord::Base.connection` (a
-    # stateless facade over `Db`) already does.
-    class DbPool
-      def with_connection
-        yield ActiveRecord::Base.connection
-      end
-
-      # Rails hands the thread's connection back to the pool so another
-      # can take it — campfire's counter test does, before writing
-      # through a second, foreign `SQLite3::Database`. Ours holds no
-      # lock between statements, so there is nothing to hand back.
-      def release_connection
-        nil
-      end
-    end
-
     class SQLite3Adapter
       def self.resolve_path(database, root: nil)
         text = database.to_s
@@ -202,10 +184,6 @@ module ActiveRecord
         end
       end
       out
-    end
-
-    def self.connection_pool
-      ActiveRecord::ConnectionAdapters::DbPool.new
     end
 
     # `name.constantize.instantiate(attributes)` (`lower::record_snapshot`):

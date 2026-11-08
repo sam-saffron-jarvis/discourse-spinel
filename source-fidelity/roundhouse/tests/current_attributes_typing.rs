@@ -8,11 +8,9 @@
 //!    is app code; the only write the class's own syntax shows is the
 //!    generated `def session=(value); @session = value; end`, whose
 //!    parameter has no type. The seed comes from surveying the app.
-//! 2. **`reset` nilled the singleton.** `@__instance`'s type is the
-//!    union of what the class assigns it, so one `= nil` made
-//!    `self.instance` answer `Current | Nil` and every class-level
-//!    forwarder register `Untyped`. `reset` now REPLACES the instance,
-//!    which is what resetting a CurrentAttributes MEANS.
+//! 2. **`reset` must not nil the instance reader.** The registry holds a
+//!    concrete instance per execution-context frame; reset clears its fields
+//!    while references held by callers retain their identity.
 //! 3. **The forwarder's body cannot type itself.** `Ty::Class { Current }`
 //!    is both the class object and an instance here, and the
 //!    class-method table is consulted first, so `Current.instance.user`
@@ -124,15 +122,16 @@ fn a_read_through_the_forwarder_answers_the_model() {
     );
 }
 
-/// Ablation for reason 2: `reset` must not nil the slot, or
+/// Ablation for reason 2: `reset` must not nil the registered instance, or
 /// `self.instance` answers `Current | Nil` and nothing downstream types.
 #[test]
-fn reset_replaces_the_instance_rather_than_nilling_it() {
+fn reset_preserves_the_registered_instance() {
     let src = emitted("app/models/current.rb");
     assert!(
-        src.contains("Thread.current[:__current_attrs_Current] = Current.new")
-            && !src.contains("Thread.current[:__current_attrs_Current] = nil"),
-        "resetting a CurrentAttributes means a fresh instance:\n{src}"
+        src.contains("Current.instance.reset")
+            && src.contains("ActiveSupport::ExecutionContext.current_attributes_instances")
+            && !src.contains("Thread.current[:__current_attrs_Current]"),
+        "resetting must retain the registered instance and clear its fields:\n{src}"
     );
 }
 

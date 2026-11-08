@@ -2769,7 +2769,7 @@ impl Analyzer {
                 for (name, ty) in class_body_ivars {
                     // Merged: a class method's own write (`@state = "ready"`) is a value too.
                     let merged = match class_method_ivars.get(&name) {
-                        Some(written) => crate::analyze::body::union_of(written.clone(), ty),
+                        Some(written) => crate::analyze::body::join_ivar_slot(written.clone(), ty),
                         None => ty,
                     };
                     class_side_ctx.ivar_bindings.insert(name, merged);
@@ -4221,9 +4221,7 @@ impl Analyzer {
 
             if retype {
                 let initializer_ctx = Ctx { class_side: true, ..class_ctx.clone() };
-                for initializer in &mut lc.class_ivar_initializers {
-                    self.body_typer().analyze_expr(initializer, &initializer_ctx);
-                }
+                self.body_typer().analyze_declaration_initializers(&mut lc.class_ivar_initializers, &initializer_ctx);
                 for (_, value) in &mut lc.constants {
                     if self.data_factories.contains_key(&value.span) || self.class_factories.contains_key(&value.span) {
                         self.body_typer().analyze_expr(value, &class_ctx);
@@ -4262,9 +4260,7 @@ impl Analyzer {
                 let mut initializer_ctx = initializer_ctx;
                 initializer_ctx.ivar_bindings = class_writes.into_iter()
                     .map(|(name, ty)| (name, crate::analyze::body::union_of(ty, Ty::Nil))).collect();
-                for initializer in &mut lc.class_ivar_initializers {
-                    self.body_typer().analyze_expr(initializer, &initializer_ctx);
-                }
+                self.body_typer().analyze_declaration_initializers(&mut lc.class_ivar_initializers, &initializer_ctx);
             }
 
             let mut flow_ivars: HashMap<Symbol, Ty> = HashMap::default();

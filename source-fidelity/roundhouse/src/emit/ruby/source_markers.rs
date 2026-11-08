@@ -76,7 +76,7 @@ pub fn with_source_markers<R>(app: &App, f: impl FnOnce() -> R) -> R {
 
 /// The marker naming `span`'s start, or `None` when markers are off,
 /// the span is synthetic, or it names no registered file.
-pub(super) fn marker_for(span: &Span) -> Option<String> {
+pub(crate) fn marker_for(span: &Span) -> Option<String> {
     if span.is_synthetic() || span.file.0 == 0 {
         return None;
     }

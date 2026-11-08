@@ -102,7 +102,9 @@ pub const HELPER_BODY_TRANSLATE: u64 = 1 << 18;
 
 /// A model's class-body `extend AppModule`, or a call after it to that
 /// module's own method (`load_settings(…)`): app code the Ruby family
-/// replays where the source has it (`ingest::app_extension_calls`).
+/// replays where the source has it (`ingest::app_extension_calls`). Also used
+/// by target-scoped native memo-reader admission, preserving its original
+/// finite core class_eval declaration instead of synthesizing getter bodies.
 pub const REPLAYED_CLASS_BODY: u64 = 1 << 19;
 
 /// A model's `private :has_role?` naming a method its body does not

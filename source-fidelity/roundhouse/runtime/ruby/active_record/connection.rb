@@ -181,6 +181,15 @@ module ActiveRecord
   # `lower::transaction_after_commit` turns the app's block into one, so
   # the runtime types fully on every lane.
   class Transaction
+    def closed?
+      Db._txn_depth == 0
+    end
+
+    def joinable?
+      depth = Db._txn_depth
+      depth > 0 && ActiveRecord::Base._txn_parent_joinable?(depth)
+    end
+
     def after_commit(work)
       ActiveRecord::Base._after_commit(work)
     end
@@ -301,6 +310,10 @@ module ActiveRecord
   end
 
   class Connection
+    def current_transaction
+      ActiveRecord::Base.current_transaction
+    end
+
     def self.shared
       @shared ||= Connection.new
     end
@@ -625,7 +638,7 @@ module ActiveRecord
     # instance per call would lose. Held on Connection, not on Base, so
     # `User.connection` and `ActiveRecord::Base.connection` agree.
     def self.connection
-      ActiveRecord::Connection.shared
+      ActiveRecord::ConnectionLease.checkout
     end
 
     # Rails' `Model.sanitize_sql(["insert … values (?, ?)", a, b])` —

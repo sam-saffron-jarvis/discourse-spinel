@@ -30,7 +30,6 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use roundhouse::analyze::{diagnose, Severity};
-use roundhouse::ingest::ingest_app;
 use roundhouse::project::{self, BuildTarget};
 
 fn usage() -> &'static str {
@@ -395,7 +394,7 @@ fn run_transpile(
     // which the error-recovering parser otherwise drops on the floor —
     // are collected and routed through the same report as emit gaps.
     let (app_result, parse_diags) =
-        roundhouse::ingest::prism::scope(|| ingest_app(input));
+        roundhouse::ingest::prism::scope(|| roundhouse::ingest::ingest_app_for_target(input, target));
     let mut survey_gaps =
         if survey { roundhouse::ingest::survey::drain() } else { Vec::new() };
     let mut app = match app_result {

@@ -55,7 +55,7 @@ typedef struct {
   char *seen;        /* per constant: a settled assignment has run */
   char *plain;       /* per constant: ... of a value built of literals alone */
   int clean;         /* nothing that has run so far can run the program's code */
-  const int *par;    /* the parent map */
+  int *par;          /* owned parent-map snapshot; nested elaboration may replace the compiler cache */
   char **crefs;      /* the lexical names of the classes and modules flagged reads are written in, as an error shows them */
   int ncrefs, ccrefs;
   int hooks;         /* a definition can run a hook of the program's */
@@ -334,13 +334,16 @@ static int const_class_presence(Compiler *c, int id, int program);
    (see the header comment). */
 void an_const_presence(Compiler *c) {
   const NodeTable *nt = c->nt;
-  ConstWalk w = { .c = c, .nt = nt, .clean = 1, .par = comp_parent_map(c) };
+  /* This pass annotates nodes, invalidating the compiler's cached parent map.
+     Elaboration queries below can rebuild that cache while the walk still uses
+     it, so retain an owned structural snapshot until this pass completes. */
+  ConstWalk w = { .c = c, .nt = nt, .clean = 1, .par = an_parent_map(nt) };
   size_t nn = (size_t)(nt->count > 0 ? nt->count : 1), nc = (size_t)(c->nconsts > 0 ? c->nconsts : 1);
   w.settled = calloc(nn, 1);
   w.seen = calloc(nc, 1);
   w.plain = calloc(nc, 1);
   char *listed_only = calloc(nc, 1);      /* per constant: early only to a `constants` listing */
-  if (!w.settled || !w.seen || !w.plain ||
+  if (!w.par || !w.settled || !w.seen || !w.plain ||
       !listed_only) {
     fprintf(stderr, "spinel: out of memory\n"); exit(1);
   }
@@ -426,6 +429,7 @@ void an_const_presence(Compiler *c) {
   free(cref);
   for (int i = 0; i < w.ncrefs; i++) free(w.crefs[i]);
   free(w.crefs);
+  free(w.par);
   free(w.settled);
   free(w.seen); free(w.plain); free(listed_only);
   free(first_settled); free(early_reads);

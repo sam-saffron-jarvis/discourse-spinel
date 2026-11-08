@@ -1,0 +1,45 @@
+{
+  "pin": "96ce8d44401a8a568ecc71561c26dca8ec6bfeb8",
+  "source": "lib/ember_assets.rb",
+  "source_sha256": "6435e5c5a84f109c3355c733ebf6bafa54ab3d349f107d7ba82d959d3bf6d741",
+  "selected_spans": [
+    {
+      "source": "lib/ember_assets.rb",
+      "method": "script_chunks",
+      "start_byte": 585,
+      "end_byte": 1185,
+      "text_sha256": "54c09a8f4877b35f19c729d5f07cbe497f03164ad13d1cd935f41dbd7992d40a"
+    },
+    {
+      "source": "lib/ember_assets.rb",
+      "method": "import_map",
+      "start_byte": 1279,
+      "end_byte": 1494,
+      "text_sha256": "c69c4e02c219038cec559a3c76fc77432642b0f7514ae0818ce6a3f21e57ad7a"
+    },
+    {
+      "source": "lib/ember_assets.rb",
+      "method": "logical_name",
+      "start_byte": 1498,
+      "end_byte": 1594,
+      "text_sha256": "e381cc8609f618adfaa7450d43cca43b23b26616a0a5ebd02ffd6608d5d2ce8b"
+    },
+    {
+      "source": "lib/ember_assets.rb",
+      "method": "deep_imports_for",
+      "start_byte": 1598,
+      "end_byte": 1895,
+      "text_sha256": "b3ebc9890edfa2b4ae3992a5fbd7b66744d6b1070d847be6f8b20139356755f2"
+    }
+  ],
+  "candidate": "compat/discourse/lib/portable_ember_asset_graph.rb",
+  "candidate_sha256": "b2abc2b1082fbd59664747685fa0e9676769bb64bbfa18212d6d655e0cb9a52c",
+  "scope": "Pure manifest graph dependency only; not full EmberAssets or HTML/page acceptance",
+  "transformations": [
+    "script_chunks/import_map take the caller's live manifest explicitly",
+    "Build status, filesystem acquisition and lifecycle cache remain outside this pure dependency",
+    "Original traversal, Set cycle suppression, entrypoint merge, naming and mapping retained"
+  ],
+  "captured_runtime_manifest": false,
+  "html_accepted": false
+}

@@ -60,12 +60,11 @@ end
         .expect("current.rb")
 }
 
-/// The base is gone — nothing in an emitted tree provides it.
+/// Keep the typed reset interface used by the generic context registry.
 #[test]
-fn the_current_attributes_base_is_dropped() {
+fn the_current_attributes_reset_interface_is_retained() {
     let c = current();
-    assert!(!c.contains("ActiveSupport::CurrentAttributes"), "{c}");
-    assert!(c.contains("class Current\n"), "{c}");
+    assert!(c.contains("class Current < ActiveSupport::CurrentAttributes"), "{c}");
 }
 
 /// `attribute :session, :user, :request` becomes real ivar accessors.

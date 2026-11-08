@@ -22,15 +22,24 @@ module ActiveSupport
     def value_for_key: (untyped key, untyped value, String? full_parent_key, Hash[untyped, untyped]? original_params) -> untyped
   end
 
+  class CurrentAttributes
+    def self.clear_all: () -> Hash[Symbol, CurrentAttributes]
+    def reset: () -> void
+  end
+
   module ExecutionContext
     class Record
       @store: Hash[Symbol, untyped]
       @stack: Array[Hash[Symbol, untyped]]
+      @current_attributes_instances: Hash[Symbol, ::ActiveSupport::CurrentAttributes]
+      @instances_stack: Array[Hash[Symbol, ::ActiveSupport::CurrentAttributes]]
 
       def initialize: () -> void
       def store: () -> Hash[Symbol, untyped]
+      def current_attributes_instances: () -> Hash[Symbol, ::ActiveSupport::CurrentAttributes]
       def push: () -> ::ActiveSupport::ExecutionContext::Record
       def pop: () -> ::ActiveSupport::ExecutionContext::Record
+      def empty_instances: () -> Hash[Symbol, ::ActiveSupport::CurrentAttributes]
       def flush: () -> ::ActiveSupport::ExecutionContext::Record
     end
 
@@ -46,6 +55,7 @@ module ActiveSupport
     def self.pop: () -> untyped
     def self.clear: () -> nil
     def self.flush: () -> ::ActiveSupport::ExecutionContext::Record
+    def self.current_attributes_instances: () -> Hash[Symbol, ::ActiveSupport::CurrentAttributes]
     def self.record: () -> ::ActiveSupport::ExecutionContext::Record
   end
 

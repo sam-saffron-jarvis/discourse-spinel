@@ -1,0 +1,406 @@
+# frozen_string_literal: true
+require_relative "../route_matcher"
+
+# You may have seen references to v0 and v1 of our auth cookie in the codebase
+# and you're not sure how they differ, so here is an explanation:
+#
+# From the very early days of Discourse, the auth cookie (_t) consisted only of
+# a 32 characters random string that Discourse used to identify/lookup the
+# current user. We didn't include any metadata with the cookie or encrypt/sign
+# it.
+#
+# That was v0 of the auth cookie until Nov 2021 when we merged a change that
+# required us to store additional metadata with the cookie so we could get more
+# information about current user early in the request lifecycle before we
+# performed database lookup. We also started encrypting and signing the cookie
+# to prevent tampering and obfuscate user information that we include in the
+# cookie. This is v1 of our auth cookie and we still use it to this date.
+#
+# We still accept v0 of the auth cookie to keep users logged in, but upon
+# cookie rotation (which happen every 10 minutes) they'll be switched over to
+# the v1 format.
+#
+# We'll drop support for v0 after Discourse 2.9 is released.
+
+class Auth::DefaultCurrentUserProvider
+  CURRENT_USER_KEY = "_DISCOURSE_CURRENT_USER"
+  USER_TOKEN_KEY = "_DISCOURSE_USER_TOKEN"
+  API_KEY = "api_key"
+  API_USERNAME = "api_username"
+  HEADER_API_KEY = "HTTP_API_KEY"
+  HEADER_API_USERNAME = "HTTP_API_USERNAME"
+  HEADER_API_USER_EXTERNAL_ID = "HTTP_API_USER_EXTERNAL_ID"
+  HEADER_API_USER_ID = "HTTP_API_USER_ID"
+  PARAMETER_USER_API_KEY = "user_api_key"
+  USER_API_KEY = "HTTP_USER_API_KEY"
+  USER_API_CLIENT_ID = "HTTP_USER_API_CLIENT_ID"
+  API_KEY_ENV = "_DISCOURSE_API"
+  USER_API_KEY_ENV = "_DISCOURSE_USER_API"
+  TOKEN_COOKIE = ENV["DISCOURSE_TOKEN_COOKIE"] || "_t"
+  PATH_INFO = "PATH_INFO"
+  COOKIE_ATTEMPTS_PER_MIN = 10
+  BAD_TOKEN = "_DISCOURSE_BAD_TOKEN"
+  DECRYPTED_AUTH_COOKIE = "_DISCOURSE_DECRYPTED_AUTH_COOKIE"
+
+  TOKEN_SIZE = 32
+
+  def self.shared_session_redis_key(key)
+    "shared_session_user_auth_token_id:#{key}"
+  end
+
+  def self.store_shared_session_key(key, token_id)
+    Discourse.redis.setex(shared_session_redis_key(key), 7.days, token_id)
+  end
+
+  PARAMETER_API_PATTERNS = [
+    RouteMatcher.new(
+      methods: :get,
+      actions: [
+        "posts#latest",
+        "posts#user_posts_feed",
+        "groups#posts_feed",
+        "groups#mentions_feed",
+        "list#user_topics_feed",
+        "list#category_feed",
+        "topics#feed",
+        "badges#show",
+        "tags#tag_feed",
+        "tags#show",
+        *%i[latest unread new read posted bookmarks].map { |f| "list##{f}_feed" },
+        *%i[all yearly quarterly monthly weekly daily].map { |p| "list#top_#{p}_feed" },
+        *%i[latest unread new read posted bookmarks].map { |f| "tags#show_#{f}" },
+      ],
+      formats: :rss,
+    ),
+    RouteMatcher.new(methods: :get, actions: "users#bookmarks", formats: :ics),
+    RouteMatcher.new(methods: :post, actions: "admin/email#handle_mail", formats: nil),
+  ]
+
+  def self.find_v0_auth_cookie(request)
+    cookie = request.cookies[TOKEN_COOKIE]
+
+    cookie if cookie&.valid_encoding? && cookie.present? && cookie.size == TOKEN_SIZE
+  end
+
+  def self.find_v1_auth_cookie(env)
+    return find_v1_auth_cookie_for_latest_json(env) if env["PATH_INFO"] == "/latest.json"
+    return env[DECRYPTED_AUTH_COOKIE] if env.key?(DECRYPTED_AUTH_COOKIE)
+
+    env[DECRYPTED_AUTH_COOKIE] = begin
+      request = ActionDispatch::Request.new(env)
+      cookie = request.cookies[TOKEN_COOKIE]
+
+      # don't even initialize a cookie jar if we don't have a cookie at all
+      if cookie&.valid_encoding? && cookie.present?
+        request.cookie_jar.encrypted[TOKEN_COOKIE]&.with_indifferent_access
+      end
+    end
+  end
+
+  # do all current user initialization here
+  def initialize(env)
+    @env = env
+    @request = ActionDispatch::Request.new(env)
+    @user_token = env[USER_TOKEN_KEY]
+  end
+
+  # our current user, return nil if none is found
+  def current_user
+  # Supported request profile only. Never accept a credential as anonymous.
+  %w[HTTP_COOKIE HTTP_AUTHORIZATION HTTP_X_SHARED_SESSION_KEY HTTP_API_KEY HTTP_API_USERNAME HTTP_API_USER_EXTERNAL_ID HTTP_API_USER_ID HTTP_USER_API_KEY HTTP_USER_API_CLIENT_ID HTTP_DISCOURSE_LOGGED_IN].each do |key|
+    value = @env[key]
+    raise ArgumentError, "unsupported credential-bearing current-user profile" unless value.nil? || value == ""
+  end
+  %w[api_key api_username user_api_key user_api_client_id user_api_public_key auth_redirect].each do |key|
+    raise ArgumentError, "unsupported credential-bearing current-user query" if @request.params.key?(key)
+  end
+  unless @env[USER_TOKEN_KEY].nil? && @env[DECRYPTED_AUTH_COOKIE].nil? && @env[CURRENT_USER_KEY].nil? && @env[API_KEY_ENV].nil? && @env[USER_API_KEY_ENV].nil?
+    raise ArgumentError, "unsupported preauthenticated current-user context"
+  end
+  return @env[CURRENT_USER_KEY] if @env.key?(CURRENT_USER_KEY)
+  current_user = nil
+  @env[CURRENT_USER_KEY] = current_user
+end
+
+  def refresh_session(user, session, cookie_jar)
+    return refresh_session_for_latest_json(user, session, cookie_jar) if @env[PATH_INFO] == "/latest.json"
+    # if user was not loaded, no point refreshing session
+    # it could be an anonymous path, this would add cost
+    return if is_api? || !@env.key?(CURRENT_USER_KEY)
+
+    if !is_user_api? && @user_token && @user_token.user == user
+      rotated_at = @user_token.rotated_at
+
+      needs_rotation =
+        (
+          if @user_token.auth_token_seen
+            rotated_at < UserAuthToken::ROTATE_TIME.ago
+          else
+            rotated_at < UserAuthToken::URGENT_ROTATE_TIME.ago
+          end
+        )
+
+      if needs_rotation
+        if @user_token.rotate!(
+             user_agent: @env["HTTP_USER_AGENT"],
+             client_ip: @request.ip,
+             path: @env["REQUEST_PATH"],
+           )
+          set_auth_cookie!(@user_token.unhashed_auth_token, user, cookie_jar)
+          DiscourseEvent.trigger(:user_session_refreshed, user)
+        end
+      end
+    end
+
+    cookie_jar.delete(TOKEN_COOKIE) if !user && cookie_jar.key?(TOKEN_COOKIE)
+  end
+
+  def log_on_user(user, session, cookie_jar, opts = {})
+    @env[USER_TOKEN_KEY] = @user_token =
+      UserAuthToken.generate!(
+        user_id: user.id,
+        user_agent: @env["HTTP_USER_AGENT"],
+        path: @env["REQUEST_PATH"],
+        client_ip: @request.ip,
+        staff: user.staff?,
+        impersonate: opts[:impersonate],
+        authenticated_with_oauth: opts[:authenticated_with_oauth],
+      )
+
+    set_auth_cookie!(@user_token.unhashed_auth_token, user, cookie_jar)
+    user.unstage!
+
+    make_developer_admin(user)
+    bootstrap_first_admin(user)
+
+    UserAuthToken.enforce_session_count_limit!(user.id)
+
+    @env[CURRENT_USER_KEY] = user
+  end
+
+  def start_impersonating_user(user)
+    @user_token.update!(
+      impersonated_user_id: user.id,
+      impersonation_expires_at:
+        SiteSetting.experimental_impersonation_time_limit_minutes.minutes.from_now,
+    )
+  end
+
+  def stop_impersonating_user
+    @user_token.update!(impersonated_user_id: nil, impersonation_expires_at: nil)
+    # Clear memoization of `current_user` so we can get the acting user back in
+    # the context of the same request.
+    @env.delete(CURRENT_USER_KEY)
+  end
+
+  def impersonation_acting_user
+    @user_token.acting_user
+  end
+
+  def set_auth_cookie!(unhashed_auth_token, user, cookie_jar)
+    data = {
+      token: unhashed_auth_token,
+      user_id: user.id,
+      username: user.username,
+      trust_level: user.trust_level,
+      issued_at: Time.zone.now.to_i,
+    }
+
+    expires = SiteSetting.maximum_session_age.hours.from_now if SiteSetting.persistent_sessions
+
+    same_site = SiteSetting.same_site_cookies if SiteSetting.same_site_cookies != "Disabled"
+
+    cookie_jar.encrypted[TOKEN_COOKIE] = {
+      value: data,
+      httponly: true,
+      secure: SiteSetting.force_https,
+      expires: expires,
+      same_site: same_site,
+    }
+  end
+
+  # This is also used to set the first admin of the site via
+  # the finish installation & register -> user account activation
+  # for signup flow, since all admin emails are stored in
+  # DISCOURSE_DEVELOPER_EMAILS for self-hosters.
+  def make_developer_admin(user)
+    if user.active? && !user.admin && Rails.configuration.respond_to?(:developer_emails) &&
+         Rails.configuration.developer_emails.include?(user.email)
+      user.admin = true
+      user.save
+      Group.refresh_automatic_groups!(:staff, :admins)
+    end
+  end
+
+  def bootstrap_first_admin(user)
+    return if !user.admin || user.moderator || !user.last_seen_at.nil? || !user.is_singular_admin?
+
+    user.grant_moderation!
+    StaffActionLogger.new(Discourse.system_user).log_grant_moderation(user)
+  end
+
+  def log_off_user(session, cookie_jar, push_subscription: nil)
+    user = current_user
+
+    if SiteSetting.log_out_strict && user
+      user.user_auth_tokens.destroy_all
+
+      if user.admin && defined?(Rack::MiniProfiler)
+        # clear the profiling cookie to keep stuff tidy
+        cookie_jar.delete("__profilin")
+      end
+
+      PushNotificationPusher.clear_subscriptions(user)
+      user.logged_out
+    elsif user && @user_token
+      @user_token.destroy
+      PushNotificationPusher.unsubscribe(user, push_subscription) if push_subscription
+      DiscourseEvent.trigger(:user_logged_out, user)
+    end
+
+    cookie_jar.delete("authentication_data")
+    cookie_jar.delete(TOKEN_COOKIE)
+  end
+
+  # api has special rights return true if api was detected
+  def is_api?
+    current_user
+    !!@env[API_KEY_ENV]
+  end
+
+  def is_user_api?
+    current_user
+    !!@env[USER_API_KEY_ENV]
+  end
+
+  def has_auth_cookie?
+    find_auth_token.present?
+  end
+
+  def should_update_last_seen?
+    return false unless can_write?
+
+    api = !!@env[API_KEY_ENV] || !!@env[USER_API_KEY_ENV]
+
+    if @request.xhr? || api
+      @env["HTTP_DISCOURSE_PRESENT"] == "true"
+    else
+      true
+    end
+  end
+
+  protected
+
+  def lookup_api_user(api_key_value, request)
+    if api_key = ApiKey.active.with_key(api_key_value).includes(:user).first
+      api_username = header_api_key? ? @env[HEADER_API_USERNAME] : request[API_USERNAME]
+
+      return nil if !api_key.request_allowed?(@env)
+
+      user =
+        if api_key.user
+          api_key.user if !api_username || (api_key.user.username_lower == api_username.downcase)
+        elsif api_username
+          User.find_by(username_lower: api_username.downcase)
+        elsif user_id = header_api_key? ? @env[HEADER_API_USER_ID] : request["api_user_id"]
+          User.find_by(id: user_id.to_i)
+        elsif external_id =
+              header_api_key? ? @env[HEADER_API_USER_EXTERNAL_ID] : request["api_user_external_id"]
+          SingleSignOnRecord.find_by(external_id: external_id.to_s).try(:user)
+        end
+
+      if user && can_write?
+        Scheduler::Defer.later "Updating api_key last_used" do
+          api_key.update_last_used!
+        end
+      end
+
+      user
+    end
+  end
+
+  private
+
+  def parameter_api_patterns
+    PARAMETER_API_PATTERNS + DiscoursePluginRegistry.api_parameter_routes
+  end
+
+  # By default we only allow headers for sending API credentials
+  # However, in some scenarios it is essential to send them via url parameters
+  # so we need to add some exceptions
+  def api_parameter_allowed?
+    parameter_api_patterns.any? { |p| p.match?(env: @env) }
+  end
+
+  def header_api_key?
+    !!@env[HEADER_API_KEY]
+  end
+
+  def can_write?
+    @can_write ||= !Discourse.pg_readonly_mode?
+  end
+
+  def admin_api_key_limiter
+    return @admin_api_key_limiter if @admin_api_key_limiter
+
+    limit = GlobalSetting.max_admin_api_reqs_per_minute.to_i
+    if GlobalSetting.respond_to?(:max_admin_api_reqs_per_key_per_minute)
+      Discourse.deprecate(
+        "DISCOURSE_MAX_ADMIN_API_REQS_PER_KEY_PER_MINUTE is deprecated. Please use DISCOURSE_MAX_ADMIN_API_REQS_PER_MINUTE",
+        drop_from: "2.9.0",
+      )
+      limit = [GlobalSetting.max_admin_api_reqs_per_key_per_minute.to_i, limit].max
+    end
+    @admin_api_key_limiter =
+      RateLimiter.new(nil, "admin_api_min", limit, 1.minute, error_code: "admin_api_key_rate_limit")
+  end
+
+  def user_api_key_limiter_60_secs
+    @user_api_key_limiter_60_secs ||=
+      RateLimiter.new(
+        nil,
+        "user_api_min_#{@hashed_user_api_key}",
+        GlobalSetting.max_user_api_reqs_per_minute,
+        1.minute,
+        error_code: "user_api_key_limiter_60_secs",
+      )
+  end
+
+  def user_api_key_limiter_1_day
+    @user_api_key_limiter_1_day ||=
+      RateLimiter.new(
+        nil,
+        "user_api_day_#{@hashed_user_api_key}",
+        GlobalSetting.max_user_api_reqs_per_day,
+        1.day,
+        error_code: "user_api_key_limiter_1_day",
+      )
+  end
+
+  def find_auth_token
+    return @auth_token if defined?(@auth_token)
+
+    @auth_token =
+      if v0 = self.class.find_v0_auth_cookie(@request)
+        v0
+      elsif v1 = self.class.find_v1_auth_cookie(@env)
+        v1[:token] if v1[:issued_at] >= SiteSetting.maximum_session_age.hours.ago.to_i
+      end
+  end
+end
+class Auth::DefaultCurrentUserProvider
+  def refresh_session_for_latest_json(user, session, cookie_jar)
+    return if is_api? || !@env.key?(CURRENT_USER_KEY)
+    raise ArgumentError, "unsupported authenticated session rotation profile" unless user.nil? && @user_token.nil?
+    cookie_jar.delete(TOKEN_COOKIE) if !user && cookie_jar.to_hash.key?(TOKEN_COOKIE)
+  end
+end
+class Auth::DefaultCurrentUserProvider
+  def self.find_v1_auth_cookie_for_latest_json(env)
+    header = env["HTTP_COOKIE"]
+    raise ArgumentError, "unsupported credential-bearing overload cookie profile" unless header.nil? || header == ""
+    raise ArgumentError, "unsupported preauthenticated overload cookie profile" unless env[DECRYPTED_AUTH_COOKIE].nil?
+    return env[DECRYPTED_AUTH_COOKIE] if env.key?(DECRYPTED_AUTH_COOKIE)
+    env[DECRYPTED_AUTH_COOKIE] = nil
+  end
+end

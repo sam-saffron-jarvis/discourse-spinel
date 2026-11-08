@@ -1293,6 +1293,13 @@ fn every_runtime_method_body_concretely_typed() {
     // yield result in active_record/connection.rb. Its row is a typed
     // Hash[String, untyped]; the generic block result has no caller in
     // this probe. Existing methods have unchanged per-method counts.
+    // Recovery11: scalar indexed writes now use Assign/Index instead of a
+    // nil-returning Send. On identical runtime bytes the preserved prior
+    // parser measures 921, and the corrected parser measures 936: arbitrary
+    // RBS values now propagate through the assignment result instead of
+    // claiming nil. The root/path changes add zero sites (including in this
+    // global context). Keep this tracker failing; do not conceal the newly
+    // exposed residual or raise its ceiling to make the source fix green.
     const CEILING: usize = 920;
     assert!(
         total_gradual <= CEILING,
@@ -1321,6 +1328,21 @@ fn hash_option_helpers_add_no_gradual_or_unresolved_sites() {
         let mut unresolved = Vec::new();
         collect_untyped(&method.body, method.name.as_str(), &mut unresolved);
         assert!(unresolved.is_empty(), "{unresolved:#?}");
+    }
+}
+
+#[test]
+fn rails_root_path_helpers_add_no_gradual_or_unresolved_sites() {
+    let methods = load_typed("rails");
+    for name in ["root", "public_path", "to_s", "to_path"] {
+        let selected: Vec<_> = methods.iter().filter(|method| method.name.as_str() == name).collect();
+        assert!(!selected.is_empty(), "missing Rails path helper {name}");
+        for method in selected {
+            assert_eq!(count_gradual(&method.body), 0, "{}", method.name.as_str());
+            let mut unresolved = Vec::new();
+            collect_untyped(&method.body, method.name.as_str(), &mut unresolved);
+            assert!(unresolved.is_empty(), "{unresolved:#?}");
+        }
     }
 }
 
