@@ -266,3 +266,68 @@ Fullcumulative9k integration600timeouts unchanged; stylesheet/layout/HTML200/
 browser/page/019 FALSE. Next actualSlug.for (actualgettercallbacks, rawname not
 localizedname), color_scheme_cache_key/liveglobals, sourcebuilder/path/diskconditions
 as permitted; refusebeforeanyprohibitedBuilder/rebake/WizardPGwritedispatch.
+
+## Next bounded experiment: actual Slug/cache-key/live globals
+
+Checkpoint12e781a clean before extension. Add exactsourceSlug algorithm withASCII
+admission becauseexistingparameterize hasNOtransliteration; allnativeinputnonASCII
+refuses, no outputcoercion/forcedmethod/capturedkey. Actualslug_generation_method
+GETTER reuses source-provenno-wrap SlugSetting family, exactmetadata guard andreal
+provider/current snapshot; no genericscalarflag/guard relaxation. Sameactualdefault
+locale getter/I18n.with_locale. Actualcachekey read_attribute(:name) rawslot contract
+only; unknownattributes/types refuse, notlocalizedname. Sourcecachekey/globalread
+component stillUNACCEPTED pending nativeAND RUN/3-way+independentrealAR/AS checks.
+192025 extractorwrongproviderpath (actualnested inGlobalSetting model) refused;
+192050 emitterunknownruntimecontextconstant ininputGlobalSetting getter refused.
+Keepcachekey source/runtimefacade inexistingbuildcomponentlayer (likebasefactory),
+Slug stillpassesactualapplicationemitter. No compiler/harness/type/effects waiver.
+192148 sharedsourceSlug callsunlowered String#parameterize (missingruntimeString
+reopen). Bindexplicit Inflector.parameterize underASCIIguard, reuseexistingactual
+runtime, no frameworkedit. 192247 sharedRUN+allinheritedpreflightcontrols pass,
+livecachekeys/hostname/root/sluggeneration/defaultlocale computed; independentraw
+AR/AS reference needsactualsourceEmoji regex declaration (notnewcannedvalue).
+ExtractliteralPrismconstant frompinnedsource; no syntheticgetter/key/CSS.
+192331 independentactualAR/AS/I18n sourcekey equals sharedRUN, freshROprovider4PG
+constructorattestations. Nativecompile337.655s correctlyrefuses wrongexistingencoder
+namespace(ActionView::Helpers vsactualViewHelpers) andnewruntimeObject#extend. Fix
+namespace; scopedclassSiteSetting singletongetter binding (notlive-objectmixing),
+reuseexistingstorecurrentmethod. No compilerchange/widerstub or sourcebranchskip.
+193034 nativecompile336.521s AND native0.214/shared0.515/rawsource0.564s RUNRC0;
+actualAR/AS/I18n source key/unitfields agree,91ownedfixturecleanups true. Final
+localized-name negative rejects safelyatASCIIguard onFrench localizedname instead
+ofanticipatedkeyinvariant. AddSTRONGERrawattribute-vs-rawslot invariant withineach
+locale beforekeycall; retainsoriginalkeylocaleinvariant andguard, no assertion
+weakening. All4newcontrols alsopreflightbeforeexpensivenativebuild. Notyetaccepted
+becauseexpectedcontrol diagnostic mismatch retained. No productioncompiler/effect
+semantics changed; control mutationremainsTESTonly.
+193815 preflightcorrectlycaughtlocalizationfaultbeforecompile: inheritedrequest
+leavesI18n.locale=:fr; initialkeyevaluation precedeslocale-loop invariant. Assert
+rawslot/rawattribute equalityBEFOREinitialkey too, preservingallchecks. No forced
+locale/requestsemantics or effectchange. Thiscatch provesfrpublicname couldnotbe
+silentlysluggifiedwithASCIIhelper; correctrawsourceLight remainsASCII inalllocales.
+
+## 193916 source Slug/cache key/live globals VERIFIED, not stylesheet
+
+ExplicitO0nativecompile343.774s AND native0.214/shared0.514/rawsource0.564s RUNRC0.
+Actualrawnamekeycomputed (notprovided), actualno-wrapsluggetter/defaultlocale,
+sourceemoji/prettify/truncate/numericfallback, existingparameterizeASCII helper,
+sourcecurrenthostname(forcehostname+database.yml) andnullableGlobalSettingroot.
+All3agreewithseparateactualAR/ActiveSupport/I18n fullsourceSlug/cachekey execution,
+freshprovider/config,4readonlyPGconstructorattestations. NoRailsapp/HTMLinvoked.
+Actual inheritedlocale fr remainsunchanged; rawnamekeystableacrossen/fr display
+names, sourcecachekey:niltheme andactualdefaultthemematched. ExplicitASCII UNIT
+vectors coverpunctuation/underscore/apostrophe/numeric/emoji-only/255truncation;
+neverusedasapplicationrecordinputs. NonASCII refuses beforeunacquiredtransliteration.
+All4preflight+8runtime rawattribute/localizedname/root/nonASCII negativespass,
+includingstrongerrawslotinvariant BEFOREfirstkeyevaluation. Inheritedcontrols
+unchanged. 88nativeROSQL/all96ownedcachefixtures clean. Baseline194855PASS;syntax/
+diffchecksPASS. Full27435-bloboriginalANDservingroot auditunchangedcanonical
+1e1d4bbf63d2888ac507550b8c3ed0fbb3026d123b1853bef4b295194869d9c0.
+Actualsourcegetterfamilyproofreusespreviousverifiedutilityenumabsenceofwrap;
+independent4threferenceusesfreshsharedprovidergetterandactualAR/AS/I18nalgorithm,
+notawholeRails/settingsdeclarationbootstrap. Alloriginalbodies/exactadaptations
+recorded; no genericscalar/type/securityadmissionchange or compilerrepair.
+Stylesheet/layout/HTML200/browser/page/019 FALSE. Next genuineBuilder.scheme_slug
+requireslocalizedname transliteration (NOTrawcachekey'sname), plusactualparent-theme
+Integercache before resolve_baked_field; acquireeffects/paths honestly, no bareORM
+substitutionforcache. ColdBuilder/ThemeField/Wizardwritesremainprohibited.

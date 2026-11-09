@@ -417,3 +417,8 @@ verify-palette-record-prefix:
 .PHONY: verify-palette-base-read
 verify-palette-base-read:
 	python3 tools/probe_palette_base_read.py
+
+# Actual raw-name Slug/cache key/live globals, ASCII slug profile; not stylesheet.
+.PHONY: verify-stylesheet-key-read
+verify-stylesheet-key-read:
+	python3 tools/probe_stylesheet_key_read.py

@@ -1,10 +1,10 @@
 {
-  "captured_at": "2026-11-09T19:20:01.688539+11:00",
+  "captured_at": "2026-11-09T20:00:02.602423+11:00",
   "components": {
     "fidelity": {
       "branch_at_capture": "main",
       "contains_uncommitted_work": false,
-      "file_count": 999,
+      "file_count": 1003,
       "files": {
         ".gitignore": {
           "bytes": 39,
@@ -32,9 +32,9 @@
           "sha256": "8177f97513213526df2cf6184d8ff986c675afb514d4e68a404010521b880643"
         },
         "Makefile": {
-          "bytes": 17162,
+          "bytes": 17353,
           "executable": false,
-          "sha256": "9124c8d590053609a28839faa4dde84b396d219b0e82fcc4c6dae0018d783b89"
+          "sha256": "7ff3f4a324efaf5e95494ce42dba49cd190cac0d6cab8a3d29a8a6f9ffd91477"
         },
         "README.md": {
           "bytes": 46099,
@@ -97,9 +97,9 @@
           "sha256": "14cda41d6124b79b692c5520a487bca7697900c48fc9733c338c2d54882e6b66"
         },
         "RECOVERY35.md": {
-          "bytes": 18822,
+          "bytes": 23711,
           "executable": false,
-          "sha256": "1d72327a6d63cfa754643be5ba47a5268c0a1a3ba68198f11d02a0c0e9eae63d"
+          "sha256": "76545f4f791c6f59e6d7b939fc7f7d0f93999a0e5700a0a6ca895765c1809bf5"
         },
         "SEEDFU_SOURCE_ORDER.md": {
           "bytes": 21893,
@@ -530,6 +530,11 @@
           "bytes": 3423,
           "executable": false,
           "sha256": "eb8e9997021319a8ab238026f6ca2ab591cb87c704759fbf1453a73f2b55176c"
+        },
+        "compat/discourse/lib/site_settings/portable_stylesheet_slug_reader.rb": {
+          "bytes": 1156,
+          "executable": false,
+          "sha256": "95ec12a7831c1ef4988e8478ad54affb601d3db097bb78152e649ef3394def28"
         },
         "compat/discourse/lib/site_settings/portable_upload_readers.rb": {
           "bytes": 616,
@@ -3306,6 +3311,11 @@
           "executable": false,
           "sha256": "181dafa7460a247e23ff644272c69256310570c4ba09dd0640192a08d3087fdf"
         },
+        "test/stylesheet_key_read_context.rb": {
+          "bytes": 2314,
+          "executable": false,
+          "sha256": "b748be090dc9a1e8a54da96155012088b9521a4d4ce66255a61055748fe73c84"
+        },
         "test/stylesheet_manager_read_context.rb": {
           "bytes": 2387,
           "executable": false,
@@ -4131,6 +4141,11 @@
           "executable": false,
           "sha256": "b93a445ae68f7f28bb9934c7c74b89f791c4588d19b5d89b35a418519f85aa2f"
         },
+        "tools/generate_stylesheet_key_read.rb": {
+          "bytes": 8763,
+          "executable": false,
+          "sha256": "da99611fa3d7a7e6c387d30ad8fc5646ff0b53440300ff2f4f4a81f0ed9e56bb"
+        },
         "tools/generate_stylesheet_manager_read_stage.rb": {
           "bytes": 3678,
           "executable": false,
@@ -4626,6 +4641,11 @@
           "executable": false,
           "sha256": "c7b98864cce7f6cea25ba85d66430c3b5717b18c8d35d0dcd3e4504cfa342bbe"
         },
+        "tools/probe_stylesheet_key_read.py": {
+          "bytes": 8298,
+          "executable": false,
+          "sha256": "c03ad52bea5e2e23f72fa097dd7fb7829326391607b8a871a1fa160e54f1b39b"
+        },
         "tools/probe_stylesheet_manager_read_stage.py": {
           "bytes": 6818,
           "executable": false,
@@ -5002,8 +5022,8 @@
           "sha256": "a194f20c2e80ed839fa8eeaef488ce66e7ccc445019384c7e5558499eee0e8e6"
         }
       },
-      "head": "12e781ab72ce13136d67ddc76b1df1d397ad4901",
-      "source_bytes": 10920994,
+      "head": "2ee76ee15622198c0d06fc5295398a91315313be",
+      "source_bytes": 10946605,
       "upstream": null,
       "working_tree_status": []
     },
