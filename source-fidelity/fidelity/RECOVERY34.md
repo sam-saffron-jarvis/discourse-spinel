@@ -525,3 +525,166 @@ prefixedroot namespace profiles unsupported, no network callback fallback. Bound
 reader threads. Fiddle installed-package paths/hash proven, originalGemfile untouched.
 This is XML COMPONENT ONLY, not source bundle/version/path/request/page acceptance.
 Next integrate actual custom/theme/core source producers and full XML bundle.
+
+## BEFORE complete source SVG bundle integration
+
+Integrate passed Ruby-free XML component behind SAME native/shared Ruby adapter;
+raw original source symbols_for/prepare_symbol uses actual Nokogiri. All6actual
+source files additionally pinned in serving lease. Actual complete all_icons Set
+merge/filter/map/sort chain (standalone native Set chain passed), core/plugin/
+custom/bundle source, ThemeField/ThemeSvgSprite readonly plucks and genuine nil bulk
+cache follow. Nil-only default-theme sprite domain explicitly refuses any nonempty
+sprite or missing-sprite unowned logger profile, no fake empty XML. Source version
+SHA1 and path computed from actual assembled XML, then explicit next client-meta
+boundary. Real new nil bulk/version cache domains have per-key/value ownership;
+String/extra_js/field guards unchanged, actual bulk jobs/members accounted separately.
+Warm nil hit/no query or republish, source core memo identity, default icon coverage,
+full source bundle digest/path/bytes and6engine calls/0documents compared across3
+runtimes. Source asynchronous cold nil recomputations may vary, never assumed fake
+preload/miss counts. All old mutations remain mandatory,6newfocusedCRubycontrols
+precede native600s compilation. FullHTML/page stillFALSE; no extra write authority.
+
+## SVG103128 actual binary schema metadata stop
+
+Live theme_svg_sprites catalog has sprite bytea. Schema collector correctly rejects
+unknown metadata before codegen; no request/fixture/native run. Existing ORM schema
+already represents binary columns as real binary/PGbytea. Opt in ONLY this stage's
+metadata map bytea->binary, never text/coerced SVG. Nonempty ThemeSvgSprite rows are
+explicitly refused before consuming sprite values; full bytea wire codec remains
+unacquired and is not claimed. Old schema stages still reject unknown bytea metadata.
+Source model/schema/read query unchanged, actual empty relation must be acquired.
+No fake empty row or skipped applicable callback. Preserve failure and continue.
+
+## SVG103246 exact source generation span mismatch
+
+Generator refused whitespace-dependent missing-sprite warning substring before
+any request/native compile. Use Prism-selected actual missing_sprites IfNode and
+actual plugin-path Each call spans instead of hand-indented heredoc strings. Source
+body/profile/guards unchanged, no source assertion removed. Failure preserved.
+
+## SVG103332 real nil bulk publication refused by old final value guard
+
+Actual source custom query/bulk computed nil, full core XML read progressed. Owned
+lease final publication guard only admitsString or translation-field nil, correctly
+refused new nil sprite payload. Add explicit admitted_svg_bundle_value? signature
+predicate alongside old field predicate; this only accepts registered actual nil
+sprite/version entries with exact hash/key/wire shape. No arbitrary nil/value/key
+or shared endpoint admitted. No native compile. Worker error and full fixture
+teardown retained; no fake publication/preload or guarded error reporter bypass.
+
+## SVG103428 complete shared proof, native near-CC600s timeout
+
+Positive CRuby computed real180981-byte XML bundle/318sortedicons/2203core symbols,
+source SHA1/path,6verified source files, warm nil hits/core memo. ALL6new+8inherited
+focused controls pass,15EACHfixturefamilycleanup true. Nativecodegen558.940s+CC
+missed600; no nativeRUN accepted. Changed application closure: source Set merge/
+filter/map/reinsert/sort lowered to ordered Array unions of SAME real producers,
+then filter/strip/freeze/union/sort. Source Set String-key freezing was independently
+pinned on native+CRuby; preserve it explicitly, no input mutation/alias/fake values.
+Original full Set source remains independent reference. Native nonempty sprite map
+stops at explicit first unsupported row constructor (actual empty map still runs),
+not carrying unexecuted XML/logger branches. No callback skipped on admitted profile,
+no native bound/flags/compiler repair. Next full three-way run required.
+
+## SVG104743 AST map selector ambiguity retained
+
+Two source maps exist (missing-sprite IDs map(&:second), then row-symbol map do).
+Select actual BlockNode row-symbol map only; preserve preceding source ID map and
+missing-sprite guard. No runtime/compile yet, no profile/assertion waiver.
+
+## SVG104820 second near-CC timeout — pluck-only model closure
+
+Native558.407s codegen+CC misses600; no accepted RUN. Compared094425: new source
+model/DOM/cache paths add159methods and18analysis builds. Changed scope is actual
+ThemeSvgSprite pluck-only reader: keep actual catalog/provenance, but project only
+source-used theme_id/upload_id/sprite column metadata, no unused id/timestamps or
+unused belongs_to record machinery. This is explicit partial read metadata, not
+schema/data change, fake AR rows, alternate SQL or claimed full binary/association
+support. Source original query/guards unchanged, no applicable callbacks (pluck)
+omitted; nonempty rows still refuse. Old collectors default to all columns. Avoid
+carrying unrelated record materialization into each source pluck. Source allIcons
+Array lowering still requires final rawsource3way output/freeze checks. No timeout/
+compiler/flags/lifetime repair or attempt reset. Fresh run required.
+
+## SVG110117 pluck metadata projection still timeout — exact read-only ORM component
+
+Native577.495s codegen+CC misses600. New record-model inclusion still expands generic
+ORM materialization machinery despite pluck never constructing a record. Changed
+application experiment: explicit SvgThemeSpriteRead component supplies real source
+no-default-scope/table/three-column metadata to EXISTING generic ORM Relation.where/
+pluck. No bespoke data SQL; actual readonly catalog freshly verifies integer/int/
+bytea types, source class AST verifies no default-scope/callback profile. Any actual
+row raises before decode/value use (binary codec/full record model unacquired).
+Source query collaborator explicitly bound to this pluck-only component in BOTH
+native/shared and isolated-source reference; not claimed original model identity.
+Remove experimental general schema collector changes and new full model entirely;
+all older catalog assertions return unchanged. No fake empty relation or skipped
+applicable callback. Full original source method keeps real where/pluck chain and
+nonempty refusal. This is source-capability decomposition, not compiler repair,
+measurement extension, gate change or a hidden type coercion.
+
+## SVG111555 read-component identifier quote API mismatch
+
+Real where/pluck component reached, no fake rows; runtime adapter exposes shared
+quote_column_name for single SQL identifiers, not Rails quote_table_name. Use that
+same identifier quoting API for the fixed catalog-verified table identifier. Actual
+bound predicate/pluck remain ORM-generated. No native compile, all teardown retained.
+
+## SVG111635 minimal pluck source still600s timeout — lexical role alias experiment
+
+New pluck-only component and actual shared/full focused controls pass; native
+575.153s codegen+CC missed600. Do not repeat same closure or change gates. Earlier
+Onebox collision diagnosis suggests bare source constant grounding can activate
+unrelated unresolved source names. Changed lexical experiment: candidate SVG_ICONS/
+THEME_SPRITE_VAR_NAME use unique read-role aliases READ_ICON_SET/READ_SPRITE_NAME;
+original raw source keeps exact names/values bound to same source declarations.
+No actual constant data/value/type/cache/profile/order change, no compiler edits.
+This is a hypothesis to measure, not an asserted fix. Prior failures retained,
+full native SVG/page unaccepted. Continue bounded source measurement.
+
+## SVG112946 declaration alias wiring typo
+
+Preflight correctly refuses absent READ_ICON_SET: generator declaration literal
+still used original name while source methods used role alias. Fix generated
+constant declaration only, same original AST data. No compiler run or semantics
+assertion changed; failure/teardown retained. Next real lexical measurement follows.
+
+## SVG113025 lexical alias alone still timeout — explicit O0 execution profile
+
+Native566.447s codegen+CC misses600, all focused/shared source proof retained.
+CPU0-3 frequencies5.6GHz/lowpressure do not establish a host scheduling barrier.
+Stop speculative source rewrites: restore exact raw source Set chain (Array lowering
+not needed/accepted) and select unchanged compiler's supported -O0 option ONLY in
+new full-SVG experiment, retaining SAME monolithic600s bound, all error/source/type/
+cache/cleanup/control assertions. This changes C optimization build profile, not
+Ruby logic, compiler code/lifetime, private effects or protected gate. Earlier O2
+FAILURES remain unaccepted; any pass is explicitly O0 and never represented as an
+O2 measurement or fullpage acceptance. No performance requirement/old gate waived.
+Smallest changed build execution profile before another application closure detour.
+
+## Actual COMPLETE SVG bundle/version/path PASS — explicit O0, NOT PAGE
+
+Canonical114330 PASS_SCOPED_ACTUAL_SVG_XML_BUNDLE_VERSION_PATH, native -O0 585.013s
+compile AND RUN2.467s, SAME CRuby+isolated rawsource/Nokogiri RUN RC0. O2 old build
+measurements remain FAILED; O0 profile explicitly recorded, no timeout/behavior
+assertion waived.1108fullsettingsconsumer values,202actualreadonlySQL,270EACHcache/
+VM/asset/MFfixturecleanups true. All6newbundlemutants and6focused controls reject.
+
+Real source all_icons Set chain yields318sortedicons; core actual6sourceSVG files/
+2203symbols produce180981-byte XML bundle, SHA256
+f72aa3e3dba173afd0d88b038579d176ecd0f4d2522ad29d384a8c03aeea29b8,
+source SHA1 cc912bfda804d2c7d60c95b75a6b9351ca8b6e33 and actual sourcepath
+/svg-sprite/localhost/svg--1-cc912bfda804d2c7d60c95b75a6b9351ca8b6e33.js.
+These are OUTPUT evidence, NEVER runtime inputs. Native/shared XML engine6calls/
+0liveDocuments; raw original uses realNokogiri, fullsymbol/core memo identity and
+warm nil sprite cache noquery/no republish match. Actual ThemeField/ThemeSvgSprite
+read-only ORM plucks (nil-only source component), real nil bulk publication/source
+keys/deferred accounting and version/icon cache values all matched. No bytea/full
+record support claimed, no originalRailsHTML invocation/privatePG/write/API escape.
+
+Current source getter returns actual SVGpath INTERNALLY then explicit next boundary
+before client setup/meta serialization; full clientsetup/layout/HTML200/browser/
+page/019FALSE. Next let realpath reach source client-side data Hash/tag builder and
+acquire actual encoded meta result, then continue layout through permitted effects.
+No future stylesheet/Wizard/rebakePG effects authorized. Full source failures and
+other optimization experiments preserved, no compiler code/lifetime repair.

@@ -371,3 +371,8 @@ verify-layout-svg-theme-icons:
 .PHONY: verify-svg-xml-engine
 verify-svg-xml-engine:
 	bundle exec ruby tools/probe_svg_xml_engine.rb
+
+# Actual complete XML bundle/digest/path, explicitly bounded native -O0 profile.
+.PHONY: verify-layout-svg-bundle
+verify-layout-svg-bundle:
+	python3 tools/probe_svg_bundle_stage.py

@@ -1,10 +1,10 @@
 {
-  "captured_at": "2026-11-09T10:30:05.767514+11:00",
+  "captured_at": "2026-11-09T12:12:16.968665+11:00",
   "components": {
     "fidelity": {
       "branch_at_capture": "main",
       "contains_uncommitted_work": false,
-      "file_count": 965,
+      "file_count": 971,
       "files": {
         ".gitignore": {
           "bytes": 39,
@@ -32,9 +32,9 @@
           "sha256": "8177f97513213526df2cf6184d8ff986c675afb514d4e68a404010521b880643"
         },
         "Makefile": {
-          "bytes": 15319,
+          "bytes": 15501,
           "executable": false,
-          "sha256": "160b9deafd9a9c5f1386332111192c69bdec69da3d94841fe53e378ada39ab81"
+          "sha256": "99dcd1f209a7fde33268f72cc7bd37eb1a1b7d15fe912f219d9e480ba9d08465"
         },
         "README.md": {
           "bytes": 46099,
@@ -92,9 +92,9 @@
           "sha256": "b4836b14d2d6ca0423a77566991d08ba1c6117408d9ab5cff7daacd5925df357"
         },
         "RECOVERY34.md": {
-          "bytes": 35256,
+          "bytes": 46020,
           "executable": false,
-          "sha256": "cd551a4e771bf1ee334f4a1ab349a52333b127a4cdcd36d5d471da3be440609b"
+          "sha256": "069ce4abb5eae3d49d2ec6d6d5228e6c362c9fd014bf4fd88d8c2c045104035a"
         },
         "SEEDFU_SOURCE_ORDER.md": {
           "bytes": 21893,
@@ -3271,6 +3271,21 @@
           "executable": false,
           "sha256": "181dafa7460a247e23ff644272c69256310570c4ba09dd0640192a08d3087fdf"
         },
+        "test/svg_bundle_context.rb": {
+          "bytes": 7265,
+          "executable": false,
+          "sha256": "9059211ccf961fada43d1741c2ad62d1ae9fb8508d037516c4f7b89f1970fc24"
+        },
+        "test/svg_bundle_original_context.rb": {
+          "bytes": 1140,
+          "executable": false,
+          "sha256": "e29b0ee13b896bc17329b5941fb5de02024165449adb64998e6191675208445f"
+        },
+        "test/svg_bundle_transport.rb": {
+          "bytes": 1826,
+          "executable": false,
+          "sha256": "30dac4c3ea7d4828f7ea4931ae0d5243b5009e40990cf6a80f563c90afe634b0"
+        },
         "test/svg_cache_context.rb": {
           "bytes": 2445,
           "executable": false,
@@ -3405,6 +3420,11 @@
           "bytes": 1821,
           "executable": false,
           "sha256": "07cd3a6a303e2fa4cd9b138fb2a335b46c5f93f4d300d745e5a283c9222afd0d"
+        },
+        "test/svg_sprite_read_component.rb": {
+          "bytes": 1137,
+          "executable": false,
+          "sha256": "1d18ccbe9a9a826e4da992e6031a1b571faf5a2ce2b608ac30d33594d3c78051"
         },
         "test/svg_theme_icons_context.rb": {
           "bytes": 4232,
@@ -4021,6 +4041,11 @@
           "executable": false,
           "sha256": "b93a445ae68f7f28bb9934c7c74b89f791c4588d19b5d89b35a418519f85aa2f"
         },
+        "tools/generate_svg_bundle_stage.rb": {
+          "bytes": 9557,
+          "executable": false,
+          "sha256": "bd01a5d32939556bcc614a25b3ac3e11f0844a1f43f460d7b0f1acb4d07cb07b"
+        },
         "tools/generate_svg_cache_stage.rb": {
           "bytes": 4704,
           "executable": false,
@@ -4476,10 +4501,15 @@
           "executable": false,
           "sha256": "c7b98864cce7f6cea25ba85d66430c3b5717b18c8d35d0dcd3e4504cfa342bbe"
         },
-        "tools/probe_svg_cache_stage.py": {
-          "bytes": 7880,
+        "tools/probe_svg_bundle_stage.py": {
+          "bytes": 13230,
           "executable": false,
-          "sha256": "d2861e1414dd185dfd5b657cec12e2fa2ce90966ed9f36cd741341ffdb489bc5"
+          "sha256": "da9633f063cc8ee3eb3fa6800c79d25f23010c86ee0415abab8ce70faf715fd5"
+        },
+        "tools/probe_svg_cache_stage.py": {
+          "bytes": 8246,
+          "executable": false,
+          "sha256": "098616726f0055e13dc18c23961d3a337533074a4f9f463900ebc59939f7a798"
         },
         "tools/probe_svg_choice_list_stage.py": {
           "bytes": 4443,
@@ -4832,8 +4862,8 @@
           "sha256": "a194f20c2e80ed839fa8eeaef488ce66e7ccc445019384c7e5558499eee0e8e6"
         }
       },
-      "head": "646836d28bf08713db2d752ad5707193a1d30037",
-      "source_bytes": 10699093,
+      "head": "4a3925b088fd8bdae325e0bb753f5a960f7c4c10",
+      "source_bytes": 10744560,
       "upstream": null,
       "working_tree_status": []
     },
