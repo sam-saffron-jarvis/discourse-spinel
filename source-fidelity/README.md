@@ -1,6 +1,6 @@
 # Original-source Discourse on Spinel — committed WIP checkpoints
 
-**Captured 2026-11-09T18:10:02.302329+11:00. The complete native `/latest` page is not accepted.**
+**Captured 2026-11-09T19:20:01.688539+11:00. The complete native `/latest` page is not accepted.**
 
 This is the active source-fidelity migration. The repository root retains the older
 manual/adapted backend; it is not proof of this implementation.
@@ -9,7 +9,7 @@ manual/adapted backend; it is not proof of this implementation.
 
 | Component | Exact commit |
 |---|---|
-| `fidelity` | `a468ae6c07f5b5c8321dc0690427e6de0c6dc1a0` |
+| `fidelity` | `12e781ab72ce13136d67ddc76b1df1d397ad4901` |
 | `roundhouse` | `e37a1767322147cbcaccc45af53f09920066e201` |
 | `spinel` | `a1a1bea71e148d4fbd7350dbbb79d9dc36840feb` |
 

@@ -406,3 +406,14 @@ verify-theme-ids-cache-component:
 .PHONY: probe-layout-theme-ids
 probe-layout-theme-ids:
 	python3 tools/probe_theme_ids_stage.py
+
+# Actual readonly palette lookup, unsaved constructor and source SCSS prefix only.
+.PHONY: verify-palette-record-prefix
+verify-palette-record-prefix:
+	python3 tools/probe_palette_record_prefix.py
+
+# Complete source base factory, real unsaved colors, dynamic I18n and raw AR check.
+# Component proof only; NOT stylesheet/layout/HTML200/browser/page acceptance.
+.PHONY: verify-palette-base-read
+verify-palette-base-read:
+	python3 tools/probe_palette_base_read.py

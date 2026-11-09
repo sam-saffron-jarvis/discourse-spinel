@@ -1,10 +1,10 @@
 {
-  "captured_at": "2026-11-09T18:10:02.302329+11:00",
+  "captured_at": "2026-11-09T19:20:01.688539+11:00",
   "components": {
     "fidelity": {
       "branch_at_capture": "main",
       "contains_uncommitted_work": false,
-      "file_count": 993,
+      "file_count": 999,
       "files": {
         ".gitignore": {
           "bytes": 39,
@@ -32,9 +32,9 @@
           "sha256": "8177f97513213526df2cf6184d8ff986c675afb514d4e68a404010521b880643"
         },
         "Makefile": {
-          "bytes": 16700,
+          "bytes": 17162,
           "executable": false,
-          "sha256": "3a18b6bdef1f8f5108bb4dc2ed64a86f6811ef0de77dc7361b15f4843cc2ae35"
+          "sha256": "9124c8d590053609a28839faa4dde84b396d219b0e82fcc4c6dae0018d783b89"
         },
         "README.md": {
           "bytes": 46099,
@@ -97,9 +97,9 @@
           "sha256": "14cda41d6124b79b692c5520a487bca7697900c48fc9733c338c2d54882e6b66"
         },
         "RECOVERY35.md": {
-          "bytes": 11125,
+          "bytes": 18822,
           "executable": false,
-          "sha256": "dd4fa016c74a38b8a8377cc83ae8234e3e2e6e8af95dd3bf1077dc1d2ef4b2e5"
+          "sha256": "1d72327a6d63cfa754643be5ba47a5268c0a1a3ba68198f11d02a0c0e9eae63d"
         },
         "SEEDFU_SOURCE_ORDER.md": {
           "bytes": 21893,
@@ -3181,6 +3181,16 @@
           "executable": false,
           "sha256": "f26657b2ce66e39a7ed5b997f7521d255ffe320d06831e0fb2476763a149d4c7"
         },
+        "test/palette_base_read_context.rb": {
+          "bytes": 4070,
+          "executable": false,
+          "sha256": "1cbb1ec6f50b06ac249a3ccae24122895799ade2257e4eefdf8e3e3a4022d5fd"
+        },
+        "test/palette_record_prefix_context.rb": {
+          "bytes": 2888,
+          "executable": false,
+          "sha256": "f2786a56f22235b9e9541b57ba2a73d7dee2335357bc8ef5f6cc8fcd14157235"
+        },
         "test/plugin_metadata_probe.rb": {
           "bytes": 889,
           "executable": false,
@@ -4061,6 +4071,16 @@
           "executable": false,
           "sha256": "a29065a0b3dfe3900b30df8d2c6581c3713bafe142cf165388e254bfa46f1cec"
         },
+        "tools/generate_palette_base_read.rb": {
+          "bytes": 7643,
+          "executable": false,
+          "sha256": "81103a5c0664fcf24cf195fc566b6fcf9e514d733adfd006586fa9294c9be0fc"
+        },
+        "tools/generate_palette_record_prefix.rb": {
+          "bytes": 3398,
+          "executable": false,
+          "sha256": "232295f878bdd45c0266410673e5f5f41b01a2835f9e4a940ce5359dba2d9d8b"
+        },
         "tools/generate_portable_latest.rb": {
           "bytes": 11460,
           "executable": false,
@@ -4551,6 +4571,16 @@
           "executable": false,
           "sha256": "4b09eb5e1281cc6f798f9e0aca2b94f434c44bbb949f5a572adb567fb0c09a6a"
         },
+        "tools/probe_palette_base_read.py": {
+          "bytes": 8457,
+          "executable": false,
+          "sha256": "f520aa0bbc2ea6f732a65ac44f7ce51e0d30210d8d821a529908f51464f9e2ee"
+        },
+        "tools/probe_palette_record_prefix.py": {
+          "bytes": 5876,
+          "executable": false,
+          "sha256": "a3a00602b53b367129cc3bf484380e80ca280f77d9e4689ea5d797bf079d10f4"
+        },
         "tools/probe_portable_latest.py": {
           "bytes": 8854,
           "executable": false,
@@ -4747,9 +4777,9 @@
           "sha256": "d63aba7583a211599815f3d0b275c44cdb35776cc8cf1989105276bb5d9c101a"
         },
         "tools/probe_theme_ids_component.py": {
-          "bytes": 8664,
+          "bytes": 8827,
           "executable": false,
-          "sha256": "433b6892d16753dac24bdda50aedc5175c0038d139040f97a6a2d3964bee6376"
+          "sha256": "d86f94fe625b99f76f5ba527b064bcd9acd0f1cb94eb46b0b5874c9a22433020"
         },
         "tools/probe_theme_ids_stage.py": {
           "bytes": 9406,
@@ -4972,8 +5002,8 @@
           "sha256": "a194f20c2e80ed839fa8eeaef488ce66e7ccc445019384c7e5558499eee0e8e6"
         }
       },
-      "head": "a468ae6c07f5b5c8321dc0690427e6de0c6dc1a0",
-      "source_bytes": 10880340,
+      "head": "12e781ab72ce13136d67ddc76b1df1d397ad4901",
+      "source_bytes": 10920994,
       "upstream": null,
       "working_tree_status": []
     },

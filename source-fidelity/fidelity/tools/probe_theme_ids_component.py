@@ -13,6 +13,10 @@ FILES = ('theme_ids_read.rb', 'theme_ids_source.rb', 'theme_ids_cache_source.rb'
 
 class ThemeIdsComponentRun(OriginalCacheStageRun):
     ids_cleanup_families = ('owned_cache_cleanup',)
+    component_success_status = 'PASS_SCOPED_ACTUAL_THEME_IDS_CACHE_COMPONENT_NOT_FULL_LAYOUT'
+
+    def verify_component_extension(self):
+        pass
     faults = ThemeIdsStageRun.faults
     check_ids_controls = ThemeIdsStageRun.check_ids_controls
 
@@ -128,7 +132,8 @@ end
                 values.append(value)
             assert all(v['ids'] == values[0]['ids'] for v in values)
             self.check_ids_controls()
-            self.evidence.update(status='PASS_SCOPED_ACTUAL_THEME_IDS_CACHE_COMPONENT_NOT_FULL_LAYOUT', actual_theme_ids_cache=values, cumulative_layout_integration_accepted=False, forced_synchronization=False, page_accepted=False)
+            self.verify_component_extension()
+            self.evidence.update(status=self.component_success_status, actual_theme_ids_cache=values, cumulative_layout_integration_accepted=False, forced_synchronization=False, page_accepted=False)
         except BaseException as error:
             self.evidence.update(status='FAILED_THEME_IDS_COMPONENT', error=repr(error))
             raise

@@ -157,3 +157,112 @@ compile372.905s,61ownedfixturecleanup,
 integrationstillnotaccepted. Directproducer noinlining/noothercacheframework.
 
 Postcache baseline verify-20261109-180611 PASS isolatedoriginalscope; not page.
+
+## Continue independently permitted palette helpers, no fake base DBrow
+
+Sourcebase factory .define_singleton_method(:name) on runtime localobject is refused
+by immutablecompiler (tiny UNITsource/diagnostic retained), not genericframework
+repair. First acquire actual readonly ColorScheme remote_copy:false lookup, real
+unsavedActiveRecord constructor from sourceid/name constants and complete raw
+base_colors SCSS/Mutex/file/regex/memo, plus actual nextcolors= attributevector.
+NO association target/flags/localizedname fabricated: those nextsourceoperations
+remain explicitlyunacquired until compatiblecapability proven. Scope uses same
+existingrealrequest/PG/cache scaffold; sourceprefixrawRubyindependentlycompared,
+realDBselectedrow allowed onlypersisted/nonremote, newbaseconstructoronlyunsaved.
+No writes/newservice/effects introduced. Tests wrongid/persisted/colorattrs must
+reject withownedfixturecleanup. Continueactualwriter/I18n/flags afterproof, not
+promote this necessaryprefix tocompletebase/stylesheet/page acceptance.
+
+## 182217 real palette lookup/unsavedctor/SCSS PREFIX PASS (not fullbase)
+
+Nativecompile388.146s AND native0.214/shared0.514/raworiginal0.565s RUNRC0.
+Actualdefaulttheme's selectedscheme nil (freshrowdata, notnativeinput), actual
+nonremoteDBlookupalsoexercisesnonemptyrow. Baseconstructor sourceid/name creates
+realColorScheme <ActiveRecord::Base new_record=true/persisted=false; completeSCSS
+base_colors produced12orderedactualcolorattributes andwarmHashidentity.87readonly
+SQL,70ownedfixturecleanups true;3newpreflight+6runtimewrongid/persisted/colorattr
+controls reject. Association writer, sourceflags and dynamiclocalizedname NOT
+claimed. Next acquire trueunsavedColorSchemeColor objects/inverse/FK/no-persistence,
+sourceflags and sourcecompatible per-objectname semantics. Verify separate actual
+ActiveRecord gem source-only model reference (noRailsapp/HTMLboot, same5499RO and
+existingownedfixtureguard), not capturednativeinputs/fakebaseDBrow.
+
+## Independent raw ActiveRecord base-model facts, no output seeding
+
+Isolatedsource-only actualARmodel183840 RC0 underexistingPG/fixtureguards, noRails
+app/HTML/privatePG invoked, ownedfixturecleanuptrue. Important semantic discovery:
+rawunsavedowner collection append leaves child FK NIL (not ownerID), and source
+schema constructor defaults apply (e.g. version/Booleanattrs). Do NOT use these
+observedvalues as candidateinputs. Nativewriter leavesactualnewchildFKnil; private
+ownerref is onlyreadadapter ownership, not genericassociationinverseAPI claim.
+Candidatefactory independently reads actual information_schema column_defaults at
+runtime, strictInteger/BooleanSQLliteral metadata grammar, refusesotherexpressions;
+source default_scope remote_copy:false retained explicitly. No captureddefaults or
+fakeDBrows. Fields compared against independentrawARsource model. Generatorselect
+ambiguity class/instancebase_colors and failedmissing-scriptlog retained.
+
+Completeactualbasefactory nowmaps sourcecolors= loop to scopedunsavedrecordappend,
+realnewColorSchemeColor objects; name singleton lowered to privateinstanceflag+
+classmethod following actualI18n locale while rawname/otherinstances unchanged.
+Fullimmutableclient.en/fr resources staged unchanged through existingI18ncompiler.
+Bothflag/writer/name adaptations explicit; genericsingleton/proxy APIs unclaimed.
+Rawunchangedbase/colors= onactualActiveRecord/has_many/I18n reference isindependent;
+allpools5499RO,noDML/save/compile/bake/stylesheetcache. Newnegativeflags/FK/persisted
+child/fixedname mustreject. Next boundednative/shared/rawsource+rawARmodeltest.
+
+184323 emitter correctlyrefuses modelinputdirectI18n.translate_runtime (notmodeled
+publicapplication API). Use actualsource I18n.t literal inmodel; existinglocalelowerer
+owns runtimebinding andcompiledresource lookup. No framework/gate/type waiver or
+capturedtranslation. Failedemitter/source/fixtures retained; no nativebuildinvoked.
+
+184420 sharedfullbase +all16focusedpreflightcontrols pass withactualdefaultcatalog/
+unsavedchildren/I18n en/fr; no nativepassyet. Rawmodelhelper command wronglyselected
+not-yet-createdcompat cwd duringpreflight. Name it compat-preflight-* soexisting
+runner selectsactualreadytree/fixture (helperstillseparateactualAR/noRailsboot).
+Failedcontext/fixture cleanup preserved; no originalHTML retry/privatePG or new
+service invoked. Candidatefullbasevalues matchexpectedshape but referencecompare
+must complete beforeacceptance.
+
+184525 rawARfullfactoryRC0 andvaluecomparisonmatches; expectedPGlogwronglocation:
+existingValkeySandbox overwriteslog into exactper-runtimeownedfixture directory.
+Readthatactualattestation (sameendpoint/readonlyassertions), not add fakepoolproof
+or changeguard. No nativebuildinvoked yet; failedpath/source/contextpreserved.
+
+184635 nativefrontendrejects duplicategeneratedmodelRBS untyped vsnewtypedmethod
+seeds (notsemanticfailure). Keeponeexacttypedcontract on generatedOWNERfile for
+these applicationcapabilitymethods, runtimefileonlyremainingmodule/ivarhints. No
+compileredit, weakertype or removedguard. Includesstrictcolors= Array[HashSymbolString]
+writer contract, ColorSchemeColor argument/owner types, nil-returnnameflag methods.
+Allmodelcode/sourcefields unchanged; preciseRBSreplacesfallbackuntyped ownerhint.
+
+185025 native-O0compile342.141s AND native0.214/shared0.515s RUNRC0, completebase
+matchesindependentactualAR/I18n preflightrecord inclrealcatalogdefaults/unsavedchild
+FKnil/flags/dynamicenfrname. Cumulativescaffold raworiginalsource thenmissingruntime
+I18n.t (modelsource's callnormallylowered, rawRubyreference isn't). Addexactkey lexical
+I18n binding toexistingcompiledI18n.translate_runtime; bodyofrawsourcebaseunchanged,
+actualseparategemAR/I18n reference stillindependent. No suppliedtranslation/fakevalue,
+frameworkrepair or broadenedI18nAPI. Rerunallruntimes/controls; notacceptuntilpasses.
+Freshquota74%<75soft/80hard; continuepermitted boundedsourcework, no newPGauthority.
+
+## 185801 complete source base-palette helper VERIFIED, not stylesheet/page
+
+ExplicitO0 nativecompile346.869s AND native0.214/shared0.514/rawsource0.564s RUNRC0.
+IndependentactualActiveRecord+I18n rawmodel agreesfield-for-field withall3runtimes,
+includingactualruntimecatalogconstructor defaults,12realunsavedchildren withFKnil,
+sourceflags, en/frdynamicname, unchangedrawname andwarmmemoidentity. This isactual
+sourcefactory/SCSS helper, NOT fakebaseDBrow/CSS/key/URL; genericassociationproxy/
+inverse/reflection API and otherlocales unclaimed. Exactkey lexical rawreference
+I18n adapter usesexistingcompiledresources; independentrawAR/I18n comparisonalso
+runs unchanged source singleton method and actualhas_many/colors= implementation.
+BothindependentPGconstructorattestations5499/discourse_development/readonlyon.
+87native readonlySQL; all83ownedcachefixtures cleanuptrue. Added4preflight+8runtime
+flag/FK/persistedchild/fixedname negatives, previouscache/palette controlsretained.
+Source/extraction/proof paths in build/probe-portable-security-20261109-185801.
+Baseline verify-20261109-190916 PASS. Ruby/Python syntax anddiffcheckPASS. Makefile
+labelled verify-palette-record-prefix / verify-palette-base-read targets added.
+1910 freshdedupdisk124.457287GiB includingretainedrelatedroots and383/tmp/spinel*
+roots<150cap; quota74%<75soft/80hard. Still same35/session/400turn bound/deadline.
+Fullcumulative9k integration600timeouts unchanged; stylesheet/layout/HTML200/
+browser/page/019 FALSE. Next actualSlug.for (actualgettercallbacks, rawname not
+localizedname), color_scheme_cache_key/liveglobals, sourcebuilder/path/diskconditions
+as permitted; refusebeforeanyprohibitedBuilder/rebake/WizardPGwritedispatch.
