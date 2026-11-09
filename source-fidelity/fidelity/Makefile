@@ -396,3 +396,13 @@ verify-layout-stylesheet-manager-read:
 .PHONY: verify-client-meta-primitives
 verify-client-meta-primitives:
 	python3 -m unittest discover -s test -p test_client_meta_primitives.py
+
+# Actual Theme Integer-ID cache on existing request scaffold; NOT full layout.
+.PHONY: verify-theme-ids-cache-component
+verify-theme-ids-cache-component:
+	python3 tools/probe_theme_ids_component.py
+
+# Full cumulative integration diagnostic; retained failures never accept a page.
+.PHONY: probe-layout-theme-ids
+probe-layout-theme-ids:
+	python3 tools/probe_theme_ids_stage.py

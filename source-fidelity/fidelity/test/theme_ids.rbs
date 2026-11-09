@@ -1,0 +1,33 @@
+module CategoryCacheApplication
+  class DistributedCache
+    def defer_get_set_ids: (String key) { () -> Array[Integer] } -> Array[Integer]
+  end
+end
+module RequestThemeIdsSource
+  def self.cache: () -> CategoryCacheApplication::DistributedCache
+  def self.theme_ids: () -> Array[Integer]
+  def self.get_set_cache_ids: (String key) { () -> Array[Integer] } -> Array[Integer]
+end
+module ThemeIdsRead
+  @queries: Integer?
+  @computed_json: Array[String]?
+  @consumed_json: Array[String]?
+  def self.check_key: (String key) -> nil
+  def self.check_value: (untyped value) -> nil
+  def self.acquire_ids: () -> Array[Integer]
+  def self.observe_pluck: (Array[Integer] value) -> Array[Integer]
+  def self.source_ids: () -> Array[Integer]
+  def self.queries: () -> Integer
+  def self.computed_json: () -> Array[String]
+  def self.consumed_json: () -> Array[String]
+  def self.note_consumer: (Integer? id) -> nil
+  def self.verify_warm: (CategoryCacheApplication::DistributedCache cache, Array[Integer] value) -> nil
+end
+class CategoryCacheLease
+  @theme_ids_encodings: Array[String]?
+  def note_theme_ids: (String key, Array[Integer] value) -> nil
+  def admitted_theme_ids_value?: (Hash[String, untyped] data) -> bool
+end
+class RequestStyleReadManager
+  def acquire_color_theme_ids: () -> bot
+end

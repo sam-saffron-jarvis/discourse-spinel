@@ -1,10 +1,10 @@
 {
-  "captured_at": "2026-11-09T15:50:02.000942+11:00",
+  "captured_at": "2026-11-09T18:10:02.302329+11:00",
   "components": {
     "fidelity": {
       "branch_at_capture": "main",
       "contains_uncommitted_work": false,
-      "file_count": 984,
+      "file_count": 993,
       "files": {
         ".gitignore": {
           "bytes": 39,
@@ -32,9 +32,9 @@
           "sha256": "8177f97513213526df2cf6184d8ff986c675afb514d4e68a404010521b880643"
         },
         "Makefile": {
-          "bytes": 16324,
+          "bytes": 16700,
           "executable": false,
-          "sha256": "3ccac40efb35cc0ebab310dae75cce6d9e28d21517071100856eccb53c237a26"
+          "sha256": "3a18b6bdef1f8f5108bb4dc2ed64a86f6811ef0de77dc7361b15f4843cc2ae35"
         },
         "README.md": {
           "bytes": 46099,
@@ -95,6 +95,11 @@
           "bytes": 66767,
           "executable": false,
           "sha256": "14cda41d6124b79b692c5520a487bca7697900c48fc9733c338c2d54882e6b66"
+        },
+        "RECOVERY35.md": {
+          "bytes": 11125,
+          "executable": false,
+          "sha256": "dd4fa016c74a38b8a8377cc83ae8234e3e2e6e8af95dd3bf1077dc1d2ef4b2e5"
         },
         "SEEDFU_SOURCE_ORDER.md": {
           "bytes": 21893,
@@ -3741,6 +3746,26 @@
           "executable": false,
           "sha256": "3d880ea40cbe69dd23df734ae993b300cd07217d65d6029076d7b6a88ddf0e45"
         },
+        "test/theme_ids.rbs": {
+          "bytes": 1289,
+          "executable": false,
+          "sha256": "acce11cff22021df155b12d45bf08875ed2a2f580929a7e671d0bfc915b7d8cd"
+        },
+        "test/theme_ids_context.rb": {
+          "bytes": 719,
+          "executable": false,
+          "sha256": "ce939078099f3d21103b63644f150992e6c24c5fcbf79775e9ec90551126ee88"
+        },
+        "test/theme_ids_original_context.rb": {
+          "bytes": 1096,
+          "executable": false,
+          "sha256": "927eb5cace53aac9065f6e0fc741d352d22197c6fcce4b073583e6dc9f307c87"
+        },
+        "test/theme_ids_read.rb": {
+          "bytes": 3022,
+          "executable": false,
+          "sha256": "e96587f7bd5c94518cfc8e4246879e29de53205a32d3bb8e1363b263ae9eb805"
+        },
         "test/theme_lookup_context.rb": {
           "bytes": 2589,
           "executable": false,
@@ -4170,6 +4195,16 @@
           "bytes": 3130,
           "executable": false,
           "sha256": "2d6c326a36e7588dc5f5662f111959f9e20693216ecfe07156ba900190844954"
+        },
+        "tools/generate_theme_ids_component.rb": {
+          "bytes": 3153,
+          "executable": false,
+          "sha256": "413e440b97064a0aca17e0ae675ec22a6d8730a4c37ada68693eae426af17749"
+        },
+        "tools/generate_theme_ids_stage.rb": {
+          "bytes": 4498,
+          "executable": false,
+          "sha256": "27e30831cbd0bb800931e46c88d205b690f1fa2a5a3a7d9437374eac11ef8d6e"
         },
         "tools/generate_theme_lookup_stage.rb": {
           "bytes": 8856,
@@ -4711,6 +4746,16 @@
           "executable": false,
           "sha256": "d63aba7583a211599815f3d0b275c44cdb35776cc8cf1989105276bb5d9c101a"
         },
+        "tools/probe_theme_ids_component.py": {
+          "bytes": 8664,
+          "executable": false,
+          "sha256": "433b6892d16753dac24bdda50aedc5175c0038d139040f97a6a2d3964bee6376"
+        },
+        "tools/probe_theme_ids_stage.py": {
+          "bytes": 9406,
+          "executable": false,
+          "sha256": "536c9bb73225a75cfde06862c5820d3e774ab8fc9475267c845a3d2d9af030bd"
+        },
         "tools/probe_theme_lookup_stage.py": {
           "bytes": 5565,
           "executable": false,
@@ -4927,8 +4972,8 @@
           "sha256": "a194f20c2e80ed839fa8eeaef488ce66e7ccc445019384c7e5558499eee0e8e6"
         }
       },
-      "head": "eabd585ecb51e7475253ffee4a0d633a5540bf2e",
-      "source_bytes": 10836992,
+      "head": "a468ae6c07f5b5c8321dc0690427e6de0c6dc1a0",
+      "source_bytes": 10880340,
       "upstream": null,
       "working_tree_status": []
     },
