@@ -376,3 +376,18 @@ verify-svg-xml-engine:
 .PHONY: verify-layout-svg-bundle
 verify-layout-svg-bundle:
 	python3 tools/probe_svg_bundle_stage.py
+
+# Actual full setup meta immediate consumer; environment/Hash object API not claimed.
+.PHONY: verify-layout-client-meta
+verify-layout-client-meta:
+	python3 tools/probe_client_meta_stage.py
+
+# Actual config/auth/body/complete splash; refuses stylesheet effects, not a page.
+.PHONY: verify-layout-body-splash
+verify-layout-body-splash:
+	python3 tools/probe_body_layout_stage.py
+
+# Actual manager constructor/memo/arguments only, not stylesheet cache/URL/build.
+.PHONY: verify-layout-stylesheet-manager-read
+verify-layout-stylesheet-manager-read:
+	python3 tools/probe_stylesheet_manager_read_stage.py

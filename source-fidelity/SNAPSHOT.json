@@ -1,10 +1,10 @@
 {
-  "captured_at": "2026-11-09T14:50:01.752102+11:00",
+  "captured_at": "2026-11-09T15:20:03.143741+11:00",
   "components": {
     "fidelity": {
       "branch_at_capture": "main",
       "contains_uncommitted_work": false,
-      "file_count": 979,
+      "file_count": 983,
       "files": {
         ".gitignore": {
           "bytes": 39,
@@ -32,9 +32,9 @@
           "sha256": "8177f97513213526df2cf6184d8ff986c675afb514d4e68a404010521b880643"
         },
         "Makefile": {
-          "bytes": 15501,
+          "bytes": 16100,
           "executable": false,
-          "sha256": "99dcd1f209a7fde33268f72cc7bd37eb1a1b7d15fe912f219d9e480ba9d08465"
+          "sha256": "3da6effedd1d65e0202cdef919ed366473628084fdcc7696ad924bf78f39ca5f"
         },
         "README.md": {
           "bytes": 46099,
@@ -92,9 +92,9 @@
           "sha256": "b4836b14d2d6ca0423a77566991d08ba1c6117408d9ab5cff7daacd5925df357"
         },
         "RECOVERY34.md": {
-          "bytes": 60081,
+          "bytes": 62336,
           "executable": false,
-          "sha256": "e52869bb5069122ce0615ec97db5c5163e736d154260f785e97ace7997f4e174"
+          "sha256": "cc661c51af5109c8d628a8ccd61ba7e377f5b319e5c6a15e025a2913fb988edb"
         },
         "SEEDFU_SOURCE_ORDER.md": {
           "bytes": 21893,
@@ -3291,6 +3291,16 @@
           "executable": false,
           "sha256": "181dafa7460a247e23ff644272c69256310570c4ba09dd0640192a08d3087fdf"
         },
+        "test/stylesheet_manager_read_context.rb": {
+          "bytes": 2387,
+          "executable": false,
+          "sha256": "98816f8a4a1ed8b40fbf53a2cea76ce7c71304484194a907b5c5f9e8d9672146"
+        },
+        "test/stylesheet_manager_read_original_context.rb": {
+          "bytes": 475,
+          "executable": false,
+          "sha256": "ccb1c3f5d2531c909756d35c8315823d45a8b144c5404547b6f722630ea9ae05"
+        },
         "test/svg_bundle_context.rb": {
           "bytes": 7265,
           "executable": false,
@@ -4071,6 +4081,11 @@
           "executable": false,
           "sha256": "b93a445ae68f7f28bb9934c7c74b89f791c4588d19b5d89b35a418519f85aa2f"
         },
+        "tools/generate_stylesheet_manager_read_stage.rb": {
+          "bytes": 3678,
+          "executable": false,
+          "sha256": "707c3c16ab0cb1085387d624ca50141a823708e2cc08d8231ec01180fc945e5d"
+        },
         "tools/generate_svg_bundle_stage.rb": {
           "bytes": 9557,
           "executable": false,
@@ -4541,6 +4556,11 @@
           "executable": false,
           "sha256": "c7b98864cce7f6cea25ba85d66430c3b5717b18c8d35d0dcd3e4504cfa342bbe"
         },
+        "tools/probe_stylesheet_manager_read_stage.py": {
+          "bytes": 6818,
+          "executable": false,
+          "sha256": "afa7e888df98e895aa1defd9decd7d7f19b24dac4bf73450fed918e3aa9fb335"
+        },
         "tools/probe_svg_bundle_stage.py": {
           "bytes": 13230,
           "executable": false,
@@ -4902,8 +4922,8 @@
           "sha256": "a194f20c2e80ed839fa8eeaef488ce66e7ccc445019384c7e5558499eee0e8e6"
         }
       },
-      "head": "f054668c0943fb0612669c3b09d6fe495d8caa24",
-      "source_bytes": 10809299,
+      "head": "1dad8d1549cfaeab8c490538ae9df524fc6f78d8",
+      "source_bytes": 10825511,
       "upstream": null,
       "working_tree_status": []
     },

@@ -895,3 +895,37 @@ if useful; never invent existingCSS/cache warm state or claim fullpage acceptanc
 Postbody baseline verify-20261109-144337 PASS isolatedoriginalscope; not page.
 Generator proof cleanup adds raw Booleanhelper span and explicitly records ==true
 lowering and correct componentURI semantics; generated runtime bytes unchanged.
+
+## Continue safe actual stylesheet Manager source READ prefix
+
+Do NOT misstate the body boundary as dynamically reached PGwrite; source constructor
+and read arguments remain permitted. Execute actual first stylesheet partial/helper
+assignment through original stylesheet_manager defined? memo + fullManager initialize
+and real Theme.transform_ids. Candidate unique read-role alias avoids grounding full
+stylesheet/compiler class; independent original raw constructor/getter separate.
+No stylesheetURL/result returned: first not-yet-acquired colorstylesheet href/cache/
+read method explicitly refuses. No cache registration/publication, disk hydration,
+SCSS compiler/ThemeField rebake/PGwrite dispatch. Existing297+ controls/callbacks
+retained; verify realconstructorstate, sourcewarmidentity and evaluatedscheme_id,
+then wrongtransformedIDs/freshmanager xnative/sharedcontrols. This is bounded
+implementation, not new permission or full stylesheet/page acceptance.
+
+Style144830 preflight explicit missing stylesheet_manager forwarding alias after
+source getter renamed for direct observation; add exact single source delegation,
+no receiver/value substitution or skipped work. No nativecompile invoked on failure.
+
+## Actual stylesheet Manager source READ prefix PASS
+
+Canonical144910 PASS_SCOPED_ACTUAL_STYLESHEET_MANAGER_READ_PREFIX_O0_NOT_STYLESHEET:
+compile551.104s AND native2.317s/shared2.117s/raworiginal3.368s RUN RC0;
+225readonlySQL,301EACHownedfixturefamilycleanup. Actual @theme_id/-transformedIDs,
+initial empty per-instance themes_cache, defined? getter memo warmobjectidentity and
+source helper evaluated real scheme_id matched;4newwrongIDs/freshmemo runtimecontrols
+reject. No CSS/cache/URL result supplied; no stylesheetcache registered or body
+past href call executed. Unacquired color_scheme_stylesheet_link_tag_href/details
+cache/read remains implementation gap, NOT a newly inferred PG permission stop.
+Conditional Builder/compiler/rebake/PGwrite paths remain separately prohibited.
+No full stylesheet/layout/HTML/browser/page acceptance. Everyfailedattemptretained.
+
+Postmanager baseline verify-20261109-151449 PASS isolatedoriginalscope; not page.
+Add explicit opt-in labelled Makefile targets for3new scopes; no gate substitution.
