@@ -929,3 +929,65 @@ No full stylesheet/layout/HTML/browser/page acceptance. Everyfailedattemptretain
 
 Postmanager baseline verify-20261109-151449 PASS isolatedoriginalscope; not page.
 Add explicit opt-in labelled Makefile targets for3new scopes; no gate substitution.
+
+## Focused isolated UNIT metadata/URI edge vectors
+
+New UNIT matrix exercises actual serializer method and u source against raw actual
+ActionView with quote/ampersand/HTMLentities/NULL/Boolean/Integer/StringArray/UTF8/
+U2028/U2029/space/plus/control vectors; no live values/services/data fabrication.
+First UNIT refused missing explicit bundledBase64 dependency of existingViewHelpers.
+Second found reference profile mismatch: unconfiguredAS JSON defaults escapeJS=true,
+while pinnedDiscourseconfig/application.rb93 explicitly config.load_defaults8.1 and
+actualRailsConfiguration8.1 sets itfalse. Execute actual Configuration object defaults
+(no Railsapp boot) and apply that actual option to rawUNITencoder; don't change
+candidate or claim legacyASdefault equivalence. Real metadata earlierASCIIprofile
+unaffected. Both failedlogs retained. Sourceframework defaults inspected; no original
+HTML retry or dynamic app boot. Re-run independent original/shared/native matrix.
+
+## Final focused regressions and source/effects/resource audit
+
+UNIT meta/URI actual original/shared/native PASS client-meta-primitives-f07goll3:
+6edgevectors, untouched inputJSON, UTF8/control/HTMLentities/nil/false/arrays,
+actualRails8.1 configuration defaults, nativeexecve1/connect0. Not live input or
+page result. Native originalmetadata-only regression151946 PASS (compile590.963s,
+native2.317/shared2.117/original3.318s RC0,209readonlySQL,282EACHcleanups), confirming
+later tag-only observation hook leaves default exact-suffix assertions working.
+CSPnonce/provider/injector test PASS csp-nonce-a8pvoazb; assetpreloads helper PASS
+asset-preloads-7r2iglmz, native/shared/raworiginal and alltheir controls retained.
+
+Fullpinaudit15:44: ALL27435blobs originalANDserving match96ce8d4, canonical aggregate
+1e1d4bbf63d2888ac507550b8c3ed0fbb3026d123b1853bef4b295194869d9c0 unchanged.
+Original/Roundhouse/Spinel worktrees CLEAN. Effects audit130858/141726/144910/151946:
+eachnativeexecve1, connectports ONLY readonlyPG5499 + respective exactowned cache
+52119/54097/48087/48143, no observed SQLwrites; all282/297/301/282 EACHfixturefamily
+cleanups true. No taskcompile/fixture processes remain; protectedshared6399 untouched.
+Nov7statusCONSUMED,rails_invocations1,cleanup_verifiedtrue and Nov4CONSUMED unchanged;
+no originalHTML/privatePG replay or protectedgates run. MainCPU0-3/max4 aggregate8.
+Freshquota71%<75soft/80hard unknownclosed. Canonicaldedup task+allretainedrelated+
+alltasktmp123.786613GiB<150. Exact Recovery34turns375/400 at15:44, capnotreset.
+Deadline Nov10 16:27:43Sydney216h unchanged. Failedlogs retained, no resultwaivers.
+
+## Concrete next unacquired source READ contract, not an invented permission stop
+
+Stylesheet href/details first requires raw Theme.theme_ids/get_set_cache("theme_ids")
+Array[Integer] realcold/warm/deferred wire/publication, NOT reuse current bare ORM
+Theme.theme_ids read as equivalent fullcacheAPI. Existing guarded ThemeArray admits
+ONLY :extra_js: key with Array[Hash] shape; cannot silently admit newIntegerArray or
+skip callback. Then real ColorScheme lookup/fallback and rawColorScheme.base source
+creates unsavedrecord/actualSCSScolors, id/name maps/is_base/is_builtin_default flags,
+sourceI18nname singleton behavior. Do not fabricate a base DBrow/name/cachekey or
+returnCSS from capturedoutput. Slug.for/cachekey/global inputs, theme loaded builder
+fields/ensure_baked and realCSSpath existence follow; no claim yet about conditional
+PGwrite reachability. Later actualSite.json->SiteSerializer->Wizard retained realPG
+writecondition remains prohibited. These are separate remaining implementation and
+effect-authority obligations, not a reason to relax any originalsource/cache guards.
+Overall019/fullstylesheet/layout/HTML200/browser/page remain UNACCEPTED.
+
+Final enhanced UNIT client-meta-primitives-lhow8qqi PASS: unchanged pinned app
+config8.1 bytes rechecked againstgit;6positive vectors +5candidate-only admission
+controls (wrongid/key/Arraynil/nestedHash/nonHash) reject exacterrors in SAME native
+andshared serializer, zero serviceconnects. GenericActionView accepts a broader
+API and is NOT claimed equivalent on deliberately unsupported domain. No runtime
+application change from these UNIT additions. Allpositive/fullrequest/protected
+flags unchanged. Finish coherent boundedRecovery34 checkpoint/STATE; overall019
+remainsOPEN with concrete next read/cache work, no invented permission stop.

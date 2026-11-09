@@ -391,3 +391,8 @@ verify-layout-body-splash:
 .PHONY: verify-layout-stylesheet-manager-read
 verify-layout-stylesheet-manager-read:
 	python3 tools/probe_stylesheet_manager_read_stage.py
+
+# UNIT escaping/Unicode/component-URI edges; no live data, service or page claim.
+.PHONY: verify-client-meta-primitives
+verify-client-meta-primitives:
+	python3 -m unittest discover -s test -p test_client_meta_primitives.py
