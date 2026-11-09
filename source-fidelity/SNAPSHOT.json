@@ -1,10 +1,10 @@
 {
-  "captured_at": "2026-11-09T20:00:02.602423+11:00",
+  "captured_at": "2026-11-09T20:31:25.024790+11:00",
   "components": {
     "fidelity": {
       "branch_at_capture": "main",
       "contains_uncommitted_work": false,
-      "file_count": 1003,
+      "file_count": 1006,
       "files": {
         ".gitignore": {
           "bytes": 39,
@@ -32,9 +32,9 @@
           "sha256": "8177f97513213526df2cf6184d8ff986c675afb514d4e68a404010521b880643"
         },
         "Makefile": {
-          "bytes": 17353,
+          "bytes": 17619,
           "executable": false,
-          "sha256": "7ff3f4a324efaf5e95494ce42dba49cd190cac0d6cab8a3d29a8a6f9ffd91477"
+          "sha256": "95d463e9e7b33a305ab45a496796a73bfcab907647873fcc62866ec69ae4ea26"
         },
         "README.md": {
           "bytes": 46099,
@@ -97,9 +97,9 @@
           "sha256": "14cda41d6124b79b692c5520a487bca7697900c48fc9733c338c2d54882e6b66"
         },
         "RECOVERY35.md": {
-          "bytes": 23711,
+          "bytes": 29766,
           "executable": false,
-          "sha256": "76545f4f791c6f59e6d7b939fc7f7d0f93999a0e5700a0a6ca895765c1809bf5"
+          "sha256": "cd3c20a629139aea6069ca90ccb9715f5e36dc64cda40b7c1a76752cbb5aac7b"
         },
         "SEEDFU_SOURCE_ORDER.md": {
           "bytes": 21893,
@@ -3796,6 +3796,11 @@
           "executable": false,
           "sha256": "533cdc8638846d48532f1b8571abebcb1cca093269be5d85f8774bcc180bb83e"
         },
+        "test/theme_transform_cache_context.rb": {
+          "bytes": 4030,
+          "executable": false,
+          "sha256": "47e3d398f5d5decfd35df9eca598c849aa9081280eb472d8dd4522f0e368094e"
+        },
         "test/topic_query_probe.rb": {
           "bytes": 3788,
           "executable": false,
@@ -4245,6 +4250,11 @@
           "bytes": 8856,
           "executable": false,
           "sha256": "6dfb4db60a94b6703a46384692423922717230db0f69475754c0143fdf20a572"
+        },
+        "tools/generate_theme_transform_cache.rb": {
+          "bytes": 2629,
+          "executable": false,
+          "sha256": "c4eb9113f1f729c85c09be1a15ae971d96b29fbaff79e9ba8dd287867c21f04f"
         },
         "tools/generate_visible_page.rb": {
           "bytes": 5171,
@@ -4811,6 +4821,11 @@
           "executable": false,
           "sha256": "d9f781eb66c29c86934f08f7f94e214259cb56567590c3007fd04d27d4a6fb4b"
         },
+        "tools/probe_theme_transform_cache.py": {
+          "bytes": 9236,
+          "executable": false,
+          "sha256": "d7db68e639bb421eafc9bcb3e05558c5d5889e0a1b6c811ce026dbd9838d16c2"
+        },
         "tools/probe_vendored_assets.py": {
           "bytes": 6950,
           "executable": false,
@@ -5022,8 +5037,8 @@
           "sha256": "a194f20c2e80ed839fa8eeaef488ce66e7ccc445019384c7e5558499eee0e8e6"
         }
       },
-      "head": "2ee76ee15622198c0d06fc5295398a91315313be",
-      "source_bytes": 10946605,
+      "head": "3c627fe4044f403f0e4e75f8b86eb64043ed86d8",
+      "source_bytes": 10968821,
       "upstream": null,
       "working_tree_status": []
     },

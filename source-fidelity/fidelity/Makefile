@@ -422,3 +422,9 @@ verify-palette-base-read:
 .PHONY: verify-stylesheet-key-read
 verify-stylesheet-key-read:
 	python3 tools/probe_stylesheet_key_read.py
+
+# Diagnostic only: native/shared pass, unchanged raw Relation#select block fails.
+# Intentionally nonzero until three-way source/cache proof is complete.
+.PHONY: probe-theme-transform-cache
+probe-theme-transform-cache:
+	python3 tools/probe_theme_transform_cache.py

@@ -331,3 +331,83 @@ Stylesheet/layout/HTML200/browser/page/019 FALSE. Next genuineBuilder.scheme_slu
 requireslocalizedname transliteration (NOTrawcachekey'sname), plusactualparent-theme
 Integercache before resolve_baked_field; acquireeffects/paths honestly, no bareORM
 substitutionforcache. ColdBuilder/ThemeField/Wizardwritesremainprohibited.
+
+## Required next source-cache fidelity acquisition, not declaration campaign
+
+Inspecting Builder.resolve_baked_field found actualTheme.is_parent_theme? invokes
+parent_theme_ids cache. ExistingoldemittedTheme transform/parent/components helpers
+havebareORM adapters; doNOTreuse/claimthem ascachefidelity. Recovery34constructor
+scope doesNOTcloseactualnestedcachechain; keepolderprooflabel/pagefalse andpreserve
+evidence. Nextminimalactualsourcefamily: parent_theme_ids, theme_components_for_ID,
+transformed_ids_ID forfreshcurrentthemeID only. ReuseexistingIntegerdefer/wire/
+Scheduler/ownedfixture lifecycle, separatelyregisteredactualMarshalbytesPERKEY;
+no genericcacheframework/flag, newlocks/fences/seeds orSQLrewrite. Sourceparent/
+components/transform/get_set_cache and raworiginal independentbodies allpinned.
+Sourceproductionvalues/types/order/identity andlegalpendingcoldmisses preserved;
+fullstylesheet/managerintegration remainsFALSE untilgenuinelyacquired.
+200127/200151 retainedpreflightattributionfailures: keepoldThemeIDswrongkeydiagnostic
+and scopeitsTESTcopied-warmmutation toONLYoriginaltheme_ids key (notnewfamily).
+No oldassertionsremoved/relaxed. 200221 allshared/inherited/newpreflightcontrolsPASS,
+nativecompile347.537s butnativeRUN failswarmidentity onemptycomponentscache. Same
+actualwire/server/localvectors agree, no negativefaultenabled. Tiny nativeUNIT
+showsdirecttypedemptyArray->mixedHash->sort!/uniq!->iteratedidentityPASS; notpermission
+barrier/compilerrepair. Sourceforeign-column pluck hasgenericArrayABI beforedefer,
+soaddexplicittypedactualproducer helper for SAMEChildTheme.where(...).pluck(:child_theme_id)
+expression beforecacheyield. SharedRuby returnsidenticalactualORMArray (no explicit
+copy/coerce/sort/freeze/seed); typedreturnedge makesIntegerArrayownershipprecise.
+Keepwarmidentityassertionsunchanged; investigate ifstillfails, neverwaiveemptycase.
+201322 explicitproduceredge DOESNOTfixnativewarmobserveridentity; preservefailure,
+revertunhelpfulproduceradaptation. Existingownedfixture native-onlydiagnostic on
+sameartifact: first==second identity true, butmixedHashcachedpayload differsattyped
+OBSERVER argumentedge. No cachecopyactuallyestablished. TinyisolatednativeUNIT
+reproducesexactcause: GenericProducer(untypedemptyArray)->Hash[String,untyped]->
+typedgetterArray[Integer], passingHashpayload toArray[Integer] OBSERVER argument
+losesidentity; SAMErawboxed(untyped)OBSERVER comparisonPASS. Directtypedarrayunit
+alsoPASS. Correctobserverformal toitsACTUALmixedHashpayloadABI untyped andvalidate
+withunchangedstrictIntegerArray/mutability validator FIRST. Allproductiongetter/
+cache/block APIs remainArray[Integer]; no type/securityadmission relaxation/copy/
+compiler/lifetime repair. Sameidentityassertions retained andcopied-warm negative
+muststillreject. Thisisnotaproductvalueconversion or weakeningassertion. Diagnostic
+artifact/source/unit logs retained, actualsourceproducerunchangedafterrevert.
+
+## Nov9 20:28 GENUINE QUOTA SOFT PAUSE — 75%, not task acceptance
+
+Freshterm-llm usage--providerchatgpt reports75% (previous74%), mandatory75soft/80hard.
+Stopimplementation/builds now; closecommitteddiagnosticcheckpoint/STATE only.
+Verifiedsourcecheckpoints: a468ae6 actualtheme_ids cache;12e781a completebasepalette;
+2ee76ee sourceSlug/cachekey/liveglobals. Lastcompletebaseline194855PASS, immutable
+original/serving27435-blobcanonical auditunchanged. No protectedgaterun/edits,
+compilerchanges/helpers/external/PGwrites/privatePG/HTMLretry/newservice invoked.
+
+Unacceptednextcachefamily build/probe-portable-security-20261109-202219:
+explicitO0nativecompile348.035s AND native0.214/shared0.514s RUNRC0. Actualparent/
+component/transformed cachevalues, sourcecoldPG/deferredpublication/realcallbacks,
+mutableIntegerArray/warmidentity andno-requery/no-republish passEACH of3requiredkeys,
+includinggenuinelyEMPTYcomponentIDs (no seeded[]). ThemixedHashobserverABI correction
+preservesstrictproductiontypes andidentityassertions, copiedwarm preflightrejects.
+All4newpreflightcontrols pass, all30ownedcachefixtures cleanuptrue. Fullpostnative
+newruntimecontrols NOTRUN becausecompat-original failsduringactualrequest,RC1:
+ActiveRecord::Relation#select: 'select: no columns (a block form reached the projection)'
+atcompat/emitted/runtime/active_record/relation.rb:1068, calledunchangedsource
+Theme.transform_ids' Enumerable select block. Candidate sharednormalizesto.filter;
+rawsourceprojection ABIneedsboundedsource-compatible block binding (NOT SQLrewrite,
+cachebypass, forcedemptyresult or compilerrepair). Exactfailedsource/log/cleanup
+preserved. NewMakefile target is probe-theme-transform-cache, explicitlynonzero/
+UNACCEPTED; no verificationlabel orbroaderclaim. No actualBuilder/path/diskcondition
+acquisitionyet; localizedscheme_slugtransliteration stillimplementationwork, then
+actualsourcecache/readmanager/theme-field relations/digest/fsmtime/path/diskconditions.
+RefusepreciselyBEFOREconditionalBuilder/rebake/WizardPGwritedispatch; doNOTclassify
+missinghelper/projectionAPI aspermissionstop. SourceBuilder.compile andThemeField
+ensure_baked!/StylesheetCache.add effectevidence inspectedONLY, notdispatched.
+EarlierRecovery34constructorproofdidNOTcloseactualnestedtransformcachechain; this
+limitationpreservedexplicitly. Full9k600timeouts/gate34failure remainunchanged.
+Fullstylesheet/layout/HTML200/nativebrowser/page/overall019 FALSE.
+
+75%pauseisgenuineexistingbudgetbarrier; no automaticretry/restart/quotareset/new
+attemptauthorized. DeadlineNov10 16:27:43Sydney/216h unchanged. Existingdriver alone
+ownslaunch/gates; dedicatedpublisheronlyexportscommittedauditedsource, workerNO
+push/PR. ConsumedNov4/Nov7originalHTML/privatePG andallreadonly/sharedendpoint/
+CPU/disk/nohelper/noexternal boundaries unchanged. Freshclosingresourceaudit in
+build/recovery35-quota-resource-audit.json. Nextafterlegitimatebudgetcontinuation:
+resolvepreciseunchangedrawselectblockprojectionbinding, runfullnewsourcecache
+3-way+runtimecontrols, thencontinuegenuinebuilderhelperswithoutfakeCSS/keys/URLs.
