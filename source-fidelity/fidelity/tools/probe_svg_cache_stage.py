@@ -13,6 +13,7 @@ class SvgCacheStageRun(ClientHighlightStageRun):
     success_status='PASS_SCOPED_ACTUAL_SVG_CACHE_PREFIX_BEFORE_SETTINGS_HASH'
     svg_icon_producers_supported=False
     svg_bundle_supported=False
+    client_meta_supported=False
     expected_locale_boundary='source settings_hash getter acquisition pending'
     additional_schema_tables=ClientHighlightStageRun.additional_schema_tables+('badges',)
 
@@ -103,7 +104,7 @@ end
             assert len(observed)==2
             if self.svg_bundle_supported:
                 assert all(v['registered'] and v['source_getter_returned']for v in observed)
-                assert len(observed[0]['notes'])==10 and len(observed[1]['notes'])==16
+                assert len(observed[0]['notes'])==(11 if self.client_meta_supported else 10) and len(observed[1]['notes'])==(18 if self.client_meta_supported else 16)
                 assert all({'settings_icons','badge_icons','group_icons'} < set(v['values'])for v in observed)
             elif self.svg_icon_producers_supported:
                 assert all(v['registered'] and v['source_getter_returned'] and set(v['values'])=={'settings_icons','badge_icons','group_icons'}for v in observed)

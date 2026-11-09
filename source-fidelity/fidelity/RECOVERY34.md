@@ -688,3 +688,125 @@ page/019FALSE. Next let realpath reach source client-side data Hash/tag builder 
 acquire actual encoded meta result, then continue layout through permitted effects.
 No future stylesheet/Wizard/rebakePG effects authorized. Full source failures and
 other optimization experiments preserved, no compiler code/lifetime repair.
+
+## BEFORE actual client setup/meta consumer
+
+Continue actual source helper after returnedSVGpath: live config Boolean reporting,
+source palette/staff nil semantics, development SVG icon list, actual MessageBus
+last_id('/file-change') site encoding/backendGET, Guardian safe-mode check and nested
+source Upload/globalS3 Boolean (no S3 URL/network profile accepted). Existing source
+lexical getter capability reads real enable_s3_uploads; no broad scalar relaxation.
+Actual no-cookie controller CookieJar consulted; nonempty/user palette profiles
+explicitly refuse, raw original full palette methods kept. Source EnvironmentInquirer
+is projected ONLY to immediate data-attribute String consumer; no generic native
+client-side Hash/environment class API claimed. Native concrete meta id/data source
+branch uses tested actual HTML/Rails8.1 JSON escaping, raw realActionViewTagBuilder
+reference independent. Fullconsumer tag/key/value/order/bool/nil/array output compared,
+wrong escaping/attribute/palette/channel controls required. New file-change scope
+is exact READ ONLY on owned fixture, no new publication authority. Next remaining
+layout checkpoint after actual meta output, NOT HTML200/page. O0/600s profile explicit.
+
+## Meta122051 actual global false-fallback returns nil, not forced false
+
+CRuby reaches remaining helper, error_reporting guard incorrectly assumed Boolean.
+Pinned GlobalSetting BaseProvider resolve converts false fallback to nil; shared
+configuration already preserves this independently proved behavior. Admit nullable
+Boolean, NEVER convert nil to false. Source TagHelper omits nil data attribute.
+Failure retained/allcleanup. Also bind new layout boundary as concrete view method
+(existing head configuration boundary is concrete), preserving its exact yield
+callback and ensure close_request_assets; no cleanup/callback skipped. Original
+uses real ActionView::OutputBuffer and same original head callback/asset cleanup.
+No native compile; continue full consumer proof, not partial Hash success.
+
+## Meta122202 genuine CookieJar missing-vs-empty contract
+
+Actual framework CookieJar [] intentionally returns emptyString for missing .to_s
+consumers, but source palette helpers explicitly test nil. Guard correctly rejected
+rather than silently choosing palette0. Add source-specific nullable presence read
+on the SAME real inbound CookieJar store, view adapter memoized per view. Missing
+key yieldsnil, present-empty staysempty; no header/cookie/value manufactured, no
+write/parser bypass. Existing framework [] behavior unchanged for old consumers;
+raw original full palette methods use same presence-preserving read view. Nonempty
+HTTP_COOKIE/user palette ingress still unsupported. Failure/allcleanup preserved.
+
+## Meta122310 full helper/tag reached actual view-flow assertion
+
+No missing getter now; actual returned meta checkpoint reached but source body event
+ordering assertion rejected. Preserve exact assertion and failure, add stage-local
+actual/expected event diagnostic before inherited observer to diagnose missing/extra
+source callback ordering. No native compile/assertion weakening, allcleanup retained.
+
+## Meta122400 diagnosed legitimate async cold cache interleaving
+
+Actual source development all_icons was called after path return but before its
+owned deferred icon publication, so it legitimately recomputed icons/settings-hit
+(extra source event); no fake output/callback skip. Preserve old ordering rejection.
+Changed TEST scheduling experiment: at existing TEST SvgBundleBootstrap path-return
+boundary only, wait for that ALREADY computed actual cold version publication on
+same owned fixture before continuing source helper. This chooses a legal original
+worker interleaving, supplies/seeds/forces NO cache value or producer/preload, and
+runs all genuine deferred effects. All3runtimes use identical fence; application
+source helpers/paths/order unchanged. Label client-meta proof CONTROLLED POST-SVG
+QUIESCENCE, not arbitrary concurrent cold-cache semantics. Warm source identity/
+no-republication and every callback/cleanup assertion stay required. No scope or
+source expectation derived from observed event logs; deterministic ordering remains.
+
+## Meta122650 edit quoting failure retained
+
+The Python patch command itself had an unterminated string and did not alter runner;
+subsequent preflight repeated old ordering failure, not a new fence result. Correct
+patch via literal file edit, verify syntax, then measure changed scheduling experiment.
+No native compile, no failure erased or accepted under a false description.
+
+## Meta122739 shared full consumer+all focused controls PASS; native analysis timeout
+
+Controlled actual post-SVG publication fence gives exact shared source helper/meta
+output and all4newfocused controls,19EACHfixturefamilycleanups true. Native-O0 hits
+600 during type fixpoint after class-structure219.775s, BEFORE codegen (different
+from prior CC limit). Inspect actual data API: new meta boundary/returned Hash was
+seeded untyped although source admitted values are ONLY nullable String/Integer/
+Boolean/StringArray. Narrow new API seed to this truthful checked union, not a
+value/type fabrication or framework-wide relaxation; source guards still enforce
+actual shape and original meta output comparison required. No compiler edit,
+source callback skip, runtime result waiver or measurement extension. Fresh run.
+
+## Meta124219 timeout, no union seed benefit
+
+Analysis526.203s vs baseline422.251s; class-structure259.332s vs175.756s,
+methodanalysis near baseline; new union seed not a win and adds no needed runtime
+guard, restore existing boxed Hash[Symbol,untyped]. Concrete source observation
+reduction: the ONLY String subclass needing conversion in isolated-original is
+:environment; replace whole mixedHash transform_values/is_a?/to_s block with
+shallowdup + environment-only conversion (all other actual data values retained).
+This changes observation only, not helper/serializer runtime values or callbacks.
+No compiler changes/time waiver. Fresh quota68%, dedup122.968GiB/150cap, turn259+.
+
+## Meta125714 native compiled AND RUN; original next-template boundary uncovered
+
+Boxed actual Hash + environment-only observation conversion: native-O0 compile
+515.372s, nativeRUN2.520s and SAMEsharedRUN2.871s RC0; actual18key Hash/meta exactly
+matches between these2. No overall pass: isolated-original full template correctly
+continues beyond completed meta into discourse_config_environment (not yet acquired).
+Align independent raw Erubi template prefix to same exact actual source cursor,
+immediately after setup meta append. Do NOT implement fake nexthelper or skip any
+work before cursor. Source prefix hash/bytes proved, raw actual ActionView tag stays.
+Full remaining layout/HTML/browser stillFALSE. New run allretained controls.
+
+## Actual full client setup/meta immediate consumer PASS
+
+Canonical130858 PASS_SCOPED_ACTUAL_CLIENT_SETUP_META_CONSUMER_O0:
+nativecompile519.525s AND nativeRUN2.267s/SAMEsharedRUN2.117s/raworiginalRUN3.368s
+allRC0. Same18sourcekeys and8251byte actual voidmeta, source environment original
+StringInquirer projected ONLY at immediate String attribute; no genericsetupHash/
+EnvironmentInquirer object API claim. Configerrorreporting and staff nil preserved,
+actual source palette absentcookie nil=>-1, real nestedUpload/globalS3 algorithm,
+source development all_icons and genuine MessageBus last_id /file-change GET.
+Source original Erubi prefix ends exactly after metaappend, matching candidate.
+Controlled TEST postSVG genuine deferred-publication quiescence fence, not cache
+seed/preload; allactualcold/warmsourcecalls/effects still executed and checked.
+209readonlySQL,282EACHownedcache/VM/asset/MFfixturefamilycleanups true. Fournewmeta
+mutations x2native/shared +4preflights reject; every inherited control retained.
+No PGwrite/shared6399write/originalRailsHTML invocation. All failed attempts kept.
+Full genericclientsetupHashAPI/layout/HTML200/browser/page/overall019 stillFALSE.
+
+Postmeta baseline verify-20261109-133132 PASS isolatedoriginalscope; not page.
