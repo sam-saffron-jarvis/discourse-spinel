@@ -1,10 +1,10 @@
 {
-  "captured_at": "2026-11-09T13:40:02.820758+11:00",
+  "captured_at": "2026-11-09T14:50:01.752102+11:00",
   "components": {
     "fidelity": {
       "branch_at_capture": "main",
       "contains_uncommitted_work": false,
-      "file_count": 975,
+      "file_count": 979,
       "files": {
         ".gitignore": {
           "bytes": 39,
@@ -92,9 +92,9 @@
           "sha256": "b4836b14d2d6ca0423a77566991d08ba1c6117408d9ab5cff7daacd5925df357"
         },
         "RECOVERY34.md": {
-          "bytes": 54112,
+          "bytes": 60081,
           "executable": false,
-          "sha256": "6f97d12602f521fff090936a42cad4db1d6a2518223a3583fdd732ae7389eaab"
+          "sha256": "e52869bb5069122ce0615ec97db5c5163e736d154260f785e97ace7997f4e174"
         },
         "SEEDFU_SOURCE_ORDER.md": {
           "bytes": 21893,
@@ -2816,6 +2816,16 @@
           "executable": false,
           "sha256": "e37ff1cc9a7995bbb6555c1371f44b0162bfb0aeebcfc693f456fe1004d14733"
         },
+        "test/body_layout_context.rb": {
+          "bytes": 8128,
+          "executable": false,
+          "sha256": "cee2ca5d85a1ba2fe16a2a80b759b2d6a5d81f70e7a4b1df55b7a00f1d3f4b3c"
+        },
+        "test/body_layout_original_context.rb": {
+          "bytes": 1857,
+          "executable": false,
+          "sha256": "51bd2f38862befbcd36746b46f15b63bc04387913c12569c5b692d3602ef49a9"
+        },
         "test/category_cache_context.rb": {
           "bytes": 12355,
           "executable": false,
@@ -2847,9 +2857,9 @@
           "sha256": "659784f9954d45fab4688d1d8f67d917161c80b220879b87bfd99d59caddf001"
         },
         "test/client_meta_context.rb": {
-          "bytes": 7555,
+          "bytes": 7635,
           "executable": false,
-          "sha256": "17249bea735043adedfb17c07ddbf6408a4202ed57e74f64ab1e8ef125260bcf"
+          "sha256": "38465b371677df0ede78daa2f0ddf05fa699125ff6fb04446c278e5fa3b89adf"
         },
         "test/client_meta_original_context.rb": {
           "bytes": 1423,
@@ -3861,6 +3871,11 @@
           "executable": false,
           "sha256": "87b6419ada21841fe3ae6c9ffbfe98edf49ac1dadd6c03b202da6f18b854dec1"
         },
+        "tools/generate_body_layout_stage.rb": {
+          "bytes": 6394,
+          "executable": false,
+          "sha256": "8ba90911692eac138cc34d2b484ee0a76515d55450051d407572aee922c0f00c"
+        },
         "tools/generate_category_cache_source.rb": {
           "bytes": 14800,
           "executable": false,
@@ -4295,6 +4310,11 @@
           "bytes": 5040,
           "executable": false,
           "sha256": "25f995087b271cddb66c8b155d283a88b19dc2505066005c48575f5633b000da"
+        },
+        "tools/probe_body_layout_stage.py": {
+          "bytes": 8282,
+          "executable": false,
+          "sha256": "351ad4d8d2deb3452784c2f4b186446dd9d911332d09f9e63c8e9b603889e3e6"
         },
         "tools/probe_category_cache_stage.py": {
           "bytes": 11238,
@@ -4882,8 +4902,8 @@
           "sha256": "a194f20c2e80ed839fa8eeaef488ce66e7ccc445019384c7e5558499eee0e8e6"
         }
       },
-      "head": "e6969aaae09671a1f59ed6de14bce92ccc714a63",
-      "source_bytes": 10778589,
+      "head": "f054668c0943fb0612669c3b09d6fe495d8caa24",
+      "source_bytes": 10809299,
       "upstream": null,
       "working_tree_status": []
     },

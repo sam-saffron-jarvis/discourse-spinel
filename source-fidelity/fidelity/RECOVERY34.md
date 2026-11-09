@@ -810,3 +810,88 @@ No PGwrite/shared6399write/originalRailsHTML invocation. All failed attempts kep
 Full genericclientsetupHashAPI/layout/HTML200/browser/page/overall019 stillFALSE.
 
 Postmeta baseline verify-20261109-133132 PASS isolatedoriginalscope; not page.
+
+## Continue genuine config/auth/body/full splash to stylesheet effect boundary
+
+Next experiment sources actual config Hash/JSON + ERB u, authentication missing-
+cookie defined? memo (instrument actual read exactly once and no warm reread), body
+class Set, controller splash environment predicate and complete splash partial.
+Live nullable splash upload uses existing actual upload reader; independent raw
+original setup_methods getter, raw original config/ActionView/ERB/color lookup.
+Extend guarded existing palette names ONLY secondary/tertiary, real owned cache
+publication/cleanup still mandatory. Nonempty upload/user/category/auth profiles
+refuse before unsupported collaborators. Last actual call is stylesheet partial,
+which must raise before any stylesheet acquisition/effect; no fake stylesheet,
+write permission extension, full layout or page claim. Original template cursor
+identical. Existing meta assertions retained via exact tag-only extraction when
+subsequent template bytes are now present; full prefix separately compared too.
+
+## Body133937 shared genuine full splash runs; cross-cache observer race
+
+Positive shared fullbody stage RC0. Existing SVG drop-core-icon control reached
+inherited global publication-count warm invariant while newly queued genuine splash
+palette jobs were still publishing, failing 'SVG warm bundle republished' before
+its intended icon assertion. No assertion weakening: add TEST-only quiescence fence
+at already-reached stylesheet effect boundary, waiting existing owned scheduler
+queued==finished (no values/seeds/skips; allpublication/effect/cleanup assertions
+remain). Same fence native/shared/raworiginal. File133937 and control retained.
+
+Body134133 shared+allinheritedpreflight controls run after genuinejobsfence. New
+wrong-splash-predicate correctly rejects earliest exact inherited event-order
+assertion 'body view-flow ordering changed' (not the preceding coarse first4-event
+'body/layout sequence changed' assumed in new control). Correct only NEW control
+expected diagnostic, no assertion weakened, source or success result unchanged.
+
+Body134310 shared fullsource and all24focusedcontrols pass; native analysis397s
+and codegen reach actual entire splash method, refuse condition on explicit raising
+unacquired image animation helper (bottom method unseeded, not Boolean). Add truthful
+source Boolean API RBS contract for that always-raising unsupported method; no fake
+false result or branch deletion. Tiny no-service native UNIT declaration experiment
+build/recovery34/body-bool-rbs confirms compile and actual ArgumentError, no compiler
+edit. Full actual source image profile remains guardednil and unsupported otherwise.
+
+Body135359 same bottom predicate refusal despite truthful classRBS; fullmodule
+context does not honor it at dead-branch call, no nativeacceptance. Tiny mixin UNIT
+passes both RBSowners, so do not infer or fix compiler internals. Source-level
+Boolean lowering next: actual helper is Boolean if it ever returns (present? &&
+match?); compare predicate ==true in candidate partial ONLY, preserving raise and
+actual Boolean truthiness, never inserting false or deleting branch. Original
+partial separately compiled unchanged for differential. Tiny immutable native
+no-RBS UNIT confirms actual raising helper ==true compiles and stillArgumentError.
+No compiler edit or time/gate waiver. Full nonempty customimage remainsunsupported.
+
+Body140545 native-O0compile536.725s +native2.267s/shared2.167s RUN RC0,
+actual3123byte fullsplash, realpalette/cache and authnilreadonce/warmmemo. Raworiginal
+rejects observer's assumed form-query CGI space '+': actual ERB6.0.7 Util.url_encode
+uses component '%20'. Confirmed independent raw UNIT: {"x":"a b"} => %20 versus+.
+Correct candidate u to exact CGIbyteencoding + spaces%20; independentoriginalu
+unchanged; proof adds actualERB6.0.7 source package. Fullnativeoriginalacceptance
+stillFALSE until rerun; no assertion weakening/callbackskip or fake encoding result.
+
+## Actual config/auth/body/full splash PASS; actual stylesheet call reached
+
+Canonical141726 PASS_SCOPED_ACTUAL_CONFIG_AUTH_BODY_SPLASH_BEFORE_STYLESHEET_EFFECTS_O0:
+nativecompile538.401s AND native2.367s/shared2.117s/raworiginal3.370s RUN allRC0.
+217readonlySQL,297EACHownedcache/VM/asset/MFfixturefamilycleanups true. Actual
+3123byte fullsplash, nonce-normalizedSHA256
+9da298f22e3906aacf7ee018b3966bb5357fa9507fa886d370ab258a974788d2.
+Actual configJSON +correctERBURI%20 matchedraworiginal; source authentication
+cookie read exactlyonce and defined? nilmemo warmno-reread; sourceSetbodyclasses,
+realUploadnullablegetter/customdecision; actualpalette header_background/secondary/
+tertiary and corresponding darkscheme13 via realORM/source-ownedcache/publications.
+10newruntimewrongoutput controls+5preflights; allinheritedcontrols retained.
+TESTonlyactualschedulerqueued==finished quiescence before globalwarmobservers,
+no cache seeds/preloads/values, fakeoutputs or callback skips. Original splash
+independently rawErubi, candidate provenBoolean dead-branch predicate==true lowering.
+Stylesheet partial actually called and explicitly refused BEFORE acquisition.
+This is not evidence that conditional stylesheetPGwrites were dynamically reached:
+source review says Builder#compile can hydrate disk or compile/add/cleanupPG,
+ThemeField#ensure_baked! may write while computingdigest. No such path invoked.
+Later originalSite.json/SiteSerializer/Wizard realwrite barrier remains as retained
+Recovery27/28 evidence; consumedHTML/privatePG authority unchanged. Full layout/
+HTML200/browser/page/overall019 FALSE. Continue safe source manager READ prefix only
+if useful; never invent existingCSS/cache warm state or claim fullpage acceptance.
+
+Postbody baseline verify-20261109-144337 PASS isolatedoriginalscope; not page.
+Generator proof cleanup adds raw Booleanhelper span and explicitly records ==true
+lowering and correct componentURI semantics; generated runtime bytes unchanged.

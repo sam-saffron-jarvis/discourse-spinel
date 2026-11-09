@@ -108,6 +108,7 @@ module ClientMetaViewProtocol
       close_request_assets
     end
   end
+  def client_meta_markup(prefix, index); prefix[index..-1]; end
   def client_meta_stage_observation
     puts 'FIDELITY_CLIENT_META_EVENTS ' + JSON.generate({actual: @events, expected: expected_body_events})
     record = svg_bundle_stage_observation
@@ -130,7 +131,7 @@ module ClientMetaViewProtocol
     prefix = prefix_snapshot
     index = prefix.index('<meta id="data-discourse-setup"')
     raise 'client setup actual meta tag missing' if index.nil?
-    actual = prefix[index..-1]
+    actual = client_meta_markup(prefix, index)
     raise 'client setup meta escaping/output changed' unless actual == expected
     record[:client_meta] = {keys: normalized.keys, data: normalized, html: actual, bytes: actual.bytesize, file_change_read: true, nullable_staff_preserved: true, environment_immediate_string_consumer: true, generic_setup_hash_api_supported: false}
     record
